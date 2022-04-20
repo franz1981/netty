@@ -366,6 +366,27 @@ public class DefaultHttpHeaders extends HttpHeaders {
     }
 
     private static void validateHeaderNameElement(byte value) {
+        // Check to see if the character is not an ASCII character, or invalid
+        if (value < 0) {
+            throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " + value);
+        }
+        if (!VALID_HEADER_NAME_ELEMENT[value]) {
+            throw new IllegalArgumentException(
+                    "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
+                    value);
+        }
+    }
+
+    private static final boolean[] VALID_HEADER_NAME_ELEMENT;
+
+    static {
+        VALID_HEADER_NAME_ELEMENT = new boolean[Byte.MAX_VALUE + 1];
+        for (int i = 0; i < Byte.MAX_VALUE + 1; i++) {
+            VALID_HEADER_NAME_ELEMENT[i] = isValidHeaderNameElement(i);
+        }
+    }
+
+    private static boolean isValidHeaderNameElement(int value) {
         switch (value) {
         case 0x1c:
         case 0x1d:
@@ -382,43 +403,23 @@ public class DefaultHttpHeaders extends HttpHeaders {
         case ':':
         case ';':
         case '=':
-            throw new IllegalArgumentException(
-               "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
-                       value);
+            return false;
         default:
-            // Check to see if the character is not an ASCII character, or invalid
-            if (value < 0) {
-                throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " + value);
-            }
+            return true;
         }
     }
 
     private static void validateHeaderNameElement(char value) {
-        switch (value) {
-        case 0x1c:
-        case 0x1d:
-        case 0x1e:
-        case 0x1f:
-        case 0x00:
-        case '\t':
-        case '\n':
-        case 0x0b:
-        case '\f':
-        case '\r':
-        case ' ':
-        case ',':
-        case ':':
-        case ';':
-        case '=':
+        // Check to see if the character is not an ASCII character, or invalid
+        if (value > Byte.MAX_VALUE || value < 0) {
+            throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " +
+                                               value);
+        }
+        final byte byteValue = (byte) value;
+        if (!VALID_HEADER_NAME_ELEMENT[byteValue]) {
             throw new IllegalArgumentException(
-               "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
-                       value);
-        default:
-            // Check to see if the character is not an ASCII character, or invalid
-            if (value > 127) {
-                throw new IllegalArgumentException("a header name cannot contain non-ASCII character: " +
-                        value);
-            }
+                    "a header name cannot contain the following prohibited characters: =,;: \\t\\r\\n\\v\\f: " +
+                    value);
         }
     }
 

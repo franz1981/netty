@@ -26,7 +26,7 @@ import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ByteProcessor;
-import io.netty.util.internal.AppendableCharSequence;
+import io.netty.util.CharsetUtil;
 
 import java.util.List;
 
@@ -239,7 +239,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         checkPositive(maxHeaderSize, "maxHeaderSize");
         checkPositive(maxChunkSize, "maxChunkSize");
 
-        AppendableCharSequence seq = new AppendableCharSequence(initialBufferSize);
+        ByteBuf seq = Unpooled.buffer(initialBufferSize);
         lineParser = new LineParser(seq, maxInitialLineLength);
         headerParser = new HeaderParser(seq, maxHeaderSize);
         this.maxChunkSize = maxChunkSize;
@@ -259,7 +259,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         case SKIP_CONTROL_CHARS:
             // Fall-through
         case READ_INITIAL: try {
-            AppendableCharSequence line = lineParser.parse(buffer);
+            ByteBuf line = lineParser.parse(buffer);
             if (line == null) {
                 return;
             }
@@ -373,11 +373,11 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
          * read chunk, read and ignore the CRLF and repeat until 0
          */
         case READ_CHUNK_SIZE: try {
-            AppendableCharSequence line = lineParser.parse(buffer);
+            ByteBuf line = lineParser.parse(buffer);
             if (line == null) {
                 return;
             }
-            int chunkSize = getChunkSize(line.toString());
+            int chunkSize = getChunkSize(line.toString(CharsetUtil.US_ASCII));
             this.chunkSize = chunkSize;
             if (chunkSize == 0) {
                 currentState = State.READ_CHUNK_FOOTER;
@@ -623,17 +623,18 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         final HttpMessage message = this.message;
         final HttpHeaders headers = message.headers();
 
-        AppendableCharSequence line = headerParser.parse(buffer);
+        ByteBuf line = headerParser.parse(buffer);
         if (line == null) {
             return null;
         }
-        if (line.length() > 0) {
+        if (line.readableBytes() > 0) {
             do {
-                char firstChar = line.charAtUnsafe(0);
+                final byte[] lineContent = line.array();
+                final byte firstChar = lineContent[0];
                 if (name != null && (firstChar == ' ' || firstChar == '\t')) {
                     //please do not make one line from below code
                     //as it breaks +XX:OptimizeStringConcat optimization
-                    String trimmedLine = line.toString().trim();
+                    String trimmedLine = line.toString(CharsetUtil.US_ASCII).trim();
                     String valueStr = String.valueOf(value);
                     value = valueStr + ' ' + trimmedLine;
                 } else {
@@ -647,7 +648,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 if (line == null) {
                     return null;
                 }
-            } while (line.length() > 0);
+            } while (line.readableBytes() > 0);
         }
 
         // Add the last header.
@@ -726,12 +727,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
     }
 
     private LastHttpContent readTrailingHeaders(ByteBuf buffer) {
-        AppendableCharSequence line = headerParser.parse(buffer);
+        ByteBuf line = headerParser.parse(buffer);
         if (line == null) {
             return null;
         }
         LastHttpContent trailer = this.trailer;
-        if (line.length() == 0 && trailer == null) {
+        if (line.readableBytes() == 0 && trailer == null) {
             // We have received the empty line which signals the trailer is complete and did not parse any trailers
             // before. Just return an empty last content to reduce allocations.
             return LastHttpContent.EMPTY_LAST_CONTENT;
@@ -741,15 +742,16 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         if (trailer == null) {
             trailer = this.trailer = new DefaultLastHttpContent(Unpooled.EMPTY_BUFFER, validateHeaders);
         }
-        while (line.length() > 0) {
-            char firstChar = line.charAtUnsafe(0);
+        while (line.readableBytes() > 0) {
+            final byte[] lineContent = line.array();
+            final byte firstChar = lineContent[0];
             if (lastHeader != null && (firstChar == ' ' || firstChar == '\t')) {
                 List<String> current = trailer.trailingHeaders().getAll(lastHeader);
                 if (!current.isEmpty()) {
                     int lastPos = current.size() - 1;
                     //please do not make one line from below code
                     //as it breaks +XX:OptimizeStringConcat optimization
-                    String lineTrimmed = line.toString().trim();
+                    String lineTrimmed = line.toString(CharsetUtil.US_ASCII).trim();
                     String currentLastPos = current.get(lastPos);
                     current.set(lastPos, currentLastPos + lineTrimmed);
                 }
@@ -793,7 +795,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         return Integer.parseInt(hex, 16);
     }
 
-    private static String[] splitInitialLine(AppendableCharSequence sb) {
+    private static String[] splitInitialLine(ByteBuf sb) {
         int aStart;
         int aEnd;
         int bStart;
@@ -801,32 +803,37 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         int cStart;
         int cEnd;
 
-        aStart = findNonSPLenient(sb, 0);
-        aEnd = findSPLenient(sb, aStart);
+        final byte[] sbContent = sb.array();
 
-        bStart = findNonSPLenient(sb, aEnd);
-        bEnd = findSPLenient(sb, bStart);
+        final int length = sb.readableBytes();
 
-        cStart = findNonSPLenient(sb, bEnd);
-        cEnd = findEndOfString(sb);
+        aStart = findNonSPLenient(sbContent, 0, length);
+        aEnd = findSPLenient(sbContent, aStart, length);
+
+        bStart = findNonSPLenient(sbContent, aEnd, length);
+        bEnd = findSPLenient(sbContent, bStart, length);
+
+        cStart = findNonSPLenient(sbContent, bEnd, length);
+        cEnd = findEndOfString(sbContent, length);
 
         return new String[] {
-                sb.subStringUnsafe(aStart, aEnd),
-                sb.subStringUnsafe(bStart, bEnd),
-                cStart < cEnd? sb.subStringUnsafe(cStart, cEnd) : "" };
+                sb.toString(aStart, aEnd - aStart, CharsetUtil.US_ASCII),
+                sb.toString(bStart, bEnd - bStart, CharsetUtil.US_ASCII),
+                cStart < cEnd ? sb.toString(cStart, cEnd - cStart, CharsetUtil.US_ASCII) : ""};
     }
 
-    private void splitHeader(AppendableCharSequence sb) {
-        final int length = sb.length();
+    private void splitHeader(ByteBuf sb) {
+        final byte[] sbContent = sb.array();
+        final int length = sb.readableBytes();
         int nameStart;
         int nameEnd;
         int colonEnd;
         int valueStart;
         int valueEnd;
 
-        nameStart = findNonWhitespace(sb, 0);
+        nameStart = findNonWhitespace(sbContent, 0, length);
         for (nameEnd = nameStart; nameEnd < length; nameEnd ++) {
-            char ch = sb.charAtUnsafe(nameEnd);
+            byte ch = sbContent[nameEnd];
             // https://tools.ietf.org/html/rfc7230#section-3.2.4
             //
             // No whitespace is allowed between the header field-name and colon. In
@@ -852,25 +859,25 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         for (colonEnd = nameEnd; colonEnd < length; colonEnd ++) {
-            if (sb.charAtUnsafe(colonEnd) == ':') {
+            if (sbContent[colonEnd] == ':') {
                 colonEnd ++;
                 break;
             }
         }
 
-        name = sb.subStringUnsafe(nameStart, nameEnd);
-        valueStart = findNonWhitespace(sb, colonEnd);
+        name = sb.toString(nameStart, nameEnd - nameStart, CharsetUtil.US_ASCII);
+        valueStart = findNonWhitespace(sbContent, colonEnd, length);
         if (valueStart == length) {
             value = EMPTY_VALUE;
         } else {
-            valueEnd = findEndOfString(sb);
-            value = sb.subStringUnsafe(valueStart, valueEnd);
+            valueEnd = findEndOfString(sbContent, length);
+            value = sb.toString(valueStart, valueEnd - valueStart, CharsetUtil.US_ASCII);
         }
     }
 
-    private static int findNonSPLenient(AppendableCharSequence sb, int offset) {
-        for (int result = offset; result < sb.length(); ++result) {
-            char c = sb.charAtUnsafe(result);
+    private static int findNonSPLenient(byte[] sb, int offset, int length) {
+        for (int result = offset; result < length; ++result) {
+            byte c = sb[result];
             // See https://tools.ietf.org/html/rfc7230#section-3.5
             if (isSPLenient(c)) {
                 continue;
@@ -881,26 +888,26 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             }
             return result;
         }
-        return sb.length();
+        return length;
     }
 
-    private static int findSPLenient(AppendableCharSequence sb, int offset) {
-        for (int result = offset; result < sb.length(); ++result) {
-            if (isSPLenient(sb.charAtUnsafe(result))) {
+    private static int findSPLenient(byte[] sb, int offset, int length) {
+        for (int result = offset; result < length; ++result) {
+            if (isSPLenient(sb[result])) {
                 return result;
             }
         }
-        return sb.length();
+        return length;
     }
 
-    private static boolean isSPLenient(char c) {
+    private static boolean isSPLenient(byte c) {
         // See https://tools.ietf.org/html/rfc7230#section-3.5
-        return c == ' ' || c == (char) 0x09 || c == (char) 0x0B || c == (char) 0x0C || c == (char) 0x0D;
+        return c == ' ' || c == 0x09 || c == 0x0B || c == 0x0C || c == 0x0D;
     }
 
-    private static int findNonWhitespace(AppendableCharSequence sb, int offset) {
-        for (int result = offset; result < sb.length(); ++result) {
-            char c = sb.charAtUnsafe(result);
+    private static int findNonWhitespace(byte[] sb, int offset, int length) {
+        for (int result = offset; result < length; ++result) {
+            byte c = sb[result];
             if (!Character.isWhitespace(c)) {
                 return result;
             } else if (!isOWS(c)) {
@@ -909,75 +916,79 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                         " but received a '" + c + "' (0x" + Integer.toHexString(c) + ")");
             }
         }
-        return sb.length();
+        return length;
     }
 
-    private static int findEndOfString(AppendableCharSequence sb) {
-        for (int result = sb.length() - 1; result > 0; --result) {
-            if (!Character.isWhitespace(sb.charAtUnsafe(result))) {
+    private static int findEndOfString(byte[] sb, int length) {
+        for (int result = length - 1; result > 0; --result) {
+            if (!Character.isWhitespace(sb[result])) {
                 return result + 1;
             }
         }
         return 0;
     }
 
-    private static boolean isOWS(char ch) {
-        return ch == ' ' || ch == (char) 0x09;
+    private static boolean isOWS(byte ch) {
+        return ch == ' ' || ch == 0x09;
     }
 
-    private static class HeaderParser implements ByteProcessor {
-        private final AppendableCharSequence seq;
-        private final int maxLength;
+    private static class HeaderParser {
+        protected final ByteBuf seq;
+        protected final int maxLength;
         int size;
 
-        HeaderParser(AppendableCharSequence seq, int maxLength) {
+        HeaderParser(ByteBuf seq, int maxLength) {
             this.seq = seq;
             this.maxLength = maxLength;
         }
 
-        public AppendableCharSequence parse(ByteBuf buffer) {
-            final int oldSize = size;
-            seq.reset();
-            int i = buffer.forEachByte(this);
-            if (i == -1) {
-                size = oldSize;
+        public ByteBuf parse(ByteBuf buffer) {
+            final int readableBytes = buffer.readableBytes();
+            final int readerIndex = buffer.readerIndex();
+            final int maxBodySize = maxLength - size;
+            // adding 2 to account for both CR (if present) and LF
+            final int maxBodySizeWithCRLF = maxBodySize + 2;
+            final int toProcess = Math.min(maxBodySizeWithCRLF, readableBytes);
+            final int toIndexExclusive = readerIndex + toProcess;
+            final int indexOfLf = buffer.indexOf(readerIndex, toIndexExclusive, HttpConstants.LF);
+            if (indexOfLf == -1) {
+                if (readableBytes > maxBodySize) {
+                    // TODO: Respond with Bad Request and discard the traffic
+                    //    or close the connection.
+                    //       No need to notify the upstream handlers - just log.
+                    //       If decoding a response, just throw an exception.
+                    throw newException(maxLength);
+                }
                 return null;
             }
-            buffer.readerIndex(i + 1);
+            final int endOfSeqIncluded;
+            if (indexOfLf > readerIndex && buffer.getByte(indexOfLf - 1) == HttpConstants.CR) {
+                // Drop CR if we had a CRLF pair
+                endOfSeqIncluded = indexOfLf - 1;
+            } else {
+                endOfSeqIncluded = indexOfLf;
+            }
+            final int newSize = endOfSeqIncluded - readerIndex;
+            if (newSize == 0) {
+                seq.clear();
+                buffer.readerIndex(indexOfLf + 1);
+                return seq;
+            }
+            int size = this.size + newSize;
+            if (size > maxLength) {
+                throw newException(maxLength);
+            }
+            this.size = size;
+            seq.clear();
+            // from
+            seq.writeBytes(buffer, readerIndex, newSize);
+            assert seq.readableBytes() == newSize;
+            buffer.readerIndex(indexOfLf + 1);
             return seq;
         }
 
         public void reset() {
             size = 0;
-        }
-
-        @Override
-        public boolean process(byte value) throws Exception {
-            char nextByte = (char) (value & 0xFF);
-            if (nextByte == HttpConstants.LF) {
-                int len = seq.length();
-                // Drop CR if we had a CRLF pair
-                if (len >= 1 && seq.charAtUnsafe(len - 1) == HttpConstants.CR) {
-                    -- size;
-                    seq.setLength(len - 1);
-                }
-                return false;
-            }
-
-            increaseCount();
-
-            seq.append(nextByte);
-            return true;
-        }
-
-        protected final void increaseCount() {
-            if (++ size > maxLength) {
-                // TODO: Respond with Bad Request and discard the traffic
-                //    or close the connection.
-                //       No need to notify the upstream handlers - just log.
-                //       If decoding a response, just throw an exception.
-                throw newException(maxLength);
-            }
         }
 
         protected TooLongFrameException newException(int maxLength) {
@@ -987,28 +998,35 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
     private final class LineParser extends HeaderParser {
 
-        LineParser(AppendableCharSequence seq, int maxLength) {
+        LineParser(ByteBuf seq, int maxLength) {
             super(seq, maxLength);
         }
 
         @Override
-        public AppendableCharSequence parse(ByteBuf buffer) {
+        public ByteBuf parse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
-            return super.parse(buffer);
-        }
-
-        @Override
-        public boolean process(byte value) throws Exception {
-            if (currentState == State.SKIP_CONTROL_CHARS) {
-                char c = (char) (value & 0xFF);
-                if (Character.isISOControl(c) || Character.isWhitespace(c)) {
-                    increaseCount();
-                    return true;
-                }
-                currentState = State.READ_INITIAL;
+            final int readableBytes = buffer.readableBytes();
+            if (readableBytes == 0) {
+                return null;
             }
-            return super.process(value);
+            final int readerIndex = buffer.readerIndex();
+            if (currentState == State.SKIP_CONTROL_CHARS) {
+                final int maxToSkip = Math.min(maxLength, readableBytes);
+                final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+                if (firstNonControlIndex == -1) {
+                    buffer.skipBytes(maxToSkip);
+                    if (readableBytes > maxLength) {
+                        throw newException(maxLength);
+                    }
+                    return null;
+                }
+                // TODO size should be increased as well in order to let super::parse
+                buffer.readerIndex(firstNonControlIndex);
+                currentState = State.READ_INITIAL;
+                // from now on we don't care about control chars
+            }
+            return super.parse(buffer);
         }
 
         @Override
@@ -1016,4 +1034,14 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return new TooLongHttpLineException("An HTTP line is larger than " + maxLength + " bytes.");
         }
     }
+    private static final ByteProcessor SKIP_CONTROL_CHARS_BYTES = new ByteProcessor() {
+        @Override
+        public boolean process(byte value) {
+            final int ch = value & 0xFF;
+            if (Character.isISOControl(ch) || Character.isWhitespace(ch)) {
+                return true;
+            }
+            return false;
+        }
+    };
 }
