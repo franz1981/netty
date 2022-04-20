@@ -27,6 +27,7 @@ import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.AppendableCharSequence;
+import io.netty.util.internal.StringUtil;
 
 import java.util.List;
 
@@ -263,12 +264,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             if (line == null) {
                 return;
             }
-            String[] initialLine = splitInitialLine(line);
-            if (initialLine.length < 3) {
-                // Invalid initial line - ignore.
-                currentState = State.SKIP_CONTROL_CHARS;
-                return;
-            }
+            final String[] initialLine = splitInitialLine(line);
+            assert initialLine.length == 3 : "initialLine::length must be 3";
 
             message = createMessage(initialLine);
             currentState = State.READ_HEADER;
@@ -377,7 +374,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             if (line == null) {
                 return;
             }
-            int chunkSize = getChunkSize(line.toString());
+            int chunkSize = getChunkSize(line);
             this.chunkSize = chunkSize;
             if (chunkSize == 0) {
                 currentState = State.READ_CHUNK_FOOTER;
@@ -780,17 +777,18 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;
     protected abstract HttpMessage createInvalidMessage();
 
-    private static int getChunkSize(String hex) {
-        hex = hex.trim();
-        for (int i = 0; i < hex.length(); i ++) {
-            char c = hex.charAt(i);
-            if (c == ';' || Character.isWhitespace(c) || Character.isISOControl(c)) {
-                hex = hex.substring(0, i);
-                break;
+    private static int getChunkSize(AppendableCharSequence hex) {
+        // hex should contain neither ISO chars nor spaces ie we can save checking it
+        int result = 0;
+        for (int i = 0, length = hex.length(); i < length; i++) {
+            final int digit = StringUtil.decodeHexNibble(hex.charAtUnsafe(i));
+            if (digit == -1) {
+                throw new NumberFormatException();
             }
+            result *= 16;
+            result += digit;
         }
-
-        return Integer.parseInt(hex, 16);
+        return result;
     }
 
     private static String[] splitInitialLine(AppendableCharSequence sb) {
@@ -825,6 +823,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         int valueEnd;
 
         nameStart = findNonWhitespace(sb, 0);
+        final boolean isDecodingRequest = isDecodingRequest();
         for (nameEnd = nameStart; nameEnd < length; nameEnd ++) {
             char ch = sb.charAtUnsafe(nameEnd);
             // https://tools.ietf.org/html/rfc7230#section-3.2.4
@@ -841,7 +840,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                     // is done in the DefaultHttpHeaders implementation.
                     //
                     // In the case of decoding a response we will "skip" the whitespace.
-                    (!isDecodingRequest() && isOWS(ch))) {
+                    (!isDecodingRequest && isOWS(ch))) {
                 break;
             }
         }
@@ -870,12 +869,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
     private static int findNonSPLenient(AppendableCharSequence sb, int offset) {
         for (int result = offset; result < sb.length(); ++result) {
-            char c = sb.charAtUnsafe(result);
+            byte c = (byte) sb.charAtUnsafe(result);
             // See https://tools.ietf.org/html/rfc7230#section-3.5
             if (isSPLenient(c)) {
                 continue;
             }
-            if (Character.isWhitespace(c)) {
+            if (isWhitespace(c)) {
                 // Any other whitespace delimiter is invalid
                 throw new IllegalArgumentException("Invalid separator");
             }
@@ -886,22 +885,44 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
     private static int findSPLenient(AppendableCharSequence sb, int offset) {
         for (int result = offset; result < sb.length(); ++result) {
-            if (isSPLenient(sb.charAtUnsafe(result))) {
+            if (isSPLenient((byte) sb.charAtUnsafe(result))) {
                 return result;
             }
         }
         return sb.length();
     }
 
-    private static boolean isSPLenient(char c) {
+    private static final boolean[] SP_LENIENT_BYTES;
+    private static final boolean[] LATIN_WHITESPACE;
+
+    static {
         // See https://tools.ietf.org/html/rfc7230#section-3.5
-        return c == ' ' || c == (char) 0x09 || c == (char) 0x0B || c == (char) 0x0C || c == (char) 0x0D;
+        SP_LENIENT_BYTES = new boolean[256];
+        SP_LENIENT_BYTES[128 + ' '] = true;
+        SP_LENIENT_BYTES[128 + 0x09] = true;
+        SP_LENIENT_BYTES[128 + 0x0B] = true;
+        SP_LENIENT_BYTES[128 + 0x0C] = true;
+        SP_LENIENT_BYTES[128 + 0x0D] = true;
+        // TO SAVE PERFORMING Character::isWhitespace ceremony
+        LATIN_WHITESPACE = new boolean[256];
+        for (byte b = Byte.MIN_VALUE; b < Byte.MAX_VALUE; b++) {
+            LATIN_WHITESPACE[128 + b] = Character.isWhitespace(b);
+        }
+    }
+
+    private static boolean isSPLenient(byte c) {
+        // See https://tools.ietf.org/html/rfc7230#section-3.5
+        return SP_LENIENT_BYTES[c + 128];
+    }
+
+    private static boolean isWhitespace(byte b) {
+        return LATIN_WHITESPACE[b + 128];
     }
 
     private static int findNonWhitespace(AppendableCharSequence sb, int offset) {
         for (int result = offset; result < sb.length(); ++result) {
             char c = sb.charAtUnsafe(result);
-            if (!Character.isWhitespace(c)) {
+            if (!isWhitespace((byte) c)) {
                 return result;
             } else if (!isOWS(c)) {
                 // Only OWS is supported for whitespace
@@ -914,7 +935,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
 
     private static int findEndOfString(AppendableCharSequence sb) {
         for (int result = sb.length() - 1; result > 0; --result) {
-            if (!Character.isWhitespace(sb.charAtUnsafe(result))) {
+            if (!isWhitespace((byte) sb.charAtUnsafe(result))) {
                 return result + 1;
             }
         }
@@ -922,12 +943,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
     }
 
     private static boolean isOWS(char ch) {
-        return ch == ' ' || ch == (char) 0x09;
+        return ch == ' ' || ch == 0x09;
     }
 
     private static class HeaderParser implements ByteProcessor {
-        private final AppendableCharSequence seq;
-        private final int maxLength;
+        protected final AppendableCharSequence seq;
+        protected final int maxLength;
         int size;
 
         HeaderParser(AppendableCharSequence seq, int maxLength) {
@@ -936,14 +957,46 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         public AppendableCharSequence parse(ByteBuf buffer) {
-            final int oldSize = size;
-            seq.reset();
-            int i = buffer.forEachByte(this);
-            if (i == -1) {
-                size = oldSize;
+            final int readableBytes = buffer.readableBytes();
+            final int readerIndex = buffer.readerIndex();
+            final int maxBodySize = maxLength - size;
+            // adding 2 to account for both CR (if present) and LF
+            final int maxBodySizeWithCRLF = maxBodySize + 2;
+            final int toProcess = Math.min(maxBodySizeWithCRLF, readableBytes);
+            final int toIndexExclusive = readerIndex + toProcess;
+            final int indexOfLf = buffer.indexOf(readerIndex, toIndexExclusive, HttpConstants.LF);
+            if (indexOfLf == -1) {
+                if (readableBytes > maxBodySize) {
+                    // TODO: Respond with Bad Request and discard the traffic
+                    //    or close the connection.
+                    //       No need to notify the upstream handlers - just log.
+                    //       If decoding a response, just throw an exception.
+                    throw newException(maxLength);
+                }
                 return null;
             }
-            buffer.readerIndex(i + 1);
+            final int endOfSeqIncluded;
+            if (indexOfLf > readerIndex && buffer.getByte(indexOfLf - 1) == HttpConstants.CR) {
+                // Drop CR if we had a CRLF pair
+                endOfSeqIncluded = indexOfLf - 1;
+            } else {
+                endOfSeqIncluded = indexOfLf;
+            }
+            final int newSize = endOfSeqIncluded - readerIndex;
+            if (newSize == 0) {
+                seq.reset();
+                buffer.readerIndex(indexOfLf + 1);
+                return seq;
+            }
+            int size = this.size + newSize;
+            if (size > maxLength) {
+                throw newException(maxLength);
+            }
+            this.size = size;
+            seq.reset();
+            buffer.forEachByte(readerIndex, newSize, this);
+            assert seq.length() == newSize;
+            buffer.readerIndex(indexOfLf + 1);
             return seq;
         }
 
@@ -954,30 +1007,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         @Override
         public boolean process(byte value) throws Exception {
             char nextByte = (char) (value & 0xFF);
-            if (nextByte == HttpConstants.LF) {
-                int len = seq.length();
-                // Drop CR if we had a CRLF pair
-                if (len >= 1 && seq.charAtUnsafe(len - 1) == HttpConstants.CR) {
-                    -- size;
-                    seq.setLength(len - 1);
-                }
-                return false;
-            }
-
-            increaseCount();
-
             seq.append(nextByte);
             return true;
-        }
-
-        protected final void increaseCount() {
-            if (++ size > maxLength) {
-                // TODO: Respond with Bad Request and discard the traffic
-                //    or close the connection.
-                //       No need to notify the upstream handlers - just log.
-                //       If decoding a response, just throw an exception.
-                throw newException(maxLength);
-            }
         }
 
         protected TooLongFrameException newException(int maxLength) {
@@ -995,20 +1026,28 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         public AppendableCharSequence parse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
-            return super.parse(buffer);
-        }
-
-        @Override
-        public boolean process(byte value) throws Exception {
-            if (currentState == State.SKIP_CONTROL_CHARS) {
-                char c = (char) (value & 0xFF);
-                if (Character.isISOControl(c) || Character.isWhitespace(c)) {
-                    increaseCount();
-                    return true;
-                }
-                currentState = State.READ_INITIAL;
+            final int readableBytes = buffer.readableBytes();
+            if (readableBytes == 0) {
+                return null;
             }
-            return super.process(value);
+            final int readerIndex = buffer.readerIndex();
+            if (currentState == State.SKIP_CONTROL_CHARS) {
+                final int maxToSkip = Math.min(maxLength, readableBytes);
+                final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+                if (firstNonControlIndex == -1) {
+                    buffer.skipBytes(maxToSkip);
+                    if (readableBytes > maxLength) {
+                        throw newException(maxLength);
+                    }
+                    seq.reset();
+                    return seq;
+                }
+                // TODO size should be increased as well in order to let super::parse
+                buffer.readerIndex(firstNonControlIndex);
+                currentState = State.READ_INITIAL;
+                // from now on we don't care about control chars
+            }
+            return super.parse(buffer);
         }
 
         @Override
@@ -1016,4 +1055,21 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return new TooLongHttpLineException("An HTTP line is larger than " + maxLength + " bytes.");
         }
     }
+
+    private static final boolean[] ISO_CONTROL_OR_WHITESPACE;
+
+    static {
+        ISO_CONTROL_OR_WHITESPACE = new boolean[256];
+        for (byte b = Byte.MIN_VALUE; b < Byte.MAX_VALUE; b++) {
+            ISO_CONTROL_OR_WHITESPACE[128 + b] = Character.isISOControl(b) || isWhitespace(b);
+        }
+    }
+
+    private static final ByteProcessor SKIP_CONTROL_CHARS_BYTES = new ByteProcessor() {
+
+        @Override
+        public boolean process(byte value) {
+            return ISO_CONTROL_OR_WHITESPACE[128 + value];
+        }
+    };
 }
