@@ -17,6 +17,7 @@ package io.netty.handler.codec.http;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
+import io.netty.channel.FileRegion;
 
 import static io.netty.handler.codec.http.HttpConstants.*;
 
@@ -27,8 +28,31 @@ import static io.netty.handler.codec.http.HttpConstants.*;
 public class HttpResponseEncoder extends HttpObjectEncoder<HttpResponse> {
 
     @Override
+    protected HttpResponse safeCastToHttpMessage(final Object msg) {
+        if (msg instanceof HttpResponse) {
+            return (HttpResponse) msg;
+        }
+        return null;
+    }
+
+    @Override
     public boolean acceptOutboundMessage(Object msg) throws Exception {
-        return super.acceptOutboundMessage(msg) && !(msg instanceof HttpRequest);
+        if (msg instanceof HttpResponse) {
+            return true;
+        }
+        if (msg instanceof ByteBuf) {
+            return true;
+        }
+        if (msg instanceof FileRegion) {
+            return true;
+        }
+        if (msg instanceof HttpRequest) {
+            return false;
+        }
+        if (msg instanceof HttpContent) {
+            return true;
+        }
+        return false;
     }
 
     @Override

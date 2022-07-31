@@ -17,6 +17,7 @@ package io.netty.handler.codec.http;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
+import io.netty.channel.FileRegion;
 import io.netty.util.CharsetUtil;
 
 import static io.netty.handler.codec.http.HttpConstants.SP;
@@ -32,8 +33,31 @@ public class HttpRequestEncoder extends HttpObjectEncoder<HttpRequest> {
     private static final int SPACE_SLASH_AND_SPACE_MEDIUM = (SP << 16) | SLASH_AND_SPACE_SHORT;
 
     @Override
+    protected HttpRequest safeCastToHttpMessage(final Object msg) {
+        if (msg instanceof HttpRequest) {
+            return (HttpRequest) msg;
+        }
+        return null;
+    }
+
+    @Override
     public boolean acceptOutboundMessage(Object msg) throws Exception {
-        return super.acceptOutboundMessage(msg) && !(msg instanceof HttpResponse);
+        if (msg instanceof HttpRequest) {
+            return true;
+        }
+        if (msg instanceof ByteBuf) {
+            return true;
+        }
+        if (msg instanceof FileRegion) {
+            return true;
+        }
+        if (msg instanceof HttpResponse) {
+            return false;
+        }
+        if (msg instanceof HttpContent) {
+            return true;
+        }
+        return false;
     }
 
     @Override
