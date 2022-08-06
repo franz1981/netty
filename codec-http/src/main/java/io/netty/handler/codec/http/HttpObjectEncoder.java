@@ -22,10 +22,12 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.FileRegion;
 import io.netty.handler.codec.MessageToMessageEncoder;
 import io.netty.util.CharsetUtil;
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
 
 import static io.netty.buffer.Unpooled.directBuffer;
@@ -79,8 +81,17 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
      */
     private float trailersEncodedSizeAccumulator = 256;
 
+    private static final Map<Class<?>, Boolean> TYPE_PROFILE = PlatformDependent.newConcurrentHashMap();
+
     @Override
     protected void encode(ChannelHandlerContext ctx, Object msg, List<Object> out) throws Exception {
+        final Class<?> msgClazz = msg.getClass();
+        if (TYPE_PROFILE.get(msgClazz) == null) {
+            if (TYPE_PROFILE.put(msgClazz, Boolean.TRUE) == null) {
+                System.out.println("*************************** Found " + msg.getClass().getName().toUpperCase() +
+                        " type on HttpObjectEncoder ***************************");
+            }
+        }
         ByteBuf buf = null;
         if (msg instanceof HttpMessage) {
             if (state != ST_INIT) {
