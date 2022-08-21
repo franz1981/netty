@@ -167,7 +167,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelRegistered(this);
                 } else if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelRegistered(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelRegistered(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelRegistered(this);
                 }
@@ -206,7 +206,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelUnregistered(this);
                 } else if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelUnregistered(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelUnregistered(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelUnregistered(this);
                 }
@@ -245,7 +245,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelActive(this);
                 } else  if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelActive(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelActive(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelActive(this);
                 }
@@ -284,7 +284,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelInactive(this);
                 } else if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelInactive(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelInactive(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelInactive(this);
                 }
@@ -373,7 +373,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
             try {
                 final ChannelHandler handler = handler();
                 if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).userEventTriggered(null, event);
+                    ((DefaultChannelPipeline.TailContext) handler).userEventTriggered(this, event);
                 } else {
                     ((ChannelInboundHandler) handler).userEventTriggered(this, event);
                 }
@@ -449,7 +449,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelReadComplete(this);
                 } else if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelReadComplete(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelReadComplete(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelReadComplete(this);
                 }
@@ -487,7 +487,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
                 if (handler instanceof DefaultChannelPipeline.HeadContext) {
                     ((DefaultChannelPipeline.HeadContext) handler).channelWritabilityChanged(this);
                 } else if (handler instanceof DefaultChannelPipeline.TailContext) {
-                    ((DefaultChannelPipeline.TailContext) handler).channelWritabilityChanged(null);
+                    ((DefaultChannelPipeline.TailContext) handler).channelWritabilityChanged(this);
                 } else {
                     ((ChannelInboundHandler) handler).channelWritabilityChanged(this);
                 }
@@ -768,7 +768,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
         try {
             final ChannelHandler handler = handler();
             if (handler instanceof DefaultChannelPipeline.HeadContext) {
-                ((DefaultChannelPipeline.HeadContext) handler).write(null, msg, promise);
+                ((DefaultChannelPipeline.HeadContext) handler).write(this, msg, promise);
             } else {
                 ((ChannelOutboundHandler) handler).write(this, msg, promise);
             }
@@ -806,7 +806,7 @@ abstract class AbstractChannelHandlerContext implements ChannelHandlerContext, R
         try {
             final ChannelHandler handler = handler();
             if (handler instanceof DefaultChannelPipeline.HeadContext) {
-                ((DefaultChannelPipeline.HeadContext) handler).flush(null);
+                ((DefaultChannelPipeline.HeadContext) handler).flush(this);
             } else {
                 ((ChannelOutboundHandler) handler).flush(this);
             }
