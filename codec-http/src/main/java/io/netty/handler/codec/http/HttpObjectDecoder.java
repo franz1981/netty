@@ -27,6 +27,7 @@ import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ByteProcessor;
 import io.netty.util.CharsetUtil;
+import io.netty.util.internal.StringUtil;
 
 import java.util.List;
 
@@ -377,7 +378,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             if (line == null) {
                 return;
             }
-            int chunkSize = getChunkSize(line.toString(CharsetUtil.US_ASCII));
+            int chunkSize = getChunkSize(line.array(), line.readableBytes());
             this.chunkSize = chunkSize;
             if (chunkSize == 0) {
                 currentState = State.READ_CHUNK_FOOTER;
@@ -782,17 +783,18 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
     protected abstract HttpMessage createMessage(String[] initialLine) throws Exception;
     protected abstract HttpMessage createInvalidMessage();
 
-    private static int getChunkSize(String hex) {
-        hex = hex.trim();
-        for (int i = 0; i < hex.length(); i ++) {
-            char c = hex.charAt(i);
-            if (c == ';' || Character.isWhitespace(c) || Character.isISOControl(c)) {
-                hex = hex.substring(0, i);
-                break;
+    private static int getChunkSize(byte[] hex, int length) {
+        // hex shouldn't contain both ISO chars nor spaces
+        int result = 0;
+        for (int i = 0; i < length; i++) {
+            final int digit = StringUtil.decodeHexNibble(hex[i]);
+            if (digit == -1) {
+                throw new NumberFormatException();
             }
+            result *= 16;
+            result += digit;
         }
-
-        return Integer.parseInt(hex, 16);
+        return result;
     }
 
     private static String[] splitInitialLine(ByteBuf sb) {
