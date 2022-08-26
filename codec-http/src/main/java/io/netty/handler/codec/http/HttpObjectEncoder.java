@@ -197,11 +197,26 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
         }
     }
 
-    private void encodeByteBufHttpContent(int state, ChannelHandlerContext ctx, ByteBuf buf, ByteBuf content,
+    /**
+     * @return {@code true} if {@code content} is been copied,
+     *         {@code false} if there's an implicit ownership transfer.
+     */
+    private boolean encodeByteBufHttpContent(int state, ChannelHandlerContext ctx, ByteBuf buf, ByteBuf content,
                                           HttpHeaders trailingHeaders, List<Object> out) {
+        boolean contentCopied = false;
         switch (state) {
             case ST_CONTENT_NON_CHUNK:
-                if (encodeContentNonChunk(out, buf, content)) {
+                final int contentLength = content.readableBytes();
+                if (contentLength > 0) {
+                    if (buf.writableBytes() >= contentLength) {
+                        // merge into other buffer for performance reasons
+                        buf.writeBytes(content);
+                        contentCopied = true;
+                        out.add(buf);
+                    } else {
+                        out.add(buf);
+                        out.add(content);
+                    }
                     break;
                 }
                 // fall-through!
@@ -217,12 +232,14 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             default:
                 throw new Error();
         }
+        return contentCopied;
     }
 
     private void encodeHttpMessageNotLastContent(ChannelHandlerContext ctx, H m, List<Object> out) throws Exception {
         assert m instanceof HttpContent;
         assert !(m instanceof LastHttpContent);
         final HttpContent httpContent = (HttpContent) m;
+        boolean release = true;
         try {
             if (state != ST_INIT) {
                 throwUnexpectedMessageTypeEx(m, state);
@@ -231,15 +248,18 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
 
             assert checkContentState(state);
 
-            encodeByteBufHttpContent(state, ctx, buf, httpContent.content(), null, out);
+            release = encodeByteBufHttpContent(state, ctx, buf, httpContent.content(), null, out);
         } finally {
-            httpContent.release();
+            if (release) {
+                httpContent.release();
+            }
         }
     }
 
     private void encodeHttpMessageLastContent(ChannelHandlerContext ctx, H m, List<Object> out) throws Exception {
         assert m instanceof LastHttpContent;
         final LastHttpContent httpContent = (LastHttpContent) m;
+        boolean release = true;
         try {
             if (state != ST_INIT) {
                 throwUnexpectedMessageTypeEx(m, state);
@@ -248,25 +268,24 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
 
             assert checkContentState(state);
 
-            encodeByteBufHttpContent(state, ctx, buf, httpContent.content(), httpContent.trailingHeaders(), out);
+            release = encodeByteBufHttpContent(state, ctx, buf, httpContent.content(), httpContent.trailingHeaders(), out);
 
             state = ST_INIT;
         } finally {
-            httpContent.release();
+            if (release) {
+                httpContent.release();
+            }
         }
     }
     @SuppressWarnings("ConditionCoveredByFurtherCondition")
     private void encodeNotHttpMessageContentTypes(ChannelHandlerContext ctx, Object msg, List<Object> out) {
         assert !(msg instanceof HttpMessage);
         if (state == ST_INIT) {
-            try {
-                if (msg instanceof ByteBuf && bypassEncoderIfEmpty((ByteBuf) msg, out)) {
-                    return;
-                }
-                throwUnexpectedMessageTypeEx(msg, ST_INIT);
-            } finally {
-                ReferenceCountUtil.release(msg);
+            if (msg instanceof ByteBuf && bypassEncoderIfEmpty((ByteBuf) msg, out)) {
+                return;
             }
+            ReferenceCountUtil.release(msg);
+            throwUnexpectedMessageTypeEx(msg, ST_INIT);
         }
         if (msg == LastHttpContent.EMPTY_LAST_CONTENT) {
             state = encodeEmptyLastHttpContent(state, out);
@@ -299,6 +318,7 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             throws Exception {
         assert o instanceof FullHttpMessage;
         final FullHttpMessage msg = (FullHttpMessage) o;
+        boolean release = true;
         try {
             if (state != ST_INIT) {
                 throwUnexpectedMessageTypeEx(o, state);
@@ -321,26 +341,12 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             headersEncodedSizeAccumulator = HEADERS_WEIGHT_NEW * padSizeForAccumulation(buf.readableBytes()) +
                     HEADERS_WEIGHT_HISTORICAL * headersEncodedSizeAccumulator;
 
-            encodeByteBufHttpContent(state, ctx, buf, msg.content(), msg.trailingHeaders(), out);
+            release = encodeByteBufHttpContent(state, ctx, buf, msg.content(), msg.trailingHeaders(), out);
         } finally {
-            msg.release();
-        }
-    }
-
-    private static boolean encodeContentNonChunk(List<Object> out, ByteBuf buf, ByteBuf content) {
-        final int contentLength = content.readableBytes();
-        if (contentLength > 0) {
-            if (buf.writableBytes() >= contentLength) {
-                // merge into other buffer for performance reasons
-                buf.writeBytes(content);
-                out.add(buf);
-            } else {
-                out.add(buf);
-                out.add(content.retain());
+            if (release) {
+                msg.release();
             }
-            return true;
         }
-        return false;
     }
 
     private static void throwUnexpectedMessageTypeEx(Object msg, int state) {
@@ -349,12 +355,14 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
     }
 
     private void encodeFileRegionContent(ChannelHandlerContext ctx, FileRegion msg, List<Object> out) {
+        boolean release = true;
         try {
             assert state != ST_INIT;
+
             switch (state) {
                 case ST_CONTENT_NON_CHUNK:
                     if (msg.count() > 0) {
-                        out.add(msg.retain());
+                        out.add(msg);
                         break;
                     }
 
@@ -371,12 +379,15 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
                     break;
                 case ST_CONTENT_CHUNK:
                     encodedChunkedFileRegionContent(ctx, msg, out);
+                    release = false;
                     break;
                 default:
                     throw new Error();
             }
         } finally {
-            msg.release();
+            if (release) {
+                msg.release();
+            }
         }
     }
 
@@ -387,21 +398,25 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
     // See https://github.com/netty/netty/issues/2983 for more information.
     private static boolean bypassEncoderIfEmpty(ByteBuf msg, List<Object> out) {
         if (!msg.isReadable()) {
-            out.add(msg.retain());
+            out.add(msg);
             return true;
         }
         return false;
     }
 
     private void encodeByteBufContent(ChannelHandlerContext ctx, ByteBuf content, List<Object> out) {
+        boolean release = true;
         try {
             assert state != ST_INIT;
             if (bypassEncoderIfEmpty(content, out)) {
+                release = false;
                 return;
             }
-            encodeByteBufAndTrailers(state, ctx, out, content, null);
+            release = encodeByteBufAndTrailers(state, ctx, out, content, null);
         } finally {
-            content.release();
+            if (release) {
+                content.release();
+            }
         }
     }
 
@@ -438,14 +453,15 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
         assert !(msg instanceof HttpMessage);
         assert !(msg instanceof LastHttpContent);
         try {
-            this.encodeByteBufAndTrailers(state, ctx, out, msg.content(), null);
+            encodeByteBufAndTrailers(state, ctx, out, msg.content(), null);
         } finally {
             msg.release();
         }
     }
 
-    private void encodeByteBufAndTrailers(int state, ChannelHandlerContext ctx, List<Object> out, ByteBuf content,
+    private boolean encodeByteBufAndTrailers(int state, ChannelHandlerContext ctx, List<Object> out, ByteBuf content,
                                           HttpHeaders trailingHeaders) {
+        boolean canRelease = false;
         switch (state) {
             case ST_CONTENT_NON_CHUNK:
                 if (content.isReadable()) {
@@ -454,6 +470,7 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
                 }
                 // fall-through!
             case ST_CONTENT_ALWAYS_EMPTY:
+                canRelease = true;
                 out.add(Unpooled.EMPTY_BUFFER);
                 break;
             case ST_CONTENT_CHUNK:
@@ -462,14 +479,19 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             default:
                 throw new Error();
         }
+        return canRelease;
     }
 
+    /**
+     * It expects ownership of {@code content} ie it won't perform {@link ByteBuf#retain()} on it, but assume
+     * an implicitly to own it.
+     */
     private void encodeChunkedHttpContent(ChannelHandlerContext ctx, ByteBuf content, HttpHeaders trailingHeaders,
                                           List<Object> out) {
         final int contentLength = content.readableBytes();
         if (contentLength > 0) {
             addEncodedLengthHex(ctx, contentLength, out);
-            out.add(content.retain());
+            out.add(content);
             out.add(CRLF_BUF.duplicate());
         }
         if (trailingHeaders != null) {
@@ -477,7 +499,7 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
         } else if (contentLength == 0) {
             // Need to produce some output otherwise an
             // IllegalStateException will be thrown
-            out.add(content.retain());
+            out.add(content);
         }
     }
 
@@ -525,16 +547,20 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
         }
     }
 
+    /**
+     * It expects ownership of {@code msg} ie it won't perform {@link FileRegion#retain()} on it, but assume
+     * an implicitly to own it.
+     */
     private static void encodedChunkedFileRegionContent(ChannelHandlerContext ctx, FileRegion msg, List<Object> out) {
         final long contentLength = msg.count();
         if (contentLength > 0) {
             addEncodedLengthHex(ctx, contentLength, out);
-            out.add(msg.retain());
+            out.add(msg);
             out.add(CRLF_BUF.duplicate());
         } else if (contentLength == 0) {
             // Need to produce some output otherwise an
             // IllegalStateException will be thrown
-            out.add(msg.retain());
+            out.add(msg);
         }
     }
 
