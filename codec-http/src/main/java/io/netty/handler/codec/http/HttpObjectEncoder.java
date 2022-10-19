@@ -308,7 +308,10 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
 
             final ByteBuf buf = ctx.alloc().buffer((int) headersEncodedSizeAccumulator);
 
-            encodeInitialLine(buf, msg);
+            msg.protocolVersion().encode(buf);
+            buf.writeByte(SP);
+            ((FullHttpResponse) msg).status().encode(buf);
+            ByteBufUtil.writeShortBE(buf, CRLF_SHORT);
 
             final int state = isContentAlwaysEmpty(m) ? ST_CONTENT_ALWAYS_EMPTY :
                     HttpUtil.isTransferEncodingChunked(m) ? ST_CONTENT_CHUNK : ST_CONTENT_NON_CHUNK;
@@ -590,14 +593,6 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
     @Deprecated
     protected static void encodeAscii(String s, ByteBuf buf) {
         buf.writeCharSequence(s, CharsetUtil.US_ASCII);
-    }
-
-    private static void encodeInitialLine(ByteBuf buf, FullHttpMessage response) {
-        // in theory it should see a single concrete type !!!
-        response.protocolVersion().encode(buf);
-        buf.writeByte(SP);
-        ((FullHttpResponse) response).status().encode(buf);
-        ByteBufUtil.writeShortBE(buf, CRLF_SHORT);
     }
 
     protected abstract void encodeInitialLine(ByteBuf buf, H message) throws Exception;
