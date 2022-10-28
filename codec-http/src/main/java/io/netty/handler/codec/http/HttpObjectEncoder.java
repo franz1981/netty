@@ -159,7 +159,34 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
         // https://github.com/netty/netty/issues/12708 contains more detail re how the previous version of this
         // code was interacting with the JIT instanceof optimizations.
         if (msg instanceof FullHttpMessage) {
-            encodeFullHttpMessage(ctx, msg, out);
+            // inlining it will reset the JIT inlining budget (because methods too big ;))
+            final FullHttpMessage fullMsg = (FullHttpMessage) msg;
+            try {
+                if (state != ST_INIT) {
+                    throwUnexpectedMessageTypeEx(msg, state);
+                }
+
+                final H m = (H) msg;
+
+                final ByteBuf buf = ctx.alloc().buffer((int) headersEncodedSizeAccumulator);
+
+                encodeInitialLine(buf, m);
+
+                final int state = isContentAlwaysEmpty(m) ? ST_CONTENT_ALWAYS_EMPTY :
+                        HttpUtil.isTransferEncodingChunked(m) ? ST_CONTENT_CHUNK : ST_CONTENT_NON_CHUNK;
+
+                sanitizeHeadersBeforeEncode(m, state == ST_CONTENT_ALWAYS_EMPTY);
+
+                encodeHeaders(m.headers(), buf);
+                ByteBufUtil.writeShortBE(buf, CRLF_SHORT);
+
+                headersEncodedSizeAccumulator = HEADERS_WEIGHT_NEW * padSizeForAccumulation(buf.readableBytes()) +
+                        HEADERS_WEIGHT_HISTORICAL * headersEncodedSizeAccumulator;
+
+                encodeByteBufHttpContent(state, ctx, buf, fullMsg.content(), fullMsg.trailingHeaders(), out);
+            } finally {
+                fullMsg.release();
+            }
             return;
         }
         if (msg instanceof HttpMessage) {
@@ -293,38 +320,6 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             throwUnexpectedMessageTypeEx(msg, state);
         } finally {
             ReferenceCountUtil.release(msg);
-        }
-    }
-
-    private void encodeFullHttpMessage(ChannelHandlerContext ctx, Object o, List<Object> out)
-            throws Exception {
-        assert o instanceof FullHttpMessage;
-        final FullHttpMessage msg = (FullHttpMessage) o;
-        try {
-            if (state != ST_INIT) {
-                throwUnexpectedMessageTypeEx(o, state);
-            }
-
-            final H m = (H) o;
-
-            final ByteBuf buf = ctx.alloc().buffer((int) headersEncodedSizeAccumulator);
-
-            encodeInitialLine(buf, m);
-
-            final int state = isContentAlwaysEmpty(m) ? ST_CONTENT_ALWAYS_EMPTY :
-                    HttpUtil.isTransferEncodingChunked(m) ? ST_CONTENT_CHUNK : ST_CONTENT_NON_CHUNK;
-
-            sanitizeHeadersBeforeEncode(m, state == ST_CONTENT_ALWAYS_EMPTY);
-
-            encodeHeaders(m.headers(), buf);
-            ByteBufUtil.writeShortBE(buf, CRLF_SHORT);
-
-            headersEncodedSizeAccumulator = HEADERS_WEIGHT_NEW * padSizeForAccumulation(buf.readableBytes()) +
-                    HEADERS_WEIGHT_HISTORICAL * headersEncodedSizeAccumulator;
-
-            encodeByteBufHttpContent(state, ctx, buf, msg.content(), msg.trailingHeaders(), out);
-        } finally {
-            msg.release();
         }
     }
 

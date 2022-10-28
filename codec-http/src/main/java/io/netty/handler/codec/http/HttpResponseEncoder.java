@@ -42,26 +42,30 @@ public class HttpResponseEncoder extends HttpObjectEncoder<HttpResponse> {
     @Override
     protected void sanitizeHeadersBeforeEncode(HttpResponse msg, boolean isAlwaysEmpty) {
         if (isAlwaysEmpty) {
-            HttpResponseStatus status = msg.status();
-            if (status.codeClass() == HttpStatusClass.INFORMATIONAL ||
-                    status.code() == HttpResponseStatus.NO_CONTENT.code()) {
+            sanitizeHeadersBeforeEncodeAlwaysEmpty(msg);
+        }
+    }
 
-                // Stripping Content-Length:
-                // See https://tools.ietf.org/html/rfc7230#section-3.3.2
-                msg.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+    private static void sanitizeHeadersBeforeEncodeAlwaysEmpty(HttpResponse msg) {
+        HttpResponseStatus status = msg.status();
+        if (status.codeClass() == HttpStatusClass.INFORMATIONAL ||
+                status.code() == HttpResponseStatus.NO_CONTENT.code()) {
 
-                // Stripping Transfer-Encoding:
-                // See https://tools.ietf.org/html/rfc7230#section-3.3.1
-                msg.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
-            } else if (status.code() == HttpResponseStatus.RESET_CONTENT.code()) {
+            // Stripping Content-Length:
+            // See https://tools.ietf.org/html/rfc7230#section-3.3.2
+            msg.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
 
-                // Stripping Transfer-Encoding:
-                msg.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+            // Stripping Transfer-Encoding:
+            // See https://tools.ietf.org/html/rfc7230#section-3.3.1
+            msg.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+        } else if (status.code() == HttpResponseStatus.RESET_CONTENT.code()) {
 
-                // Set Content-Length: 0
-                // https://httpstatuses.com/205
-                msg.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
-            }
+            // Stripping Transfer-Encoding:
+            msg.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
+
+            // Set Content-Length: 0
+            // https://httpstatuses.com/205
+            msg.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
         }
     }
 
@@ -69,11 +73,10 @@ public class HttpResponseEncoder extends HttpObjectEncoder<HttpResponse> {
     protected boolean isContentAlwaysEmpty(HttpResponse msg) {
         // Correctly handle special cases as stated in:
         // https://tools.ietf.org/html/rfc7230#section-3.3.3
-        HttpResponseStatus status = msg.status();
-
+        final HttpResponseStatus status = msg.status();
         if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
-
-            if (status.code() == HttpResponseStatus.SWITCHING_PROTOCOLS.code()) {
+            final int statusCode = status.code();
+            if (statusCode == HttpResponseStatus.SWITCHING_PROTOCOLS.code()) {
                 // We need special handling for WebSockets version 00 as it will include an body.
                 // Fortunally this version should not really be used in the wild very often.
                 // See https://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-00#section-1.2
@@ -81,8 +84,9 @@ public class HttpResponseEncoder extends HttpObjectEncoder<HttpResponse> {
             }
             return true;
         }
-        return status.code() == HttpResponseStatus.NO_CONTENT.code() ||
-                status.code() == HttpResponseStatus.NOT_MODIFIED.code() ||
-                status.code() == HttpResponseStatus.RESET_CONTENT.code();
+        final int statusCode = status.code();
+        return statusCode == HttpResponseStatus.NO_CONTENT.code() ||
+                statusCode == HttpResponseStatus.NOT_MODIFIED.code() ||
+                statusCode == HttpResponseStatus.RESET_CONTENT.code();
     }
 }
