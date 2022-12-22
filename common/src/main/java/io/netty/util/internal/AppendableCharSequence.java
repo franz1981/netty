@@ -40,6 +40,10 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
         this.pos = length;
     }
 
+    public void setLengthUnsafe(int length) {
+        this.pos = length;
+    }
+
     @Override
     public int length() {
         return pos;

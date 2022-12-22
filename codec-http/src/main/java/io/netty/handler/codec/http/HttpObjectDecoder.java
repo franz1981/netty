@@ -989,7 +989,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             final int longCount = len >> 3;
             for (int i = 0; i < longCount; i++) {
                 final long octet = src.getLongLE(srcIndex);
-                seq.charsAtUnsafe(longCount << 3,
+                seq.charsAtUnsafe(i << 3,
                         (char) (octet & 0xFF),
                         (char) (octet >> 8 & 0xFF),
                         (char) (octet >> 16 & 0xFF),
@@ -1007,7 +1007,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                     seq.charAtUnsafe(seqPos + i, (char) src.getByte(srcIndex + i));
                 }
             }
-            seq.setLength(len);
+            seq.setLengthUnsafe(len);
         }
 
         public void reset() {
