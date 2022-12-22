@@ -75,6 +75,39 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
         return new AppendableCharSequence(Arrays.copyOfRange(chars, start, end));
     }
 
+    public void ensureCapacity(int requiredCapacity) {
+        char[] chars = this.chars;
+        final int pos = this.pos;
+        final int newTotalCapacity = pos + requiredCapacity;
+        if (newTotalCapacity > chars.length) {
+            char[] old = chars;
+            chars = new char[Math.max(old.length << 1, newTotalCapacity)];
+            System.arraycopy(old, 0, chars, 0, pos);
+            this.chars = chars;
+        }
+    }
+
+    public AppendableCharSequence append(char c0, char c1, char c2, char c3, char c4, char c5, char c6, char c7) {
+        char[] chars = this.chars;
+        if (pos == chars.length) {
+            char[] old = chars;
+            chars = new char[Math.max(old.length << 1, old.length + 8)];
+            System.arraycopy(old, 0, chars, 0, old.length);
+            this.chars = chars;
+        }
+        final int pos = this.pos;
+        chars[pos] = c0;
+        chars[pos + 1] = c1;
+        chars[pos + 2] = c2;
+        chars[pos + 3] = c3;
+        chars[pos + 4] = c4;
+        chars[pos + 5] = c5;
+        chars[pos + 6] = c6;
+        chars[pos + 7] = c7;
+        this.pos = pos + 8;
+        return this;
+    }
+
     @Override
     public AppendableCharSequence append(char c) {
         if (pos == chars.length) {

@@ -931,9 +931,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         return ch == ' ' || ch == (char) 0x09;
     }
 
-    private static class HeaderParser implements ByteProcessor {
-        private final AppendableCharSequence seq;
-        private final int maxLength;
+    private static class HeaderParser {
+        protected final AppendableCharSequence seq;
+        protected final int maxLength;
         int size;
 
         HeaderParser(AppendableCharSequence seq, int maxLength) {
@@ -942,48 +942,71 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         public AppendableCharSequence parse(ByteBuf buffer) {
-            final int oldSize = size;
-            seq.reset();
-            int i = buffer.forEachByte(this);
-            if (i == -1) {
-                size = oldSize;
+            final int readableBytes = buffer.readableBytes();
+            final int readerIndex = buffer.readerIndex();
+            final int maxBodySize = maxLength - size;
+            // adding 2 to account for both CR (if present) and LF
+            final int maxBodySizeWithCRLF = maxBodySize + 2;
+            final int toProcess = Math.min(maxBodySizeWithCRLF, readableBytes);
+            final int toIndexExclusive = readerIndex + toProcess;
+            final int indexOfLf = buffer.indexOf(readerIndex, toIndexExclusive, HttpConstants.LF);
+            if (indexOfLf == -1) {
+                if (readableBytes > maxBodySize) {
+                    // TODO: Respond with Bad Request and discard the traffic
+                    //    or close the connection.
+                    //       No need to notify the upstream handlers - just log.
+                    //       If decoding a response, just throw an exception.
+                    throw newException(maxLength);
+                }
                 return null;
             }
-            buffer.readerIndex(i + 1);
+            final int endOfSeqIncluded;
+            if (indexOfLf > readerIndex && buffer.getByte(indexOfLf - 1) == HttpConstants.CR) {
+                // Drop CR if we had a CRLF pair
+                endOfSeqIncluded = indexOfLf - 1;
+            } else {
+                endOfSeqIncluded = indexOfLf;
+            }
+            final int newSize = endOfSeqIncluded - readerIndex;
+            if (newSize == 0) {
+                seq.reset();
+                buffer.readerIndex(indexOfLf + 1);
+                return seq;
+            }
+            int size = this.size + newSize;
+            if (size > maxLength) {
+                throw newException(maxLength);
+            }
+            this.size = size;
+            seq.reset();
+            appendAscii(seq, buffer, buffer.readerIndex(), newSize);
+            buffer.readerIndex(indexOfLf + 1);
             return seq;
+        }
+
+        private static void appendAscii(AppendableCharSequence seq, ByteBuf src, int srcIndex, int len) {
+            seq.ensureCapacity(len);
+            final int longCount = len >> 3;
+            for (int i = 0; i < longCount; i++) {
+                final long octet = src.getLongLE(srcIndex);
+                seq.append((char) (octet & 0xFF),
+                        (char) (octet >> 8 & 0xFF),
+                        (char) (octet >> 16 & 0xFF),
+                        (char) (octet >> 24 & 0xFF),
+                        (char) (octet >> 32 & 0xFF),
+                        (char) (octet >> 40 & 0xFF),
+                        (char) (octet >> 48 & 0xFF),
+                        (char) (octet >> 56 & 0xFF));
+                srcIndex += 8;
+            }
+            final int remaining = len & 7;
+            for (int i = 0; i < remaining; i++) {
+                seq.append((char) src.getByte(srcIndex + i));
+            }
         }
 
         public void reset() {
             size = 0;
-        }
-
-        @Override
-        public boolean process(byte value) throws Exception {
-            char nextByte = (char) (value & 0xFF);
-            if (nextByte == HttpConstants.LF) {
-                int len = seq.length();
-                // Drop CR if we had a CRLF pair
-                if (len >= 1 && seq.charAtUnsafe(len - 1) == HttpConstants.CR) {
-                    -- size;
-                    seq.setLength(len - 1);
-                }
-                return false;
-            }
-
-            increaseCount();
-
-            seq.append(nextByte);
-            return true;
-        }
-
-        protected final void increaseCount() {
-            if (++ size > maxLength) {
-                // TODO: Respond with Bad Request and discard the traffic
-                //    or close the connection.
-                //       No need to notify the upstream handlers - just log.
-                //       If decoding a response, just throw an exception.
-                throw newException(maxLength);
-            }
         }
 
         protected TooLongFrameException newException(int maxLength) {
@@ -1001,20 +1024,32 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         public AppendableCharSequence parse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
+            final int readableBytes = buffer.readableBytes();
+            if (readableBytes == 0) {
+                return null;
+            }
+            final int readerIndex = buffer.readerIndex();
+            if (currentState == State.SKIP_CONTROL_CHARS && skipControlChars(buffer, readableBytes, readerIndex)) {
+                return null;
+            }
             return super.parse(buffer);
         }
 
-        @Override
-        public boolean process(byte value) throws Exception {
-            if (currentState == State.SKIP_CONTROL_CHARS) {
-                char c = (char) (value & 0xFF);
-                if (Character.isISOControl(c) || Character.isWhitespace(c)) {
-                    increaseCount();
-                    return true;
+        private boolean skipControlChars(ByteBuf buffer, int readableBytes, int readerIndex) {
+            assert currentState == State.SKIP_CONTROL_CHARS;
+            final int maxToSkip = Math.min(maxLength, readableBytes);
+            final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+            if (firstNonControlIndex == -1) {
+                buffer.skipBytes(maxToSkip);
+                if (readableBytes > maxLength) {
+                    throw newException(maxLength);
                 }
-                currentState = State.READ_INITIAL;
+                return true;
             }
-            return super.process(value);
+            // from now on we don't care about control chars
+            buffer.readerIndex(firstNonControlIndex);
+            currentState = State.READ_INITIAL;
+            return false;
         }
 
         @Override
@@ -1022,4 +1057,21 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return new TooLongHttpLineException("An HTTP line is larger than " + maxLength + " bytes.");
         }
     }
+
+    private static final boolean[] ISO_CONTROL_OR_WHITESPACE;
+
+    static {
+        ISO_CONTROL_OR_WHITESPACE = new boolean[256];
+        for (byte b = Byte.MIN_VALUE; b < Byte.MAX_VALUE; b++) {
+            ISO_CONTROL_OR_WHITESPACE[128 + b] = Character.isISOControl(b) || Character.isWhitespace(b);
+        }
+    }
+
+    private static final ByteProcessor SKIP_CONTROL_CHARS_BYTES = new ByteProcessor() {
+
+        @Override
+        public boolean process(byte value) {
+            return ISO_CONTROL_OR_WHITESPACE[128 + value];
+        }
+    };
 }
