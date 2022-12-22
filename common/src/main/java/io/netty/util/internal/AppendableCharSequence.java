@@ -87,24 +87,21 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
         }
     }
 
-    public AppendableCharSequence append(char c0, char c1, char c2, char c3, char c4, char c5, char c6, char c7) {
-        char[] chars = this.chars;
-        if (pos == chars.length) {
-            char[] old = chars;
-            chars = new char[Math.max(old.length << 1, old.length + 8)];
-            System.arraycopy(old, 0, chars, 0, old.length);
-            this.chars = chars;
-        }
-        final int pos = this.pos;
-        chars[pos] = c0;
-        chars[pos + 1] = c1;
-        chars[pos + 2] = c2;
-        chars[pos + 3] = c3;
-        chars[pos + 4] = c4;
-        chars[pos + 5] = c5;
-        chars[pos + 6] = c6;
-        chars[pos + 7] = c7;
-        this.pos = pos + 8;
+    public AppendableCharSequence charAtUnsafe(int index, char c) {
+        chars[index] = c;
+        return this;
+    }
+
+    public AppendableCharSequence charsAtUnsafe(int index, char c0, char c1, char c2, char c3, char c4, char c5, char c6, char c7) {
+        final char[] chars = this.chars;
+        chars[index] = c0;
+        chars[index + 1] = c1;
+        chars[index + 2] = c2;
+        chars[index + 3] = c3;
+        chars[index + 4] = c4;
+        chars[index + 5] = c5;
+        chars[index + 6] = c6;
+        chars[index + 7] = c7;
         return this;
     }
 

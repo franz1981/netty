@@ -978,18 +978,19 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 throw newException(maxLength);
             }
             this.size = size;
-            seq.reset();
-            appendAscii(seq, buffer, buffer.readerIndex(), newSize);
+            setAscii(seq, buffer, buffer.readerIndex(), newSize);
             buffer.readerIndex(indexOfLf + 1);
             return seq;
         }
 
-        private static void appendAscii(AppendableCharSequence seq, ByteBuf src, int srcIndex, int len) {
+        private static void setAscii(AppendableCharSequence seq, ByteBuf src, int srcIndex, int len) {
+            seq.reset();
             seq.ensureCapacity(len);
             final int longCount = len >> 3;
             for (int i = 0; i < longCount; i++) {
                 final long octet = src.getLongLE(srcIndex);
-                seq.append((char) (octet & 0xFF),
+                seq.charsAtUnsafe(longCount << 3,
+                        (char) (octet & 0xFF),
                         (char) (octet >> 8 & 0xFF),
                         (char) (octet >> 16 & 0xFF),
                         (char) (octet >> 24 & 0xFF),
@@ -1000,9 +1001,13 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 srcIndex += 8;
             }
             final int remaining = len & 7;
-            for (int i = 0; i < remaining; i++) {
-                seq.append((char) src.getByte(srcIndex + i));
+            if (remaining > 0) {
+                final int seqPos = longCount << 3;
+                for (int i = 0; i < remaining; i++) {
+                    seq.charAtUnsafe(seqPos + i, (char) src.getByte(srcIndex + i));
+                }
             }
+            seq.setLength(len);
         }
 
         public void reset() {
