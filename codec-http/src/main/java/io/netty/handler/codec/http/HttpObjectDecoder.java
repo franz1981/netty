@@ -27,6 +27,7 @@ import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.AppendableCharSequence;
+import io.netty.util.internal.PlatformDependent;
 
 import java.util.List;
 
@@ -876,7 +877,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             }
         }
 
-        name = sb.subStringUnsafe(nameStart, nameEnd);
+        name = splitHeaderName(sb, nameStart, nameEnd);
         valueStart = findNonWhitespace(sb, colonEnd);
         if (valueStart == length) {
             value = EMPTY_VALUE;
@@ -884,6 +885,10 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             valueEnd = findEndOfString(sb);
             value = sb.subStringUnsafe(valueStart, valueEnd);
         }
+    }
+
+    protected String splitHeaderName(AppendableCharSequence sb, int start, int end) {
+        return sb.subStringUnsafe(start, end);
     }
 
     private static int findNonSPLenient(AppendableCharSequence sb, int offset) {
@@ -947,6 +952,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         private final AppendableCharSequence seq;
         private final int maxLength;
         int size;
+        private TooLongFrameException tooLongFrameEx;
 
         HeaderParser(AppendableCharSequence seq, int maxLength) {
             this.seq = seq;
@@ -957,6 +963,11 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             final int oldSize = size;
             seq.reset();
             int i = buffer.forEachByte(this);
+            final TooLongFrameException ex = this.tooLongFrameEx;
+            if (ex != null) {
+                this.tooLongFrameEx = null;
+                PlatformDependent.throwException(ex);
+            }
             if (i == -1) {
                 size = oldSize;
                 return null;
@@ -970,8 +981,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         @Override
-        public boolean process(byte value) throws Exception {
+        public boolean process(byte value) {
             char nextByte = (char) (value & 0xFF);
+            final AppendableCharSequence seq = this.seq;
             if (nextByte == HttpConstants.LF) {
                 int len = seq.length();
                 // Drop CR if we had a CRLF pair
@@ -982,20 +994,24 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 return false;
             }
 
-            increaseCount();
+            if (!increaseCount()) {
+                return false;
+            }
 
             seq.append(nextByte);
             return true;
         }
 
-        protected final void increaseCount() {
+        protected final boolean increaseCount() {
             if (++ size > maxLength) {
                 // TODO: Respond with Bad Request and discard the traffic
                 //    or close the connection.
                 //       No need to notify the upstream handlers - just log.
                 //       If decoding a response, just throw an exception.
-                throw newException(maxLength);
+                this.tooLongFrameEx = newException(maxLength);
+                return false;
             }
+            return true;
         }
 
         protected TooLongFrameException newException(int maxLength) {
@@ -1017,11 +1033,13 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
 
         @Override
-        public boolean process(byte value) throws Exception {
+        public boolean process(byte value) {
             if (currentState == State.SKIP_CONTROL_CHARS) {
                 char c = (char) (value & 0xFF);
                 if (Character.isISOControl(c) || Character.isWhitespace(c)) {
-                    increaseCount();
+                    if (!increaseCount()) {
+                        return false;
+                    }
                     return true;
                 }
                 currentState = State.READ_INITIAL;

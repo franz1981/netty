@@ -77,12 +77,21 @@ public final class AppendableCharSequence implements CharSequence, Appendable {
 
     @Override
     public AppendableCharSequence append(char c) {
+        final char[] chars = this.chars;
+        int pos = this.pos;
         if (pos == chars.length) {
-            char[] old = chars;
-            chars = new char[old.length << 1];
-            System.arraycopy(old, 0, chars, 0, old.length);
+            return enlargeAndAppend(chars, c);
         }
         chars[pos++] = c;
+        this.pos = pos;
+        return this;
+    }
+
+    private AppendableCharSequence enlargeAndAppend(char[] old, char c) {
+        char[] newChars = new char[old.length << 1];
+        System.arraycopy(old, 0, newChars, 0, pos);
+        newChars[pos++] = c;
+        this.chars = newChars;
         return this;
     }
 
