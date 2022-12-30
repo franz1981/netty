@@ -799,7 +799,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         return Integer.parseInt(hex, 16);
     }
 
-    private static String[] splitInitialLine(AppendableCharSequence sb) {
+    private String[] splitInitialLine(AppendableCharSequence sb) {
         int aStart;
         int aEnd;
         int bStart;
@@ -817,9 +817,21 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         cEnd = findEndOfString(sb);
 
         return new String[] {
-                sb.subStringUnsafe(aStart, aEnd),
-                sb.subStringUnsafe(bStart, bEnd),
-                cStart < cEnd? sb.subStringUnsafe(cStart, cEnd) : "" };
+                splitFirstWordInitialLine(sb, aStart, aEnd),
+                splitSecondWordInitialLine(sb, bStart, bEnd),
+                cStart < cEnd? splitThirdWordInitialLine(sb, cStart, cEnd) : "" };
+    }
+
+    protected String splitFirstWordInitialLine(AppendableCharSequence sb, int start, int end) {
+        return sb.subStringUnsafe(start, end);
+    }
+
+    protected String splitSecondWordInitialLine(AppendableCharSequence sb, int start, int end) {
+        return sb.subStringUnsafe(start, end);
+    }
+
+    protected String splitThirdWordInitialLine(AppendableCharSequence sb, int start, int end) {
+        return sb.subStringUnsafe(start, end);
     }
 
     private void splitHeader(AppendableCharSequence sb) {

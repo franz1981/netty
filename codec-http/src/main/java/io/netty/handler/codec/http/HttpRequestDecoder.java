@@ -17,6 +17,7 @@ package io.netty.handler.codec.http;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelPipeline;
+import io.netty.util.internal.AppendableCharSequence;
 
 /**
  * Decodes {@link ByteBuf}s into {@link HttpRequest}s and {@link HttpContent}s.
@@ -76,6 +77,14 @@ import io.netty.channel.ChannelPipeline;
  */
 public class HttpRequestDecoder extends HttpObjectDecoder {
 
+    private static int GET_AS_INT = 'G' | 'E' << 8 | 'T' << 16;
+    private static int POST_AS_INT = 'P' | 'O' << 8 | 'S' << 16 | 'T' << 24;
+    private static long HTTP_1_1_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
+            (long) '1' << 40 | (long) '.' << 48 | (long) '1' << 56;
+
+    private static long HTTP_1_0_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
+            (long) '1' << 40 | (long) '.' << 48 | (long) '0' << 56;
+
     /**
      * Creates a new instance with the default
      * {@code maxInitialLineLength (4096)}, {@code maxHeaderSize (8192)}, and
@@ -123,6 +132,49 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
         return new DefaultHttpRequest(
                 HttpVersion.valueOf(initialLine[2]),
                 HttpMethod.valueOf(initialLine[0]), initialLine[1], validateHeaders);
+    }
+
+    @Override
+    protected String splitFirstWordInitialLine(final AppendableCharSequence sb, final int start, final int end) {
+        final int length = end - start;
+        if (length == 3) {
+            final int maybeGet = sb.charAtUnsafe(start) |
+                    sb.charAtUnsafe(start + 1) << 8 |
+                    sb.charAtUnsafe(start + 2) << 16;
+            if (maybeGet == GET_AS_INT) {
+                return HttpMethod.GET.name();
+            }
+        } else if (length == 4) {
+            final int maybePost = sb.charAtUnsafe(start) |
+                    sb.charAtUnsafe(start + 1) << 8 |
+                    sb.charAtUnsafe(start + 2) << 16 |
+                    sb.charAtUnsafe(start + 3) << 24;
+            if (maybePost == POST_AS_INT) {
+                return HttpMethod.POST.name();
+            }
+        }
+        return super.splitFirstWordInitialLine(sb, start, end);
+    }
+
+    @Override
+    protected String splitThirdWordInitialLine(final AppendableCharSequence sb, final int start, final int end) {
+        final int length = end - start;
+        if (length == 8) {
+            final long maybeHttp1_x = sb.charAtUnsafe(start) |
+                    sb.charAtUnsafe(start + 1) << 8 |
+                    sb.charAtUnsafe(start + 2) << 16 |
+                    sb.charAtUnsafe(start + 3) << 24 |
+                    ((long) sb.charAtUnsafe(start + 4)) << 32 |
+                    ((long) sb.charAtUnsafe(start + 5)) << 40 |
+                    ((long) sb.charAtUnsafe(start + 6)) << 48 |
+                    ((long) sb.charAtUnsafe(start + 7)) << 56;
+            if (maybeHttp1_x == HTTP_1_1_AS_LONG) {
+                return HttpVersion.HTTP_1_1_STRING;
+            } else if (maybeHttp1_x == HTTP_1_0_AS_LONG) {
+                return HttpVersion.HTTP_1_0_STRING;
+            }
+        }
+        return super.splitThirdWordInitialLine(sb, start, end);
     }
 
     @Override
