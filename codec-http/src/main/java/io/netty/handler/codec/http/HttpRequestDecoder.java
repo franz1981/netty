@@ -77,14 +77,28 @@ import io.netty.util.internal.AppendableCharSequence;
  */
 public class HttpRequestDecoder extends HttpObjectDecoder {
 
-    private static int GET_AS_INT = 'G' | 'E' << 8 | 'T' << 16;
-    private static int POST_AS_INT = 'P' | 'O' << 8 | 'S' << 16 | 'T' << 24;
-    private static long HTTP_1_1_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
+    private static final int GET_AS_INT = 'G' | 'E' << 8 | 'T' << 16;
+    private static final int POST_AS_INT = 'P' | 'O' << 8 | 'S' << 16 | 'T' << 24;
+    private static final long HTTP_1_1_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
             (long) '1' << 40 | (long) '.' << 48 | (long) '1' << 56;
 
-    private static long HTTP_1_0_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
+    private static final long HTTP_1_0_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
             (long) '1' << 40 | (long) '.' << 48 | (long) '0' << 56;
 
+    private static final int HOST_AS_INT = 'H' | 'o' << 8 | 's' << 16 | 't' << 24;
+
+    private static final long CONNECTION_AS_LONG_0 = 'C' | 'o' << 8 | 'n' << 16 | 'n' << 24 |
+            (long) 'e' << 32 | (long) 'c' << 40 | (long) 't' << 48 | (long) 'i' << 56;
+
+    private static final short CONNECTION_AS_SHORT_1 = 'o' | 'n' << 8;
+
+    private static final long CONTENT_AS_LONG = 'C' | 'o' << 8 | 'n' << 16 | 't' << 24 |
+            (long) 'e' << 32 | (long) 'n' << 40 | (long) 't' << 48 | (long) '-' << 56;
+
+    private static final int TYPE_AS_INT = 'T' | 'y' << 8 | 'p' << 16 | 'e' << 24;
+
+    private static final long LENGTH_AS_LONG = 'L' | 'e' << 8 | 'n' << 16 | 'g' << 24 |
+            (long) 't' << 32 | (long) 'h' << 40;
     /**
      * Creates a new instance with the default
      * {@code maxInitialLineLength (4096)}, {@code maxHeaderSize (8192)}, and
@@ -135,21 +149,119 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
     }
 
     @Override
+    protected String splitHeaderName(final AppendableCharSequence sb, final int start, final int end) {
+        final int length = end - start;
+        final char firstChar = sb.charAtUnsafe(start);
+        if (firstChar == 'H' && length == 4) {
+            if (isHost(sb, start)) {
+                return "Host";
+            }
+        } else if (firstChar == 'C') {
+            if (length == 10) {
+                if (isConnection(sb, start)) {
+                    return "Connection";
+                }
+            } else if (length == 12) {
+                if (isContentType(sb, start)) {
+                    return "Content-Type";
+                }
+            } else if (length == 14) {
+                if (isContentLength(sb, start)) {
+                    return "Content-Length";
+                }
+            }
+        }
+        return super.splitHeaderName(sb, start, end);
+    }
+
+    private static boolean isHost(AppendableCharSequence sb, int start) {
+        final int maybeHost = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24;
+        return maybeHost == HOST_AS_INT;
+    }
+
+    private static boolean isConnection(AppendableCharSequence sb, int start) {
+        final long maybeConnecti = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24 |
+                (long) sb.charAtUnsafe(start + 4) << 32 |
+                (long) sb.charAtUnsafe(start + 5) << 40 |
+                (long) sb.charAtUnsafe(start + 6) << 48 |
+                (long) sb.charAtUnsafe(start + 7) << 56;
+        if (maybeConnecti != CONNECTION_AS_LONG_0) {
+            return false;
+        }
+        final short maybeOn = (short) (sb.charAtUnsafe(start + 8) | sb.charAtUnsafe(start + 9) << 8);
+        return maybeOn == CONNECTION_AS_SHORT_1;
+    }
+
+    private static boolean isContentType(AppendableCharSequence sb, int start) {
+        final long maybeContent = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24 |
+                (long) sb.charAtUnsafe(start + 4) << 32 |
+                (long) sb.charAtUnsafe(start + 5) << 40 |
+                (long) sb.charAtUnsafe(start + 6) << 48 |
+                (long) sb.charAtUnsafe(start + 7) << 56;
+        if (maybeContent != CONTENT_AS_LONG) {
+            return false;
+        }
+        final int maybeType = sb.charAtUnsafe(start + 8) |
+                sb.charAtUnsafe(start + 9) << 8 |
+                sb.charAtUnsafe(start + 10) << 16 |
+                sb.charAtUnsafe(start + 11) << 24;
+        return maybeType == TYPE_AS_INT;
+    }
+
+    private static boolean isContentLength(AppendableCharSequence sb, int start) {
+        final long maybeContent = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24 |
+                (long) sb.charAtUnsafe(start + 4) << 32 |
+                (long) sb.charAtUnsafe(start + 5) << 40 |
+                (long) sb.charAtUnsafe(start + 6) << 48 |
+                (long) sb.charAtUnsafe(start + 7) << 56;
+        if (maybeContent != CONTENT_AS_LONG) {
+            return false;
+        }
+        final long maybeLength = sb.charAtUnsafe(start + 8) |
+                sb.charAtUnsafe(start + 9) << 8 |
+                sb.charAtUnsafe(start + 10) << 16 |
+                sb.charAtUnsafe(start + 11) << 24 |
+                (long) sb.charAtUnsafe(start + 12) << 32 |
+                (long) sb.charAtUnsafe(start + 13) << 40;
+        return maybeLength == LENGTH_AS_LONG;
+    }
+
+    private static boolean isGetMethod(final AppendableCharSequence sb, int start) {
+        final int maybeGet = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16;
+        return maybeGet == GET_AS_INT;
+    }
+
+    private static boolean isPostMethod(final AppendableCharSequence sb, int start) {
+        final int maybePost = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24;
+        return maybePost == POST_AS_INT;
+    }
+
+    @Override
     protected String splitFirstWordInitialLine(final AppendableCharSequence sb, final int start, final int end) {
         final int length = end - start;
         if (length == 3) {
-            final int maybeGet = sb.charAtUnsafe(start) |
-                    sb.charAtUnsafe(start + 1) << 8 |
-                    sb.charAtUnsafe(start + 2) << 16;
-            if (maybeGet == GET_AS_INT) {
+            if (isGetMethod(sb, start)) {
                 return HttpMethod.GET.name();
             }
         } else if (length == 4) {
-            final int maybePost = sb.charAtUnsafe(start) |
-                    sb.charAtUnsafe(start + 1) << 8 |
-                    sb.charAtUnsafe(start + 2) << 16 |
-                    sb.charAtUnsafe(start + 3) << 24;
-            if (maybePost == POST_AS_INT) {
+            if (isPostMethod(sb, start)) {
                 return HttpMethod.POST.name();
             }
         }
