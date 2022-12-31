@@ -97,8 +97,9 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
 
     private static final int TYPE_AS_INT = 'T' | 'y' << 8 | 'p' << 16 | 'e' << 24;
 
-    private static final long LENGTH_AS_LONG = 'L' | 'e' << 8 | 'n' << 16 | 'g' << 24 |
-            (long) 't' << 32 | (long) 'h' << 40;
+    private static final long ACCEPT_AS_LONG = 'A' | 'c' << 8 | 'c' << 16 | 'e' << 24 |
+            (long) 'p' << 32 | (long) 't' << 40;
+
     /**
      * Creates a new instance with the default
      * {@code maxInitialLineLength (4096)}, {@code maxHeaderSize (8192)}, and
@@ -156,6 +157,10 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
             if (isHost(sb, start)) {
                 return "Host";
             }
+        } else if (firstChar == 'A' && length == 6) {
+            if (isAccept(sb, start)) {
+                return "Accept";
+            }
         } else if (firstChar == 'C') {
             if (length == 10) {
                 if (isConnection(sb, start)) {
@@ -164,10 +169,6 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
             } else if (length == 12) {
                 if (isContentType(sb, start)) {
                     return "Content-Type";
-                }
-            } else if (length == 14) {
-                if (isContentLength(sb, start)) {
-                    return "Content-Length";
                 }
             }
         }
@@ -180,6 +181,16 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
                 sb.charAtUnsafe(start + 2) << 16 |
                 sb.charAtUnsafe(start + 3) << 24;
         return maybeHost == HOST_AS_INT;
+    }
+
+    private static boolean isAccept(AppendableCharSequence sb, int start) {
+        final long maybeAccept = sb.charAtUnsafe(start) |
+                sb.charAtUnsafe(start + 1) << 8 |
+                sb.charAtUnsafe(start + 2) << 16 |
+                sb.charAtUnsafe(start + 3) << 24 |
+                (long) sb.charAtUnsafe(start + 4) << 32 |
+                (long) sb.charAtUnsafe(start + 5) << 40;
+        return maybeAccept == ACCEPT_AS_LONG;
     }
 
     private static boolean isConnection(AppendableCharSequence sb, int start) {
@@ -215,27 +226,6 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
                 sb.charAtUnsafe(start + 10) << 16 |
                 sb.charAtUnsafe(start + 11) << 24;
         return maybeType == TYPE_AS_INT;
-    }
-
-    private static boolean isContentLength(AppendableCharSequence sb, int start) {
-        final long maybeContent = sb.charAtUnsafe(start) |
-                sb.charAtUnsafe(start + 1) << 8 |
-                sb.charAtUnsafe(start + 2) << 16 |
-                sb.charAtUnsafe(start + 3) << 24 |
-                (long) sb.charAtUnsafe(start + 4) << 32 |
-                (long) sb.charAtUnsafe(start + 5) << 40 |
-                (long) sb.charAtUnsafe(start + 6) << 48 |
-                (long) sb.charAtUnsafe(start + 7) << 56;
-        if (maybeContent != CONTENT_AS_LONG) {
-            return false;
-        }
-        final long maybeLength = sb.charAtUnsafe(start + 8) |
-                sb.charAtUnsafe(start + 9) << 8 |
-                sb.charAtUnsafe(start + 10) << 16 |
-                sb.charAtUnsafe(start + 11) << 24 |
-                (long) sb.charAtUnsafe(start + 12) << 32 |
-                (long) sb.charAtUnsafe(start + 13) << 40;
-        return maybeLength == LENGTH_AS_LONG;
     }
 
     private static boolean isGetMethod(final AppendableCharSequence sb, int start) {
