@@ -17,6 +17,7 @@ package io.netty.handler.codec.http;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelPipeline;
+import io.netty.util.AsciiString;
 import io.netty.util.internal.AppendableCharSequence;
 
 /**
@@ -77,6 +78,10 @@ import io.netty.util.internal.AppendableCharSequence;
  */
 public class HttpRequestDecoder extends HttpObjectDecoder {
 
+    private static final AsciiString CONTENT_TYPE = AsciiString.cached("Content-Type");
+    private static final AsciiString HOST = AsciiString.cached("Host");
+    private static final AsciiString ACCEPT = AsciiString.cached("Accept");
+    private static final AsciiString CONNECTION = AsciiString.cached("Connection");
     private static final int GET_AS_INT = 'G' | 'E' << 8 | 'T' << 16;
     private static final int POST_AS_INT = 'P' | 'O' << 8 | 'S' << 16 | 'T' << 24;
     private static final long HTTP_1_1_AS_LONG = 'H' | 'T' << 8 | 'T' << 16 | 'P' << 24 | (long) '/' << 32 |
@@ -150,25 +155,25 @@ public class HttpRequestDecoder extends HttpObjectDecoder {
     }
 
     @Override
-    protected String splitHeaderName(final AppendableCharSequence sb, final int start, final int end) {
+    protected CharSequence splitHeaderName(final AppendableCharSequence sb, final int start, final int end) {
         final int length = end - start;
         final char firstChar = sb.charAtUnsafe(start);
         if (firstChar == 'H' && length == 4) {
             if (isHost(sb, start)) {
-                return "Host";
+                return HOST;
             }
         } else if (firstChar == 'A' && length == 6) {
             if (isAccept(sb, start)) {
-                return "Accept";
+                return ACCEPT;
             }
         } else if (firstChar == 'C') {
             if (length == 10) {
                 if (isConnection(sb, start)) {
-                    return "Connection";
+                    return CONNECTION;
                 }
             } else if (length == 12) {
                 if (isContentType(sb, start)) {
-                    return "Content-Type";
+                    return CONTENT_TYPE;
                 }
             }
         }

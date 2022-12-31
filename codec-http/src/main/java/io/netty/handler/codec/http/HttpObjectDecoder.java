@@ -25,6 +25,7 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.codec.TooLongFrameException;
+import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.AppendableCharSequence;
 import io.netty.util.internal.PlatformDependent;
@@ -887,7 +888,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
     }
 
-    protected String splitHeaderName(AppendableCharSequence sb, int start, int end) {
+    protected CharSequence splitHeaderName(AppendableCharSequence sb, int start, int end) {
         return sb.subStringUnsafe(start, end);
     }
 
