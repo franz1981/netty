@@ -1297,7 +1297,7 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     int forEachByteAsc0(int start, int end, ByteProcessor processor) throws Exception {
-        if (PlatformDependent.isUnaligned() && (end - start) == 0) {
+        if (PlatformDependent.isUnaligned() && (end - start) >= 8) {
             return forEachByteBatchAsc(start, end, processor);
         } else {
             final int len = end - start;
