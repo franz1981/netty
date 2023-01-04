@@ -1299,16 +1299,18 @@ public abstract class AbstractByteBuf extends ByteBuf {
     int forEachByteAsc0(int start, int end, ByteProcessor processor) throws Exception {
         if (PlatformDependent.isUnaligned() && (end - start) >= 8) {
             return forEachByteBatchAsc(start, end, processor);
-        } else {
-            final int len = end - start;
-            for (int i = 0; i < len; i++) {
-                if (!processor.process(_getByte(start + i))) {
-                    return start + i;
-                }
-            }
-
-            return -1;
         }
+        return forEachSingleByteAsc(start, end - start, processor);
+    }
+
+    private int forEachSingleByteAsc(int start, int len, ByteProcessor processor) throws Exception {
+        for (int i = 0; i < len; i++) {
+            if (!processor.process(_getByte(start + i))) {
+                return start + i;
+            }
+        }
+
+        return -1;
     }
 
     private int forEachByteBatchAsc(int start, int end, ByteProcessor processor) throws Exception {
@@ -1335,16 +1337,8 @@ public abstract class AbstractByteBuf extends ByteBuf {
                 }
             }
         }
-        final int remaning = len & 7;
-        if (remaning > 0) {
-            final int offset = start + (len - remaning);
-            for (int i = 0; i < remaning; i++) {
-                if (!processor.process(_getByte(offset + i))) {
-                    return offset + i;
-                }
-            }
-        }
-        return -1;
+        final int remaining = len & 7;
+        return forEachSingleByteAsc(start + (len - remaining), remaining, processor);
     }
 
     private int forEachByteAscLE(int start, int end, ByteProcessor processor) throws Exception {
@@ -1359,16 +1353,8 @@ public abstract class AbstractByteBuf extends ByteBuf {
                 }
             }
         }
-        final int remaning = len & 7;
-        if (remaning > 0) {
-            final int offset = start + (len - remaning);
-            for (int i = 0; i < remaning; i++) {
-                if (!processor.process(_getByte(offset + i))) {
-                    return offset + i;
-                }
-            }
-        }
-        return -1;
+        final int remaining = len & 7;
+        return forEachSingleByteAsc(start + (len - remaining), remaining, processor);
     }
 
     @Override
