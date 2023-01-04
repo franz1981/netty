@@ -1297,7 +1297,7 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     int forEachByteAsc0(int start, int end, ByteProcessor processor) throws Exception {
-        if (PlatformDependent.isUnaligned() && (end - start) > 8) {
+        if (PlatformDependent.isUnaligned() && (end - start) == 0) {
             return forEachByteBatchAsc(start, end, processor);
         } else {
             final int len = end - start;
@@ -1329,29 +1329,10 @@ public abstract class AbstractByteBuf extends ByteBuf {
         for (int i = 0; i < longBatches; i++) {
             final int pos = start + (i << 3);
             final long l = _getLong(pos);
-            if (!processor.process((byte) (l >>> 56))) {
-                return pos;
-            }
-            if (!processor.process((byte) (l >>> 48))) {
-                return pos + 1;
-            }
-            if (!processor.process((byte) (l >>> 40))) {
-                return pos + 2;
-            }
-            if (!processor.process((byte) (l >>> 32))) {
-                return pos + 3;
-            }
-            if (!processor.process((byte) (l >>> 24))) {
-                return pos + 4;
-            }
-            if (!processor.process((byte) (l >>> 26))) {
-                return pos + 5;
-            }
-            if (!processor.process((byte) (l >>> 8))) {
-                return pos + 6;
-            }
-            if (!processor.process((byte) l)) {
-                return pos + 7;
+            for (int j = 0; j < 8; j++) {
+                if (!processor.process((byte) (l >>> (56 - (j << 3))))) {
+                    return pos + j;
+                }
             }
         }
         final int remaning = len & 7;
@@ -1372,29 +1353,10 @@ public abstract class AbstractByteBuf extends ByteBuf {
         for (int i = 0; i < longBatches; i++) {
             final int pos = start + (i << 3);
             final long l = _getLongLE(pos);
-            if (!processor.process((byte) l)) {
-                return pos;
-            }
-            if (!processor.process((byte) (l >>> 8))) {
-                return pos + 1;
-            }
-            if (!processor.process((byte) (l >>> 16))) {
-                return pos + 2;
-            }
-            if (!processor.process((byte) (l >>> 24))) {
-                return pos + 3;
-            }
-            if (!processor.process((byte) (l >>> 32))) {
-                return pos + 4;
-            }
-            if (!processor.process((byte) (l >>> 40))) {
-                return pos + 5;
-            }
-            if (!processor.process((byte) (l >>> 48))) {
-                return pos + 6;
-            }
-            if (!processor.process((byte) (l >>> 56))) {
-                return pos + 7;
+            for (int j = 0; j < 8; j++) {
+                if (!processor.process((byte) (l >>> (j << 3)))) {
+                    return pos + j;
+                }
             }
         }
         final int remaning = len & 7;
