@@ -1297,12 +1297,115 @@ public abstract class AbstractByteBuf extends ByteBuf {
     }
 
     int forEachByteAsc0(int start, int end, ByteProcessor processor) throws Exception {
-        for (; start < end; ++start) {
-            if (!processor.process(_getByte(start))) {
-                return start;
+        if (PlatformDependent.isUnaligned() && (end - start) > 8) {
+            return forEachByteBatchAsc(start, end, processor);
+        } else {
+            final int len = end - start;
+            for (int i = 0; i < len; i++) {
+                if (!processor.process(_getByte(start + i))) {
+                    return start + i;
+                }
+            }
+
+            return -1;
+        }
+    }
+
+    private int forEachByteBatchAsc(int start, int end, ByteProcessor processor) throws Exception {
+        final boolean useLE = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
+        if (useLE) {
+            return forEachByteAscLE(start, end, processor);
+        }
+        if (order() == ByteOrder.LITTLE_ENDIAN) {
+            // meh :( _getLong is still performing some byte swap, at this point just use forEachByteAscLE
+            return forEachByteAscLE(start, end, processor);
+        }
+        return forEachByteAscBE(start, end, processor);
+    }
+
+    private int forEachByteAscBE(int start, int end, ByteProcessor processor) throws Exception {
+        final int len = end - start;
+        final int longBatches = len >> 3;
+        for (int i = 0; i < longBatches; i++) {
+            final int pos = start + (i << 3);
+            final long l = _getLong(pos);
+            if (!processor.process((byte) (l >>> 56))) {
+                return pos;
+            }
+            if (!processor.process((byte) (l >>> 48))) {
+                return pos + 1;
+            }
+            if (!processor.process((byte) (l >>> 40))) {
+                return pos + 2;
+            }
+            if (!processor.process((byte) (l >>> 32))) {
+                return pos + 3;
+            }
+            if (!processor.process((byte) (l >>> 24))) {
+                return pos + 4;
+            }
+            if (!processor.process((byte) (l >>> 26))) {
+                return pos + 5;
+            }
+            if (!processor.process((byte) (l >>> 8))) {
+                return pos + 6;
+            }
+            if (!processor.process((byte) l)) {
+                return pos + 7;
             }
         }
+        final int remaning = len & 7;
+        if (remaning > 0) {
+            final int offset = start + (len - remaning);
+            for (int i = 0; i < remaning; i++) {
+                if (!processor.process(_getByte(offset + i))) {
+                    return offset + i;
+                }
+            }
+        }
+        return -1;
+    }
 
+    private int forEachByteAscLE(int start, int end, ByteProcessor processor) throws Exception {
+        final int len = end - start;
+        final int longBatches = len >> 3;
+        for (int i = 0; i < longBatches; i++) {
+            final int pos = start + (i << 3);
+            final long l = _getLongLE(pos);
+            if (!processor.process((byte) l)) {
+                return pos;
+            }
+            if (!processor.process((byte) (l >>> 8))) {
+                return pos + 1;
+            }
+            if (!processor.process((byte) (l >>> 16))) {
+                return pos + 2;
+            }
+            if (!processor.process((byte) (l >>> 24))) {
+                return pos + 3;
+            }
+            if (!processor.process((byte) (l >>> 32))) {
+                return pos + 4;
+            }
+            if (!processor.process((byte) (l >>> 40))) {
+                return pos + 5;
+            }
+            if (!processor.process((byte) (l >>> 48))) {
+                return pos + 6;
+            }
+            if (!processor.process((byte) (l >>> 56))) {
+                return pos + 7;
+            }
+        }
+        final int remaning = len & 7;
+        if (remaning > 0) {
+            final int offset = start + (len - remaning);
+            for (int i = 0; i < remaning; i++) {
+                if (!processor.process(_getByte(offset + i))) {
+                    return offset + i;
+                }
+            }
+        }
         return -1;
     }
 
