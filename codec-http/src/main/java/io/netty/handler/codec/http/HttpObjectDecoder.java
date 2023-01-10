@@ -259,7 +259,9 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             case SKIP_CONTROL_CHARS:
                 // Fall-through
             case READ_INITIAL: try {
-                AppendableCharSequence line = lineParser.parse(buffer);
+                AppendableCharSequence line = currentState == State.SKIP_CONTROL_CHARS ?
+                        lineParser.skipControlCharAndParse(buffer) :
+                        lineParser.parse(buffer);
                 if (line == null) {
                     return;
                 }
@@ -966,7 +968,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         public AppendableCharSequence parse(ByteBuf buffer) {
             final int oldSize = size;
             seq.reset();
-            int i = buffer.forEachByte(this);
+            int i = buffer.forEachByte(HeaderParser.this);
             if (i == -1) {
                 size = oldSize;
                 return null;
@@ -1018,40 +1020,50 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         }
     }
 
-    private final class LineParser extends HeaderParser {
+    private static final class LineParser extends HeaderParser {
 
         LineParser(AppendableCharSequence seq, int maxLength) {
             super(seq, maxLength);
+        }
+
+        private boolean skipControlChars(ByteBuf buffer) {
+            final int readableBytes = buffer.readableBytes();
+            if (readableBytes == 0) {
+                return false;
+            }
+            final int maxLength = this.maxLength;
+            final int maxToSkip = Math.min(maxLength, readableBytes);
+            final int readerIndex = buffer.readerIndex();
+            final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+            if (firstNonControlIndex == -1) {
+                buffer.skipBytes(maxToSkip);
+                if (readableBytes > maxLength) {
+                    throw new TooLongHttpLineException("An HTTP line is larger than " + maxLength + " bytes.");
+                }
+                return false;
+            }
+            final int skipped = firstNonControlIndex - readerIndex;
+            if (skipped > 0) {
+                buffer.skipBytes(skipped);
+                assert buffer.readerIndex() == firstNonControlIndex;
+                increaseCount(skipped);
+            }
+            return true;
+        }
+
+        public AppendableCharSequence skipControlCharAndParse(ByteBuf buffer) {
+            // Suppress a warning because HeaderParser.reset() is supposed to be called
+            reset();    // lgtm[java/subtle-inherited-call]
+            if (!skipControlChars(buffer)) {
+                return null;
+            }
+            return super.parse(buffer);
         }
 
         @Override
         public AppendableCharSequence parse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
-            final int readableBytes = buffer.readableBytes();
-            if (readableBytes == 0) {
-                return null;
-            }
-            if (currentState == State.SKIP_CONTROL_CHARS) {
-                final int maxToSkip = Math.min(maxLength, readableBytes);
-                final int readerIndex = buffer.readerIndex();
-                final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
-                if (firstNonControlIndex == -1) {
-                    buffer.skipBytes(maxToSkip);
-                    if (readableBytes > maxLength) {
-                        throw newException(maxLength);
-                    }
-                    return null;
-                }
-                final int skipped = firstNonControlIndex - readerIndex;
-                if (skipped > 0) {
-                    increaseCount(skipped);
-                    buffer.skipBytes(skipped);
-                    assert buffer.readerIndex() == firstNonControlIndex;
-                }
-                currentState = State.READ_INITIAL;
-                // from now on we don't care about control chars
-            }
             return super.parse(buffer);
         }
 
