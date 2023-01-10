@@ -998,14 +998,19 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return true;
         }
 
-        protected final void increaseCount() {
-            if (++ size > maxLength) {
+        protected final void increaseCount(int delta) {
+            size += delta;
+            if (size > maxLength) {
                 // TODO: Respond with Bad Request and discard the traffic
                 //    or close the connection.
                 //       No need to notify the upstream handlers - just log.
                 //       If decoding a response, just throw an exception.
                 throw newException(maxLength);
             }
+        }
+
+        protected final void increaseCount() {
+            increaseCount(1);
         }
 
         protected TooLongFrameException newException(int maxLength) {
@@ -1029,7 +1034,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             }
             if (currentState == State.SKIP_CONTROL_CHARS) {
                 final int maxToSkip = Math.min(maxLength, readableBytes);
-                final int firstNonControlIndex = buffer.forEachByte(buffer.readerIndex(), maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+                final int readerIndex = buffer.readerIndex();
+                final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
                 if (firstNonControlIndex == -1) {
                     buffer.skipBytes(maxToSkip);
                     if (readableBytes > maxLength) {
@@ -1037,7 +1043,12 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                     }
                     return null;
                 }
-                buffer.readerIndex(firstNonControlIndex);
+                final int skipped = firstNonControlIndex - readerIndex;
+                if (skipped > 0) {
+                    increaseCount(skipped);
+                    buffer.skipBytes(skipped);
+                    assert buffer.readerIndex() == firstNonControlIndex;
+                }
                 currentState = State.READ_INITIAL;
                 // from now on we don't care about control chars
             }
