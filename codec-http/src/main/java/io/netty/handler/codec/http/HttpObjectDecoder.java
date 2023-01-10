@@ -145,8 +145,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
     private final boolean allowPartialChunks;
     protected final boolean validateHeaders;
     private final boolean allowDuplicateContentLengths;
-    private final HeaderParser headerParser;
-    private final LineParser lineParser;
+    private final CrLfParser headerParser;
+    private final CrLfParser lineParser;
 
     private HttpMessage message;
     private long chunkSize;
@@ -240,8 +240,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         checkPositive(maxChunkSize, "maxChunkSize");
 
         AppendableCharSequence seq = new AppendableCharSequence(initialBufferSize);
-        lineParser = new LineParser(seq, maxInitialLineLength);
-        headerParser = new HeaderParser(seq, maxHeaderSize);
+        lineParser = new CrLfParser(seq, maxInitialLineLength, false);
+        headerParser = new CrLfParser(seq, maxHeaderSize, true);
         this.maxChunkSize = maxChunkSize;
         this.chunkedSupported = chunkedSupported;
         this.validateHeaders = validateHeaders;
@@ -260,8 +260,8 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                 // Fall-through
             case READ_INITIAL: try {
                 AppendableCharSequence line = currentState == State.SKIP_CONTROL_CHARS ?
-                        lineParser.skipControlCharAndParse(buffer) :
-                        lineParser.parse(buffer);
+                        lineParser.resetSkipControlCharAndParse(buffer) :
+                        lineParser.resetAndParse(buffer);
                 if (line == null) {
                     return;
                 }
@@ -375,7 +375,7 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
              * read chunk, read and ignore the CRLF and repeat until 0
              */
             case READ_CHUNK_SIZE: try {
-                AppendableCharSequence line = lineParser.parse(buffer);
+                AppendableCharSequence line = lineParser.resetAndParse(buffer);
                 if (line == null) {
                     return;
                 }
@@ -955,75 +955,16 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
         return ch == ' ' || ch == (char) 0x09;
     }
 
-    private static class HeaderParser implements ByteProcessor {
-        protected final AppendableCharSequence seq;
-        protected final int maxLength;
-        int size;
+    private static final class CrLfParser implements ByteProcessor {
+        private final AppendableCharSequence seq;
+        private final int maxLength;
+        private int size;
+        private final boolean header;
 
-        HeaderParser(AppendableCharSequence seq, int maxLength) {
+        CrLfParser(AppendableCharSequence seq, int maxLength, boolean header) {
             this.seq = seq;
             this.maxLength = maxLength;
-        }
-
-        public AppendableCharSequence parse(ByteBuf buffer) {
-            final int oldSize = size;
-            seq.reset();
-            int i = buffer.forEachByte(HeaderParser.this);
-            if (i == -1) {
-                size = oldSize;
-                return null;
-            }
-            buffer.readerIndex(i + 1);
-            return seq;
-        }
-
-        public void reset() {
-            size = 0;
-        }
-
-        @Override
-        public final boolean process(byte value) {
-            char nextByte = (char) (value & 0xFF);
-            if (nextByte == HttpConstants.LF) {
-                int len = seq.length();
-                // Drop CR if we had a CRLF pair
-                if (len >= 1 && seq.charAtUnsafe(len - 1) == HttpConstants.CR) {
-                    -- size;
-                    seq.setLength(len - 1);
-                }
-                return false;
-            }
-
-            increaseCount();
-
-            seq.append(nextByte);
-            return true;
-        }
-
-        protected final void increaseCount(int delta) {
-            size += delta;
-            if (size > maxLength) {
-                // TODO: Respond with Bad Request and discard the traffic
-                //    or close the connection.
-                //       No need to notify the upstream handlers - just log.
-                //       If decoding a response, just throw an exception.
-                throw newException(maxLength);
-            }
-        }
-
-        protected final void increaseCount() {
-            increaseCount(1);
-        }
-
-        protected TooLongFrameException newException(int maxLength) {
-            return new TooLongHttpHeaderException("HTTP header is larger than " + maxLength + " bytes.");
-        }
-    }
-
-    private static final class LineParser extends HeaderParser {
-
-        LineParser(AppendableCharSequence seq, int maxLength) {
-            super(seq, maxLength);
+            this.header = header;
         }
 
         private boolean skipControlChars(ByteBuf buffer) {
@@ -1051,24 +992,75 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
             return true;
         }
 
-        public AppendableCharSequence skipControlCharAndParse(ByteBuf buffer) {
+        public AppendableCharSequence resetSkipControlCharAndParse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
             if (!skipControlChars(buffer)) {
                 return null;
             }
-            return super.parse(buffer);
+            return parse(buffer);
         }
 
-        @Override
-        public AppendableCharSequence parse(ByteBuf buffer) {
+        public AppendableCharSequence resetAndParse(ByteBuf buffer) {
             // Suppress a warning because HeaderParser.reset() is supposed to be called
             reset();    // lgtm[java/subtle-inherited-call]
-            return super.parse(buffer);
+            return parse(buffer);
+        }
+
+        public AppendableCharSequence parse(ByteBuf buffer) {
+            final int oldSize = size;
+            seq.reset();
+            int i = buffer.forEachByte(this);
+            if (i == -1) {
+                size = oldSize;
+                return null;
+            }
+            buffer.readerIndex(i + 1);
+            return seq;
+        }
+
+        public void reset() {
+            size = 0;
         }
 
         @Override
+        public boolean process(byte value) {
+            char nextByte = (char) (value & 0xFF);
+            if (nextByte == HttpConstants.LF) {
+                int len = seq.length();
+                // Drop CR if we had a CRLF pair
+                if (len >= 1 && seq.charAtUnsafe(len - 1) == HttpConstants.CR) {
+                    -- size;
+                    seq.setLength(len - 1);
+                }
+                return false;
+            }
+
+            increaseCount();
+
+            seq.append(nextByte);
+            return true;
+        }
+
+        protected void increaseCount(int delta) {
+            size += delta;
+            if (size > maxLength) {
+                // TODO: Respond with Bad Request and discard the traffic
+                //    or close the connection.
+                //       No need to notify the upstream handlers - just log.
+                //       If decoding a response, just throw an exception.
+                throw newException(maxLength);
+            }
+        }
+
+        protected void increaseCount() {
+            increaseCount(1);
+        }
+
         protected TooLongFrameException newException(int maxLength) {
+            if (header) {
+                return new TooLongHttpHeaderException("HTTP header is larger than " + maxLength + " bytes.");
+            }
             return new TooLongHttpLineException("An HTTP line is larger than " + maxLength + " bytes.");
         }
     }
