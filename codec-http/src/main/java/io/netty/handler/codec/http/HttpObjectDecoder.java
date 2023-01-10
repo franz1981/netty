@@ -307,8 +307,23 @@ public abstract class HttpObjectDecoder extends ByteToMessageDecoder {
                  */
                 long contentLength = contentLength();
                 if (contentLength == 0 || contentLength == -1 && isDecodingRequest()) {
-                    out.add(message);
-                    out.add(LastHttpContent.EMPTY_LAST_CONTENT);
+                    final HttpMessage msg = this.message;
+                    if (msg instanceof DefaultHttpRequest) {
+                        final DefaultHttpRequest req = (DefaultHttpRequest) msg;
+                        // no need to validate headers again here
+                        DefaultFullHttpRequest fullReq = new DefaultFullHttpRequest(
+                                req.protocolVersion(), req.method(), req.uri(),
+                                Unpooled.EMPTY_BUFFER,
+                                req.headers(), EmptyHttpHeaders.INSTANCE);
+                        DecoderResult result = req.decoderResult();
+                        if (result != null) {
+                            fullReq.setDecoderResult(result);
+                        }
+                        out.add(fullReq);
+                    } else {
+                        out.add(message);
+                        out.add(LastHttpContent.EMPTY_LAST_CONTENT);
+                    }
                     resetNow();
                     return;
                 }
