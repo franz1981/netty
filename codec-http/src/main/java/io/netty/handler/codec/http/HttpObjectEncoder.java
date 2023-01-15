@@ -162,6 +162,7 @@ public abstract class HttpObjectEncoder<H extends HttpMessage> extends MessageTo
             encodeFullHttpMessage(ctx, msg, out);
             return;
         }
+        System.err.println("Seen type = " + msg.getClass().getSimpleName());
         if (msg instanceof HttpMessage) {
             final H m;
             try {
