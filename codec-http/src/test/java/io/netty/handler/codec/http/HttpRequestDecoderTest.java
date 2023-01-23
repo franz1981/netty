@@ -20,12 +20,18 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
+import net.sf.saxon.functions.PositionAndLast.Last;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.*;
 import static io.netty.handler.codec.http.HttpHeadersTestUtils.of;
@@ -33,11 +39,7 @@ import static org.hamcrest.CoreMatchers.instanceOf;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class HttpRequestDecoderTest {
     private static final byte[] CONTENT_CRLF_DELIMITERS = createContent("\r\n");
@@ -197,6 +199,51 @@ public class HttpRequestDecoderTest {
         LastHttpContent c = channel.readInbound();
         c.release();
 
+        assertFalse(channel.finish());
+        assertNull(channel.readInbound());
+    }
+
+    @Test
+    public void testInitialLineAndHeaderNamesPooling() {
+        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
+        String crlf = "\r\n";
+        String request = "GET /some/path HTTP/1.1" + crlf +
+                         "Host: localhost" + crlf +
+                         "Connection: localhost" + crlf +
+                         "Content-Type: text/plain" + crlf +
+                         "Content-Length: 0" + crlf + crlf;
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII)));
+        HttpRequest req = channel.readInbound();
+        assertSame(HttpMethod.GET, req.method());
+        assertSame(HttpVersion.HTTP_1_1, req.protocolVersion());
+        assertTrue(req.headers().contains(CONNECTION));
+        assertTrue(req.headers().contains(HOST));
+        assertTrue(req.headers().contains(CONTENT_TYPE));
+        assertTrue(req.headers().contains(HttpHeaderNames.CONTENT_LENGTH));
+        final IdentityHashMap<CharSequence, Boolean> pooledHeaderNames = new IdentityHashMap<CharSequence, Boolean>(4);
+        final Iterator<Entry<CharSequence, CharSequence>> entryIterator = req.headers().iteratorCharSequence();
+        while (entryIterator.hasNext()) {
+            final AsciiString headerName = (AsciiString) entryIterator.next().getKey();
+            if (headerName.contentEqualsIgnoreCase(CONNECTION) || headerName.contentEqualsIgnoreCase(HOST) ||
+                headerName.contentEqualsIgnoreCase(CONTENT_TYPE) ||
+                headerName.contentEqualsIgnoreCase(HttpHeaderNames.CONTENT_LENGTH)) {
+                assertNull(pooledHeaderNames.put(headerName, true));
+            }
+        }
+        ((LastHttpContent) channel.readInbound()).release();
+        // decode it again and check header names are pooled
+        assertTrue(channel.writeInbound(Unpooled.copiedBuffer(request, CharsetUtil.US_ASCII)));
+        HttpRequest secondReq = channel.readInbound();
+        for (CharSequence name : pooledHeaderNames.keySet()) {
+            assertTrue(req.headers().contains(name));
+        }
+        final Iterator<Entry<CharSequence, CharSequence>> entrySecondIterator =
+                secondReq.headers().iteratorCharSequence();
+        while (entrySecondIterator.hasNext()) {
+            final CharSequence headerName = entrySecondIterator.next().getKey();
+            assertNotNull(pooledHeaderNames.get(headerName));
+        }
+        ((LastHttpContent) channel.readInbound()).release();
         assertFalse(channel.finish());
         assertNull(channel.readInbound());
     }
