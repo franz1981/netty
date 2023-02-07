@@ -61,6 +61,8 @@ final class PlatformDependent0 {
 
     private static final boolean IS_EXPLICIT_TRY_REFLECTION_SET_ACCESSIBLE = explicitTryReflectionSetAccessible0();
 
+    private static final Method IS_VIRTUAL_THREAD_METHOD = isVirtualThreadMethod();
+
     static final Unsafe UNSAFE;
 
     // constants borrowed from murmur3
@@ -481,6 +483,43 @@ final class PlatformDependent0 {
 
         logger.debug("java.nio.DirectByteBuffer.<init>(long, int): {}",
                 DIRECT_BUFFER_CONSTRUCTOR != null ? "available" : "unavailable");
+    }
+
+    private static Method isVirtualThreadMethod() {
+        if (JAVA_VERSION < 19) {
+            return null;
+        }
+        if (!SystemPropertyUtil.contains("io.netty.loom.support")) {
+            return null;
+        }
+        try {
+            Method isVirtualMethod = Thread.class.getMethod("isVirtual");
+            Throwable err = ReflectionUtil.trySetAccessible(isVirtualMethod, true);
+            if (err != null) {
+                logger.debug("virtual thread support isn't enabled due to setAccessible errors: ", err);
+                return null;
+            }
+            // this is to check if --enable-preview for Java 19 is correctly set
+            boolean dummy = (Boolean) isVirtualMethod.invoke(Thread.currentThread());
+            return isVirtualMethod;
+        } catch (Throwable e) {
+            logger.debug("virtual thread support isn't enabled due to ", e);
+            return null;
+        }
+    }
+
+    static boolean hasVirtualThreadSupport() {
+        return IS_VIRTUAL_THREAD_METHOD != null;
+    }
+
+    static boolean isVirtualThread(Thread thread) {
+        try {
+            return (Boolean) IS_VIRTUAL_THREAD_METHOD.invoke(thread);
+        } catch (IllegalAccessException e) {
+            throw new Error(e);
+        } catch (InvocationTargetException e) {
+            throw new Error(e);
+        }
     }
 
     private static boolean unsafeStaticFieldOffsetSupported() {

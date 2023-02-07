@@ -535,6 +535,17 @@ public final class PlatformDependent {
                 "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
     }
 
+    public static boolean hasVirtualThreadSupport() {
+        return PlatformDependent0.hasVirtualThreadSupport();
+    }
+
+    public static boolean isVirtualThread(Thread thread) {
+        if (PlatformDependent0.hasVirtualThreadSupport()) {
+            return PlatformDependent0.isVirtualThread(thread);
+        }
+        throw new UnsupportedOperationException("virtual thread support is not enabled on this runtime");
+    }
+
     public static Object getObject(Object object, long fieldOffset) {
         return PlatformDependent0.getObject(object, fieldOffset);
     }
