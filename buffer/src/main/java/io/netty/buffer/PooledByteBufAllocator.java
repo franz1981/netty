@@ -369,9 +369,23 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         return chunkSize;
     }
 
+    private PoolThreadCache getPoolThreadCache() {
+        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return uncachedPool();
+        }
+        return threadCache.get();
+    }
+
+    private PoolThreadCache uncachedPool() {
+        // TODO: with this one heap/direct arenas are not stable for the same v thread! use thread id as hash + some chaos
+        final PoolArena<byte[]> heapArena = leastUsedArena(heapArenas);
+        final PoolArena<ByteBuffer> directArena = leastUsedArena(directArenas);
+        return new PoolThreadCache(heapArena, directArena);
+    }
+
     @Override
     protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
-        PoolThreadCache cache = threadCache.get();
+        PoolThreadCache cache = getPoolThreadCache();
         PoolArena<byte[]> heapArena = cache.heapArena;
 
         final ByteBuf buf;
@@ -388,7 +402,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
 
     @Override
     protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
-        PoolThreadCache cache = threadCache.get();
+        PoolThreadCache cache = getPoolThreadCache();
         PoolArena<ByteBuffer> directArena = cache.directArena;
 
         final ByteBuf buf;
@@ -488,6 +502,9 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
      */
     @Deprecated
     public boolean hasThreadLocalCache() {
+        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return false;
+        }
         return threadCache.isSet();
     }
 
@@ -497,10 +514,13 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
      */
     @Deprecated
     public void freeThreadLocalCache() {
+        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return;
+        }
         threadCache.remove();
     }
 
-    private final class PoolThreadLocalCache extends FastThreadLocal<PoolThreadCache> {
+    private final class PoolThreadLocalCache extends FastThreadLocal<PoolThreadFullCache> {
         private final boolean useCacheForAllThreads;
 
         PoolThreadLocalCache(boolean useCacheForAllThreads) {
@@ -508,7 +528,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         }
 
         @Override
-        protected synchronized PoolThreadCache initialValue() {
+        protected synchronized PoolThreadFullCache initialValue() {
             final PoolArena<byte[]> heapArena = leastUsedArena(heapArenas);
             final PoolArena<ByteBuffer> directArena = leastUsedArena(directArenas);
 
@@ -521,7 +541,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
                     // The Thread is used by an EventExecutor, let's use the cache as the chances are good that we
                     // will allocate a lot!
                     executor != null) {
-                final PoolThreadCache cache = new PoolThreadCache(
+                final PoolThreadFullCache cache = new PoolThreadFullCache(
                         heapArena, directArena, smallCacheSize, normalCacheSize,
                         DEFAULT_MAX_CACHED_BUFFER_CAPACITY, DEFAULT_CACHE_TRIM_INTERVAL);
 
@@ -534,34 +554,34 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
                 return cache;
             }
             // No caching so just use 0 as sizes.
-            return new PoolThreadCache(heapArena, directArena, 0, 0, 0, 0);
+            return new PoolThreadFullCache(heapArena, directArena, 0, 0, 0, 0);
         }
 
         @Override
-        protected void onRemoval(PoolThreadCache threadCache) {
+        protected void onRemoval(PoolThreadFullCache threadCache) {
             threadCache.free(false);
         }
+    }
 
-        private <T> PoolArena<T> leastUsedArena(PoolArena<T>[] arenas) {
-            if (arenas == null || arenas.length == 0) {
-                return null;
-            }
+    private static <T> PoolArena<T> leastUsedArena(PoolArena<T>[] arenas) {
+        if (arenas == null || arenas.length == 0) {
+            return null;
+        }
 
-            PoolArena<T> minArena = arenas[0];
-            //optimized
-            //If it is the first execution, directly return minarena and reduce the number of for loop comparisons below
-            if (minArena.numThreadCaches.get() == CACHE_NOT_USED) {
-                return minArena;
-            }
-            for (int i = 1; i < arenas.length; i++) {
-                PoolArena<T> arena = arenas[i];
-                if (arena.numThreadCaches.get() < minArena.numThreadCaches.get()) {
-                    minArena = arena;
-                }
-            }
-
+        PoolArena<T> minArena = arenas[0];
+        //optimized
+        //If it is the first execution, directly return minarena and reduce the number of for loop comparisons below
+        if (minArena.numThreadCaches.get() == CACHE_NOT_USED) {
             return minArena;
         }
+        for (int i = 1; i < arenas.length; i++) {
+            PoolArena<T> arena = arenas[i];
+            if (arena.numThreadCaches.get() < minArena.numThreadCaches.get()) {
+                minArena = arena;
+            }
+        }
+
+        return minArena;
     }
 
     @Override
@@ -726,7 +746,7 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     final PoolThreadCache threadCache() {
-        PoolThreadCache cache =  threadCache.get();
+        PoolThreadCache cache = getPoolThreadCache();
         assert cache != null;
         return cache;
     }
@@ -738,7 +758,10 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
      * Returns {@code true} if a cache for the current {@link Thread} exists and so was trimmed, false otherwise.
      */
     public boolean trimCurrentThreadCache() {
-        PoolThreadCache cache = threadCache.getIfExists();
+        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return false;
+        }
+        PoolThreadFullCache cache = threadCache.getIfExists();
         if (cache != null) {
             cache.trim();
             return true;
