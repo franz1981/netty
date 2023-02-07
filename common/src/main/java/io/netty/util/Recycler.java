@@ -168,6 +168,11 @@ public abstract class Recycler<T> {
 
     @SuppressWarnings("unchecked")
     public final T get() {
+        // TODO in a future we can decide for a different pooling strategy here - using a striped MPMC pool
+        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
+            return newObject((Handle<T>) NOOP_HANDLE);
+        }
+        // TODO neither non event loop threads should pool anything here!!!
         if (maxCapacityPerThread == 0) {
             return newObject((Handle<T>) NOOP_HANDLE);
         }
