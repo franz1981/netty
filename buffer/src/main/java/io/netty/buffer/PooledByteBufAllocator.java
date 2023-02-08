@@ -370,16 +370,41 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
     }
 
     private PoolThreadCache getPoolThreadCache() {
-        if (PlatformDependent.hasVirtualThreadSupport() && PlatformDependent.isVirtualThread(Thread.currentThread())) {
-            return uncachedPool();
+        if (PlatformDependent.hasVirtualThreadSupport()) {
+            final Thread current = Thread.currentThread();
+            if (PlatformDependent.isVirtualThread(current)) {
+                return uncachedPool(current.getId());
+            }
         }
         return threadCache.get();
     }
 
-    private PoolThreadCache uncachedPool() {
-        // TODO: with this one heap/direct arenas are not stable for the same v thread! use thread id as hash + some chaos
-        final PoolArena<byte[]> heapArena = leastUsedArena(heapArenas);
-        final PoolArena<ByteBuffer> directArena = leastUsedArena(directArenas);
+    private static <T> PoolArena<T> pickRandomArena(PoolArena<T>[] arenas, long threadId) {
+        final int arenaCount = arenas.length;
+        if (arenaCount == 1) {
+            return arenas[0];
+        }
+        // to spread consecutive ids (see Knuth multiplicative method at "The Art of Computer Programming", section 6.4).
+        long probe = (int) ((threadId * 0x9e3779b9) & Integer.MAX_VALUE);
+        // xorshift; see https://en.wikipedia.org/wiki/Xorshift
+        probe ^= probe << 13;
+        probe ^= probe >>> 17;
+        probe ^= probe << 5;
+        // this is to turn it into a positive probe, if needed
+        probe = probe & Long.MAX_VALUE;
+        final int arenaIndex;
+        if (Integer.bitCount(arenaCount) == 1) {
+            arenaIndex = (int) (probe & arenaCount - 1);
+        } else {
+            // :"(
+            arenaIndex = (int) (probe % arenaCount);
+        }
+        return arenas[arenaIndex];
+    }
+
+    private PoolThreadCache uncachedPool(long threadId) {
+        final PoolArena<byte[]> heapArena = pickRandomArena(heapArenas, threadId);
+        final PoolArena<ByteBuffer> directArena = pickRandomArena(directArenas, threadId);
         return new PoolThreadCache(heapArena, directArena);
     }
 
@@ -561,27 +586,27 @@ public class PooledByteBufAllocator extends AbstractByteBufAllocator implements 
         protected void onRemoval(PoolThreadFullCache threadCache) {
             threadCache.free(false);
         }
-    }
 
-    private static <T> PoolArena<T> leastUsedArena(PoolArena<T>[] arenas) {
-        if (arenas == null || arenas.length == 0) {
-            return null;
-        }
+        private <T> PoolArena<T> leastUsedArena(PoolArena<T>[] arenas) {
+            if (arenas == null || arenas.length == 0) {
+                return null;
+            }
 
-        PoolArena<T> minArena = arenas[0];
-        //optimized
-        //If it is the first execution, directly return minarena and reduce the number of for loop comparisons below
-        if (minArena.numThreadCaches.get() == CACHE_NOT_USED) {
+            PoolArena<T> minArena = arenas[0];
+            //optimized
+            //If it is the first execution, directly return minarena and reduce the number of for loop comparisons below
+            if (minArena.numThreadCaches.get() == CACHE_NOT_USED) {
+                return minArena;
+            }
+            for (int i = 1; i < arenas.length; i++) {
+                PoolArena<T> arena = arenas[i];
+                if (arena.numThreadCaches.get() < minArena.numThreadCaches.get()) {
+                    minArena = arena;
+                }
+            }
+
             return minArena;
         }
-        for (int i = 1; i < arenas.length; i++) {
-            PoolArena<T> arena = arenas[i];
-            if (arena.numThreadCaches.get() < minArena.numThreadCaches.get()) {
-                minArena = arena;
-            }
-        }
-
-        return minArena;
     }
 
     @Override
