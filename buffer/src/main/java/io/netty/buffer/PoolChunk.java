@@ -22,7 +22,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.PriorityQueue;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Description of algorithm for PageRun/PoolSubpage allocation from PoolChunk
@@ -159,8 +158,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
      */
     private final LongPriorityQueue[] runsAvail;
 
-    private final ReentrantLock runsAvailLock;
-
     /**
      * manage all subpages in this chunk
      */
@@ -203,7 +200,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
         freeBytes = chunkSize;
 
         runsAvail = newRunsAvailqueueArray(maxPageIdx);
-        runsAvailLock = new ReentrantLock();
         runsAvailMap = new LongLongHashMap(-1);
         subpages = new PoolSubpage[chunkSize >> pageShifts];
 
@@ -225,7 +221,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
         pageShifts = 0;
         runsAvailMap = null;
         runsAvail = null;
-        runsAvailLock = null;
         subpages = null;
         chunkSize = size;
         cachedNioBuffers = null;
@@ -288,11 +283,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
         if (this.unpooled) {
             freeBytes = this.freeBytes;
         } else {
-            runsAvailLock.lock();
-            try {
+            synchronized (runsAvail) {
                 freeBytes = this.freeBytes;
-            } finally {
-                runsAvailLock.unlock();
             }
         }
         return usage(freeBytes);
@@ -339,8 +331,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
         int pages = runSize >> pageShifts;
         int pageIdx = arena.pages2pageIdx(pages);
 
-        runsAvailLock.lock();
-        try {
+        synchronized (runsAvail) {
             //find first queue which has at least one big enough run
             int queueIdx = runFirstBestFit(pageIdx);
             if (queueIdx == -1) {
@@ -362,8 +353,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
             int pinnedSize = runSize(pageShifts, handle);
             freeBytes -= pinnedSize;
             return handle;
-        } finally {
-            runsAvailLock.unlock();
         }
     }
 
@@ -442,8 +431,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
         // Obtain the head of the PoolSubPage pool that is owned by the PoolArena and synchronize on it.
         // This is need as we may add it back and so alter the linked-list structure.
         PoolSubpage<T> head = arena.findSubpagePoolHead(sizeIdx);
-        head.lock();
-        try {
+        synchronized (head) {
             //allocate a new run
             int runSize = calculateRunSize(sizeIdx);
             //runSize must be multiples of pageSize
@@ -461,8 +449,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
             subpages[runOffset] = subpage;
             return subpage.allocate();
-        } finally {
-            head.unlock();
         }
     }
 
@@ -484,8 +470,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
             // Obtain the head of the PoolSubPage pool that is owned by the PoolArena and synchronize on it.
             // This is need as we may add it back and so alter the linked-list structure.
-            head.lock();
-            try {
+            synchronized (head) {
                 assert subpage != null && subpage.doNotDestroy;
                 if (subpage.free(head, bitmapIdx(handle))) {
                     //the subpage is still used, do not free it
@@ -494,14 +479,11 @@ final class PoolChunk<T> implements PoolChunkMetric {
                 assert !subpage.doNotDestroy;
                 // Null out slot in the array as it was freed and we should not use it anymore.
                 subpages[sIdx] = null;
-            } finally {
-                head.unlock();
             }
         }
 
         //start free run
-        runsAvailLock.lock();
-        try {
+        synchronized (runsAvail) {
             // collapse continuous runs, successfully collapsed runs
             // will be removed from runsAvail and runsAvailMap
             long finalRun = collapseRuns(handle);
@@ -513,8 +495,6 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
             insertAvailRun(runOffset(finalRun), runPages(finalRun), finalRun);
             freeBytes += runSize;
-        } finally {
-            runsAvailLock.unlock();
         }
 
         if (nioBuffer != null && cachedNioBuffers != null &&
@@ -625,11 +605,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
         if (this.unpooled) {
             return freeBytes;
         }
-        runsAvailLock.lock();
-        try {
+        synchronized (runsAvail) {
             return freeBytes;
-        } finally {
-            runsAvailLock.unlock();
         }
     }
 
@@ -643,11 +620,8 @@ final class PoolChunk<T> implements PoolChunkMetric {
         if (this.unpooled) {
             freeBytes = this.freeBytes;
         } else {
-            runsAvailLock.lock();
-            try {
+            synchronized (runsAvail) {
                 freeBytes = this.freeBytes;
-            } finally {
-                runsAvailLock.unlock();
             }
         }
 

@@ -16,8 +16,6 @@
 
 package io.netty.buffer;
 
-import java.util.concurrent.locks.ReentrantLock;
-
 import static io.netty.buffer.PoolChunk.RUN_OFFSET_SHIFT;
 import static io.netty.buffer.PoolChunk.SIZE_SHIFT;
 import static io.netty.buffer.PoolChunk.IS_USED_SHIFT;
@@ -41,8 +39,6 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
     private int bitmapLength;
     private int nextAvail;
     private int numAvail;
-
-    private final ReentrantLock lock = new ReentrantLock();
 
     // TODO: Test if adding padding helps under contention
     //private long pad0, pad1, pad2, pad3, pad4, pad5, pad6, pad7;
@@ -227,8 +223,7 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             numAvail = 0;
             elemSize = -1;
         } else {
-            chunk.arena.lock();
-            try {
+            synchronized (chunk.arena) {
                 if (!this.doNotDestroy) {
                     doNotDestroy = false;
                     // Not used for creating the String.
@@ -239,8 +234,6 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
                     numAvail = this.numAvail;
                     elemSize = this.elemSize;
                 }
-            } finally {
-                chunk.arena.unlock();
             }
         }
 
@@ -258,11 +251,9 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             // It's the head.
             return 0;
         }
-        chunk.arena.lock();
-        try {
+
+        synchronized (chunk.arena) {
             return maxNumElems;
-        } finally {
-            chunk.arena.unlock();
         }
     }
 
@@ -273,11 +264,8 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             return 0;
         }
 
-        chunk.arena.lock();
-        try {
+        synchronized (chunk.arena) {
             return numAvail;
-        } finally {
-            chunk.arena.unlock();
         }
     }
 
@@ -288,11 +276,8 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
             return -1;
         }
 
-        chunk.arena.lock();
-        try {
+        synchronized (chunk.arena) {
             return elemSize;
-        } finally {
-            chunk.arena.unlock();
         }
     }
 
@@ -305,13 +290,5 @@ final class PoolSubpage<T> implements PoolSubpageMetric {
         if (chunk != null) {
             chunk.destroy();
         }
-    }
-
-    void lock() {
-        lock.lock();
-    }
-
-    void unlock() {
-        lock.unlock();
     }
 }
