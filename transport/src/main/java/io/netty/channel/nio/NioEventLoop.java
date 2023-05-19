@@ -48,6 +48,8 @@ import java.util.NoSuchElementException;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -56,6 +58,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  */
 public final class NioEventLoop extends SingleThreadEventLoop {
+
+    private static final boolean ENABLE_COMPANION_SELECTOR_THREAD = Boolean.getBoolean("io.netty.select.poller");
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(NioEventLoop.class);
 
@@ -71,6 +75,22 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         @Override
         public int get() throws Exception {
             return selectNow();
+        }
+    };
+
+    private IOException pollerSelectEx;
+    private int pollerSelectedKeys;
+    private long pollerSelectDeadline;
+    private Runnable select = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                pollerSelectedKeys = select(null, pollerSelectDeadline);
+            } catch (IOException ioEx) {
+                pollerSelectDeadline = -1;
+                pollerSelectedKeys = 0;
+                pollerSelectEx = ioEx;
+            }
         }
     };
 
@@ -502,107 +522,114 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     @Override
     protected void run() {
-        int selectCnt = 0;
-        for (;;) {
-            try {
-                int strategy;
+        // we can name it, actually!
+        final ExecutorService pollerService = Executors.newSingleThreadExecutor();
+        try {
+            int selectCnt = 0;
+            for (;;) {
                 try {
-                    strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
-                    switch (strategy) {
-                    case SelectStrategy.CONTINUE:
-                        continue;
+                    int strategy;
+                    try {
+                        strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
+                        switch (strategy) {
+                        case SelectStrategy.CONTINUE:
+                            continue;
 
-                    case SelectStrategy.BUSY_WAIT:
-                        // fall-through to SELECT since the busy-wait is not supported with NIO
+                        case SelectStrategy.BUSY_WAIT:
+                            // fall-through to SELECT since the busy-wait is not supported with NIO
 
-                    case SelectStrategy.SELECT:
-                        long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
-                        if (curDeadlineNanos == -1L) {
-                            curDeadlineNanos = NONE; // nothing on the calendar
+                        case SelectStrategy.SELECT:
+                            long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
+                            if (curDeadlineNanos == -1L) {
+                                curDeadlineNanos = NONE; // nothing on the calendar
+                            }
+                            nextWakeupNanos.set(curDeadlineNanos);
+                            try {
+                                if (!hasTasks()) {
+                                    strategy = select(pollerService, curDeadlineNanos);
+                                }
+                            } finally {
+                                // This update is just to help block unnecessary selector wakeups
+                                // so use of lazySet is ok (no race condition)
+                                nextWakeupNanos.lazySet(AWAKE);
+                            }
+                            // fall through
+                        default:
                         }
-                        nextWakeupNanos.set(curDeadlineNanos);
+                    } catch (IOException e) {
+                        // If we receive an IOException here its because the Selector is messed up. Let's rebuild
+                        // the selector and retry. https://github.com/netty/netty/issues/8566
+                        rebuildSelector0();
+                        selectCnt = 0;
+                        handleLoopException(e);
+                        continue;
+                    }
+
+                    selectCnt++;
+                    cancelledKeys = 0;
+                    needsToSelectAgain = false;
+                    final int ioRatio = this.ioRatio;
+                    boolean ranTasks;
+                    if (ioRatio == 100) {
                         try {
-                            if (!hasTasks()) {
-                                strategy = select(curDeadlineNanos);
+                            if (strategy > 0) {
+                                processSelectedKeys();
                             }
                         } finally {
-                            // This update is just to help block unnecessary selector wakeups
-                            // so use of lazySet is ok (no race condition)
-                            nextWakeupNanos.lazySet(AWAKE);
+                            // Ensure we always run tasks.
+                            ranTasks = runAllTasks();
                         }
-                        // fall through
-                    default:
-                    }
-                } catch (IOException e) {
-                    // If we receive an IOException here its because the Selector is messed up. Let's rebuild
-                    // the selector and retry. https://github.com/netty/netty/issues/8566
-                    rebuildSelector0();
-                    selectCnt = 0;
-                    handleLoopException(e);
-                    continue;
-                }
-
-                selectCnt++;
-                cancelledKeys = 0;
-                needsToSelectAgain = false;
-                final int ioRatio = this.ioRatio;
-                boolean ranTasks;
-                if (ioRatio == 100) {
-                    try {
-                        if (strategy > 0) {
+                    } else if (strategy > 0) {
+                        final long ioStartTime = System.nanoTime();
+                        try {
                             processSelectedKeys();
+                        } finally {
+                            // Ensure we always run tasks.
+                            final long ioTime = System.nanoTime() - ioStartTime;
+                            ranTasks = runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                         }
-                    } finally {
-                        // Ensure we always run tasks.
-                        ranTasks = runAllTasks();
+                    } else {
+                        ranTasks = runAllTasks(0); // This will run the minimum number of tasks
                     }
-                } else if (strategy > 0) {
-                    final long ioStartTime = System.nanoTime();
-                    try {
-                        processSelectedKeys();
-                    } finally {
-                        // Ensure we always run tasks.
-                        final long ioTime = System.nanoTime() - ioStartTime;
-                        ranTasks = runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
-                    }
-                } else {
-                    ranTasks = runAllTasks(0); // This will run the minimum number of tasks
-                }
 
-                if (ranTasks || strategy > 0) {
-                    if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS && logger.isDebugEnabled()) {
-                        logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
-                                selectCnt - 1, selector);
-                    }
-                    selectCnt = 0;
-                } else if (unexpectedSelectorWakeup(selectCnt)) { // Unexpected wakeup (unusual case)
-                    selectCnt = 0;
-                }
-            } catch (CancelledKeyException e) {
-                // Harmless exception - log anyway
-                if (logger.isDebugEnabled()) {
-                    logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
-                            selector, e);
-                }
-            } catch (Error e) {
-                throw e;
-            } catch (Throwable t) {
-                handleLoopException(t);
-            } finally {
-                // Always handle shutdown even if the loop processing threw an exception.
-                try {
-                    if (isShuttingDown()) {
-                        closeAll();
-                        if (confirmShutdown()) {
-                            return;
+                    if (ranTasks || strategy > 0) {
+                        if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS && logger.isDebugEnabled()) {
+                            logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
+                                         selectCnt - 1, selector);
                         }
+                        selectCnt = 0;
+                    } else if (unexpectedSelectorWakeup(selectCnt)) { // Unexpected wakeup (unusual case)
+                        selectCnt = 0;
+                    }
+                } catch (CancelledKeyException e) {
+                    // Harmless exception - log anyway
+                    if (logger.isDebugEnabled()) {
+                        logger.debug(
+                                CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
+                                selector, e);
                     }
                 } catch (Error e) {
                     throw e;
                 } catch (Throwable t) {
                     handleLoopException(t);
+                } finally {
+                    // Always handle shutdown even if the loop processing threw an exception.
+                    try {
+                        if (isShuttingDown()) {
+                            closeAll();
+                            if (confirmShutdown()) {
+                                return;
+                            }
+                        }
+                    } catch (Error e) {
+                        throw e;
+                    } catch (Throwable t) {
+                        handleLoopException(t);
+                    }
                 }
             }
+        } finally {
+            pollerService.shutdown();
         }
     }
 
@@ -874,13 +901,46 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         return selector.selectNow();
     }
 
-    private int select(long deadlineNanos) throws IOException {
+    private int pollerSelect(ExecutorService pollerService, long deadlineNanos) {
+        assert deadlineNanos >= 0 || deadlineNanos == NONE;
+        pollerSelectDeadline = deadlineNanos;
+        try {
+            pollerService.submit(select).get();
+            final IOException ioEx = pollerSelectEx;
+            if (ioEx != null) {
+                pollerSelectEx = null;
+                throw ioEx;
+            }
+            return pollerSelectedKeys;
+        } catch (Throwable ignore) {
+            pollerSelectEx = null;
+            // no-op this shouldn't happen, really!
+            return 0;
+        } finally {
+            pollerSelectedKeys = 0;
+            pollerSelectDeadline = -1;
+        }
+    }
+
+    private int select(ExecutorService pollerService, long deadlineNanos) throws IOException {
         if (deadlineNanos == NONE) {
-            return selector.select();
+            if (pollerService != null) {
+                return pollerSelect(pollerService, NONE);
+            } else {
+                return selector.select();
+            }
         }
         // Timeout will only be 0 if deadline is within 5 microsecs
         long timeoutMillis = deadlineToDelayNanos(deadlineNanos + 995000L) / 1000000L;
-        return timeoutMillis <= 0 ? selector.selectNow() : selector.select(timeoutMillis);
+        if (timeoutMillis <= 0) {
+            // non-blocking (in theory)!
+            return selector.selectNow();
+        }
+        if (pollerService != null) {
+            return pollerSelect(pollerService, deadlineNanos);
+        } else {
+            return selector.select(timeoutMillis);
+        }
     }
 
     private void selectAgain() {
