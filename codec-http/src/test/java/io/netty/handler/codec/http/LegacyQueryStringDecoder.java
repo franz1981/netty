@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 The Netty Project
+ * Copyright 2023 The Netty Project
  *
  * The Netty Project licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -17,7 +17,6 @@ package io.netty.handler.codec.http;
 
 import io.netty.util.CharsetUtil;
 import io.netty.util.internal.PlatformDependent;
-import io.netty.util.internal.UnstableApi;
 
 import java.net.URI;
 import java.net.URLDecoder;
@@ -27,7 +26,6 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
 import static io.netty.util.internal.ObjectUtil.checkPositive;
@@ -62,7 +60,7 @@ import static io.netty.util.internal.StringUtil.decodeHexByte;
  *
  * @see QueryStringEncoder
  */
-public class QueryStringDecoder {
+public class LegacyQueryStringDecoder {
 
     private static final int DEFAULT_MAX_PARAMS = 1024;
 
@@ -78,7 +76,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI. The decoder will
      * assume that the query string is encoded in UTF-8.
      */
-    public QueryStringDecoder(String uri) {
+    public LegacyQueryStringDecoder(String uri) {
         this(uri, HttpConstants.DEFAULT_CHARSET);
     }
 
@@ -86,7 +84,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(String uri, boolean hasPath) {
+    public LegacyQueryStringDecoder(String uri, boolean hasPath) {
         this(uri, HttpConstants.DEFAULT_CHARSET, hasPath);
     }
 
@@ -94,7 +92,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(String uri, Charset charset) {
+    public LegacyQueryStringDecoder(String uri, Charset charset) {
         this(uri, charset, true);
     }
 
@@ -102,7 +100,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(String uri, Charset charset, boolean hasPath) {
+    public LegacyQueryStringDecoder(String uri, Charset charset, boolean hasPath) {
         this(uri, charset, hasPath, DEFAULT_MAX_PARAMS);
     }
 
@@ -110,7 +108,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(String uri, Charset charset, boolean hasPath, int maxParams) {
+    public LegacyQueryStringDecoder(String uri, Charset charset, boolean hasPath, int maxParams) {
         this(uri, charset, hasPath, maxParams, false);
     }
 
@@ -118,7 +116,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(String uri, Charset charset, boolean hasPath,
+    public LegacyQueryStringDecoder(String uri, Charset charset, boolean hasPath,
                               int maxParams, boolean semicolonIsNormalChar) {
         this.uri = checkNotNull(uri, "uri");
         this.charset = checkNotNull(charset, "charset");
@@ -133,7 +131,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI. The decoder will
      * assume that the query string is encoded in UTF-8.
      */
-    public QueryStringDecoder(URI uri) {
+    public LegacyQueryStringDecoder(URI uri) {
         this(uri, HttpConstants.DEFAULT_CHARSET);
     }
 
@@ -141,7 +139,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(URI uri, Charset charset) {
+    public LegacyQueryStringDecoder(URI uri, Charset charset) {
         this(uri, charset, DEFAULT_MAX_PARAMS);
     }
 
@@ -149,7 +147,7 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(URI uri, Charset charset, int maxParams) {
+    public LegacyQueryStringDecoder(URI uri, Charset charset, int maxParams) {
         this(uri, charset, maxParams, false);
     }
 
@@ -157,13 +155,18 @@ public class QueryStringDecoder {
      * Creates a new decoder that decodes the specified URI encoded in the
      * specified charset.
      */
-    public QueryStringDecoder(URI uri, Charset charset, int maxParams, boolean semicolonIsNormalChar) {
+    public LegacyQueryStringDecoder(URI uri, Charset charset, int maxParams, boolean semicolonIsNormalChar) {
+        String rawPath = uri.getRawPath();
+        if (rawPath == null) {
+            rawPath = EMPTY_STRING;
+        }
+        String rawQuery = uri.getRawQuery();
         // Also take care of cut of things like "http://localhost"
-        this.uri = parsableUri(uri);
+        this.uri = rawQuery == null? rawPath : rawPath + '?' + rawQuery;
         this.charset = checkNotNull(charset, "charset");
         this.maxParams = checkPositive(maxParams, "maxParams");
         this.semicolonIsNormalChar = semicolonIsNormalChar;
-        pathEndIdx = pathEndIdx(uri);
+        pathEndIdx = rawPath.length();
     }
 
     @Override
@@ -188,42 +191,14 @@ public class QueryStringDecoder {
         return path;
     }
 
-    @UnstableApi
-    final boolean hasDecodedParameters() {
-        return params != null;
-    }
-
     /**
      * Returns the decoded key-value parameter pairs of the URI.
      */
     public Map<String, List<String>> parameters() {
         if (params == null) {
-            params = decodeParams(uri, pathEndIdx(), charset, null, maxParams, semicolonIsNormalChar);
+            params = decodeParams(uri, pathEndIdx(), charset, maxParams, semicolonIsNormalChar);
         }
         return params;
-    }
-
-    /**
-     * Decodes {@link #uri()} parameters, reporting them in the provided {@link ParameterConsumer}.<br>
-     * This method doesn't make uses of any previously cached {@link #parameters()} results, but
-     * always perform a fresh new decoding.
-     */
-    public void decodeParameters(ParameterConsumer parameters) {
-        checkNotNull(parameters, "parameters");
-        final Map<String, List<String>> params = this.params;
-        if (params != null) {
-            if (params.isEmpty()) {
-                return;
-            }
-            for (Entry<String, List<String>> param : params.entrySet()) {
-                final List<String> values = param.getValue();
-                for (int i = 0; i < values.size(); i++) {
-                    parameters.accept(param.getKey(), values.get(i));
-                }
-            }
-        } else {
-            decodeParams(uri, pathEndIdx(), charset, parameters, maxParams, semicolonIsNormalChar);
-        }
     }
 
     /**
@@ -248,205 +223,55 @@ public class QueryStringDecoder {
         return pathEndIdx;
     }
 
-    private static String parsableUri(URI uri) {
-        String rawPath = uri.getRawPath();
-        if (rawPath == null) {
-            rawPath = EMPTY_STRING;
-        }
-        String rawQuery = uri.getRawQuery();
-        // Also take care of cut of things like "http://localhost"
-        return rawQuery == null? rawPath : rawPath + '?' + rawQuery;
-    }
-
-    private static int pathEndIdx(URI uri) {
-        return uri.getRawPath().length();
-    }
-
-    public static int getDefaultMaxParams() {
-        return DEFAULT_MAX_PARAMS;
-    }
-
-    /**
-     * Decodes the specified URI encoded in the specified charset.
-     */
-    public static void decodeParams(URI uri, Charset charset, int maxParams, boolean semicolonIsNormalChar,
-                                       ParameterConsumer parameters) {
-        checkNotNull(uri, "uri");
-        checkNotNull(charset, "charset");
-        checkPositive(maxParams, "maxParams");
-        checkNotNull(parameters, "parameters");
-        String parsableUri = parsableUri(uri);
-        int pathEndIdx = pathEndIdx(uri);
-        decodeParams(parsableUri, pathEndIdx, charset, parameters, maxParams, semicolonIsNormalChar);
-    }
-
-    /**
-     * Decodes the specified URI encoded in the specified charset.
-     */
-    public static void decodeParams(String uri, Charset charset, boolean hasPath, int maxParams,
-                                       boolean semicolonIsNormalChar,
-                                       ParameterConsumer parameters) {
-        checkNotNull(uri, "uri");
-        checkNotNull(charset, "charset");
-        checkPositive(maxParams, "maxParams");
-        checkNotNull(parameters, "parameters");
-        int pathEndIdx = hasPath? findPathEndIndex(uri) : 0;
-        decodeParams(uri, pathEndIdx, charset, parameters, maxParams, semicolonIsNormalChar);
-    }
-
-    /**
-     * Decodes the specified URI encoded in the specified charset.
-     */
-    public static Map<String, List<String>> decodeParams(URI uri, Charset charset, int maxParams,
-                                                         boolean semicolonIsNormalChar) {
-        checkNotNull(uri, "uri");
-        checkNotNull(charset, "charset");
-        checkPositive(maxParams, "maxParams");
-        String parsableUri = parsableUri(uri);
-        int pathEndIdx = pathEndIdx(uri);
-        return decodeParams(parsableUri, pathEndIdx, charset, null, maxParams, semicolonIsNormalChar);
-    }
-
-    /**
-     * Decodes the specified URI encoded in the specified charset.
-     */
-    public static Map<String, List<String>> decodeParams(String uri, Charset charset, boolean hasPath, int maxParams,
-                                                         boolean semicolonIsNormalChar) {
-        checkNotNull(uri, "uri");
-        checkNotNull(charset, "charset");
-        checkPositive(maxParams, "maxParams");
-        int pathEndIdx = hasPath? findPathEndIndex(uri) : 0;
-        return decodeParams(uri, pathEndIdx, charset, null, maxParams, semicolonIsNormalChar);
-    }
-
-    private static Map<String, List<String>> decodeParams(String uri, int from, Charset charset,
-                                                          ParameterConsumer parameters,
-                                                          int paramsLimit, boolean semicolonIsNormalChar) {
-        int len = uri.length();
+    private static Map<String, List<String>> decodeParams(String s, int from, Charset charset, int paramsLimit,
+                                                          boolean semicolonIsNormalChar) {
+        int len = s.length();
         if (from >= len) {
             return Collections.emptyMap();
         }
-        if (uri.charAt(from) == '?') {
+        if (s.charAt(from) == '?') {
             from++;
         }
-        Map<String, List<String>> params = parameters != null? null : new LinkedHashMap<String, List<String>>();
-        decodeParams(uri, from, charset, params, parameters, paramsLimit, semicolonIsNormalChar);
+        Map<String, List<String>> params = new LinkedHashMap<String, List<String>>();
+        int nameStart = from;
+        int valueStart = -1;
+        int i;
+        loop:
+        for (i = from; i < len; i++) {
+            switch (s.charAt(i)) {
+            case '=':
+                if (nameStart == i) {
+                    nameStart = i + 1;
+                } else if (valueStart < nameStart) {
+                    valueStart = i + 1;
+                }
+                break;
+            case ';':
+                if (semicolonIsNormalChar) {
+                    continue;
+                }
+                // fall-through
+            case '&':
+                if (addParam(s, nameStart, valueStart, i, params, charset)) {
+                    paramsLimit--;
+                    if (paramsLimit == 0) {
+                        return params;
+                    }
+                }
+                nameStart = i + 1;
+                break;
+            case '#':
+                break loop;
+            default:
+                // continue
+            }
+        }
+        addParam(s, nameStart, valueStart, i, params, charset);
         return params;
     }
 
-    private static void decodeParams(String s, int from, Charset charset,
-                                     Map<String, List<String>> params,
-                                     ParameterConsumer parameters,
-                                     int paramsLimit, boolean semicolonIsNormalChar) {
-        int nameStart = from;
-        int len = s.length();
-        for (int p = 0; p < paramsLimit; p++) {
-            int valueEndExclusive = -1;
-            int indexOfEquals = -1;
-            // we need to search for `=' but still keeping an eye in case we find a separator too
-            for (int i = nameStart; i < len; i++) {
-                char ch = s.charAt(i);
-                if (ch == '=') {
-                    indexOfEquals = i;
-                    break;
-                }
-                // this is unlikely to happen at this point: we usually have `=' earlier
-                if (ch == '&' || (!semicolonIsNormalChar && ch == ';')) {
-                    valueEndExclusive = i;
-                    break;
-                }
-                // super unlikely and highly predictable
-                if (ch == '#') {
-                    len = i;
-                    break;
-                }
-            }
-            int nextValueStart;
-            if (indexOfEquals != -1) {
-                assert valueEndExclusive == -1;
-                // we have found `=` first (which is quite common)
-                nextValueStart = indexOfEquals + 1;
-                for (int i = nextValueStart; i < len; i++) {
-                    char ch = s.charAt(i);
-                    if (ch == '&' || (!semicolonIsNormalChar && ch == ';')) {
-                        valueEndExclusive = i;
-                        break;
-                    }
-                    if (ch == '#') {
-                        len = i;
-                        break;
-                    }
-                }
-            } else {
-                nextValueStart = -1;
-            }
-            if (valueEndExclusive == -1) {
-                valueEndExclusive = len;
-            }
-            assert nextValueStart == -1 ||
-                   (nextValueStart >= nameStart || nextValueStart < valueEndExclusive);
-            int valueStart;
-            if (nextValueStart != -1) {
-                valueStart = nextValueStart;
-                if (valueStart == nameStart + 1) {
-                    // uncommon slow path: it seems there is no name!
-                    // search nameStart while skipping useless subsequent =, if any
-                    nameStart = skipIf(s, valueStart, valueEndExclusive, '=');
-                    valueStart = indexOf(s, nameStart + 1, valueEndExclusive, '=');
-                }
-            } else {
-                valueStart = -1;
-            }
-            addParam(s, nameStart, valueStart, valueEndExclusive, params, parameters, charset);
-            if (valueEndExclusive == len) {
-                break;
-            }
-            nameStart = valueEndExclusive + 1;
-        }
-    }
-
-    private static int indexOf(String s, int from, int to, int ch) {
-        for (int i = from; i < to; i++) {
-            if (s.charAt(i) == ch) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private static int skipIf(String s, int from, int to, int ch) {
-        for (int i = from; i < to; i++) {
-            if (s.charAt(i) != ch) {
-                return i;
-            }
-        }
-        return to;
-    }
-
-    /**
-     * This interface is used to consume the decoded params coming from
-     * {@link #decodeParams(String, Charset, boolean, int, boolean, ParameterConsumer)} and
-     * {@link #decodeParams(URI, Charset, int, boolean, ParameterConsumer)}.<br>
-     * The {@link #accept(String, String)} method would receive the query parameters in the same order are
-     * decoded from the provided {@code uri}
-     * <p>
-     * eg "a=1&b=2&c=3"
-     * <p>
-     * would cause
-     * accept("a", "1"), accept("b", "2"), accept("c", "3")
-     * <p>
-     * to be called.
-     * <p>
-     * Order of calling {@link #accept(String, String)} is an implementation details users shouldn't rely on, anyway,
-     * and just store/report/filter them assuming random ordering, instead.
-     */
-    public interface ParameterConsumer {
-        void accept(String name, String value);
-    }
-
     private static boolean addParam(String s, int nameStart, int valueStart, int valueEnd,
-                                    Map<String, List<String>> params, ParameterConsumer parameters,
-                                    Charset charset) {
+                                    Map<String, List<String>> params, Charset charset) {
         if (nameStart >= valueEnd) {
             return false;
         }
@@ -455,10 +280,6 @@ public class QueryStringDecoder {
         }
         String name = decodeComponent(s, nameStart, valueStart - 1, charset, false);
         String value = decodeComponent(s, valueStart, valueEnd, charset, false);
-        if (parameters != null) {
-            parameters.accept(name, value);
-            return true;
-        }
         List<String> values = params.get(name);
         if (values == null) {
             values = new ArrayList<String>(1);  // Often there's only 1 value.
