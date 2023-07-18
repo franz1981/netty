@@ -517,22 +517,12 @@ public class QueryStringDecoder {
         if (len <= 0) {
             return EMPTY_STRING;
         }
-        int firstEscaped = -1;
-        for (int i = from; i < toExcluded; i++) {
-            char c = s.charAt(i);
-            if (c == '%' || c == '+' && !isPath) {
-                firstEscaped = i;
-                break;
-            }
-        }
+        int firstEscaped = getFirstEscaped(s, from, toExcluded, isPath);
         if (firstEscaped == -1) {
             return s.substring(from, toExcluded);
         }
 
-        // Each encoded byte takes 3 characters (e.g. "%20")
-        int decodedCapacity = (toExcluded - firstEscaped) / 3;
-        byte[] buf = PlatformDependent.allocateUninitializedArray(decodedCapacity);
-        int bufIdx;
+        byte[] buf = null;
 
         StringBuilder strBuf = new StringBuilder(len);
         strBuf.append(s, from, firstEscaped);
@@ -543,20 +533,66 @@ public class QueryStringDecoder {
                 strBuf.append(c != '+' || isPath? c : SPACE);
                 continue;
             }
-
-            bufIdx = 0;
-            do {
-                if (i + 3 > toExcluded) {
-                    throw new IllegalArgumentException("unterminated escape sequence at index " + i + " of: " + s);
+            // fast-path first: single byte
+            if (i + 3 > toExcluded) {
+                throw new IllegalArgumentException("unterminated escape sequence at index " + i + " of: " + s);
+            }
+            if ((i + 3) == toExcluded || s.charAt(i + 3) != '%') {
+                // Latin1 single-char fast-path
+                strBuf.append((char) decodeHexByte(s, i + 1));
+                i += 2;
+            } else {
+                if (buf == null) {
+                    // Each encoded byte takes 3 characters (e.g. "%20")
+                    int decodedCapacity = (toExcluded - i) / 3;
+                    buf = PlatformDependent.allocateUninitializedArray(decodedCapacity);
                 }
-                buf[bufIdx++] = decodeHexByte(s, i + 1);
-                i += 3;
-            } while (i < toExcluded && s.charAt(i) == '%');
-            i--;
-
-            strBuf.append(new String(buf, 0, bufIdx, charset));
+                i = decodeEscaping(s, i, toExcluded, charset, buf, strBuf);
+            }
         }
         return strBuf.toString();
+    }
+
+    private static int decodeEscaping(String s, int i, int toExcluded, Charset charset, byte[] buf,
+                                      StringBuilder strBuf) {
+        byte firstByte = decodeHexByte(s, i + 1);
+        buf[0] = firstByte;
+        boolean isAscii = firstByte >= 0;
+        int bufIdx = 1;
+        i += 3;
+        do {
+            if (i + 3 > toExcluded) {
+                throw new IllegalArgumentException("unterminated escape sequence at index " + i + " of: " + s);
+            }
+            byte decodedByte = decodeHexByte(s, i + 1);
+            if (isAscii) {
+                isAscii = decodedByte >= 0;
+            }
+            buf[bufIdx++] = decodedByte;
+            i += 3;
+        } while (i < toExcluded && s.charAt(i) == '%');
+        if (isAscii) {
+            strBuf.ensureCapacity(bufIdx);
+            for (int j = 0; j < bufIdx; j++) {
+                strBuf.append((char) buf[j]);
+            }
+        } else {
+            strBuf.append(new String(buf, 0, bufIdx, charset));
+        }
+        i--;
+        return i;
+    }
+
+    private static int getFirstEscaped(String s, int from, int toExcluded, boolean isPath) {
+        int firstEscaped = -1;
+        for (int i = from; i < toExcluded; i++) {
+            char c = s.charAt(i);
+            if (c == '%' || c == '+' && !isPath) {
+                firstEscaped = i;
+                break;
+            }
+        }
+        return firstEscaped;
     }
 
     private static int findPathEndIndex(String uri) {
