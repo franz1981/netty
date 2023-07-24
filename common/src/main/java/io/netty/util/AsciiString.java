@@ -27,6 +27,8 @@ import java.nio.charset.CharsetEncoder;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -1405,6 +1407,8 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
         return asciiString;
     }
 
+    private static final ConcurrentMap<CharSequence, Boolean> ALREADY_VISITED = new ConcurrentHashMap<>();
+
     /**
      * Returns the case-insensitive hash code of the specified string. Note that this method uses the same hashing
      * algorithm with {@link #hashCode()} so that you can put both {@link AsciiString}s and arbitrary
@@ -1417,7 +1421,10 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
         if (value instanceof AsciiString) {
             return value.hashCode();
         }
-
+        if (ALREADY_VISITED.putIfAbsent(value, Boolean.TRUE) == null) {
+            System.out.println("*************** SLOW PATH ASCII!!! Happening for " + value);
+            new Throwable().printStackTrace(System.out);
+        }
         return PlatformDependent.hashCodeAscii(value);
     }
 
