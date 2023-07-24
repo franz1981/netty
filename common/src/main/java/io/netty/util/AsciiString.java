@@ -1407,7 +1407,8 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
         return asciiString;
     }
 
-    private static final ConcurrentMap<CharSequence, Boolean> ALREADY_VISITED = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<CharSequence, Boolean> ALREADY_VISITED =
+            new ConcurrentHashMap<CharSequence, Boolean>();
 
     /**
      * Returns the case-insensitive hash code of the specified string. Note that this method uses the same hashing
