@@ -68,13 +68,6 @@ public interface Http2Headers extends Headers<CharSequence, CharSequence, Http2H
 
         private final AsciiString value;
         private final boolean requestOnly;
-        private static final CharSequenceMap<PseudoHeaderName> PSEUDO_HEADERS = new CharSequenceMap<PseudoHeaderName>();
-
-        static {
-            for (PseudoHeaderName pseudoHeader : values()) {
-                PSEUDO_HEADERS.add(pseudoHeader.value(), pseudoHeader);
-            }
-        }
 
         PseudoHeaderName(String value, boolean requestOnly) {
             this.value = AsciiString.cached(value);
@@ -104,7 +97,21 @@ public interface Http2Headers extends Headers<CharSequence, CharSequence, Http2H
          * Indicates whether the given header name is a valid HTTP/2 pseudo header.
          */
         public static boolean isPseudoHeader(CharSequence header) {
-            return PSEUDO_HEADERS.contains(header);
+            return getPseudoHeader(header) != null;
+        }
+
+        /**
+         * Indicates whether the given header name is a valid HTTP/2 pseudo header.
+         */
+        public static boolean isPseudoHeader(AsciiString header) {
+            return getPseudoHeader(header) != null;
+        }
+
+        /**
+         * Indicates whether the given header name is a valid HTTP/2 pseudo header.
+         */
+        public static boolean isPseudoHeader(String header) {
+            return getPseudoHeader(header) != null;
         }
 
         /**
@@ -113,7 +120,197 @@ public interface Http2Headers extends Headers<CharSequence, CharSequence, Http2H
          * @return corresponding {@link PseudoHeaderName} if any, {@code null} otherwise.
          */
         public static PseudoHeaderName getPseudoHeader(CharSequence header) {
-            return PSEUDO_HEADERS.get(header);
+            if (header instanceof AsciiString) {
+                return getPseudoHeader((AsciiString) header);
+            }
+            if (header instanceof String) {
+                return getPseudoHeader((String) header);
+            }
+            if (header.length() > 0 && header.charAt(0) == PSEUDO_HEADER_PREFIX) {
+                switch (header.length()) {
+                case 5:
+                    // :path
+                    if (":path".contentEquals(header)) {
+                        return PATH;
+                    }
+                    return null;
+                case 7:
+                    // :method, :scheme, :status
+                    if (":method".contentEquals(header)) {
+                        return METHOD;
+                    }
+                    if (":scheme".contentEquals(header)) {
+                        return SCHEME;
+                    }
+                    if (":status".contentEquals(header)) {
+                        return STATUS;
+                    }
+                    return null;
+                case 9:
+                    // :protocol
+                    if (":protocol".contentEquals(header)) {
+                        return PROTOCOL;
+                    }
+                    return null;
+                case 10:
+                    // :authority
+                    if (":authority".contentEquals(header)) {
+                        return AUTHORITY;
+                    }
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        // These methods below are factorized separately to allow the JIT to inline them and its caller
+        private static PseudoHeaderName getPathIfEqualsNoPrefix(byte[] array, int offset) {
+            if (array[offset + 1] == 'p' && array[offset + 2] == 'a' &&
+                array[offset + 3] == 't' && array[offset + 4] == 'h') {
+                return PATH;
+            }
+            return null;
+        }
+
+        private static PseudoHeaderName getMethodSchemeStatusIfEqualsNoPrefix(byte[] array, int offset) {
+            byte first = array[offset + 1];
+            if (first == 'm') {
+                if (array[offset + 2] == 'e' && array[offset + 3] == 't' && array[offset + 4] == 'h' &&
+                    array[offset + 5] == 'o' && array[offset + 6] == 'd') {
+                    return METHOD;
+                }
+            } else if (first == 's') {
+                if (array[offset + 2] == 'c' && array[offset + 3] == 'h' && array[offset + 4] == 'e' &&
+                    array[offset + 5] == 'm' && array[offset + 6] == 'e') {
+                    return SCHEME;
+                } else if (array[offset + 2] == 't' && array[offset + 3] == 'a' && array[offset + 4] == 't' &&
+                           array[offset + 5] == 'u' && array[offset + 6] == 's') {
+                    return STATUS;
+                }
+            }
+            return null;
+        }
+
+        private static PseudoHeaderName getAuthorityIfEqualsNoPrefix(byte[] array, int offset) {
+            if (array[offset + 1] == 'a' && array[offset + 2] == 'u' && array[offset + 3] == 't' &&
+                array[offset + 4] == 'h' && array[offset + 5] == 'o' && array[offset + 6] == 'r' &&
+                array[offset + 7] == 'i' && array[offset + 8] == 't' && array[offset + 9] == 'y') {
+                return AUTHORITY;
+            }
+            return null;
+        }
+
+        private static PseudoHeaderName getProtocolIfEqualsNoPrefix(byte[] array, int offset) {
+            if (array[offset + 1] == 'p' && array[offset + 2] == 'r' && array[offset + 3] == 'o' &&
+                array[offset + 4] == 't' && array[offset + 5] == 'o' && array[offset + 6] == 'c' &&
+                array[offset + 7] == 'o' && array[offset + 8] == 'l') {
+                return PROTOCOL;
+            }
+            return null;
+        }
+
+        /**
+         * Returns the {@link PseudoHeaderName} corresponding to the specified header name.
+         *
+         * @return corresponding {@link PseudoHeaderName} if any, {@code null} otherwise.
+         */
+        public static PseudoHeaderName getPseudoHeader(AsciiString header) {
+            int length = header.length();
+            if (length == 0) {
+                return null;
+            }
+            byte[] array = header.array();
+            int offset = header.arrayOffset();
+            if (array[offset] == PSEUDO_HEADER_PREFIX_BYTE) {
+                switch (length) {
+                case 5:
+                    if (header == PATH.value()) {
+                        return PATH;
+                    }
+                    // :path
+                    return getPathIfEqualsNoPrefix(array, offset);
+                case 7:
+                    if (header == METHOD.value()) {
+                        return METHOD;
+                    }
+                    if (header == SCHEME.value()) {
+                        return SCHEME;
+                    }
+                    if (header == STATUS.value()) {
+                        return STATUS;
+                    }
+                    // :method, :scheme, :status
+                    return getMethodSchemeStatusIfEqualsNoPrefix(array, offset);
+                case 9:
+                    if (header == PROTOCOL.value()) {
+                        return PROTOCOL;
+                    }
+                    // :protocol
+                    return getProtocolIfEqualsNoPrefix(array, offset);
+                case 10:
+                    if (header == AUTHORITY.value()) {
+                        return AUTHORITY;
+                    }
+                    // :authority
+                    return getAuthorityIfEqualsNoPrefix(array, offset);
+                }
+            }
+            return null;
+        }
+        private static final int METHOD_STRING_HASHCODE = -1141949029;
+        private static final int SCHEME_STRING_HASHCODE = -972381601;
+        private static final int STATUS_STRING_HASHCODE = -956875604;
+        private static final int PATH_STRING_HASHCODE = 56997727;
+        private static final int AUTHORITY_STRING_HASHCODE = -1332238263;
+        private static final int PROTOCOL_STRING_HASHCODE = 1552659666;
+
+        static {
+            // do the same but throw a runtime exception here
+            // this is to ensure that the hashcode of the strings are the same as the hashcode of the enum
+            if (METHOD.value().toString().hashCode() != METHOD_STRING_HASHCODE) {
+                throw new RuntimeException("cached :method hashcode is not the same as the enum' String hashcode");
+            }
+            if (SCHEME.value().toString().hashCode() != SCHEME_STRING_HASHCODE) {
+                throw new RuntimeException("cached :scheme hashcode is not the same as the enum' String hashcode");
+            }
+            if (STATUS.value().toString().hashCode() != STATUS_STRING_HASHCODE) {
+                throw new RuntimeException("cached :status hashcode is not the same as the enum' String hashcode");
+            }
+            if (PATH.value().toString().hashCode() != PATH_STRING_HASHCODE) {
+                throw new RuntimeException("cached :path hashcode is not the same as the enum' String hashcode");
+            }
+            if (AUTHORITY.value().toString().hashCode() != AUTHORITY_STRING_HASHCODE) {
+                throw new RuntimeException("cached :authority hashcode is not the same as the enum' String hashcode");
+            }
+            if (PROTOCOL.value().toString().hashCode() != PROTOCOL_STRING_HASHCODE) {
+                throw new RuntimeException("cached :protocol hashcode is not the same as the enum' String hashcode");
+            }
+        }
+
+        /**
+         * Returns the {@link PseudoHeaderName} corresponding to the specified header name.
+         *
+         * @return corresponding {@link PseudoHeaderName} if any, {@code null} otherwise.
+         */
+        public static PseudoHeaderName getPseudoHeader(String header) {
+            // String::hashCode is intrinsified
+            // the cases uses String's literal which are the same used in the enums
+            // String::hashCode is a contract which is not going to change
+            switch (header.hashCode()) {
+            case PATH_STRING_HASHCODE:
+                return ":path".equals(header) ? PATH : null;
+            case METHOD_STRING_HASHCODE:
+                return ":method".equals(header) ? METHOD : null;
+            case SCHEME_STRING_HASHCODE:
+                return ":scheme".equals(header) ? SCHEME : null;
+            case STATUS_STRING_HASHCODE:
+                return ":status".equals(header) ? STATUS : null;
+            case AUTHORITY_STRING_HASHCODE:
+                return ":authority".equals(header) ? AUTHORITY : null;
+            case PROTOCOL_STRING_HASHCODE:
+                return ":protocol".equals(header) ? PROTOCOL : null;
+            }
+            return null;
         }
 
         /**

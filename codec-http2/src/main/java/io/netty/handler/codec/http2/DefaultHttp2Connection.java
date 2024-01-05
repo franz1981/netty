@@ -232,9 +232,10 @@ public class DefaultHttp2Connection implements Http2Connection {
         }
 
         localEndpoint.lastStreamKnownByPeer(lastKnownStream);
+        final List<Listener> listeners = this.listeners;
         for (int i = 0; i < listeners.size(); ++i) {
             try {
-                listeners.get(i).onGoAwayReceived(lastKnownStream, errorCode, debugData);
+                onGoAwayReceived(listeners.get(i), lastKnownStream, errorCode, debugData);
             } catch (Throwable cause) {
                 logger.error("Caught Throwable from listener onGoAwayReceived.", cause);
             }
@@ -264,9 +265,10 @@ public class DefaultHttp2Connection implements Http2Connection {
         }
 
         remoteEndpoint.lastStreamKnownByPeer(lastKnownStream);
+        final List<Listener> listeners = this.listeners;
         for (int i = 0; i < listeners.size(); ++i) {
             try {
-                listeners.get(i).onGoAwaySent(lastKnownStream, errorCode, debugData);
+                onGoAwaySent(listeners.get(i), lastKnownStream, errorCode, debugData);
             } catch (Throwable cause) {
                 logger.error("Caught Throwable from listener onGoAwaySent.", cause);
             }
@@ -312,9 +314,10 @@ public class DefaultHttp2Connection implements Http2Connection {
         }
 
         if (removed) {
+            final List<Listener> listeners = this.listeners;
             for (int i = 0; i < listeners.size(); i++) {
                 try {
-                    listeners.get(i).onStreamRemoved(stream);
+                    onStreamRemoved(listeners.get(i), stream);
                 } catch (Throwable cause) {
                     logger.error("Caught Throwable from listener onStreamRemoved.", cause);
                 }
@@ -342,9 +345,10 @@ public class DefaultHttp2Connection implements Http2Connection {
     }
 
     void notifyHalfClosed(Http2Stream stream) {
+        final List<Listener> listeners = this.listeners;
         for (int i = 0; i < listeners.size(); i++) {
             try {
-                listeners.get(i).onStreamHalfClosed(stream);
+                onStreamHalfClosed(listeners.get(i), stream);
             } catch (Throwable cause) {
                 logger.error("Caught Throwable from listener onStreamHalfClosed.", cause);
             }
@@ -352,9 +356,10 @@ public class DefaultHttp2Connection implements Http2Connection {
     }
 
     void notifyClosed(Http2Stream stream) {
+        final List<Listener> listeners = this.listeners;
         for (int i = 0; i < listeners.size(); i++) {
             try {
-                listeners.get(i).onStreamClosed(stream);
+                onStreamClosed(listeners.get(i), stream);
             } catch (Throwable cause) {
                 logger.error("Caught Throwable from listener onStreamClosed.", cause);
             }
@@ -388,11 +393,13 @@ public class DefaultHttp2Connection implements Http2Connection {
         private static final byte META_STATE_RECV_HEADERS = 1 << 4;
         private static final byte META_STATE_RECV_TRAILERS = 1 << 5;
         private final int id;
+        private final long identity;
         private final PropertyMap properties = new PropertyMap();
         private State state;
         private byte metaState;
 
-        DefaultStream(int id, State state) {
+        DefaultStream(long identity, int id, State state) {
+            this.identity = identity;
             this.id = id;
             this.state = state;
         }
@@ -599,6 +606,20 @@ public class DefaultHttp2Connection implements Http2Connection {
                 }
             }
         }
+
+        @Override
+        public boolean equals(final Object obj) {
+            return super.equals(obj);
+        }
+
+        @Override
+        public int hashCode() {
+            long value = identity;
+            if (value == 0) {
+                return System.identityHashCode(this);
+            }
+            return (int) (value ^ (value >>> 32));
+        }
     }
 
     /**
@@ -606,7 +627,7 @@ public class DefaultHttp2Connection implements Http2Connection {
      */
     private final class ConnectionStream extends DefaultStream {
         ConnectionStream() {
-            super(CONNECTION_STREAM_ID, IDLE);
+            super(0, CONNECTION_STREAM_ID, IDLE);
         }
 
         @Override
@@ -671,6 +692,10 @@ public class DefaultHttp2Connection implements Http2Connection {
     private final class DefaultEndpoint<F extends Http2FlowController> implements Endpoint<F> {
         private final boolean server;
         /**
+         * This is an always increasing sequence number used to hash {@link DefaultStream} instances.
+         */
+        private long lastCreatedStreamIdentity;
+        /**
          * The minimum stream ID allowed when creating the next stream. This only applies at the time the stream is
          * created. If the ID of the stream being created is less than this value, stream creation will fail. Upon
          * successful creation of a stream, this value is incremented to the next valid stream ID.
@@ -694,6 +719,7 @@ public class DefaultHttp2Connection implements Http2Connection {
         int numStreams;
 
         DefaultEndpoint(boolean server, int maxReservedStreams) {
+            this.lastCreatedStreamIdentity = 0;
             this.server = server;
 
             // Determine the starting stream ID for this endpoint. Client-initiated streams
@@ -750,8 +776,10 @@ public class DefaultHttp2Connection implements Http2Connection {
 
             checkNewStreamAllowed(streamId, state);
 
+            lastCreatedStreamIdentity++;
+
             // Create and initialize the stream.
-            DefaultStream stream = new DefaultStream(streamId, state);
+            DefaultStream stream = new DefaultStream(lastCreatedStreamIdentity, streamId, state);
 
             incrementExpectedStreamId(streamId);
 
@@ -785,8 +813,10 @@ public class DefaultHttp2Connection implements Http2Connection {
             State state = isLocal() ? RESERVED_LOCAL : RESERVED_REMOTE;
             checkNewStreamAllowed(streamId, state);
 
+            lastCreatedStreamIdentity++;
+
             // Create and initialize the stream.
-            DefaultStream stream = new DefaultStream(streamId, state);
+            DefaultStream stream = new DefaultStream(lastCreatedStreamIdentity, streamId, state);
 
             incrementExpectedStreamId(streamId);
 
@@ -800,9 +830,10 @@ public class DefaultHttp2Connection implements Http2Connection {
             streamMap.put(stream.id(), stream);
 
             // Notify the listeners of the event.
+            final List<Listener> listeners = DefaultHttp2Connection.this.listeners;
             for (int i = 0; i < listeners.size(); i++) {
                 try {
-                    listeners.get(i).onStreamAdded(stream);
+                    onStreamAdded(listeners.get(i), stream);
                 } catch (Throwable cause) {
                     logger.error("Caught Throwable from listener onStreamAdded.", cause);
                 }
@@ -989,10 +1020,10 @@ public class DefaultHttp2Connection implements Http2Connection {
             if (streams.add(stream)) {
                 // Update the number of active streams initiated by the endpoint.
                 stream.createdBy().numActiveStreams++;
-
+                final List<Listener> listeners = this.listeners;
                 for (int i = 0; i < listeners.size(); i++) {
                     try {
-                        listeners.get(i).onStreamActive(stream);
+                        onStreamActive(listeners.get(i), stream);
                     } catch (Throwable cause) {
                         logger.error("Caught Throwable from listener onStreamActive.", cause);
                     }
@@ -1075,6 +1106,157 @@ public class DefaultHttp2Connection implements Http2Connection {
 
         int size() {
             return keys.size();
+        }
+    }
+
+    // Optimized listener notifications, for the purpose of avoiding virtual method calls
+    private static void onGoAwayReceived(Listener listener, int lastKnownStream, long errorCode, ByteBuf debugData) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onGoAwayReceived(lastKnownStream,
+                                                                                              errorCode, debugData);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onGoAwayReceived(lastKnownStream,
+                                                                                             errorCode, debugData);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onGoAwayReceived(lastKnownStream,
+                                                                                              errorCode, debugData);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onGoAwayReceived(lastKnownStream,
+                                                                                          errorCode,
+                                                                                          debugData);
+            } else {
+                ((Http2ConnectionAdapter) listener).onGoAwayReceived(lastKnownStream, errorCode, debugData);
+            }
+        } else {
+            listener.onGoAwayReceived(lastKnownStream, errorCode, debugData);
+        }
+    }
+
+    private static void onStreamAdded(Listener listener, Http2Stream stream) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onStreamAdded(stream);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onStreamAdded(stream);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onStreamAdded(stream);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onStreamAdded(stream);
+            } else {
+                ((Http2ConnectionAdapter) listener).onStreamAdded(stream);
+            }
+        } else {
+            listener.onStreamAdded(stream);
+        }
+    }
+
+    private static void onStreamActive(Listener listener, Http2Stream stream) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onStreamActive(stream);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onStreamActive(stream);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onStreamActive(stream);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onStreamActive(stream);
+            } else {
+                ((Http2ConnectionAdapter) listener).onStreamActive(stream);
+            }
+        } else {
+            listener.onStreamActive(stream);
+        }
+    }
+
+    private static void onGoAwaySent(Listener listener, int lastKnownStream, long errorCode, ByteBuf debugData) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onGoAwaySent(lastKnownStream,
+                                                                                          errorCode, debugData);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onGoAwaySent(lastKnownStream,
+                                                                                         errorCode, debugData);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onGoAwaySent(lastKnownStream,
+                                                                                          errorCode, debugData);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onGoAwaySent(lastKnownStream,
+                                                                                      errorCode,
+                                                                                      debugData);
+            } else {
+                ((Http2ConnectionAdapter) listener).onGoAwaySent(lastKnownStream, errorCode, debugData);
+            }
+        } else {
+            listener.onGoAwaySent(lastKnownStream, errorCode, debugData);
+        }
+    }
+
+    private static void onStreamHalfClosed(Listener listener, Http2Stream stream) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onStreamHalfClosed(stream);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onStreamHalfClosed(stream);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onStreamHalfClosed(stream);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onStreamHalfClosed(stream);
+            } else {
+                ((Http2ConnectionAdapter) listener).onStreamHalfClosed(stream);
+            }
+        } else {
+            listener.onStreamHalfClosed(stream);
+        }
+    }
+
+    private static void onStreamClosed(Listener listener, Http2Stream stream) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onStreamClosed(stream);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onStreamClosed(stream);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onStreamClosed(stream);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onStreamClosed(stream);
+            } else {
+                ((Http2ConnectionAdapter) listener).onStreamClosed(stream);
+            }
+        } else {
+            listener.onStreamClosed(stream);
+        }
+    }
+
+    private static void onStreamRemoved(Listener listener, Http2Stream stream) {
+        if (listener instanceof Http2ConnectionAdapter) {
+            // fast-path to avoid virtual calls
+            Class<? extends Listener> clazz = listener.getClass();
+            if (clazz == WeightedFairQueueByteDistributor.StreamListener.class) {
+                ((WeightedFairQueueByteDistributor.StreamListener) listener).onStreamRemoved(stream);
+            } else if (clazz == DefaultHttp2LocalFlowController.StreamListener.class) {
+                ((DefaultHttp2LocalFlowController.StreamListener) listener).onStreamRemoved(stream);
+            } else if (clazz == DefaultHttp2RemoteFlowController.StreamListener.class) {
+                ((DefaultHttp2RemoteFlowController.StreamListener) listener).onStreamRemoved(stream);
+            } else if (clazz == UniformStreamByteDistributor.StreamListener.class) {
+                ((UniformStreamByteDistributor.StreamListener) listener).onStreamRemoved(stream);
+            } else {
+                ((Http2ConnectionAdapter) listener).onStreamRemoved(stream);
+            }
+        } else {
+            listener.onStreamRemoved(stream);
         }
     }
 }

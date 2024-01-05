@@ -1044,7 +1044,6 @@ public final class AsciiString implements CharSequence, Comparable<CharSequence>
         if (a instanceof AsciiString) {
             return equals(a);
         }
-
         for (int i = arrayOffset(), j = 0; j < a.length(); ++i, ++j) {
             if (b2c(value[i]) != a.charAt(j)) {
                 return false;
