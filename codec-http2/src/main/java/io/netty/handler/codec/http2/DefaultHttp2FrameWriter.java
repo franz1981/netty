@@ -23,6 +23,7 @@ import io.netty.handler.codec.http2.Http2CodecUtil.SimpleChannelPromiseAggregato
 import io.netty.handler.codec.http2.Http2FrameWriter.Configuration;
 import io.netty.handler.codec.http2.Http2HeadersEncoder.SensitivityDetector;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.UnstableApi;
 
 import static io.netty.buffer.Unpooled.directBuffer;
@@ -147,9 +148,8 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
         }
         if (padding == 0) {
             return writeDataNoPadding(ctx, streamId, data, endStream, promise);
-        } else {
-            return writeDataWithPadding(ctx, streamId, data, padding, endStream, promise);
         }
+        return writeDataWithPadding(ctx, streamId, data, padding, endStream, promise);
     }
 
     private ChannelFuture writeDataWithPadding(ChannelHandlerContext ctx, int streamId, ByteBuf data,
@@ -209,7 +209,7 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
                 ctx.write(frameHeader2, promiseAggregator.newPromise());
 
                 // Write the payload.
-                if (data != null) { // Make sure Data is not null
+                if (data != null) { // Make sure data is not null
                     if (remainingData == 0) {
                         ByteBuf lastFrame = data.readSlice(frameDataBytes);
                         data = null;
@@ -264,7 +264,7 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
             ctx.write(frameHeader2, promiseAggregator.newPromise());
 
             // Write the payload.
-            ByteBuf lastFrame = data.readSlice(remainingData);
+            ByteBuf lastFrame = data.writerIndex(data.readerIndex() + remainingData);
             data = null;
             ctx.write(lastFrame, promiseAggregator.newPromise());
             return promiseAggregator.doneAllocatingPromises();
@@ -561,12 +561,14 @@ public class DefaultHttp2FrameWriter implements Http2FrameWriter, Http2FrameSize
                 first.release();
             }
         } catch (Throwable silent) {
+            ThrowableUtil.addSuppressed(t, silent);
         }
         try {
             if (second != null) {
                 second.release();
             }
         } catch (Throwable silent) {
+            ThrowableUtil.addSuppressed(t, silent);
         } finally {
             if (promiseAggregator != null) {
                 promiseAggregator.setFailure(t);
