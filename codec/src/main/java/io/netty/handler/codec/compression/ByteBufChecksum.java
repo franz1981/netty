@@ -33,14 +33,13 @@ import java.util.zip.Checksum;
  * byte array ({@link ByteBuf#hasArray()} is {@code true}) or not.
  */
 abstract class ByteBufChecksum implements Checksum {
-    private static final Method ADLER32_UPDATE_METHOD;
-    private static final Method CRC32_UPDATE_METHOD;
 
-    static {
-        // See if we can use fast-path when using ByteBuf that is not heap based as Adler32 and CRC32 added support
-        // for update(ByteBuffer) in JDK8.
-        ADLER32_UPDATE_METHOD = updateByteBuffer(new Adler32());
-        CRC32_UPDATE_METHOD = updateByteBuffer(new CRC32());
+    private static class Adler32UpdateReflective {
+        private static final Method METHOD = updateByteBuffer(new Adler32());
+    }
+
+    private static class CRC32UpdateReflective {
+        private static final Method METHOD = updateByteBuffer(new CRC32());
     }
 
     private final ByteProcessor updateProcessor = new ByteProcessor() {
@@ -69,11 +68,11 @@ abstract class ByteBufChecksum implements Checksum {
         if (checksum instanceof ByteBufChecksum) {
             return (ByteBufChecksum) checksum;
         }
-        if (checksum instanceof Adler32 && ADLER32_UPDATE_METHOD != null) {
-            return new ReflectiveByteBufChecksum(checksum, ADLER32_UPDATE_METHOD);
+        if (checksum instanceof Adler32 && Adler32UpdateReflective.METHOD != null) {
+            return new ReflectiveByteBufChecksum(checksum, Adler32UpdateReflective.METHOD);
         }
-        if (checksum instanceof CRC32 && CRC32_UPDATE_METHOD != null) {
-            return new ReflectiveByteBufChecksum(checksum, CRC32_UPDATE_METHOD);
+        if (checksum instanceof CRC32 && CRC32UpdateReflective.METHOD != null) {
+            return new ReflectiveByteBufChecksum(checksum, CRC32UpdateReflective.METHOD);
         }
         return new SlowByteBufChecksum(checksum);
     }
