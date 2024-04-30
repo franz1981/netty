@@ -39,8 +39,8 @@ import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.util.Arrays;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -117,7 +117,7 @@ final class AdaptivePoolingAllocator {
     private final StampedLock magazineExpandLock;
     private volatile Magazine[] magazines;
     private final FastThreadLocal<Object> cachedMagazines;
-    private final CopyOnWriteArraySet<Magazine> liveCachedMagazines;
+    private final Set<Magazine> liveCachedMagazines;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, MagazineCaching magazineCaching) {
         ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
@@ -134,7 +134,7 @@ final class AdaptivePoolingAllocator {
                    magazineCaching == MagazineCaching.FastThreadLocalThreads;
             final boolean cachedMagazinesNonEventLoopThreads =
                     magazineCaching == MagazineCaching.FastThreadLocalThreads;
-            CopyOnWriteArraySet<Magazine> liveMagazines = new CopyOnWriteArraySet<>();
+            Set<Magazine> liveMagazines = new CopyOnWriteArraySet<Magazine>();
             cachedMagazines = new FastThreadLocal<Object>() {
                 @Override
                 protected Object initialValue() {
