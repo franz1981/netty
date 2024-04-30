@@ -134,13 +134,13 @@ final class AdaptivePoolingAllocator {
                    magazineCaching == MagazineCaching.FastThreadLocalThreads;
             final boolean cachedMagazinesNonEventLoopThreads =
                     magazineCaching == MagazineCaching.FastThreadLocalThreads;
-            Set<Magazine> liveMagazines = new CopyOnWriteArraySet<Magazine>();
+            final Set<Magazine> liveMagazines = new CopyOnWriteArraySet<Magazine>();
             cachedMagazines = new FastThreadLocal<Object>() {
                 @Override
                 protected Object initialValue() {
                     if (cachedMagazinesNonEventLoopThreads || ThreadExecutorMap.currentExecutor() != null) {
                         Magazine mag = new Magazine(AdaptivePoolingAllocator.this, false);
-                        liveCachedMagazines.add(mag);
+                        liveMagazines.add(mag);
                         return mag;
                     }
                     return NO_MAGAZINE;
@@ -149,7 +149,7 @@ final class AdaptivePoolingAllocator {
                 @Override
                 protected void onRemoval(final Object value) throws Exception {
                     if (value != NO_MAGAZINE) {
-                        liveCachedMagazines.remove(value);
+                        liveMagazines.remove(value);
                     }
                 }
             };
