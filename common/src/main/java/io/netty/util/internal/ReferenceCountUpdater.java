@@ -17,6 +17,7 @@ package io.netty.util.internal;
 
 import static io.netty.util.internal.ObjectUtil.checkPositive;
 
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import io.netty.util.IllegalReferenceCountException;
@@ -53,6 +54,10 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
 
     protected abstract AtomicIntegerFieldUpdater<T> updater();
 
+    protected VarHandle varHandleUpdater() {
+        return null;
+    }
+
     protected abstract long unsafeOffset();
 
     public final int initialValue() {
@@ -62,7 +67,14 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
     public void setInitialValue(T instance) {
         final long offset = unsafeOffset();
         if (offset == -1) {
-            updater().set(instance, initialValue());
+            VarHandle vh = varHandleUpdater();
+            int initialValue = initialValue();
+            if (vh != null) {
+                vh.set(instance, (int) initialValue);
+                VarHandle.storeStoreFence();
+            } else {
+                updater().set(instance, initialValue);
+            }
         } else {
             PlatformDependent.safeConstructPutInt(instance, offset, initialValue());
         }
@@ -95,7 +107,17 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
 
     public final boolean isLiveNonVolatile(T instance) {
         final long offset = unsafeOffset();
-        final int rawCnt = offset != -1 ? PlatformDependent.getInt(instance, offset) : updater().get(instance);
+        final int rawCnt;
+        if (offset != -1) {
+            rawCnt = PlatformDependent.getInt(instance, offset);
+        } else {
+            VarHandle vh = varHandleUpdater();
+            if (vh != null) {
+                rawCnt = (int) vh.get(instance);
+            } else {
+                rawCnt = updater().get(instance);
+            }
+        }
 
         // The "real" ref count is > 0 if the rawCnt is even.
         return rawCnt == 2 || rawCnt == 4 || rawCnt == 6 || rawCnt == 8 || (rawCnt & 1) == 0;

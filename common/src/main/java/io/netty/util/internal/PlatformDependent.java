@@ -39,6 +39,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -129,6 +130,7 @@ public final class PlatformDependent {
     public static final boolean BIG_ENDIAN_NATIVE_ORDER = ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN;
 
     private static final boolean JFR;
+    private static final boolean VAR_HANDLE;
 
     private static final Cleaner NOOP = new Cleaner() {
         @Override
@@ -257,6 +259,25 @@ public final class PlatformDependent {
             logger.debug("-Dio.netty.jfr.enabled: {}", JFR, jfrFailure);
         } else if (logger.isDebugEnabled()) {
             logger.debug("-Dio.netty.jfr.enabled: {}", JFR);
+        }
+        // try to enable VarHandle support if we are running on Java 9+ and Unsafe is not available
+        boolean varHandleAvailable = false;
+        Throwable varHandleFailure = null;
+        if (UNSAFE_UNAVAILABILITY_CAUSE != null && javaVersion() >= 9) {
+            // If we are running on Java 9+ and Unsafe is not available, we can use VarHandle.
+            try {
+                VarHandle.storeStoreFence();
+                varHandleAvailable = true;
+            } catch (Throwable t) {
+                // no-op
+                varHandleFailure = t;
+            }
+        }
+        VAR_HANDLE = SystemPropertyUtil.getBoolean("io.netty.varHandle.enabled", varHandleAvailable);
+        if (logger.isTraceEnabled() && varHandleFailure != null) {
+            logger.debug("-Dio.netty.varHandle.enabled: {}", VAR_HANDLE, varHandleFailure);
+        } else if (logger.isDebugEnabled()) {
+            logger.debug("-Dio.netty.varHandle.enabled: {}", VAR_HANDLE);
         }
     }
 
@@ -592,6 +613,55 @@ public final class PlatformDependent {
                 "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
     }
 
+    public static VarHandle findVarHandleOfIntField(Class<?> type, String fieldName) {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.privateFindVarHandle(type, fieldName, int.class);
+        }
+        return null;
+    }
+
+    public static VarHandle intBeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.intBeArrayView();
+        }
+        return null;
+    }
+
+    public static VarHandle intLeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.intLeArrayView();
+        }
+        return null;
+    }
+
+    public static VarHandle longBeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.longBeArrayView();
+        }
+        return null;
+    }
+
+    public static VarHandle longLeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.longLeArrayView();
+        }
+        return null;
+    }
+
+    public static VarHandle shortBeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.shortBeArrayView();
+        }
+        return null;
+    }
+
+    public static VarHandle shortLeArrayView() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.shortLeArrayView();
+        }
+        return null;
+    }
+
     public static Object getObject(Object object, long fieldOffset) {
         return PlatformDependent0.getObject(object, fieldOffset);
     }
@@ -602,18 +672,6 @@ public final class PlatformDependent {
 
     static void safeConstructPutInt(Object object, long fieldOffset, int value) {
         PlatformDependent0.safeConstructPutInt(object, fieldOffset, value);
-    }
-
-    public static void putShortOrdered(long adddress, short newValue) {
-        PlatformDependent0.putShortOrdered(adddress, newValue);
-    }
-
-    public static int getIntVolatile(long address) {
-        return PlatformDependent0.getIntVolatile(address);
-    }
-
-    public static void putIntOrdered(long adddress, int newValue) {
-        PlatformDependent0.putIntOrdered(adddress, newValue);
     }
 
     public static byte getByte(long address) {

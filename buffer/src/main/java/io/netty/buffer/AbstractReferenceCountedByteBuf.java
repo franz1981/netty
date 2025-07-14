@@ -16,8 +16,10 @@
 
 package io.netty.buffer;
 
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.ReferenceCountUpdater;
 
 /**
@@ -29,12 +31,21 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
     private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> AIF_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(AbstractReferenceCountedByteBuf.class, "refCnt");
 
+    private static final VarHandle REFCNT_FIELD_VH = PlatformDependent.findVarHandleOfIntField(
+            AbstractReferenceCountedByteBuf.class, "refCnt");
+
     private static final ReferenceCountUpdater<AbstractReferenceCountedByteBuf> updater =
             new ReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
         @Override
         protected AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> updater() {
             return AIF_UPDATER;
         }
+
+        @Override
+        protected VarHandle varHandleUpdater() {
+            return REFCNT_FIELD_VH;
+        }
+
         @Override
         protected long unsafeOffset() {
             return REFCNT_FIELD_OFFSET;

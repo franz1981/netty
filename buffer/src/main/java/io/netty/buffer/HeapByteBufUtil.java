@@ -15,6 +15,10 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.PlatformDependent;
+
+import java.lang.invoke.VarHandle;
+
 /**
  * Utility class for heap buffers.
  */
@@ -25,10 +29,18 @@ final class HeapByteBufUtil {
     }
 
     static short getShort(byte[] memory, int index) {
+        VarHandle shortBeArrayView = PlatformDependent.shortBeArrayView();
+        if (shortBeArrayView != null) {
+            return (short) shortBeArrayView.get(memory, index);
+        }
         return (short) (memory[index] << 8 | memory[index + 1] & 0xFF);
     }
 
     static short getShortLE(byte[] memory, int index) {
+        VarHandle shortLeArrayView = PlatformDependent.shortLeArrayView();
+        if (shortLeArrayView != null) {
+            return (short) shortLeArrayView.get(memory, index);
+        }
         return (short) (memory[index] & 0xff | memory[index + 1] << 8);
     }
 
@@ -45,6 +57,10 @@ final class HeapByteBufUtil {
     }
 
     static int getInt(byte[] memory, int index) {
+        VarHandle intBeArrayView  = PlatformDependent.intBeArrayView();
+        if (intBeArrayView != null) {
+            return (int) intBeArrayView.get(memory, index);
+        }
         return  (memory[index]     & 0xff) << 24 |
                 (memory[index + 1] & 0xff) << 16 |
                 (memory[index + 2] & 0xff) <<  8 |
@@ -52,6 +68,10 @@ final class HeapByteBufUtil {
     }
 
     static int getIntLE(byte[] memory, int index) {
+        VarHandle intLeArrayView = PlatformDependent.intLeArrayView();
+        if (intLeArrayView != null) {
+            return (int) intLeArrayView.get(memory, index);
+        }
         return  memory[index]      & 0xff        |
                 (memory[index + 1] & 0xff) << 8  |
                 (memory[index + 2] & 0xff) << 16 |
@@ -59,6 +79,10 @@ final class HeapByteBufUtil {
     }
 
     static long getLong(byte[] memory, int index) {
+        VarHandle longBeArrayView = PlatformDependent.longBeArrayView();
+        if (longBeArrayView != null) {
+            return (long) longBeArrayView.get(memory, index);
+        }
         return  ((long) memory[index]     & 0xff) << 56 |
                 ((long) memory[index + 1] & 0xff) << 48 |
                 ((long) memory[index + 2] & 0xff) << 40 |
@@ -70,6 +94,10 @@ final class HeapByteBufUtil {
     }
 
     static long getLongLE(byte[] memory, int index) {
+        VarHandle longLeArrayView = PlatformDependent.longLeArrayView();
+        if (longLeArrayView != null) {
+            return (long) longLeArrayView.get(memory, index);
+        }
         return  (long) memory[index]      & 0xff        |
                 ((long) memory[index + 1] & 0xff) <<  8 |
                 ((long) memory[index + 2] & 0xff) << 16 |
@@ -85,11 +113,21 @@ final class HeapByteBufUtil {
     }
 
     static void setShort(byte[] memory, int index, int value) {
+        VarHandle shortBeArrayView = PlatformDependent.shortBeArrayView();
+        if (shortBeArrayView != null) {
+            shortBeArrayView.set(memory, index, (short) value);
+            return;
+        }
         memory[index]     = (byte) (value >>> 8);
         memory[index + 1] = (byte) value;
     }
 
     static void setShortLE(byte[] memory, int index, int value) {
+        VarHandle shortLeArrayView = PlatformDependent.shortLeArrayView();
+        if (shortLeArrayView != null) {
+            shortLeArrayView.set(memory, index, (short) value);
+            return;
+        }
         memory[index]     = (byte) value;
         memory[index + 1] = (byte) (value >>> 8);
     }
@@ -107,6 +145,11 @@ final class HeapByteBufUtil {
     }
 
     static void setInt(byte[] memory, int index, int value) {
+        VarHandle intBeArrayView = PlatformDependent.intBeArrayView();
+        if (intBeArrayView != null) {
+            intBeArrayView.set(memory, index, value);
+            return;
+        }
         memory[index]     = (byte) (value >>> 24);
         memory[index + 1] = (byte) (value >>> 16);
         memory[index + 2] = (byte) (value >>> 8);
@@ -114,6 +157,11 @@ final class HeapByteBufUtil {
     }
 
     static void setIntLE(byte[] memory, int index, int value) {
+        VarHandle intLeArrayView = PlatformDependent.intLeArrayView();
+        if (intLeArrayView != null) {
+            intLeArrayView.set(memory, index, value);
+            return;
+        }
         memory[index]     = (byte) value;
         memory[index + 1] = (byte) (value >>> 8);
         memory[index + 2] = (byte) (value >>> 16);
@@ -121,6 +169,11 @@ final class HeapByteBufUtil {
     }
 
     static void setLong(byte[] memory, int index, long value) {
+        VarHandle longBeArrayView = PlatformDependent.longBeArrayView();
+        if (longBeArrayView != null) {
+            longBeArrayView.set(memory, index, value);
+            return;
+        }
         memory[index]     = (byte) (value >>> 56);
         memory[index + 1] = (byte) (value >>> 48);
         memory[index + 2] = (byte) (value >>> 40);
@@ -132,6 +185,11 @@ final class HeapByteBufUtil {
     }
 
     static void setLongLE(byte[] memory, int index, long value) {
+        VarHandle longLeArrayView = PlatformDependent.longLeArrayView();
+        if (longLeArrayView != null) {
+            longLeArrayView.set(memory, index, value);
+            return;
+        }
         memory[index]     = (byte) value;
         memory[index + 1] = (byte) (value >>> 8);
         memory[index + 2] = (byte) (value >>> 16);
