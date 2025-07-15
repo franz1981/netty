@@ -25,6 +25,7 @@ import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.concurrent.MpscIntQueue;
+import io.netty.util.internal.AtomicReferenceCountUpdater;
 import io.netty.util.internal.ObjectPool;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
@@ -1078,8 +1079,6 @@ final class AdaptivePoolingAllocator {
     }
 
     private static class Chunk implements ReferenceCounted, ChunkInfo {
-        private static final long REFCNT_FIELD_OFFSET =
-                ReferenceCountUpdater.getUnsafeOffset(Chunk.class, "refCnt");
         private static final AtomicIntegerFieldUpdater<Chunk> AIF_UPDATER =
                 AtomicIntegerFieldUpdater.newUpdater(Chunk.class, "refCnt");
 
@@ -1092,16 +1091,10 @@ final class AdaptivePoolingAllocator {
         protected int allocatedBytes;
 
         private static final ReferenceCountUpdater<Chunk> updater =
-                new ReferenceCountUpdater<Chunk>() {
+                new AtomicReferenceCountUpdater<Chunk>() {
                     @Override
                     protected AtomicIntegerFieldUpdater<Chunk> updater() {
                         return AIF_UPDATER;
-                    }
-                    @Override
-                    protected long unsafeOffset() {
-                        // on native image, REFCNT_FIELD_OFFSET can be recomputed even with Unsafe unavailable, so we
-                        // need to guard here
-                        return PlatformDependent.hasUnsafe() ? REFCNT_FIELD_OFFSET : -1;
                     }
                 };
 

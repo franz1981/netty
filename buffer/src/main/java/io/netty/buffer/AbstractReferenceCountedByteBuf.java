@@ -16,50 +16,60 @@
 
 package io.netty.buffer;
 
+import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
-import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.AtomicReferenceCountUpdater;
 import io.netty.util.internal.ReferenceCountUpdater;
+import io.netty.util.internal.ReferenceCountUpdater.Configuration;
+import io.netty.util.internal.UnsafeReferenceCountUpdater;
+import io.netty.util.internal.VarHandleUnsafeReferenceCountUpdater;
 
 /**
  * Abstract base class for {@link ByteBuf} implementations that count references.
  */
 public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
-    private static final long REFCNT_FIELD_OFFSET =
-            ReferenceCountUpdater.getUnsafeOffset(AbstractReferenceCountedByteBuf.class, "refCnt");
-    private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> AIF_UPDATER =
-            AtomicIntegerFieldUpdater.newUpdater(AbstractReferenceCountedByteBuf.class, "refCnt");
+    private static final long REFCNT_FIELD_OFFSET;
+    private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> AIF_UPDATER;
+    private static final Object REFCNT_FIELD_VH;
+    private static final ReferenceCountUpdater<AbstractReferenceCountedByteBuf> updater;
 
-    private static final Object REFCNT_FIELD_VH = PlatformDependent.findVarHandleOfIntField(
-            AbstractReferenceCountedByteBuf.class, "refCnt");
-
-    private static final ReferenceCountUpdater<AbstractReferenceCountedByteBuf> updater =
-            new ReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
-        @Override
-        protected AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> updater() {
-            return AIF_UPDATER;
+    static {
+        Configuration<AbstractReferenceCountedByteBuf> config = Configuration.of(AbstractReferenceCountedByteBuf.class,
+                "refCnt", MethodHandles::lookup, AtomicIntegerFieldUpdater::newUpdater);
+        REFCNT_FIELD_OFFSET = config.fieldOffset();
+        REFCNT_FIELD_VH = config.varHandle();
+        AIF_UPDATER = config.updater();
+        switch (config.updaterType()) {
+            case Atomic:
+                updater = new AtomicReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
+                    @Override
+                    protected AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> updater() {
+                        return AIF_UPDATER;
+                    }
+                };
+                break;
+            case Unsafe:
+                updater = new UnsafeReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
+                    @Override
+                    protected long refCntFieldOffset() {
+                        return REFCNT_FIELD_OFFSET;
+                    }
+                };
+                break;
+            case VarHandle:
+                updater = new VarHandleUnsafeReferenceCountUpdater<AbstractReferenceCountedByteBuf>() {
+                    @Override
+                    protected VarHandle varHandle() {
+                        return (VarHandle) REFCNT_FIELD_VH;
+                    }
+                };
+                break;
+            default:
+                throw new Error("Unknown updater type: " + config.updaterType());
         }
-
-        @Override
-        protected Object varHandleUpdater() {
-            return REFCNT_FIELD_VH;
-        }
-
-        @Override
-        protected void setVarHandleRefCnt(VarHandle vh, AbstractReferenceCountedByteBuf instance, int refCnt) {
-            vh.set(instance, refCnt);
-        }
-
-        @Override
-        protected int getVarHandleRefCnt(VarHandle vh, AbstractReferenceCountedByteBuf instance) {
-            return (int) vh.get(instance);
-        }
-                @Override
-        protected long unsafeOffset() {
-            return REFCNT_FIELD_OFFSET;
-        }
-    };
+    }
 
     // Value might not equal "real" reference count, all access should be via the updater
     @SuppressWarnings({"unused", "FieldMayBeFinal"})

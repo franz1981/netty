@@ -679,6 +679,22 @@ final class PlatformDependent0 {
         return UNSAFE.getInt(object, fieldOffset);
     }
 
+    static int getIntVolatile(Object object, long fieldOffset) {
+        return UNSAFE.getIntVolatile(object, fieldOffset);
+    }
+
+    static void putOrderedInt(Object object, long fieldOffset, int value) {
+        UNSAFE.putOrderedInt(object, fieldOffset, value);
+    }
+
+    static int getAndAddInt(Object object, long fieldOffset, int value) {
+        return UNSAFE.getAndAddInt(object, fieldOffset, value);
+    }
+
+    static boolean compareAndSwapInt(Object object, long fieldOffset, int expected, int value) {
+        return UNSAFE.compareAndSwapInt(object, fieldOffset, expected, value);
+    }
+
     static void safeConstructPutInt(Object object, long fieldOffset, int value) {
         UNSAFE.putInt(object, fieldOffset, value);
         UNSAFE.storeFence();
@@ -726,14 +742,6 @@ final class PlatformDependent0 {
 
     static int getInt(int[] data, long index) {
         return UNSAFE.getInt(data, INT_ARRAY_BASE_OFFSET + INT_ARRAY_INDEX_SCALE * index);
-    }
-
-    static int getIntVolatile(long address) {
-        return UNSAFE.getIntVolatile(null, address);
-    }
-
-    static void putIntOrdered(long address, int newValue) {
-        UNSAFE.putOrderedInt(null, address, newValue);
     }
 
     static long getLong(byte[] data, int index) {

@@ -21,7 +21,21 @@ public class VarHandle {
     public native Object get(Object... args);
 
     @MethodHandle.PolymorphicSignature
+    public native Object getAcquire(Object... args);
+
+    @MethodHandle.PolymorphicSignature
     public native void set(Object... args);
 
-    public static native void storeStoreFence();
+    @MethodHandle.PolymorphicSignature
+    public native void setRelease(Object... args);
+
+    @MethodHandle.PolymorphicSignature
+    public native Object getAndAdd(Object... args);
+
+    @MethodHandle.PolymorphicSignature
+    public native boolean compareAndSet(Object... args);
+
+    public static void storeStoreFence() {
+        throw new UnsupportedOperationException("Not implemented in varhandle-stub");
+    }
 }

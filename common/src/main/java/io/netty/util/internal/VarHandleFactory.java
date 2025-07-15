@@ -75,17 +75,19 @@ final class VarHandleFactory {
         }
     }
 
-    private static MethodHandles.Lookup privateLookup(Class<?> targetClass) {
+    private static MethodHandles.Lookup privateLookup(MethodHandles.Lookup lookup, Class<?> targetClass) {
         try {
-            return (MethodHandles.Lookup) PRIVATE_LOOKUP_IN.invokeExact(targetClass, MethodHandles.lookup());
+            return (MethodHandles.Lookup) PRIVATE_LOOKUP_IN.invokeExact(targetClass, lookup);
         } catch (Throwable e) {
             throw new RuntimeException(e);
         }
     }
 
-    public static VarHandle privateFindVarHandle(Class<?> declaringClass, String name, Class<?> type) {
+    public static VarHandle privateFindVarHandle(MethodHandles.Lookup lookup, Class<?> declaringClass,
+                                                 String name, Class<?> type) {
         try {
-            return (VarHandle) FIND_VAR_HANDLE.invokeExact(privateLookup(declaringClass), declaringClass, name, type);
+            return (VarHandle) FIND_VAR_HANDLE.invokeExact(privateLookup(lookup, declaringClass),
+                    declaringClass, name, type);
         } catch (Throwable e) {
             throw new RuntimeException(e);
         }

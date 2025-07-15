@@ -613,9 +613,13 @@ public final class PlatformDependent {
                 "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
     }
 
-    public static VarHandle findVarHandleOfIntField(Class<?> type, String fieldName) {
+    public static boolean hasVarHandle() {
+        return VAR_HANDLE;
+    }
+
+    public static VarHandle findVarHandleOfIntField(MethodHandles.Lookup lookup, Class<?> type, String fieldName) {
         if (VAR_HANDLE) {
-            return VarHandleFactory.privateFindVarHandle(type, fieldName, int.class);
+            return VarHandleFactory.privateFindVarHandle(lookup, type, fieldName, int.class);
         }
         return null;
     }
@@ -666,8 +670,24 @@ public final class PlatformDependent {
         return PlatformDependent0.getObject(object, fieldOffset);
     }
 
+    public static int getVolatileInt(Object object, long fieldOffset) {
+        return PlatformDependent0.getIntVolatile(object, fieldOffset);
+    }
+
     public static int getInt(Object object, long fieldOffset) {
         return PlatformDependent0.getInt(object, fieldOffset);
+    }
+
+    public static void putOrderedInt(Object object, long fieldOffset, int value) {
+        PlatformDependent0.putOrderedInt(object, fieldOffset, value);
+    }
+
+    public static int getAndAddInt(Object object, long fieldOffset, int delta) {
+        return PlatformDependent0.getAndAddInt(object, fieldOffset, delta);
+    }
+
+    public static boolean compareAndSwapInt(Object object, long fieldOffset, int expected, int value) {
+        return PlatformDependent0.compareAndSwapInt(object, fieldOffset, expected, value);
     }
 
     static void safeConstructPutInt(Object object, long fieldOffset, int value) {
