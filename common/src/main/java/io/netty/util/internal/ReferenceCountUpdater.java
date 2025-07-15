@@ -177,9 +177,9 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
         }
     }
 
-    public static final class Configuration<T extends ReferenceCounted> {
+    public static final class Configuration<T> {
 
-        public static <T extends ReferenceCounted> Configuration<T> of(Class<T> type, String fieldName,
+        public static <T> Configuration<T> of(Class<T> type, String fieldName,
                                                                        Supplier<MethodHandles.Lookup> lookupFactory,
                                BiFunction<Class<T>, String, AtomicIntegerFieldUpdater<T>> updaterFactory) {
             return new Configuration<>(type, fieldName, lookupFactory, updaterFactory);

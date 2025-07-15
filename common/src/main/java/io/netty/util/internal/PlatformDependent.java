@@ -690,7 +690,7 @@ public final class PlatformDependent {
         return PlatformDependent0.compareAndSwapInt(object, fieldOffset, expected, value);
     }
 
-    static void safeConstructPutInt(Object object, long fieldOffset, int value) {
+    public static void safeConstructPutInt(Object object, long fieldOffset, int value) {
         PlatformDependent0.safeConstructPutInt(object, fieldOffset, value);
     }
 

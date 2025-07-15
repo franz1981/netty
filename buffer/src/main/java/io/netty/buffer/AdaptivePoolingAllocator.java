@@ -1078,7 +1078,7 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static class Chunk implements ReferenceCounted, ChunkInfo {
+    private static class Chunk extends ReferenceCountHolder implements ReferenceCounted, ChunkInfo {
         private static final AtomicIntegerFieldUpdater<Chunk> AIF_UPDATER =
                 AtomicIntegerFieldUpdater.newUpdater(Chunk.class, "refCnt");
 
@@ -1089,14 +1089,6 @@ final class AdaptivePoolingAllocator {
         private final int capacity;
         private final boolean pooled;
         protected int allocatedBytes;
-
-        private static final ReferenceCountUpdater<Chunk> updater =
-                new AtomicReferenceCountUpdater<Chunk>() {
-                    @Override
-                    protected AtomicIntegerFieldUpdater<Chunk> updater() {
-                        return AIF_UPDATER;
-                    }
-                };
 
         // Value might not equal "real" reference count, all access should be via the updater
         @SuppressWarnings({"unused", "FieldMayBeFinal"})
@@ -1117,7 +1109,7 @@ final class AdaptivePoolingAllocator {
             this.delegate = delegate;
             this.pooled = pooled;
             capacity = delegate.capacity();
-            updater.setInitialValue(this);
+            refCnt_setInitialValue();
             attachToMagazine(magazine);
 
             // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
@@ -1160,17 +1152,19 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public int refCnt() {
-            return updater.refCnt(this);
+            return refCnt_refCnt();
         }
 
         @Override
         public Chunk retain() {
-            return updater.retain(this);
+            refCnt_retain();
+            return this;
         }
 
         @Override
         public Chunk retain(int increment) {
-            return updater.retain(this, increment);
+            refCnt_retain(increment);
+            return this;
         }
 
         @Override
@@ -1180,7 +1174,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean release() {
-            if (updater.release(this)) {
+            if (refCnt_release()) {
                 deallocate();
                 return true;
             }
@@ -1189,7 +1183,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean release(int decrement) {
-            if (updater.release(this, decrement)) {
+            if (refCnt_release(decrement)) {
                 deallocate();
                 return true;
             }
@@ -1221,7 +1215,7 @@ final class AdaptivePoolingAllocator {
                 allocator.chunkRegistry.remove(this);
                 delegate.release();
             } else {
-                updater.resetRefCnt(this);
+                refCnt_resetRefCnt();
                 delegate.setIndex(0, 0);
                 allocatedBytes = 0;
                 if (!mag.trySetNextInLine(this)) {
@@ -1230,7 +1224,7 @@ final class AdaptivePoolingAllocator {
                     if (!mag.offerToQueue(this)) {
                         // The central queue is full. Ensure we release again as we previously did use resetRefCnt()
                         // which did increase the reference count by 1.
-                        boolean released = updater.release(this);
+                        boolean released = refCnt_release();
                         onRelease();
                         allocator.chunkRegistry.remove(this);
                         delegate.release();
