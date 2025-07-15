@@ -31,7 +31,7 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
     private static final AtomicIntegerFieldUpdater<AbstractReferenceCountedByteBuf> AIF_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(AbstractReferenceCountedByteBuf.class, "refCnt");
 
-    private static final VarHandle REFCNT_FIELD_VH = PlatformDependent.findVarHandleOfIntField(
+    private static final Object REFCNT_FIELD_VH = PlatformDependent.findVarHandleOfIntField(
             AbstractReferenceCountedByteBuf.class, "refCnt");
 
     private static final ReferenceCountUpdater<AbstractReferenceCountedByteBuf> updater =
@@ -42,7 +42,7 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
         }
 
         @Override
-        protected VarHandle varHandleUpdater() {
+        protected Object varHandleUpdater() {
             return REFCNT_FIELD_VH;
         }
 

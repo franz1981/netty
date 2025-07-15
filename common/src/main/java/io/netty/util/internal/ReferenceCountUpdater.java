@@ -54,7 +54,7 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
 
     protected abstract AtomicIntegerFieldUpdater<T> updater();
 
-    protected VarHandle varHandleUpdater() {
+    protected Object varHandleUpdater() {
         return null;
     }
 
@@ -67,9 +67,10 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
     public void setInitialValue(T instance) {
         final long offset = unsafeOffset();
         if (offset == -1) {
-            VarHandle vh = varHandleUpdater();
+            Object vho = varHandleUpdater();
             int initialValue = initialValue();
-            if (vh != null) {
+            if (vho != null) {
+                VarHandle vh = (VarHandle) vho;
                 vh.set(instance, (int) initialValue);
                 VarHandle.storeStoreFence();
             } else {
@@ -111,8 +112,9 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
         if (offset != -1) {
             rawCnt = PlatformDependent.getInt(instance, offset);
         } else {
-            VarHandle vh = varHandleUpdater();
-            if (vh != null) {
+            Object vho = varHandleUpdater();
+            if (vho != null) {
+                VarHandle vh = (VarHandle) vho;
                 rawCnt = (int) vh.get(instance);
             } else {
                 rawCnt = updater().get(instance);
