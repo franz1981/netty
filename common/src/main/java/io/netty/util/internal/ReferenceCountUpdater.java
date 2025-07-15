@@ -70,8 +70,7 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
             Object vho = varHandleUpdater();
             int initialValue = initialValue();
             if (vho != null) {
-                VarHandle vh = (VarHandle) vho;
-                vh.set(instance, (int) initialValue);
+                setVarHandleRefCnt((VarHandle) vho, instance, initialValue);
                 VarHandle.storeStoreFence();
             } else {
                 updater().set(instance, initialValue);
@@ -106,6 +105,14 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
         return realRefCnt(updater().get(instance));
     }
 
+    protected void setVarHandleRefCnt(VarHandle vh, T instance, int refCnt) {
+        vh.set(instance, refCnt);
+    }
+
+    protected int getVarHandleRefCnt(VarHandle vh, T instance) {
+        return (int) vh.get(instance);
+    }
+
     public final boolean isLiveNonVolatile(T instance) {
         final long offset = unsafeOffset();
         final int rawCnt;
@@ -114,8 +121,7 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
         } else {
             Object vho = varHandleUpdater();
             if (vho != null) {
-                VarHandle vh = (VarHandle) vho;
-                rawCnt = (int) vh.get(instance);
+                rawCnt = getVarHandleRefCnt((VarHandle) vho, instance);
             } else {
                 rawCnt = updater().get(instance);
             }

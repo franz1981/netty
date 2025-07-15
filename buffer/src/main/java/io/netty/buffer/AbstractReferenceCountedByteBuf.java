@@ -47,6 +47,15 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
         }
 
         @Override
+        protected void setVarHandleRefCnt(VarHandle vh, AbstractReferenceCountedByteBuf instance, int refCnt) {
+            vh.set(instance, refCnt);
+        }
+
+        @Override
+        protected int getVarHandleRefCnt(VarHandle vh, AbstractReferenceCountedByteBuf instance) {
+            return (int) vh.get(instance);
+        }
+                @Override
         protected long unsafeOffset() {
             return REFCNT_FIELD_OFFSET;
         }
