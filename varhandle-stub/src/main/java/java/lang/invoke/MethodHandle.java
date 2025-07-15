@@ -15,19 +15,9 @@
  */
 package java.lang.invoke;
 
-public class VarHandle {
-
-    @MethodHandle.PolymorphicSignature
-    public Object get(Object... args) {
-        throw new UnsupportedOperationException("Method not implemented");
-    }
-
-    @MethodHandle.PolymorphicSignature
-    public void set(Object... args) {
-        throw new UnsupportedOperationException("Method not implemented");
-    }
-
-    public static void storeStoreFence() {
-        throw new UnsupportedOperationException("Method not implemented");
+public class MethodHandle {
+    @java.lang.annotation.Target({java.lang.annotation.ElementType.METHOD})
+    @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME)
+    @interface PolymorphicSignature {
     }
 }
