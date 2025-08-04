@@ -819,7 +819,7 @@ final class AdaptivePoolingAllocator {
         private static final Recycler<AdaptiveByteBuf> EVENT_LOOP_LOCAL_BUFFER_POOL = new Recycler<AdaptiveByteBuf>() {
             @Override
             protected AdaptiveByteBuf newObject(Handle<AdaptiveByteBuf> handle) {
-                return new AdaptiveByteBuf(handle);
+                return new AdaptiveByteBuf((EnhancedHandle<AdaptiveByteBuf>) handle, null);
             }
         };
 
@@ -831,7 +831,6 @@ final class AdaptivePoolingAllocator {
         private final AtomicLong usedMemory;
         private final StampedLock allocationLock;
         private final Queue<AdaptiveByteBuf> bufferQueue;
-        private final ObjectPool.Handle<AdaptiveByteBuf> handle;
         private final Queue<Chunk> sharedChunkQueue;
 
         Magazine(MagazineGroup group, boolean shareable, Queue<Chunk> sharedChunkQueue,
@@ -843,16 +842,9 @@ final class AdaptivePoolingAllocator {
                 // We only need the StampedLock if this Magazine will be shared across threads.
                 allocationLock = new StampedLock();
                 bufferQueue = PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-                handle = new ObjectPool.Handle<AdaptiveByteBuf>() {
-                    @Override
-                    public void recycle(AdaptiveByteBuf self) {
-                        bufferQueue.offer(self);
-                    }
-                };
             } else {
                 allocationLock = null;
                 bufferQueue = null;
-                handle = null;
             }
             usedMemory = new AtomicLong();
             this.sharedChunkQueue = sharedChunkQueue;
@@ -1079,12 +1071,12 @@ final class AdaptivePoolingAllocator {
 
         public AdaptiveByteBuf newBuffer() {
             AdaptiveByteBuf buf;
-            if (handle == null) {
+            if (bufferQueue == null) {
                 buf = EVENT_LOOP_LOCAL_BUFFER_POOL.get();
             } else {
                 buf = bufferQueue.poll();
                 if (buf == null) {
-                    buf = new AdaptiveByteBuf(handle);
+                    buf = new AdaptiveByteBuf(null, bufferQueue);
                 }
             }
             buf.resetRefCnt();
@@ -1520,8 +1512,8 @@ final class AdaptivePoolingAllocator {
 
     static final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
 
-        private final ObjectPool.Handle<AdaptiveByteBuf> handle;
-
+        private final EnhancedHandle<AdaptiveByteBuf> handle;
+        private final Queue<AdaptiveByteBuf> sharedPool;
         // this both act as adjustment and the start index for a free list segment allocation
         private int startIndex;
         private AbstractByteBuf rootParent;
@@ -1532,9 +1524,10 @@ final class AdaptivePoolingAllocator {
         private boolean hasArray;
         private boolean hasMemoryAddress;
 
-        AdaptiveByteBuf(ObjectPool.Handle<AdaptiveByteBuf> recyclerHandle) {
+        AdaptiveByteBuf(EnhancedHandle<AdaptiveByteBuf> recyclerHandle, Queue<AdaptiveByteBuf> sharedPool) {
             super(0);
-            handle = ObjectUtil.checkNotNull(recyclerHandle, "recyclerHandle");
+            handle = recyclerHandle;
+            this.sharedPool = sharedPool;
         }
 
         void init(AbstractByteBuf unwrapped, Chunk wrapped, int readerIndex, int writerIndex,
@@ -2011,11 +2004,10 @@ final class AdaptivePoolingAllocator {
             tmpNioBuf = null;
             chunk = null;
             rootParent = null;
-            if (handle instanceof EnhancedHandle) {
-                EnhancedHandle<AdaptiveByteBuf>  enhancedHandle = (EnhancedHandle<AdaptiveByteBuf>) handle;
-                enhancedHandle.unguardedRecycle(this);
+            if (handle != null) {
+                handle.unguardedRecycle(this);
             } else {
-                handle.recycle(this);
+                sharedPool.offer(this);
             }
         }
     }
