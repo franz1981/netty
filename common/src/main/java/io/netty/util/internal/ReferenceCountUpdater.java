@@ -118,6 +118,7 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
         }
         // don't pass 0!
         if ((oldRef <= 0 && oldRef + rawIncrement >= 0)
+                || (rawIncrement == 2 && oldRef >= (Integer.MAX_VALUE - 1))
                 || (oldRef >= 0 && oldRef + rawIncrement < oldRef)) {
             // overflow case
             getAndAddRawRefCnt(instance, -rawIncrement);
@@ -128,8 +129,15 @@ public abstract class ReferenceCountUpdater<T extends ReferenceCounted> {
 
     public final boolean release(T instance) {
         int rawCnt = getRawRefCnt(instance);
-        return rawCnt == 2 ? tryFinalRelease0(instance, 2) || retryRelease0(instance, 1)
-                : nonFinalRelease0(instance, 1, rawCnt, toLiveRealRefCnt(rawCnt, 1));
+        if (rawCnt == 2) {
+            return tryFinalRelease0(instance, 2) || retryRelease0(instance, 1);
+        }
+        // this is a fast-path useful for the adaptive chunk case
+        if (rawCnt == 4) {
+            // this is saving an expensive computation (using lea  -0x2(%rax),%ebp) to the new ref cnt
+            return nonFinalRelease0(instance, 1, 4, 2);
+        }
+        return nonFinalRelease0(instance, 1, rawCnt, toLiveRealRefCnt(rawCnt, 1));
     }
 
     public final boolean release(T instance, int decrement) {
