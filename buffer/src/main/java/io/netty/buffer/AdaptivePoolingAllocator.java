@@ -1167,10 +1167,8 @@ final class AdaptivePoolingAllocator {
             this.delegate = delegate;
             this.pooled = pooled;
             capacity = delegate.capacity();
+            updater.setInitialValue(this);
             attachToMagazine(magazine);
-            if (magazine.group.ownerThread == null) {
-                updater.setInitialValue(this);
-            }
 
             // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
             allocator = magazine.group.allocator;
@@ -1262,7 +1260,7 @@ final class AdaptivePoolingAllocator {
             return release();
         }
 
-        protected void deallocate() {
+        private void deallocate() {
             Magazine mag = magazine;
             int chunkSize = delegate.capacity();
             if (!pooled || chunkReleasePredicate.shouldReleaseChunk(chunkSize) || mag == null) {
@@ -1397,7 +1395,6 @@ final class AdaptivePoolingAllocator {
         private final MpscIntQueue externalFreeList;
         private final IntStack localFreeList;
         private final Thread ownerThread;
-        private int localRefCnt = 1;
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled, int segmentSize,
                          int[] segmentOffsets, ChunkReleasePredicate shouldReleaseChunk) {
@@ -1421,23 +1418,6 @@ final class AdaptivePoolingAllocator {
             } else {
                 localFreeList = new IntStack(segmentOffsets);
             }
-        }
-
-        @Override
-        public Chunk retain() {
-            localRefCnt++;
-            return this;
-        }
-
-        @Override
-        public boolean release() {
-            localRefCnt--;
-            if (localRefCnt == 0) {
-                localRefCnt = 1;
-                deallocate();
-                return true;
-            }
-            return false;
         }
 
         @Override
