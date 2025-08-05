@@ -15,12 +15,9 @@
  */
 package io.netty.microbench.buffer;
 
-import io.netty.buffer.AdaptiveByteBufAllocator;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.MiByteBufAllocator;
-import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.buffer.*;
 import io.netty.microbench.util.AbstractMicrobenchmark;
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.internal.MathUtil;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.CompilerControl;
@@ -33,20 +30,335 @@ import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.SplittableRandom;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.channels.GatheringByteChannel;
+import java.nio.channels.ScatteringByteChannel;
+import java.util.*;
 
 @State(Scope.Thread)
 @Warmup(iterations = 10, time = 1)
 @Measurement(iterations = 10, time = 1)
-@Threads(8)
+@Threads(1)
 public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmark {
 
     private static final PooledByteBufAllocator pooledAlloc = PooledByteBufAllocator.DEFAULT;
     private static final ByteBufAllocator adaptiveAllocator = new AdaptiveByteBufAllocator();
     private static final MiByteBufAllocator miMallocAllocator = new MiByteBufAllocator();
+    private static final ThreadLocalAllocator fakeAllocator = new ThreadLocalAllocator();
+    private static class ThreadLocalAllocator extends AbstractByteBufAllocator {
+
+        static class ArenaByteBuf extends AbstractReferenceCountedByteBuf {
+
+            private ArrayDeque<ByteBuf> buffers = new ArrayDeque<>();
+
+            public ArenaByteBuf(int maxCapacity) {
+                super(maxCapacity);
+                this.buffers = null;
+            }
+
+            public void init(Arena arena) {
+                this.buffers = arena.buffers;
+            }
+
+            @Override
+            protected void deallocate() {
+                resetRefCnt();
+                buffers.addLast(this);
+            }
+
+            @Override
+            protected byte _getByte(int index) {
+                return 0;
+            }
+
+            @Override
+            protected short _getShort(int index) {
+                return 0;
+            }
+
+            @Override
+            protected short _getShortLE(int index) {
+                return 0;
+            }
+
+            @Override
+            protected int _getUnsignedMedium(int index) {
+                return 0;
+            }
+
+            @Override
+            protected int _getUnsignedMediumLE(int index) {
+                return 0;
+            }
+
+            @Override
+            protected int _getInt(int index) {
+                return 0;
+            }
+
+            @Override
+            protected int _getIntLE(int index) {
+                return 0;
+            }
+
+            @Override
+            protected long _getLong(int index) {
+                return 0;
+            }
+
+            @Override
+            protected long _getLongLE(int index) {
+                return 0;
+            }
+
+            @Override
+            protected void _setByte(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setShort(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setShortLE(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setMedium(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setMediumLE(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setInt(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setIntLE(int index, int value) {
+
+            }
+
+            @Override
+            protected void _setLong(int index, long value) {
+
+            }
+
+            @Override
+            protected void _setLongLE(int index, long value) {
+
+            }
+
+            @Override
+            public int capacity() {
+                return 0;
+            }
+
+            @Override
+            public ByteBuf capacity(int newCapacity) {
+                return null;
+            }
+
+            @Override
+            public ByteBufAllocator alloc() {
+                return null;
+            }
+
+            @Override
+            public ByteOrder order() {
+                return null;
+            }
+
+            @Override
+            public ByteBuf unwrap() {
+                return null;
+            }
+
+            @Override
+            public boolean isDirect() {
+                return false;
+            }
+
+            @Override
+            public ByteBuf getBytes(int index, ByteBuf dst, int dstIndex, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuf getBytes(int index, byte[] dst, int dstIndex, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuf getBytes(int index, ByteBuffer dst) {
+                return null;
+            }
+
+            @Override
+            public ByteBuf getBytes(int index, OutputStream out, int length) throws IOException {
+                return null;
+            }
+
+            @Override
+            public int getBytes(int index, GatheringByteChannel out, int length) throws IOException {
+                return 0;
+            }
+
+            @Override
+            public int getBytes(int index, FileChannel out, long position, int length) throws IOException {
+                return 0;
+            }
+
+            @Override
+            public ByteBuf setBytes(int index, ByteBuf src, int srcIndex, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuf setBytes(int index, byte[] src, int srcIndex, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuf setBytes(int index, ByteBuffer src) {
+                return null;
+            }
+
+            @Override
+            public int setBytes(int index, InputStream in, int length) throws IOException {
+                return 0;
+            }
+
+            @Override
+            public int setBytes(int index, ScatteringByteChannel in, int length) throws IOException {
+                return 0;
+            }
+
+            @Override
+            public int setBytes(int index, FileChannel in, long position, int length) throws IOException {
+                return 0;
+            }
+
+            @Override
+            public ByteBuf copy(int index, int length) {
+                return null;
+            }
+
+            @Override
+            public int nioBufferCount() {
+                return 0;
+            }
+
+            @Override
+            public ByteBuffer nioBuffer(int index, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuffer internalNioBuffer(int index, int length) {
+                return null;
+            }
+
+            @Override
+            public ByteBuffer[] nioBuffers(int index, int length) {
+                return new ByteBuffer[0];
+            }
+
+            @Override
+            public boolean hasArray() {
+                return false;
+            }
+
+            @Override
+            public byte[] array() {
+                return new byte[0];
+            }
+
+            @Override
+            public int arrayOffset() {
+                return 0;
+            }
+
+            @Override
+            public boolean hasMemoryAddress() {
+                return false;
+            }
+
+            @Override
+            public long memoryAddress() {
+                return 0;
+            }
+        }
+
+
+        private static final class Arena {
+
+            private final ArrayDeque<ByteBuf> buffers = new ArrayDeque<>();
+
+            Arena(int maxCapacity, int maxBuffers) {
+                for (int i = 0; i < maxBuffers; i++) {
+                    ArenaByteBuf buf = new ArenaByteBuf(maxCapacity);
+                    buf.init(this);
+                    buffers.addLast(buf);
+                }
+            }
+        }
+
+        private final FastThreadLocal<Arena[]> arenas = new FastThreadLocal<Arena[]>() {
+            @Override
+            protected Arena[] initialValue() {
+                Arena[] arenas = new Arena[(32 * 1024) / 128];
+                int maxCapacity = 0;
+                for (int i = 0; i < arenas.length; i++) {
+                    arenas[i] = new Arena(maxCapacity, MAX_LIVE_BUFFERS);
+                    maxCapacity += 1024;
+                }
+                return arenas;
+            }
+        };
+
+        private static final int WORD_MASK = 128 - 1;
+        private static final int WORD_SHIFT = 7;
+
+        private int arenaIndex(int size) {
+            return (size + WORD_MASK) >> WORD_SHIFT;
+        }
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf allocated = arenas.get()[arenaIndex(initialCapacity)].buffers.removeLast();
+            if (allocated == null) {
+                throw new IllegalStateException("No available buffer in the arena for size: " + initialCapacity);
+            }
+            return allocated;
+        }
+
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf allocated = arenas.get()[arenaIndex(initialCapacity)].buffers.removeLast();
+            if (allocated == null) {
+                throw new IllegalStateException("No available buffer in the arena for size: " + initialCapacity);
+            }
+            return allocated;
+        }
+
+        @Override
+        public boolean isDirectBufferPooled() {
+            return true;
+        }
+    }
 
     private static final int SEED = 42;
     // Allocation size array.
@@ -59,6 +371,7 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     private final ByteBuf[] pooledHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
     private final ByteBuf[] adaptiveHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
     private final ByteBuf[] mimallocHeapBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
+    private final ByteBuf[] fakeDirectBuffers = new ByteBuf[MAX_LIVE_BUFFERS];
 
     private int[] releaseIndexes;
     private int[] sizes;
@@ -77,6 +390,7 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
                 pooledDirectBuffers,
                 adaptiveDirectBuffers,
                 mimallocDirectBuffers,
+                fakeDirectBuffers,
                 pooledHeapBuffers,
                 adaptiveHeapBuffers,
                 mimallocHeapBuffers);
@@ -176,6 +490,11 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     @Benchmark
     public void mimallocHeap(Blackhole blackhole) {
         heapAlloc(blackhole, miMallocAllocator, mimallocHeapBuffers);
+    }
+
+    @Benchmark
+    public void fakeDirect(Blackhole blackhole) {
+        directAlloc(blackhole, fakeAllocator, fakeDirectBuffers);
     }
 
     /**
