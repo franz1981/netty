@@ -365,7 +365,6 @@ final class AdaptivePoolingAllocator {
         private final StampedLock magazineExpandLock;
         private final Magazine threadLocalMagazine;
         private volatile Magazine[] magazines;
-        private final Thread ownerThread;
         private volatile boolean freed;
 
         MagazineGroup(AdaptivePoolingAllocator allocator,
@@ -377,11 +376,9 @@ final class AdaptivePoolingAllocator {
             this.chunkControllerFactory = chunkControllerFactory;
             chunkReuseQueue = createSharedChunkQueue();
             if (isThreadLocal) {
-                ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
                 threadLocalMagazine = new Magazine(this, false, chunkReuseQueue, chunkControllerFactory.create(this));
             } else {
-                ownerThread = null;
                 magazineExpandLock = new StampedLock();
                 threadLocalMagazine = null;
                 Magazine[] mags = new Magazine[INITIAL_MAGAZINES];
@@ -1363,88 +1360,34 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static final class IntStack {
-
-        private final int[] stack;
-        private int top;
-
-        IntStack(int[] initialValues) {
-            stack = new int[initialValues.length];
-            // copy reversed
-            for (int i = 0; i < initialValues.length; i++) {
-                stack[i] = initialValues[initialValues.length - 1 - i];
-            }
-            top = initialValues.length - 1;
-        }
-
-        public boolean isEmpty() {
-            return top == -1;
-        }
-
-        public int pop() {
-            final int last = stack[top];
-            top--;
-            return last;
-        }
-
-        public void push(int value) {
-            stack[top + 1] = value;
-            top++;
-        }
-
-        public int size() {
-            return top + 1;
-        }
-    }
-
     private static final class SizeClassedChunk extends Chunk {
         private static final int FREE_LIST_EMPTY = -1;
         private final int segmentSize;
-        private final MpscIntQueue externalFreeList;
-        private final IntStack localFreeList;
-        private final Thread ownerThread;
+        private final MpscIntQueue freeList;
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled, int segmentSize,
                          int[] segmentOffsets, ChunkReleasePredicate shouldReleaseChunk) {
             super(delegate, magazine, pooled, shouldReleaseChunk);
-            ownerThread = magazine.group.ownerThread;
             this.segmentSize = segmentSize;
             int segmentCount = segmentOffsets.length;
             assert delegate.capacity() / segmentSize == segmentCount;
             assert segmentCount > 0: "Chunk must have a positive number of segments";
-            externalFreeList = MpscIntQueue.create(segmentCount, FREE_LIST_EMPTY);
-            if (ownerThread == null) {
-                externalFreeList.fill(segmentCount, new IntSupplier() {
-                    int counter;
-
-                    @Override
-                    public int getAsInt() {
-                        return segmentOffsets[counter++];
-                    }
-                });
-                localFreeList = null;
-            } else {
-                localFreeList = new IntStack(segmentOffsets);
-            }
+            freeList = MpscIntQueue.create(segmentCount, FREE_LIST_EMPTY);
+            freeList.fill(segmentCount, new IntSupplier() {
+                int counter;
+                @Override
+                public int getAsInt() {
+                    return segmentOffsets[counter++];
+                }
+            });
         }
 
         @Override
         public void readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
-            IntStack localFreeList = this.localFreeList;
-            final int startIndex;
-            if (localFreeList != null) {
-                assert Thread.currentThread() == ownerThread;
-                if (localFreeList.isEmpty() && copyIntoLocalFreeList(localFreeList) == 0) {
-                    throw new IllegalStateException("Free list is empty");
-                }
-                startIndex = localFreeList.pop();
-            } else {
-                startIndex = externalFreeList.poll();
-                if (startIndex == FREE_LIST_EMPTY) {
-                    throw new IllegalStateException("Free list is empty");
-                }
+            int startIndex = freeList.poll();
+            if (startIndex == FREE_LIST_EMPTY) {
+                throw new IllegalStateException("Free list is empty");
             }
-
             allocatedBytes += segmentSize;
             Chunk chunk = this;
             chunk.retain();
@@ -1462,28 +1405,13 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        private int copyIntoLocalFreeList(IntStack localFreeList) {
-            final MpscIntQueue externalFreeList = this.externalFreeList;
-            int index;
-            int count = 0;
-            while ((index = externalFreeList.poll()) != FREE_LIST_EMPTY) {
-                localFreeList.push(index);
-                count++;
-            }
-            return count;
-        }
-
         @Override
         public int remainingCapacity() {
             int remainingCapacity = super.remainingCapacity();
             if (remainingCapacity > segmentSize) {
                 return remainingCapacity;
             }
-            int updatedRemainingCapacity = externalFreeList.size() * segmentSize;
-            if (localFreeList != null) {
-                assert Thread.currentThread() == ownerThread;
-                updatedRemainingCapacity += localFreeList.size() * segmentSize;
-            }
+            int updatedRemainingCapacity = freeList.size() * segmentSize;
             if (updatedRemainingCapacity == remainingCapacity) {
                 return remainingCapacity;
             }
@@ -1507,13 +1435,8 @@ final class AdaptivePoolingAllocator {
         @Override
         boolean releaseSegment(int startIndex) {
             boolean released = release();
-            IntStack localFreeList = this.localFreeList;
-            if (localFreeList != null && Thread.currentThread() == ownerThread) {
-                localFreeList.push(startIndex);
-            } else {
-                boolean segmentReturned = externalFreeList.offer(startIndex);
-                assert segmentReturned : "Unable to return segment " + startIndex + " to free list";
-            }
+            boolean segmentReturned = freeList.offer(startIndex);
+            assert segmentReturned: "Unable to return segment " + startIndex + " to free list";
             return released;
         }
     }
