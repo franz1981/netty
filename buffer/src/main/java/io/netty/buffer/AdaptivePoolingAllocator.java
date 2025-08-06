@@ -945,12 +945,6 @@ final class AdaptivePoolingAllocator {
                 }
             }
 
-            return allocateAndRefillCurrentChunk(size, maxCapacity, buf, startingCapacity);
-        }
-
-        private boolean allocateAndRefillCurrentChunk(int size, int maxCapacity, AdaptiveByteBuf buf,
-                                                      int startingCapacity) {
-            Chunk curr;
             assert current == null;
             // The fast-path for allocations did not work.
             //
@@ -993,12 +987,6 @@ final class AdaptivePoolingAllocator {
                 }
             }
 
-            return allocateAndRefillCurrentFromSharedChunkQ(size, maxCapacity, buf, startingCapacity);
-        }
-
-        private boolean allocateAndRefillCurrentFromSharedChunkQ(int size, int maxCapacity,
-                                                                 AdaptiveByteBuf buf, int startingCapacity) {
-            Chunk curr;
             // Now try to poll from the central queue first
             curr = sharedChunkQueue.poll();
             if (curr == null) {
