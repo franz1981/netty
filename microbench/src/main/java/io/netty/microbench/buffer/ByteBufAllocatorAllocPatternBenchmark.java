@@ -15,9 +15,19 @@
  */
 package io.netty.microbench.buffer;
 
-import io.netty.buffer.*;
+import io.netty.buffer.AbstractByteBufAllocator;
+import io.netty.buffer.AbstractReferenceCountedByteBuf;
+import io.netty.buffer.AdaptiveByteBufAllocator;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.MiByteBufAllocator;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.microbench.util.AbstractMicrobenchmark;
+import io.netty.util.AbstractReferenceCounted;
+import io.netty.util.Recycler;
+import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.concurrent.MpscIntQueue;
 import io.netty.util.internal.MathUtil;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.CompilerControl;
@@ -38,7 +48,10 @@ import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.SplittableRandom;
 
 @State(Scope.Thread)
 @Warmup(iterations = 10, time = 1)
@@ -49,26 +62,39 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     private static final PooledByteBufAllocator pooledAlloc = PooledByteBufAllocator.DEFAULT;
     private static final ByteBufAllocator adaptiveAllocator = new AdaptiveByteBufAllocator();
     private static final MiByteBufAllocator miMallocAllocator = new MiByteBufAllocator();
-    private static final ThreadLocalAllocator fakeAllocator = new ThreadLocalAllocator();
-    private static class ThreadLocalAllocator extends AbstractByteBufAllocator {
+    private static final ThreadLocalFakeAdaptiveAllocator fakeAdaptiveAllocator =
+            new ThreadLocalFakeAdaptiveAllocator();
 
-        static class ArenaByteBuf extends AbstractReferenceCountedByteBuf {
+    private static class ThreadLocalFakeAdaptiveAllocator extends AbstractByteBufAllocator {
 
-            private ArrayDeque<ByteBuf> buffers = new ArrayDeque<>();
+        private static final Recycler<FakeAdaptiveByteBuf> RECYCLER = new Recycler<FakeAdaptiveByteBuf>() {
+            @Override
+            protected FakeAdaptiveByteBuf newObject(Recycler.Handle<FakeAdaptiveByteBuf> handle) {
+                return new FakeAdaptiveByteBuf((EnhancedHandle<FakeAdaptiveByteBuf>) handle);
+            }
+        };
 
-            public ArenaByteBuf(int maxCapacity) {
-                super(maxCapacity);
-                this.buffers = null;
+        private static class FakeAdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
+
+            private FakeThreadLocalMagazine fakeMagazine;
+            private int id;
+            private Recycler.EnhancedHandle<FakeAdaptiveByteBuf> handle;
+
+            FakeAdaptiveByteBuf(Recycler.EnhancedHandle<FakeAdaptiveByteBuf> handle) {
+                super(0);
+                this.handle = handle;
             }
 
-            public void init(Arena arena) {
-                this.buffers = arena.buffers;
+            public void init(FakeThreadLocalMagazine fakeMagazine, int id) {
+                this.fakeMagazine = fakeMagazine;
+                this.id = id;
             }
 
             @Override
             protected void deallocate() {
                 resetRefCnt();
-                buffers.addLast(this);
+                fakeMagazine.releaseId(id);
+                handle.unguardedRecycle(this);
             }
 
             @Override
@@ -118,47 +144,47 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
 
             @Override
             protected void _setByte(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setShort(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setShortLE(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setMedium(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setMediumLE(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setInt(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setIntLE(int index, int value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setLong(int index, long value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
             protected void _setLongLE(int index, long value) {
-
+                throw new UnsupportedOperationException();
             }
 
             @Override
@@ -302,56 +328,72 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
             }
         }
 
+        private static final class FakeThreadLocalMagazine extends AbstractReferenceCounted {
 
-        private static final class Arena {
+            // this is emulating having a single non-rotating chunk
+            private final MpscIntQueue freeIds;
 
-            private final ArrayDeque<ByteBuf> buffers = new ArrayDeque<>();
-
-            Arena(int maxCapacity, int maxBuffers) {
+            FakeThreadLocalMagazine(int maxBuffers) {
+                freeIds = MpscIntQueue.create(maxBuffers, -1);
                 for (int i = 0; i < maxBuffers; i++) {
-                    ArenaByteBuf buf = new ArenaByteBuf(maxCapacity);
-                    buf.init(this);
-                    buffers.addLast(buf);
+                    freeIds.offer(i);
                 }
+            }
+
+            public ByteBuf allocate() {
+                FakeAdaptiveByteBuf buf = RECYCLER.get();
+                retain();
+                int id = freeIds.poll();
+                if (id < 0) {
+                    throw new IllegalStateException("No available buffer id in the arena");
+                }
+                buf.init(this, id);
+                return buf;
+            }
+
+            @Override
+            public ReferenceCounted touch(Object hint) {
+                return null;
+            }
+
+            public void releaseId(int id) {
+                freeIds.offer(id);
+                release();
+            }
+
+            @Override
+            protected void deallocate() {
+                throw new UnsupportedOperationException("Arena should never be deallocated!");
             }
         }
 
-        private final FastThreadLocal<Arena[]> arenas = new FastThreadLocal<Arena[]>() {
+        private final FastThreadLocal<FakeThreadLocalMagazine[]> threadLocalMagazines =
+                new FastThreadLocal<FakeThreadLocalMagazine[]>() {
             @Override
-            protected Arena[] initialValue() {
-                Arena[] arenas = new Arena[(32 * 1024) / 128];
-                int maxCapacity = 0;
-                for (int i = 0; i < arenas.length; i++) {
-                    arenas[i] = new Arena(maxCapacity, MAX_LIVE_BUFFERS);
-                    maxCapacity += 1024;
+            protected FakeThreadLocalMagazine[] initialValue() {
+                FakeThreadLocalMagazine[] fakeMagazines = new FakeThreadLocalMagazine[(32 * 1024) / 128];
+                for (int i = 0; i < fakeMagazines.length; i++) {
+                    fakeMagazines[i] = new FakeThreadLocalMagazine(MAX_LIVE_BUFFERS);
                 }
-                return arenas;
+                return fakeMagazines;
             }
         };
 
         private static final int WORD_MASK = 128 - 1;
         private static final int WORD_SHIFT = 7;
 
-        private int arenaIndex(int size) {
+        private int sizeClassOf(int size) {
             return (size + WORD_MASK) >> WORD_SHIFT;
         }
 
         @Override
         protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
-            ByteBuf allocated = arenas.get()[arenaIndex(initialCapacity)].buffers.removeLast();
-            if (allocated == null) {
-                throw new IllegalStateException("No available buffer in the arena for size: " + initialCapacity);
-            }
-            return allocated;
+            return threadLocalMagazines.get()[sizeClassOf(initialCapacity)].allocate();
         }
 
         @Override
         protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
-            ByteBuf allocated = arenas.get()[arenaIndex(initialCapacity)].buffers.removeLast();
-            if (allocated == null) {
-                throw new IllegalStateException("No available buffer in the arena for size: " + initialCapacity);
-            }
-            return allocated;
+            return threadLocalMagazines.get()[sizeClassOf(initialCapacity)].allocate();
         }
 
         @Override
@@ -494,7 +536,7 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
 
     @Benchmark
     public void fakeDirect(Blackhole blackhole) {
-        directAlloc(blackhole, fakeAllocator, fakeDirectBuffers);
+        directAlloc(blackhole, fakeAdaptiveAllocator, fakeDirectBuffers);
     }
 
     /**
