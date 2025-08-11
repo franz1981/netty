@@ -19,8 +19,6 @@ import io.netty.util.ByteProcessor;
 import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.NettyRuntime;
-import io.netty.util.Recycler;
-import io.netty.util.Recycler.EnhancedHandle;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
@@ -47,6 +45,7 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Queue;
 import java.util.Set;
@@ -86,7 +85,7 @@ import static java.util.concurrent.atomic.AtomicIntegerFieldUpdater.newUpdater;
  * <p>
  * Since magazines are "relatively thread-local", the allocator has a central queue that allow excess chunks from any
  * magazine, to be shared with other magazines.
- * The {@link #createSharedChunkQueue()} method can be overridden to customize this queue.
+ * The {@link #createSharedChunkQueue(boolean)} method can be overridden to customize this queue.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -241,8 +240,9 @@ final class AdaptivePoolingAllocator {
      *
      * @return A new multi-producer, multi-consumer queue.
      */
-    private static Queue<Chunk> createSharedChunkQueue() {
-        return PlatformDependent.newFixedMpmcQueue(CHUNK_REUSE_QUEUE);
+    private static Queue<Chunk> createSharedChunkQueue(boolean threadLocalMagazine) {
+        return threadLocalMagazine? PlatformDependent.newFixedMpscQueue(CHUNK_REUSE_QUEUE) :
+                PlatformDependent.newFixedMpmcQueue(CHUNK_REUSE_QUEUE);
     }
 
     ByteBuf allocate(int size, int maxCapacity) {
@@ -374,7 +374,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             this.chunkAllocator = chunkAllocator;
             this.chunkControllerFactory = chunkControllerFactory;
-            chunkReuseQueue = createSharedChunkQueue();
+            chunkReuseQueue = createSharedChunkQueue(isThreadLocal);
             if (isThreadLocal) {
                 ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
@@ -815,13 +815,6 @@ final class AdaptivePoolingAllocator {
         }
         private static final Chunk MAGAZINE_FREED = new Chunk();
 
-        private static final Recycler<AdaptiveByteBuf> EVENT_LOOP_LOCAL_BUFFER_POOL = new Recycler<AdaptiveByteBuf>() {
-            @Override
-            protected AdaptiveByteBuf newObject(Handle<AdaptiveByteBuf> handle) {
-                return new AdaptiveByteBuf((EnhancedHandle<AdaptiveByteBuf>) handle, null);
-            }
-        };
-
         private Chunk current;
         @SuppressWarnings("unused") // updated via NEXT_IN_LINE
         private volatile Chunk nextInLine;
@@ -843,7 +836,7 @@ final class AdaptivePoolingAllocator {
                 bufferQueue = PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             } else {
                 allocationLock = null;
-                bufferQueue = null;
+                bufferQueue = new ArrayDeque<>(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             usedMemory = new AtomicLong();
             this.sharedChunkQueue = sharedChunkQueue;
@@ -1082,13 +1075,9 @@ final class AdaptivePoolingAllocator {
 
         public AdaptiveByteBuf newBuffer() {
             AdaptiveByteBuf buf;
-            if (bufferQueue == null) {
-                buf = EVENT_LOOP_LOCAL_BUFFER_POOL.get();
-            } else {
-                buf = bufferQueue.poll();
-                if (buf == null) {
-                    buf = new AdaptiveByteBuf(null, bufferQueue);
-                }
+            buf = bufferQueue.poll();
+            if (buf == null) {
+                buf = new AdaptiveByteBuf(bufferQueue);
             }
             buf.resetRefCnt();
             buf.discardMarks();
@@ -1432,6 +1421,17 @@ final class AdaptivePoolingAllocator {
         }
 
         @Override
+        public Chunk retain() {
+            // return super.retain();
+            return this;
+        }
+
+        @Override
+        public boolean release() {
+            return false;
+        }
+
+        @Override
         public void readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
             IntStack localFreeList = this.localFreeList;
             final int startIndex;
@@ -1523,7 +1523,6 @@ final class AdaptivePoolingAllocator {
 
     static final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
 
-        private final EnhancedHandle<AdaptiveByteBuf> handle;
         private final Queue<AdaptiveByteBuf> sharedPool;
         // this both act as adjustment and the start index for a free list segment allocation
         private int startIndex;
@@ -1535,9 +1534,8 @@ final class AdaptivePoolingAllocator {
         private boolean hasArray;
         private boolean hasMemoryAddress;
 
-        AdaptiveByteBuf(EnhancedHandle<AdaptiveByteBuf> recyclerHandle, Queue<AdaptiveByteBuf> sharedPool) {
+        AdaptiveByteBuf(Queue<AdaptiveByteBuf> sharedPool) {
             super(0);
-            handle = recyclerHandle;
             this.sharedPool = sharedPool;
         }
 
@@ -2015,11 +2013,7 @@ final class AdaptivePoolingAllocator {
             tmpNioBuf = null;
             chunk = null;
             rootParent = null;
-            if (handle != null) {
-                handle.unguardedRecycle(this);
-            } else {
-                sharedPool.offer(this);
-            }
+            sharedPool.offer(this);
         }
     }
 
