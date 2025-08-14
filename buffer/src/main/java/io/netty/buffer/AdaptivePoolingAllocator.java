@@ -241,8 +241,9 @@ final class AdaptivePoolingAllocator {
      *
      * @return A new multi-producer, multi-consumer queue.
      */
-    private static Queue<Chunk> createSharedChunkQueue() {
-        return PlatformDependent.newFixedMpmcQueue(CHUNK_REUSE_QUEUE);
+    private static Queue<Chunk> createSharedChunkQueue(boolean shared) {
+        return shared ? PlatformDependent.newFixedMpmcQueue(CHUNK_REUSE_QUEUE) :
+                PlatformDependent.newFixedMpscQueue(CHUNK_REUSE_QUEUE);
     }
 
     ByteBuf allocate(int size, int maxCapacity) {
@@ -365,7 +366,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             this.chunkAllocator = chunkAllocator;
             this.chunkControllerFactory = chunkControllerFactory;
-            chunkReuseQueue = createSharedChunkQueue();
+            chunkReuseQueue = createSharedChunkQueue(!isThreadLocal);
             if (isThreadLocal) {
                 ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
