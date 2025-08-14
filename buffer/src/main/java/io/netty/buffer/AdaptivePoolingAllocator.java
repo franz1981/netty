@@ -822,7 +822,8 @@ final class AdaptivePoolingAllocator {
                  ChunkController chunkController) {
             this.group = group;
             this.chunkController = chunkController;
-            this.externalBuffers = PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            this.externalBuffers = shareable ? PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY) :
+                    PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             if (shareable) {
                 // We only need the StampedLock if this Magazine will be shared across threads.
                 allocationLock = new StampedLock();
