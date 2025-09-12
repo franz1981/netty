@@ -355,7 +355,7 @@ final class AdaptivePoolingAllocator {
         return HistogramChunkController.sizeToBucket(size);
     }
 
-    private static final class AdaptiveRecycler extends Recycler<AdaptiveByteBuf> {
+    private static class AdaptiveRecycler extends Recycler<AdaptiveByteBuf> {
 
         protected AdaptiveRecycler(int maxCapacity, int interval, int chunkSize, Thread ownerThread,
                                    boolean unguarded) {
@@ -367,25 +367,24 @@ final class AdaptivePoolingAllocator {
         }
 
         @Override
-        protected AdaptiveByteBuf newObject(Handle<AdaptiveByteBuf> handle) {
+        protected final AdaptiveByteBuf newObject(Handle<AdaptiveByteBuf> handle) {
             return new AdaptiveByteBuf((EnhancedHandle<AdaptiveByteBuf>) handle);
         }
     }
 
-    private static final class ThreadLocalCache {
+    private static final class ThreadLocalCache extends AdaptiveRecycler {
         final MagazineGroup[] magazineGroups;
-        final AdaptiveRecycler pinnedRecycler;
 
         ThreadLocalCache(AdaptivePoolingAllocator allocator) {
-            this.pinnedRecycler = new AdaptiveRecycler(MAGAZINE_BUFFER_QUEUE_CAPACITY * 2,
-                                                       8,
-                                                       MAGAZINE_BUFFER_QUEUE_CAPACITY,
-                                                       Thread.currentThread(), true);
+            super(MAGAZINE_BUFFER_QUEUE_CAPACITY * 2,
+                  8,
+                  MAGAZINE_BUFFER_QUEUE_CAPACITY,
+                  Thread.currentThread(), true);
             this.magazineGroups = createMagazineGroupSizeClasses(allocator, true, this);
         }
 
         void free() {
-            Recycler.unpinOwner(pinnedRecycler);
+            Recycler.unpinOwner(this);
             for (MagazineGroup group : magazineGroups) {
                 group.free();
             }
@@ -418,7 +417,7 @@ final class AdaptivePoolingAllocator {
                 sharedRecycler = null;
                 ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
-                magazine = new ThreadLocalMagazine(this, chunkControllerFactory.create(this), cache.pinnedRecycler);
+                magazine = new ThreadLocalMagazine(this, chunkControllerFactory.create(this), cache);
             } else {
                 sharedRecycler = new AdaptiveRecycler(MAGAZINE_BUFFER_QUEUE_CAPACITY, true);
                 ownerThread = null;
