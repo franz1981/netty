@@ -48,6 +48,7 @@ import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -186,7 +187,8 @@ final class AdaptivePoolingAllocator {
         chunkRegistry = new ChunkRegistry();
         sizeClassedMagazineGroups = createMagazineGroupSizeClasses(this, false);
         largeBufferMagazineGroup = new MagazineGroup(
-                this, chunkAllocator, new HistogramChunkControllerFactory(true), false);
+                this, chunkAllocator, new HistogramChunkControllerFactory(true), false,
+                null, PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
 
         threadLocalGroup = new FastThreadLocal<MagazineGroup[]>() {
             @Override
@@ -210,11 +212,21 @@ final class AdaptivePoolingAllocator {
 
     private static MagazineGroup[] createMagazineGroupSizeClasses(
             AdaptivePoolingAllocator allocator, boolean isThreadLocal) {
+        final ArrayDeque<AdaptiveByteBuf> tlLocalBuffers;
+        final Queue<AdaptiveByteBuf> tlExternalBuffers;
+        if (isThreadLocal) {
+            tlLocalBuffers = new ArrayDeque<>(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            tlExternalBuffers = PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+        } else {
+            tlLocalBuffers = null;
+            tlExternalBuffers = null;
+        }
         MagazineGroup[] groups = new MagazineGroup[SIZE_CLASSES.length];
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
             int segmentSize = SIZE_CLASSES[i];
             groups[i] = new MagazineGroup(allocator, allocator.chunkAllocator,
-                    new SizeClassChunkControllerFactory(segmentSize), isThreadLocal);
+                                          new SizeClassChunkControllerFactory(segmentSize), isThreadLocal,
+                                          tlLocalBuffers, tlExternalBuffers);
         }
         return groups;
     }
@@ -356,7 +368,8 @@ final class AdaptivePoolingAllocator {
         MagazineGroup(AdaptivePoolingAllocator allocator,
                       ChunkAllocator chunkAllocator,
                       ChunkControllerFactory chunkControllerFactory,
-                      boolean isThreadLocal) {
+                      boolean isThreadLocal,
+                      ArrayDeque<AdaptiveByteBuf> tlLocalBuffers, Queue<AdaptiveByteBuf> tlExternalBuffers) {
             this.allocator = allocator;
             this.chunkAllocator = chunkAllocator;
             this.chunkControllerFactory = chunkControllerFactory;
@@ -364,14 +377,20 @@ final class AdaptivePoolingAllocator {
             if (isThreadLocal) {
                 ownerThread = Thread.currentThread();
                 magazineExpandLock = null;
-                threadLocalMagazine = new Magazine(this, false, chunkReuseQueue, chunkControllerFactory.create(this));
+                threadLocalMagazine = new Magazine(this, false, chunkReuseQueue,
+                                                   chunkControllerFactory.create(this),
+                                                   tlLocalBuffers, tlExternalBuffers);
             } else {
                 ownerThread = null;
                 magazineExpandLock = new StampedLock();
                 threadLocalMagazine = null;
                 Magazine[] mags = new Magazine[INITIAL_MAGAZINES];
                 for (int i = 0; i < mags.length; i++) {
-                    mags[i] = new Magazine(this, true, chunkReuseQueue, chunkControllerFactory.create(this));
+                    mags[i] = new Magazine(this, true, chunkReuseQueue, chunkControllerFactory.create(this),
+                                           null,
+                                           // TODO: maybe is more beneficial to be shared across all magazines & groups
+                                           // TODO 2: maybe use an unpadded variant?
+                                           PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
                 }
                 magazines = mags;
             }
@@ -434,7 +453,9 @@ final class AdaptivePoolingAllocator {
                     Magazine firstMagazine = mags[0];
                     Magazine[] expanded = new Magazine[mags.length * 2];
                     for (int i = 0, l = expanded.length; i < l; i++) {
-                        Magazine m = new Magazine(this, true, chunkReuseQueue, chunkControllerFactory.create(this));
+                        Magazine m = new Magazine(this, true, chunkReuseQueue,
+                                                  chunkControllerFactory.create(this), null,
+                                                  PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
                         firstMagazine.initializeSharedStateIn(m);
                         expanded[i] = m;
                     }
@@ -810,29 +831,27 @@ final class AdaptivePoolingAllocator {
         private final Recycler.Handle<AdaptiveByteBuf> recyclerHandle;
         private final Thread ownwerThread;
 
-        Magazine(MagazineGroup group, boolean shareable, Queue<Chunk> sharedChunkQueue,
-                 ChunkController chunkController) {
+        Magazine(MagazineGroup group, boolean shareable, Queue<Chunk> sharedChunkQueue, ChunkController chunkController,
+                 ArrayDeque<AdaptiveByteBuf> localBuffers, Queue<AdaptiveByteBuf> externalBuffers) {
             this.group = group;
             this.chunkController = chunkController;
-            this.externalBuffers = shareable ? PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY) :
-                    PlatformDependent.newFixedMpscQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            this.externalBuffers = externalBuffers;
             if (shareable) {
                 // We only need the StampedLock if this Magazine will be shared across threads.
                 allocationLock = new StampedLock();
-                localBuffers = null;
+                this.localBuffers = null;
+                ownwerThread = null;
             } else {
                 allocationLock = null;
-                localBuffers = new ArrayDeque<>();
+                this.localBuffers = Objects.requireNonNull(localBuffers);
+                ownwerThread = Objects.requireNonNull(group.ownerThread);
             }
             this.sharedChunkQueue = sharedChunkQueue;
-            this.ownwerThread = group.ownerThread;
 
             final Thread ownerThread = this.ownwerThread;
-            final Queue<AdaptiveByteBuf> externalBuffers = this.externalBuffers;
-            final ArrayDeque<AdaptiveByteBuf> localBuffers = this.localBuffers;
             // NOTE: using a lambda here is a way to use its ability to trust captured fields
             this.recyclerHandle = self -> {
-                if (Thread.currentThread() == ownerThread && localBuffers != null) {
+                if (ownerThread != null && Thread.currentThread() == ownerThread) {
                     localBuffers.addLast(self);
                 } else {
                     externalBuffers.offer(self);
@@ -1064,7 +1083,9 @@ final class AdaptivePoolingAllocator {
 
         public AdaptiveByteBuf newBuffer() {
             AdaptiveByteBuf buf = null;
-            if (ownwerThread != null && Thread.currentThread() == ownwerThread && localBuffers != null) {
+            // NOTE: the local buffer queue is only used if this Magazine is not shared across threads!
+            if (localBuffers != null) {
+                assert ownwerThread != null && Thread.currentThread() == ownwerThread;
                 buf = localBuffers.pollLast();
             }
             if (buf == null) {
