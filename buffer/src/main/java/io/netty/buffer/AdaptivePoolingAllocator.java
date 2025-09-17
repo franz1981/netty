@@ -927,12 +927,6 @@ final class AdaptivePoolingAllocator {
                 }
             }
 
-            return allocateAndRefillCurrentChunk(size, maxCapacity, buf, startingCapacity);
-        }
-
-        private boolean allocateAndRefillCurrentChunk(int size, int maxCapacity, AdaptiveByteBuf buf,
-                                                      int startingCapacity) {
-            Chunk curr;
             assert current == null;
             // The fast-path for allocations did not work.
             //
@@ -942,7 +936,10 @@ final class AdaptivePoolingAllocator {
             //
             // In any case we will store the Chunk as the current so it will be used again for the next allocation and
             // thus be "reserved" by this Magazine for exclusive usage.
-            curr = NEXT_IN_LINE.getAndSet(this, null);
+            curr = nextInLine;
+            if (curr != null) {
+                curr = NEXT_IN_LINE.getAndSet(this, null);
+            }
             if (curr != null) {
                 if (curr == MAGAZINE_FREED) {
                     // Allocation raced with a stripe-resize that freed this magazine.
@@ -975,12 +972,6 @@ final class AdaptivePoolingAllocator {
                 }
             }
 
-            return allocateAndRefillCurrentFromSharedChunkQ(size, maxCapacity, buf, startingCapacity);
-        }
-
-        private boolean allocateAndRefillCurrentFromSharedChunkQ(int size, int maxCapacity,
-                                                                 AdaptiveByteBuf buf, int startingCapacity) {
-            Chunk curr;
             // Now try to poll from the central queue first
             curr = sharedChunkQueue.poll();
             if (curr == null) {
@@ -1073,7 +1064,7 @@ final class AdaptivePoolingAllocator {
 
         public AdaptiveByteBuf newBuffer() {
             AdaptiveByteBuf buf = null;
-            if (Thread.currentThread() == ownwerThread && localBuffers != null) {
+            if (ownwerThread != null && Thread.currentThread() == ownwerThread && localBuffers != null) {
                 buf = localBuffers.pollLast();
             }
             if (buf == null) {
@@ -1674,7 +1665,7 @@ final class AdaptivePoolingAllocator {
 
         AdaptiveByteBuf(Recycler.Handle<AdaptiveByteBuf> recyclerHandle) {
             super(0);
-            handle = recyclerHandle;
+            handle = ObjectUtil.checkNotNull(recyclerHandle, "recyclerHandle");
         }
 
         void init(AbstractByteBuf unwrapped, Chunk wrapped, int readerIndex, int writerIndex,
