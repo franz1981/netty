@@ -48,7 +48,6 @@ import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.ArrayDeque;
 import java.util.Arrays;
-import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ThreadLocalRandom;
@@ -258,12 +257,13 @@ final class AdaptivePoolingAllocator {
     }
 
     ByteBuf allocate(int size, int maxCapacity) {
-        return allocate(size, maxCapacity, Thread.currentThread(), null);
+        return allocate(size, maxCapacity, null);
     }
 
-    private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
-        AdaptiveByteBuf allocated = null;
+    private AdaptiveByteBuf allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
         if (size <= MAX_POOLED_BUF_SIZE) {
+            final Thread currentThread;
+            final AdaptiveByteBuf allocated;
             final int sizeClassIndex = sizeClassIndexOf(size);
             if (sizeClassIndex != SIZE_CLASSES_COUNT) {
                 ThreadLocalMagazineGroup[] localSizeClassesGroup = null;
@@ -271,17 +271,21 @@ final class AdaptivePoolingAllocator {
                     localSizeClassesGroup = threadLocalSizeClassesGroups.get();
                 }
                 if (localSizeClassesGroup != null) {
-                    return localSizeClassesGroup[sizeClassIndex].allocate(size, maxCapacity, currentThread, buf);
+                    return localSizeClassesGroup[sizeClassIndex].allocate(size, maxCapacity, buf);
                 }
+                currentThread = Thread.currentThread();
                 allocated = sharedSizeClassesGroups[sizeClassIndex].allocate(size, maxCapacity, currentThread, buf);
             } else {
+                currentThread = Thread.currentThread();
                 allocated = sharedLargeBufferGroup.allocate(size, maxCapacity, currentThread, buf);
             }
+            if (allocated != null) {
+                return allocated;
+            }
+            return allocateFallback(size, maxCapacity, currentThread, buf);
+        } else {
+            return allocateFallback(size, maxCapacity, Thread.currentThread(), buf);
         }
-        if (allocated == null) {
-            allocated = allocateFallback(size, maxCapacity, currentThread, buf);
-        }
-        return allocated;
     }
 
     private static int sizeIndexOf(final int size) {
@@ -328,7 +332,7 @@ final class AdaptivePoolingAllocator {
      * Allocate into the given buffer. Used by {@link AdaptiveByteBuf#capacity(int)}.
      */
     void reallocate(int size, int maxCapacity, AdaptiveByteBuf into) {
-        AdaptiveByteBuf result = allocate(size, maxCapacity, Thread.currentThread(), into);
+        AdaptiveByteBuf result = allocate(size, maxCapacity, into);
         assert result == into: "Re-allocation created separate buffer instance";
     }
 
@@ -376,8 +380,6 @@ final class AdaptivePoolingAllocator {
 
         public abstract int computePreferredChunkSize(int preferredChunkSize);
 
-        public abstract AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf);
-
         boolean offerToQueue(Chunk buffer) {
             if (freed) {
                 return false;
@@ -406,20 +408,19 @@ final class AdaptivePoolingAllocator {
 
     private static final class SharedMagazineGroup extends MagazineGroup {
         private final StampedLock magazineExpandLock;
-        private volatile Magazine[] magazines;
+        private volatile SharedMagazine[] magazines;
 
         SharedMagazineGroup(AdaptivePoolingAllocator allocator,
                             ChunkAllocator chunkAllocator,
                             ChunkControllerFactory chunkControllerFactory) {
             super(allocator, chunkAllocator, chunkControllerFactory, createSharedChunkQueue(true));
             this.magazineExpandLock = new StampedLock();
-            Magazine[] mags = new Magazine[INITIAL_MAGAZINES];
+            SharedMagazine[] mags = new SharedMagazine[INITIAL_MAGAZINES];
             for (int i = 0; i < mags.length; i++) {
-                mags[i] = new Magazine(this, null, chunkReuseQueue, chunkControllerFactory.create(this),
-                                       null,
-                                       // TODO: maybe is more beneficial to be shared across all magazines & groups
-                                       // TODO 2: maybe use an unpadded variant?
-                                       PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
+                mags[i] = new SharedMagazine(this, chunkReuseQueue, chunkControllerFactory.create(this),
+                                         // TODO: maybe is more beneficial to be shared across all magazines & groups
+                                         // TODO 2: maybe use an unpadded variant?
+                                         PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
             }
             magazines = mags;
         }
@@ -433,7 +434,6 @@ final class AdaptivePoolingAllocator {
             return preferredChunkSize;
         }
 
-        @Override
         public AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
             boolean reallocate = buf != null;
 
@@ -469,7 +469,7 @@ final class AdaptivePoolingAllocator {
             if (currentLength >= MAX_STRIPES) {
                 return true;
             }
-            final Magazine[] mags;
+            final SharedMagazine[] mags;
             long writeLock = magazineExpandLock.tryWriteLock();
             if (writeLock != 0) {
                 try {
@@ -477,11 +477,11 @@ final class AdaptivePoolingAllocator {
                     if (mags.length >= MAX_STRIPES || mags.length > currentLength || freed) {
                         return true;
                     }
-                    Magazine firstMagazine = mags[0];
-                    Magazine[] expanded = new Magazine[mags.length * 2];
+                    SharedMagazine firstMagazine = mags[0];
+                    SharedMagazine[] expanded = new SharedMagazine[mags.length * 2];
                     for (int i = 0, l = expanded.length; i < l; i++) {
-                        Magazine m = new Magazine(this, null, chunkReuseQueue,
-                                                  chunkControllerFactory.create(this), null,
+                        SharedMagazine m = new SharedMagazine(this, chunkReuseQueue,
+                                                  chunkControllerFactory.create(this),
                                                   PlatformDependent.newFixedMpmcQueue(MAGAZINE_BUFFER_QUEUE_CAPACITY));
                         firstMagazine.initializeSharedStateIn(m);
                         expanded[i] = m;
@@ -490,7 +490,7 @@ final class AdaptivePoolingAllocator {
                 } finally {
                     magazineExpandLock.unlockWrite(writeLock);
                 }
-                for (Magazine magazine : mags) {
+                for (SharedMagazine magazine : mags) {
                     magazine.free();
                 }
             }
@@ -502,8 +502,8 @@ final class AdaptivePoolingAllocator {
             freed = true;
             long stamp = magazineExpandLock.writeLock();
             try {
-                Magazine[] mags = magazines;
-                for (Magazine magazine : mags) {
+                SharedMagazine[] mags = magazines;
+                for (SharedMagazine magazine : mags) {
                     magazine.free();
                 }
             } finally {
@@ -514,7 +514,7 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class ThreadLocalMagazineGroup extends MagazineGroup {
-        private final Magazine magazine;
+        private final ThreadLocalMagazine magazine;
 
         ThreadLocalMagazineGroup(AdaptivePoolingAllocator allocator,
                                  ChunkAllocator chunkAllocator,
@@ -522,9 +522,9 @@ final class AdaptivePoolingAllocator {
                                  ArrayDeque<AdaptiveByteBuf> tlLocalBuffers,
                                  Queue<AdaptiveByteBuf> tlExternalBuffers) {
             super(allocator, chunkAllocator, chunkControllerFactory, createSharedChunkQueue(false));
-            this.magazine = new Magazine(this, Thread.currentThread(), chunkReuseQueue,
-                                         chunkControllerFactory.create(this),
-                                         tlLocalBuffers, tlExternalBuffers);
+            this.magazine = new ThreadLocalMagazine(this, Thread.currentThread(), chunkReuseQueue,
+                                                    chunkControllerFactory.create(this), tlLocalBuffers,
+                                                    tlExternalBuffers);
         }
 
         @Override
@@ -532,8 +532,7 @@ final class AdaptivePoolingAllocator {
             return preferredChunkSize;
         }
 
-        @Override
-        public AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
+        public AdaptiveByteBuf allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
             boolean reallocate = buf != null;
 
             // Path for thread-local allocation.
@@ -846,59 +845,17 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static final class Magazine {
-        private static final AtomicReferenceFieldUpdater<Magazine, Chunk> NEXT_IN_LINE =
-                AtomicReferenceFieldUpdater.newUpdater(Magazine.class, Chunk.class, "nextInLine");
-        private static final Chunk MAGAZINE_FREED = new BumpChunk();
-
-        private Chunk current;
-        @SuppressWarnings("unused") // updated via NEXT_IN_LINE
-        private volatile Chunk nextInLine;
-        private final MagazineGroup group;
-        private final ChunkController chunkController;
+    private static final class SharedMagazine extends Magazine {
         private final StampedLock allocationLock;
-        private final Queue<AdaptiveByteBuf> externalBuffers;
-        private final ArrayDeque<AdaptiveByteBuf> localBuffers;
-        private final Queue<Chunk> sharedChunkQueue;
-        private final Recycler.Handle<AdaptiveByteBuf> recyclerHandle;
-        private final Thread ownwerThread;
 
-        Magazine(MagazineGroup group, Thread ownerThread, Queue<Chunk> sharedChunkQueue,
-                 ChunkController chunkController,
-                 ArrayDeque<AdaptiveByteBuf> localBuffers, Queue<AdaptiveByteBuf> externalBuffers) {
-            this.group = group;
-            this.chunkController = chunkController;
-            this.externalBuffers = externalBuffers;
-            if (ownerThread == null) {
-                // We only need the StampedLock if this Magazine will be shared across threads.
-                allocationLock = new StampedLock();
-                this.localBuffers = null;
-                ownwerThread = null;
-            } else {
-                allocationLock = null;
-                this.localBuffers = Objects.requireNonNull(localBuffers);
-                ownwerThread = ownerThread;
-            }
-            this.sharedChunkQueue = sharedChunkQueue;
-
-            final Thread constantOwnerThread = this.ownwerThread;
-            // NOTE: using a lambda here is a way to use its ability to trust captured fields
-            this.recyclerHandle = self -> {
-                if (constantOwnerThread != null && Thread.currentThread() == constantOwnerThread) {
-                    localBuffers.addLast(self);
-                } else {
-                    externalBuffers.offer(self);
-                }
-            };
+        SharedMagazine(MagazineGroup group, Queue<Chunk> sharedChunkQueue, ChunkController chunkController,
+                       Queue<AdaptiveByteBuf> externalBuffers) {
+            super(group, sharedChunkQueue, chunkController, null, externalBuffers);
+            this.allocationLock = new StampedLock();
         }
 
+        @Override
         public boolean tryAllocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
-            if (allocationLock == null) {
-                // This magazine is not shared across threads, just allocate directly.
-                return allocate(size, maxCapacity, buf, reallocate);
-            }
-
-            // Try to retrieve the lock and if successful allocate.
             long writeLock = allocationLock.tryWriteLock();
             if (writeLock != 0) {
                 try {
@@ -910,7 +867,99 @@ final class AdaptivePoolingAllocator {
             return allocateWithoutLock(size, maxCapacity, buf);
         }
 
-        private boolean allocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
+        @Override
+        public Thread ownerThread() {
+            return null;
+        }
+
+        @Override
+        protected boolean isOwnerThread() {
+            return false;
+        }
+
+        @Override
+        public void free() {
+            restoreMagazineFreed();
+            final long lock = allocationLock.writeLock();
+            try {
+                freeCurrent();
+            } finally {
+                allocationLock.unlockWrite(lock);
+            }
+        }
+    }
+
+    private static final class ThreadLocalMagazine extends Magazine {
+        private final Thread ownerThread;
+
+        ThreadLocalMagazine(MagazineGroup group, Thread ownerThread, Queue<Chunk> sharedChunkQueue,
+                            ChunkController chunkController,
+                            ArrayDeque<AdaptiveByteBuf> localBuffers, Queue<AdaptiveByteBuf> externalBuffers) {
+            super(group, sharedChunkQueue, chunkController, localBuffers, externalBuffers);
+            this.ownerThread = ownerThread;
+        }
+
+        @Override
+        public boolean tryAllocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
+            return allocate(size, maxCapacity, buf, reallocate);
+        }
+
+        @Override
+        public Thread ownerThread() {
+            return ownerThread;
+        }
+
+        @Override
+        protected boolean isOwnerThread() {
+            return ownerThread == Thread.currentThread();
+        }
+
+        @Override
+        public void free() {
+
+            freeCurrent();
+        }
+    }
+
+    private abstract static class Magazine {
+        private static final AtomicReferenceFieldUpdater<Magazine, Chunk> NEXT_IN_LINE =
+                AtomicReferenceFieldUpdater.newUpdater(Magazine.class, Chunk.class, "nextInLine");
+        private static final Chunk MAGAZINE_FREED = new BumpChunk();
+
+        private Chunk current;
+        @SuppressWarnings("unused") // updated via NEXT_IN_LINE
+        private volatile Chunk nextInLine;
+        private final MagazineGroup group;
+        private final ChunkController chunkController;
+        private final Queue<AdaptiveByteBuf> externalBuffers;
+        private final ArrayDeque<AdaptiveByteBuf> localBuffers;
+        private final Queue<Chunk> sharedChunkQueue;
+        private final Recycler.Handle<AdaptiveByteBuf> recyclerHandle;
+
+        Magazine(MagazineGroup group, Queue<Chunk> sharedChunkQueue, ChunkController chunkController,
+                 ArrayDeque<AdaptiveByteBuf> localBuffers, Queue<AdaptiveByteBuf> externalBuffers) {
+            this.group = group;
+            this.chunkController = chunkController;
+            this.externalBuffers = externalBuffers;
+            this.localBuffers = localBuffers;
+            this.sharedChunkQueue = sharedChunkQueue;
+            // NOTE: using a lambda here is a way to use its ability to trust captured fields
+            this.recyclerHandle = self -> {
+                if (isOwnerThread()) {
+                    localBuffers.addLast(self);
+                } else {
+                    externalBuffers.offer(self);
+                }
+            };
+        }
+
+        public abstract Thread ownerThread();
+
+        protected abstract boolean isOwnerThread();
+
+        public abstract boolean tryAllocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate);
+
+        protected final boolean allocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
             Chunk curr = NEXT_IN_LINE.getAndSet(this, null);
             if (curr == MAGAZINE_FREED) {
                 // Allocation raced with a stripe-resize that freed this magazine.
@@ -945,7 +994,7 @@ final class AdaptivePoolingAllocator {
             return allocated;
         }
 
-        private boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
+        protected final boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
             int startingCapacity = chunkController.computeBufferCapacity(size, maxCapacity, reallocate);
             Chunk curr = current;
             if (curr != null) {
@@ -1066,7 +1115,7 @@ final class AdaptivePoolingAllocator {
             return true;
         }
 
-        private void restoreMagazineFreed() {
+        protected final void restoreMagazineFreed() {
             Chunk next = NEXT_IN_LINE.getAndSet(this, MAGAZINE_FREED);
             if (next != null && next != MAGAZINE_FREED) {
                 // A chunk snuck in through a race. Release it after restoring MAGAZINE_FREED state.
@@ -1098,19 +1147,12 @@ final class AdaptivePoolingAllocator {
             return NEXT_IN_LINE.compareAndSet(this, null, chunk);
         }
 
-        void free() {
-            // Release the current Chunk and the next that was stored for later usage.
-            restoreMagazineFreed();
-            long stamp = allocationLock != null ? allocationLock.writeLock() : 0;
-            try {
-                if (current != null) {
-                    current.releaseFromMagazine();
-                    current = null;
-                }
-            } finally {
-                if (allocationLock != null) {
-                    allocationLock.unlockWrite(stamp);
-                }
+        public abstract void free();
+
+        protected final void freeCurrent() {
+            if (current != null) {
+                current.releaseFromMagazine();
+                current = null;
             }
         }
 
@@ -1118,7 +1160,6 @@ final class AdaptivePoolingAllocator {
             AdaptiveByteBuf buf = null;
             // NOTE: the local buffer queue is only used if this Magazine is not shared across threads!
             if (localBuffers != null) {
-                assert ownwerThread != null && Thread.currentThread() == ownwerThread;
                 buf = localBuffers.pollLast();
             }
             if (buf == null) {
@@ -1354,7 +1395,7 @@ final class AdaptivePoolingAllocator {
                 if (event.shouldCommit()) {
                     event.fill(this, AdaptiveByteBufAllocator.class);
                     event.pooled = pooled;
-                    event.threadLocal = magazine.allocationLock == null;
+                    event.threadLocal = magazine instanceof ThreadLocalMagazine;
                     event.commit();
                 }
             }
@@ -1530,7 +1571,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine, int segmentSize, int[] segmentOffsets) {
             super(delegate, magazine, true, chunkSize -> false);
-            ownerThread = magazine.ownwerThread;
+            ownerThread = magazine.ownerThread();
             this.segmentSize = segmentSize;
             int segmentCount = segmentOffsets.length;
             assert delegate.capacity() / segmentSize == segmentCount;
@@ -1551,6 +1592,17 @@ final class AdaptivePoolingAllocator {
             }
             this.segments = segmentCount;
             STATE.lazySet(this, AVAILABLE);
+        }
+
+        @Override
+        void attachToMagazine(final Magazine magazine) {
+            if (ownerThread != null && magazine.ownerThread() != ownerThread) {
+                // TODO think about it again: the expected state machine should be clear here
+                //      probably it doesn't make any sense to detach/attach to a different magazine thread-local chunks
+                throw new IllegalStateException(
+                        "thread-Local size classed chunks cannot be attached to a magazine of a different thread");
+            }
+            super.attachToMagazine(magazine);
         }
 
         @Override
@@ -1632,7 +1684,7 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int startIndex) {
             IntStack localFreeList = this.localFreeList;
-            if (localFreeList != null && Thread.currentThread() == ownerThread) {
+            if (localFreeList != null && ownerThread != null && Thread.currentThread() == ownerThread) {
                 localFreeList.push(startIndex);
                 // we don't care of having a StoreLoad here as marking to deallocate has to happen in this same thread!
                 int state = this.state;
@@ -1741,7 +1793,7 @@ final class AdaptivePoolingAllocator {
                     event.fill(this, AdaptiveByteBufAllocator.class);
                     event.chunkPooled = wrapped.pooled;
                     Magazine m = wrapped.magazine;
-                    event.chunkThreadLocal = m != null && m.allocationLock == null;
+                    event.chunkThreadLocal = m instanceof ThreadLocalMagazine;
                     event.commit();
                 }
             }
