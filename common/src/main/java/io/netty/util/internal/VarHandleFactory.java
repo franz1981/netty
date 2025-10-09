@@ -18,6 +18,7 @@ package io.netty.util.internal;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodHandles.Lookup;
 import java.lang.invoke.MethodType;
 import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
@@ -29,6 +30,7 @@ final class VarHandleFactory {
 
     private static final MethodHandle FIND_VAR_HANDLE;
     private static final MethodHandle PRIVATE_LOOKUP_IN;
+    private static final MethodHandle ARRAY_ELEMENT_VAR_HANDLE;
     private static final VarHandle LONG_LE_ARRAY_VIEW;
     private static final VarHandle LONG_BE_ARRAY_VIEW;
     private static final VarHandle INT_LE_ARRAY_VIEW;
@@ -46,6 +48,7 @@ final class VarHandleFactory {
     static {
         MethodHandle findVarHandle = null;
         MethodHandle privateLookupIn = null;
+        MethodHandle arrayElementVarHandle = null;
         VarHandle longLeArrayViewHandle = null;
         VarHandle longBeArrayViewHandle = null;
         VarHandle intLeArrayViewHandle = null;
@@ -60,11 +63,13 @@ final class VarHandleFactory {
         VarHandle shortBeByteBufferViewHandle = null;
         Throwable error = null;
         try {
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            findVarHandle = lookup.findVirtual(MethodHandles.Lookup.class, "findVarHandle",
-                    MethodType.methodType(VarHandle.class, Class.class, String.class, Class.class));
+            Lookup lookup = MethodHandles.lookup();
+            findVarHandle = lookup.findVirtual(Lookup.class, "findVarHandle",
+                                       MethodType.methodType(VarHandle.class, Class.class, String.class, Class.class));
+            arrayElementVarHandle = lookup.findStatic(MethodHandles.class, "arrayElementVarHandle",
+                    MethodType.methodType(VarHandle.class, Class.class));
             privateLookupIn = lookup.findStatic(MethodHandles.class, "privateLookupIn",
-                    MethodType.methodType(MethodHandles.Lookup.class, Class.class, MethodHandles.Lookup.class));
+                    MethodType.methodType(Lookup.class, Class.class, Lookup.class));
             MethodHandle byteArrayViewHandle = lookup.findStatic(MethodHandles.class, "byteArrayViewVarHandle",
                     MethodType.methodType(VarHandle.class, Class.class, ByteOrder.class));
             longLeArrayViewHandle = (VarHandle) byteArrayViewHandle.invokeExact(long[].class, ByteOrder.LITTLE_ENDIAN);
@@ -93,6 +98,7 @@ final class VarHandleFactory {
             error = e;
             findVarHandle = null;
             privateLookupIn = null;
+            arrayElementVarHandle = null;
             longLeArrayViewHandle = null;
             longBeArrayViewHandle = null;
             intLeArrayViewHandle = null;
@@ -107,6 +113,7 @@ final class VarHandleFactory {
         } finally {
             FIND_VAR_HANDLE = findVarHandle;
             PRIVATE_LOOKUP_IN = privateLookupIn;
+            ARRAY_ELEMENT_VAR_HANDLE = arrayElementVarHandle;
             LONG_LE_ARRAY_VIEW = longLeArrayViewHandle;
             LONG_BE_ARRAY_VIEW = longBeArrayViewHandle;
             INT_LE_ARRAY_VIEW = intLeArrayViewHandle;
@@ -144,6 +151,14 @@ final class VarHandleFactory {
         try {
             return (VarHandle) FIND_VAR_HANDLE.invokeExact(privateLookup(lookup, declaringClass),
                     declaringClass, name, type);
+        } catch (Throwable e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static VarHandle arrayElementVarHandle(Class<?> arrayClass) {
+        try {
+            return (VarHandle) ARRAY_ELEMENT_VAR_HANDLE.invokeExact(arrayClass);
         } catch (Throwable e) {
             throw new RuntimeException(e);
         }

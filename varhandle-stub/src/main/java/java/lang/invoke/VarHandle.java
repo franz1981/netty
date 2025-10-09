@@ -81,6 +81,9 @@ package java.lang.invoke;
 public class VarHandle {
 
     @MethodHandle.PolymorphicSignature
+    public native Object getOpaque(Object... args);
+
+    @MethodHandle.PolymorphicSignature
     public native Object get(Object... args);
 
     @MethodHandle.PolymorphicSignature

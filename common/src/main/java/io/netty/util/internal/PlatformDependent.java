@@ -264,8 +264,7 @@ public final class PlatformDependent {
     }
 
     private static boolean initializeVarHandle() {
-        if (UNSAFE_UNAVAILABILITY_CAUSE == null || javaVersion() < 9 ||
-                PlatformDependent0.isNativeImage()) {
+        if (javaVersion() < 9 || PlatformDependent0.isNativeImage()) {
             return false;
         }
         boolean varHandleAvailable = false;
@@ -632,6 +631,20 @@ public final class PlatformDependent {
     public static VarHandle findVarHandleOfIntField(MethodHandles.Lookup lookup, Class<?> type, String fieldName) {
         if (VAR_HANDLE) {
             return VarHandleFactory.privateFindVarHandle(lookup, type, fieldName, int.class);
+        }
+        return null;
+    }
+
+    public static VarHandle findVarHandleOfLongField(MethodHandles.Lookup lookup, Class<?> type, String fieldName) {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.privateFindVarHandle(lookup, type, fieldName, long.class);
+        }
+        return null;
+    }
+
+    public static VarHandle findVarHandleOfIntArray() {
+        if (VAR_HANDLE) {
+            return VarHandleFactory.arrayElementVarHandle(int[].class);
         }
         return null;
     }

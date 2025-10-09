@@ -17,7 +17,11 @@ package io.netty.util.concurrent;
 
 import io.netty.util.internal.MathUtil;
 import io.netty.util.internal.ObjectUtil;
+import io.netty.util.internal.PlatformDependent;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.util.Arrays;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -41,7 +45,11 @@ public interface MpscIntQueue {
      * @return The queue instance.
      */
     static MpscIntQueue create(int size, int emptyValue) {
-        return new MpscAtomicIntegerArrayQueue(size, emptyValue);
+        if (PlatformDependent.hasVarHandle()) {
+            return new MpscVarHandleIntQueue(size, emptyValue);
+        } else {
+            return new MpscAtomicIntegerArrayQueue(size, emptyValue);
+        }
     }
 
     /**
@@ -160,7 +168,7 @@ public interface MpscIntQueue {
         @Override
         public int poll() {
             final long cIndex = consumerIndex;
-            final int offset = (int) (cIndex & mask);
+            final int offset = (int) (cIndex & (length() - 1));
             // If we can't see the next available element we can't poll
             int value = get(offset);
             if (emptyValue == value) {
@@ -267,6 +275,191 @@ public interface MpscIntQueue {
                 }
             }
             return size < 0 ? 0 : size > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) size;
+        }
+    }
+
+    /**
+     * VarHandle-based implementation for better performance and explicit memory ordering.
+     */
+    final class MpscVarHandleIntQueue implements MpscIntQueue {
+        private static final VarHandle PRODUCER_INDEX;
+        private static final VarHandle PRODUCER_LIMIT;
+        private static final VarHandle CONSUMER_INDEX;
+        private static final VarHandle ARRAY_HANDLE;
+
+        static {
+            MethodHandles.Lookup lookup = MethodHandles.lookup();
+            PRODUCER_INDEX = PlatformDependent.findVarHandleOfLongField(lookup, MpscVarHandleIntQueue.class,
+                                                                        "producerIndex");
+            PRODUCER_LIMIT = PlatformDependent.findVarHandleOfLongField(lookup, MpscVarHandleIntQueue.class,
+                                                                        "producerLimit");
+            CONSUMER_INDEX = PlatformDependent.findVarHandleOfLongField(lookup, MpscVarHandleIntQueue.class,
+                                                                        "consumerIndex");
+            ARRAY_HANDLE = PlatformDependent.findVarHandleOfIntArray();
+        }
+
+        private final int[] array;
+        private final int mask;
+        private final int emptyValue;
+        private volatile long producerIndex;
+        private volatile long producerLimit;
+        private volatile long consumerIndex;
+
+        public MpscVarHandleIntQueue(int capacity, int emptyValue) {
+            int actualCapacity = MathUtil.safeFindNextPositivePowerOfTwo(capacity);
+            int[] array = new int[actualCapacity];
+            if (emptyValue != 0) {
+                Arrays.fill(array, emptyValue);
+            }
+            this.emptyValue = emptyValue;
+            mask = actualCapacity - 1;
+            this.array = array;
+        }
+
+        private static int getAcquire(int[] array, int index) {
+            return (int) ARRAY_HANDLE.getAcquire(array, index);
+        }
+
+        private static void setRelease(int[] array, int index, int value) {
+            ARRAY_HANDLE.setRelease(array, index, value);
+        }
+
+        private static void setPlain(int[] array, int index, int value) {
+            ARRAY_HANDLE.set(array, index, value);
+        }
+
+        @Override
+        public boolean offer(int value) {
+            if (value == emptyValue) {
+                throw new IllegalArgumentException("Cannot offer the \"empty\" value: " + emptyValue);
+            }
+            final int mask = this.mask;
+            long producerLimit = this.producerLimit;
+            long pIndex;
+            do {
+                pIndex = producerIndex;
+                if (pIndex >= producerLimit) {
+                    final long cIndex = consumerIndex;
+                    producerLimit = cIndex + mask + 1;
+                    if (pIndex >= producerLimit) {
+                        return false;
+                    } else {
+                        PRODUCER_LIMIT.setRelease(this, producerLimit);
+                    }
+                }
+            } while (!PRODUCER_INDEX.compareAndSet(this, pIndex, pIndex + 1));
+            final int offset = (int) (pIndex & mask);
+            setRelease(array, offset, value);
+            return true;
+        }
+
+        @Override
+        public int poll() {
+            final long cIndex = (long) CONSUMER_INDEX.get(this);
+            final int offset = (int) (cIndex & mask);
+            final int emptyValue = this.emptyValue;
+            final int[] array = this.array;
+            int value = getAcquire(array, offset);
+            if (emptyValue == value) {
+                if (cIndex == producerIndex) {
+                    return emptyValue;
+                }
+                value = spinUntilNotEmpty(array, offset, emptyValue);
+            }
+            setPlain(array, offset, emptyValue);
+            CONSUMER_INDEX.setRelease(this, cIndex + 1);
+            return value;
+        }
+
+        private static int spinUntilNotEmpty(int[] array, int offset, int emptyValue) {
+            int value;
+            do {
+                value = getAcquire(array, offset);
+            } while (emptyValue == value);
+            return value;
+        }
+
+        @Override
+        public int drain(int limit, IntConsumer consumer) {
+            Objects.requireNonNull(consumer, "consumer");
+            ObjectUtil.checkPositiveOrZero(limit, "limit");
+            if (limit == 0) {
+                return 0;
+            }
+            final int mask = this.mask;
+            final int[] array = this.array;
+            final int emptyValue = this.emptyValue;
+            final long cIndex = (long) CONSUMER_INDEX.get(this);
+            for (int i = 0; i < limit; i++) {
+                final long index = cIndex + i;
+                final int offset = (int) (index & mask);
+                final int value = getAcquire(array, offset);
+                if (emptyValue == value) {
+                    return i;
+                }
+                setPlain(array, offset, emptyValue);
+                CONSUMER_INDEX.setRelease(this, index + 1);
+                consumer.accept(value);
+            }
+            return limit;
+        }
+
+        @Override
+        public int fill(int limit, IntSupplier supplier) {
+            Objects.requireNonNull(supplier, "supplier");
+            ObjectUtil.checkPositiveOrZero(limit, "limit");
+            if (limit == 0) {
+                return 0;
+            }
+            final int mask = this.mask;
+            final long capacity = mask + 1;
+            long producerLimit = this.producerLimit;
+            long pIndex;
+            int actualLimit;
+            do {
+                pIndex = producerIndex;
+                long available = producerLimit - pIndex;
+                if (available <= 0) {
+                    final long cIndex = consumerIndex;
+                    producerLimit = cIndex + capacity;
+                    available = producerLimit - pIndex;
+                    if (available <= 0) {
+                        return 0;
+                    } else {
+                        PRODUCER_LIMIT.setRelease(this, producerLimit);
+                    }
+                }
+                actualLimit = Math.min((int) available, limit);
+            } while (!PRODUCER_INDEX.compareAndSet(this, pIndex, pIndex + actualLimit));
+            final int[] array = this.array;
+            for (int i = 0; i < actualLimit; i++) {
+                final int offset = (int) ((pIndex + i) & mask);
+                setRelease(array, offset, supplier.getAsInt());
+            }
+            return actualLimit;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            long cIndex = consumerIndex;
+            long pIndex = producerIndex;
+            return cIndex >= pIndex;
+        }
+
+        @Override
+        public int size() {
+            long after = consumerIndex;
+            long size;
+            for (;;) {
+                long before = after;
+                long pIndex = producerIndex;
+                after = consumerIndex;
+                if (before == after) {
+                    size = pIndex - after;
+                    break;
+                }
+            }
+            return size < 0? 0 : size > Integer.MAX_VALUE? Integer.MAX_VALUE : (int) size;
         }
     }
 }
