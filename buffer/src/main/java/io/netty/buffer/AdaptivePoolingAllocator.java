@@ -1190,7 +1190,7 @@ final class AdaptivePoolingAllocator {
                 allocator.chunkRegistry.remove(this);
                 delegate.release();
             } else {
-                updater.resetRefCnt(this);
+                refCnt.resetRefCnt();
                 delegate.setIndex(0, 0);
                 allocatedBytes = 0;
                 if (!mag.trySetNextInLine(this)) {
@@ -1199,7 +1199,7 @@ final class AdaptivePoolingAllocator {
                     if (!mag.offerToQueue(this)) {
                         // The central queue is full. Ensure we release again as we previously did use resetRefCnt()
                         // which did increase the reference count by 1.
-                        boolean released = updater.release(this);
+                        boolean released = refCnt.release();
                         onRelease();
                         allocator.chunkRegistry.remove(this);
                         delegate.release();
