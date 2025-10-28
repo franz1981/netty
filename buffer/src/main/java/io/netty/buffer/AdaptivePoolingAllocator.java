@@ -1761,12 +1761,19 @@ final class AdaptivePoolingAllocator {
         @Override
         public ByteBuf setBytes(int index, ByteBuf src, int srcIndex, int length) {
             checkIndex(index, length);
-            ByteBuffer tmp = internalNioBuffer();
             if (src instanceof AdaptiveByteBuf && PlatformDependent.javaVersion() >= 16) {
                 AdaptiveByteBuf srcBuf = (AdaptiveByteBuf) src;
-                PlatformDependent.absolutePut(tmp, index, srcBuf.internalNioBuffer(), srcIndex, length);
+                // bound check src as well
+                srcBuf.checkIndex(srcIndex, length);
+                AbstractByteBuf dstRoot = rootParent;
+                AbstractByteBuf srcRoot = srcBuf.rootParent;
+                // TODO why we have to pay again for accessibility and bound checks?
+                ByteBuffer dstBuffer = dstRoot.internalNioBuffer(0, dstRoot.maxFastWritableBytes());
+                ByteBuffer srcBuffer = srcRoot.internalNioBuffer(0, srcRoot.maxFastWritableBytes());
+                PlatformDependent.absolutePut(dstBuffer, idx(index), srcBuffer, srcBuf.idx(srcIndex), length);
             } else {
-                tmp.position(index);
+                ByteBuffer tmp = internalNioBuffer();
+                tmp.clear().position(index);
                 tmp.put(src.nioBuffer(srcIndex, length));
             }
             return this;

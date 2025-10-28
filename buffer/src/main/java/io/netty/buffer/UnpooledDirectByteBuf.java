@@ -749,11 +749,15 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
 
     @Override
     public ByteBuffer internalNioBuffer(int index, int length) {
-        checkIndex(index, length);
         if (!allowSectionedInternalNioBufferAccess) {
-            throw new UnsupportedOperationException("Bug: unsafe access to shared internal chunk buffer");
+            // we can only return the internalNioBuffer if the whole buffer is requested
+            if (length != capacity && index != 0) {
+                throw new UnsupportedOperationException("Bug: unsafe access to shared internal chunk buffer");
+            }
+            return internalNioBuffer();
         }
-        return (ByteBuffer) internalNioBuffer().clear().position(index).limit(index + length);
+        checkIndex(index, length);
+        return internalNioBuffer().clear().position(index).limit(index + length);
     }
 
     private ByteBuffer internalNioBuffer() {
