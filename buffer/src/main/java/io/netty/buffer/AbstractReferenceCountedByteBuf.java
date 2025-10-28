@@ -28,7 +28,7 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
     boolean isAccessible() {
         // Try to do non-volatile read for performance as the ensureAccessible() is racy anyway and only provide
         // a best-effort guard.
-        return updater.isLiveNonVolatile(this);
+        return refCnt.isLiveNonVolatile();
     }
 
     /**
@@ -43,7 +43,7 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
      * An unsafe operation intended for use by a subclass that resets the reference count of the buffer to 1
      */
     protected final void resetRefCnt() {
-        updater.resetRefCnt(this);
+        refCnt.resetRefCnt();
     }
 
     @Override
