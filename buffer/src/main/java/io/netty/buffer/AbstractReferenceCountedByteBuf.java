@@ -16,6 +16,8 @@
 
 package io.netty.buffer;
 
+import io.netty.util.internal.RefCnt;
+
 /**
  * Abstract base class for {@link ByteBuf} implementations that count references.
  */
@@ -28,11 +30,12 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
     boolean isAccessible() {
         // Try to do non-volatile read for performance as the ensureAccessible() is racy anyway and only provide
         // a best-effort guard.
-        return refCnt.isLiveNonVolatile();
+        return RefCnt.isLiveNonVolatile(this);
     }
 
     /**
-     * An unsafe operation intended for use by a subclass that sets the reference count of the buffer directly
+     * Expose an unsafe operation intended for use by a subclass or tests in the buffer package
+     * that sets the reference count of the buffer directly.
      */
     @Override
     protected final void setRefCnt(int refCnt) {
@@ -43,7 +46,7 @@ public abstract class AbstractReferenceCountedByteBuf extends AbstractByteBuf {
      * An unsafe operation intended for use by a subclass that resets the reference count of the buffer to 1
      */
     protected final void resetRefCnt() {
-        refCnt.resetRefCnt();
+        RefCnt.resetRefCnt(this);
     }
 
     @Override

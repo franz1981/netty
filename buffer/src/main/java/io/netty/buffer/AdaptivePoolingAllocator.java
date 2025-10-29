@@ -28,6 +28,7 @@ import io.netty.util.concurrent.MpscIntQueue;
 import io.netty.util.internal.ObjectPool;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.RefCnt;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.ThreadExecutorMap;
 import io.netty.util.internal.UnstableApi;
@@ -1190,7 +1191,7 @@ final class AdaptivePoolingAllocator {
                 allocator.chunkRegistry.remove(this);
                 delegate.release();
             } else {
-                refCnt.resetRefCnt();
+                RefCnt.resetRefCnt(this);
                 delegate.setIndex(0, 0);
                 allocatedBytes = 0;
                 if (!mag.trySetNextInLine(this)) {
@@ -1199,7 +1200,7 @@ final class AdaptivePoolingAllocator {
                     if (!mag.offerToQueue(this)) {
                         // The central queue is full. Ensure we release again as we previously did use resetRefCnt()
                         // which did increase the reference count by 1.
-                        boolean released = refCnt.release();
+                        boolean released = RefCnt.release(this);
                         onRelease();
                         allocator.chunkRegistry.remove(this);
                         delegate.release();
