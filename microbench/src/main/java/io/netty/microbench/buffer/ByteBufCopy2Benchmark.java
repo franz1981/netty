@@ -18,10 +18,9 @@ package io.netty.microbench.buffer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.microbench.util.AbstractMicrobenchmark;
-import org.openjdk.jmh.annotations.Benchmark;
-import org.openjdk.jmh.annotations.Param;
-import org.openjdk.jmh.annotations.Setup;
-import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.annotations.*;
+
+import java.util.concurrent.TimeUnit;
 
 public class ByteBufCopy2Benchmark extends AbstractMicrobenchmark {
     static {
@@ -59,6 +58,8 @@ public class ByteBufCopy2Benchmark extends AbstractMicrobenchmark {
     }
 
     @Benchmark
+    @BenchmarkMode(Mode.AverageTime)
+    @OutputTimeUnit(TimeUnit.NANOSECONDS)
     public ByteBuf setBytes() {
         return buffer1.setBytes(0, buffer2, 0, size);
     }
