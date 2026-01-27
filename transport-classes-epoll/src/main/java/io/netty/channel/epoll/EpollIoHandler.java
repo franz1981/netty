@@ -500,7 +500,6 @@ public class EpollIoHandler implements IoHandler {
     // Returns true if a timerFd event was encountered
     private boolean processReady(IoHandlerContext context, EpollEventArray events, int ready) {
         boolean timerFired = false;
-        context.beforeIoTasks();
         for (int i = 0; i < ready; i ++) {
             final int fd = events.fd(i);
             if (fd == eventFd.intValue()) {

@@ -190,7 +190,6 @@ public final class KQueueIoHandler implements IoHandler {
     }
 
     private void processReady(IoHandlerContext context, int ready) {
-        context.beforeIoTasks();
         for (int i = 0; i < ready; ++i) {
             final short filter = eventList.filter(i);
             final short flags = eventList.flags(i);

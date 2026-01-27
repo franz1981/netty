@@ -32,10 +32,6 @@ public interface IoHandlerContext {
      */
     boolean canBlock();
 
-    default void beforeIoTasks() {
-        // no-op
-    }
-
     default void afterIoTask() {
         // no-op
     }
