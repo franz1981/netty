@@ -76,7 +76,6 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
             ManualIoEventLoop.this.afterIoTask();
         }
 
-
         @Override
         public long delayNanos(long currentTimeNanos) {
             assert inEventLoop();
@@ -113,14 +112,12 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
      * This method is intended to be executed prior to any I/O-related batch of operations.
      */
     protected void beforeIoTasks() {
-
     }
 
     /**
      * This method is intended to be executed after any I/O-related operation.
      */
     protected void afterIoTask() {
-
     }
 
     /**
