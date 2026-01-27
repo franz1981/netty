@@ -437,7 +437,7 @@ public final class IoUringIoHandler implements IoHandler {
             completionQueue.process(handler);
             while (!handler.eventFdDrained) {
                 submissionQueue.submitAndGet();
-                processCompletionsAndHandleOverflow(null ,submissionQueue, completionQueue, handler);
+                processCompletionsAndHandleOverflow(null, submissionQueue, completionQueue, handler);
             }
         }
         // We've consumed any pending eventfd read and `eventfdAsyncNotify` should never
