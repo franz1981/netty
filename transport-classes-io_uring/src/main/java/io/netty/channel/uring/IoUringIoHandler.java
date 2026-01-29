@@ -191,6 +191,9 @@ public final class IoUringIoHandler implements IoHandler {
     private int processCompletionsAndHandleOverflow(IoHandlerContext context, SubmissionQueue submissionQueue,
                                                     CompletionQueue completionQueue, CompletionCallback callback) {
         int processed = 0;
+        if (context != null) {
+            context.beforeIoTasks();
+        }
         // Bound the maximum number of times this will loop before we return and so execute some non IO stuff.
         // 128 here is just some sort of bound and another number might be ok as well.
         for (int i = 0; i < 128; i++) {

@@ -67,6 +67,11 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
         }
 
         @Override
+        public void beforeIoTasks() {
+            ManualIoEventLoop.this.beforeIoTasks();
+        }
+
+        @Override
         public void afterIoTask() {
             ManualIoEventLoop.this.afterIoTask();
         }
@@ -101,6 +106,12 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
      */
     protected boolean canBlock() {
         return true;
+    }
+
+    /**
+     * This method is intended to be executed prior to any I/O-related batch of operations.
+     */
+    protected void beforeIoTasks() {
     }
 
     /**
@@ -170,10 +181,6 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
         return ticker;
     }
 
-    protected void manualSafeExecute(Runnable task) {
-        safeExecute(task);
-    }
-
     /**
      * Poll and run tasks from the task queue, until the task queue is empty or the given deadline is exceeded.<br>
      * If {@code timeoutNanos} is less or equals 0, no deadline is applied.
@@ -201,7 +208,7 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
             long lastExecutionTime;
             final Ticker ticker = this.ticker;
             for (;;) {
-                manualSafeExecute(task);
+                safeExecute(task);
 
                 runTasks++;
 
@@ -669,6 +676,11 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
         public boolean canBlock() {
             assert inEventLoop();
             return !hasTasks() && !hasScheduledTasks() && ManualIoEventLoop.this.canBlock();
+        }
+
+        @Override
+        public void beforeIoTasks() {
+            ManualIoEventLoop.this.beforeIoTasks();
         }
 
         @Override

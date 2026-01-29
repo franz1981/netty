@@ -532,6 +532,7 @@ public final class NioIoHandler implements IoHandler {
             return 0;
         }
 
+        context.beforeIoTasks();
         Iterator<SelectionKey> i = selectedKeys.iterator();
         int handled = 0;
         for (;;) {
@@ -564,6 +565,7 @@ public final class NioIoHandler implements IoHandler {
 
     private int processSelectedKeysOptimized(IoHandlerContext context) {
         int handled = 0;
+        context.beforeIoTasks();
         for (int i = 0; i < selectedKeys.size; ++i) {
             final SelectionKey k = selectedKeys.keys[i];
             // null out entry in the array to allow to have it GC'ed once the Channel close
