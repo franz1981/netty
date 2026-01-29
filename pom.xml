@@ -1301,18 +1301,6 @@
                 </item>
                 <item>
                   <ignore>true</ignore>
-                  <code>java.class.externalClassExposedInAPI</code>
-                  <new>class java.lang.invoke.MethodHandle</new>
-                  <justification>Stub class from netty-varhandle-stub for Java 8 compatibility.</justification>
-                </item>
-                <item>
-                  <ignore>true</ignore>
-                  <code>java.class.externalClassExposedInAPI</code>
-                  <new>class java.lang.invoke.VarHandle</new>
-                  <justification>Stub class from netty-varhandle-stub for Java 8 compatibility.</justification>
-                </item>
-                <item>
-                  <ignore>true</ignore>
                   <code>java.missing.oldClass</code> <!-- Missing in prior Netty versions -->
                   <old>missing-class org.slf4j.Logger</old>
                   <new>missing-class org.slf4j.Logger</new>
