@@ -67,17 +67,6 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
         }
 
         @Override
-        public void beforeIoTasks() {
-            ManualIoEventLoop.this.beforeIoTasks();
-        }
-
-        @Override
-        public void afterIoTask() {
-            ManualIoEventLoop.this.afterIoTask();
-        }
-
-
-        @Override
         public long delayNanos(long currentTimeNanos) {
             assert inEventLoop();
             return 0;
@@ -107,20 +96,6 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
      */
     protected boolean canBlock() {
         return true;
-    }
-
-    /**
-     * This method is intended to be executed prior to any I/O-related batch of operations.
-     */
-    protected void beforeIoTasks() {
-
-    }
-
-    /**
-     * This method is intended to be executed after any I/O-related operation.
-     */
-    protected void afterIoTask() {
-
     }
 
     /**
@@ -679,16 +654,6 @@ public class ManualIoEventLoop extends AbstractScheduledEventExecutor implements
         public boolean canBlock() {
             assert inEventLoop();
             return !hasTasks() && !hasScheduledTasks() && ManualIoEventLoop.this.canBlock();
-        }
-
-        @Override
-        public void beforeIoTasks() {
-            ManualIoEventLoop.this.beforeIoTasks();
-        }
-
-        @Override
-        public void afterIoTask() {
-            ManualIoEventLoop.this.afterIoTask();
         }
 
         @Override
