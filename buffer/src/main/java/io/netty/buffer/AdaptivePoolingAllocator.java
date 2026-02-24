@@ -450,6 +450,8 @@ final class AdaptivePoolingAllocator {
                         expanded[i] = new Magazine(this, true, chunkManagementStrategy.createController(this));
                     }
                     magazines = expanded;
+                    System.out.println("[AdaptivePoolingAllocator] Magazine expansion: " +
+                            currentLength + " -> " + expanded.length);
                 } finally {
                     magazineExpandLock.unlockWrite(writeLock);
                 }

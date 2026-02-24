@@ -71,6 +71,9 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     @Param({ "0", "200000" })
     public int pollutionIterations;
 
+    @Param({ "8192" })
+    public int maxLiveBuffers;
+
     private ByteBufAllocator allocator;
 
     @State(Scope.Thread)
@@ -85,7 +88,8 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
         @Setup
         public void setup(ByteBufAllocatorAllocPatternBenchmark benchmark) {
             this.allocator = benchmark.allocator;
-            releaseIndexes = new int[MAX_LIVE_BUFFERS];
+            int liveBuffers = MathUtil.findNextPositivePowerOfTwo(benchmark.maxLiveBuffers);
+            releaseIndexes = new int[liveBuffers];
             sizes = new int[MathUtil.findNextPositivePowerOfTwo(FLATTEND_SIZE_ARRAY.length)];
             SplittableRandom rand = new SplittableRandom(SEED);
             // Pre-generate the to be released index.
@@ -99,7 +103,7 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
             }
             nextReleaseIndex = 0;
             nextSizeIndex = 0;
-            buffers = new ByteBuf[MAX_LIVE_BUFFERS];
+            buffers = new ByteBuf[liveBuffers];
         }
 
         private int getNextReleaseIndex() {
@@ -223,8 +227,6 @@ public class ByteBufAllocatorAllocPatternBenchmark extends AbstractMicrobenchmar
     private static final int SEED = 42;
     // Allocation size array.
     private static final int[] FLATTEND_SIZE_ARRAY;
-
-    private static final int MAX_LIVE_BUFFERS = 8192;
 
     // Use event-loop threads.
     public ByteBufAllocatorAllocPatternBenchmark() {
