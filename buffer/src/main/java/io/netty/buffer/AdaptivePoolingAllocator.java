@@ -102,7 +102,7 @@ final class AdaptivePoolingAllocator {
      */
     static final int MIN_CHUNK_SIZE = 128 * 1024;
     private static final int EXPANSION_ATTEMPTS = 3;
-    private static final int INITIAL_MAGAZINES = 1;
+    private static final int INITIAL_MAGAZINES = 16;
     private static final int RETIRE_CAPACITY = 256;
     private static final int MAX_STRIPES = IS_LOW_MEM ? 1 : NettyRuntime.availableProcessors() * 2;
     private static final int BUFS_PER_CHUNK = 8; // For large buffers, aim to have about this many buffers per chunk.
@@ -523,33 +523,53 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class ConcurrentQueueChunkCache implements ChunkCache {
-        private final Queue<SizeClassedChunk> queue;
+        private final Queue<SizeClassedChunk> reusableChunks;
+        private final Queue<SizeClassedChunk> emptyChunks;
 
         private ConcurrentQueueChunkCache() {
-            queue = createSharedChunkQueue();
+            reusableChunks = createSharedChunkQueue();
+            emptyChunks = createSharedChunkQueue();
         }
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
-            // we really don't care about size here since the sized class chunk q
-            // just care about segments of fixed size!
-            Queue<SizeClassedChunk> queue = this.queue;
+            SizeClassedChunk chunkWithSpareCapacity = reusableChunks.poll();
+            if (chunkWithSpareCapacity != null) {
+                return chunkWithSpareCapacity;
+            }
+            // slow path, but trying to help the others
+            Queue<SizeClassedChunk> emptyChunks = this.emptyChunks;
+            SizeClassedChunk notEmptyChunk = null;
+            int reusableChunksMaxPerPoll = CHUNK_REUSE_QUEUE / 4;
             for (int i = 0; i < CHUNK_REUSE_QUEUE; i++) {
-                SizeClassedChunk chunk = queue.poll();
+                SizeClassedChunk chunk = emptyChunks.poll();
                 if (chunk == null) {
-                    return null;
+                    return notEmptyChunk;
                 }
                 if (chunk.hasRemainingCapacity()) {
-                    return chunk;
+                    if (notEmptyChunk == null) {
+                        notEmptyChunk = chunk;
+                    } else {
+                        reusableChunks.offer(chunk);
+                        reusableChunksMaxPerPoll--;
+                        if (reusableChunksMaxPerPoll <= 0) {
+                            return notEmptyChunk;
+                        }
+                    }
+                } else {
+                    emptyChunks.offer(chunk);
                 }
-                queue.offer(chunk);
             }
-            return null;
+            return notEmptyChunk;
         }
 
         @Override
         public boolean offerChunk(Chunk chunk) {
-            return queue.offer((SizeClassedChunk) chunk);
+            SizeClassedChunk sizeClassedChunk = (SizeClassedChunk) chunk;
+            if (sizeClassedChunk.hasRemainingCapacity()) {
+                return reusableChunks.offer(sizeClassedChunk);
+            }
+            return emptyChunks.offer(sizeClassedChunk);
         }
     }
 
