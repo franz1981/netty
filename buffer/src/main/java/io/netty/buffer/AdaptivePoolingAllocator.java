@@ -899,7 +899,9 @@ final class AdaptivePoolingAllocator {
         Chunk pollChunk() {
             long budget = purgeBudget.get();
             if (budget > 0) {
-                // Fast path: attempt to decrement the budget; under contention we may miss, which is fine.
+                // Fast path: attempt to decrement the budget.  If the CAS misses under contention,
+                // this call simply skips the decrement — by design, threads are allowed to miss
+                // the trigger opportunity to stay on the fast path (see requirement 4).
                 purgeBudget.compareAndSet(budget, budget - 1);
                 return queue.poll();
             }
@@ -933,7 +935,7 @@ final class AdaptivePoolingAllocator {
         private Chunk runPurgeScan() {
             Chunk selected = null;
             // Use a thread-local ArrayDeque to avoid allocating on every scan; a single scan is single-threaded.
-            ArrayDeque<Chunk> deferred = new ArrayDeque<Chunk>();
+            ArrayDeque<Chunk> deferred = new ArrayDeque<>();
             try {
                 Chunk chunk;
                 while ((chunk = queue.poll()) != null) {

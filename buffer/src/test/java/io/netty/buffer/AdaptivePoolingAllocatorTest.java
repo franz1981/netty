@@ -103,7 +103,7 @@ class AdaptivePoolingAllocatorTest implements Supplier<String> {
         int minChunkSize = 128 * 1024;
         int bufSize = 8 * 1024;
         int buffersPerChunk = minChunkSize / bufSize; // 16
-        List<ByteBuf> bufs1 = new ArrayList<ByteBuf>();
+        List<ByteBuf> bufs1 = new ArrayList<>();
         for (int j = 0; j < buffersPerChunk * 2; j++) {
             bufs1.add(allocator.heapBuffer(bufSize));
         }
