@@ -47,9 +47,9 @@ import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
@@ -77,9 +77,8 @@ import java.util.function.IntConsumer;
  * This allows the allocator to quickly respond to changes in the application workload,
  * without suffering undue overhead from maintaining its statistics.
  * <p>
- * Since magazines are "relatively thread-local", the allocator has a central queue that allow excess chunks from any
- * magazine, to be shared with other magazines.
- * The {@link #createSharedChunkQueue()} method can be overridden to customize this queue.
+ * Since magazines are "relatively thread-local", the allocator has a chunk cache that allows excess chunks from any
+ * magazine to be shared with other magazines.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -124,6 +123,15 @@ final class AdaptivePoolingAllocator {
      */
     private static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
+
+    static final long CHUNK_PURGE_POLLS_THREAD_LOCAL = SystemPropertyUtil.getLong(
+            "io.netty.allocator.chunkPurgePollsThreadLocal", 16L);
+
+    static final long CHUNK_PURGE_POLLS_SHARED = SystemPropertyUtil.getLong(
+            "io.netty.allocator.chunkPurgePollsShared", 128L);
+
+    static final int CHUNK_PURGE_THRESHOLD = SystemPropertyUtil.getInt(
+            "io.netty.allocator.chunkPurgeThreshold", 3);
 
     /**
      * The capacity if the magazine local buffer queue. This queue just pools the outer ByteBuf instance and not
@@ -225,30 +233,6 @@ final class AdaptivePoolingAllocator {
                     new SizeClassChunkManagementStrategy(segmentSize), isThreadLocal);
         }
         return groups;
-    }
-
-    /**
-     * Create a thread-safe multi-producer, multi-consumer queue to hold chunks that spill over from the
-     * internal Magazines.
-     * <p>
-     * Each Magazine can only hold two chunks at any one time: the chunk it currently allocates from,
-     * and the next-in-line chunk which will be used for allocation once the current one has been used up.
-     * This queue will be used by magazines to share any excess chunks they allocate, so that they don't need to
-     * allocate new chunks when their current and next-in-line chunks have both been used up.
-     * <p>
-     * The simplest implementation of this method is to return a new {@link ConcurrentLinkedQueue}.
-     * However, the {@code CLQ} is unbounded, and this means there's no limit to how many chunks can be cached in this
-     * queue.
-     * <p>
-     * Each chunk in this queue can be up to {@link #MAX_CHUNK_SIZE} in size, so it is recommended to use a bounded
-     * queue to limit the maximum memory usage.
-     * <p>
-     * The default implementation will create a bounded queue with a capacity of {@link #CHUNK_REUSE_QUEUE}.
-     *
-     * @return A new multi-producer, multi-consumer queue.
-     */
-    private static Queue<SizeClassedChunk> createSharedChunkQueue() {
-        return PlatformDependent.newFixedMpmcQueue(CHUNK_REUSE_QUEUE);
     }
 
     ByteBuf allocate(int size, int maxCapacity) {
@@ -522,29 +506,217 @@ final class AdaptivePoolingAllocator {
         boolean offerChunk(Chunk chunk);
     }
 
-    private static final class ConcurrentQueueChunkCache implements ChunkCache {
-        private final Queue<SizeClassedChunk> queue;
+    // Cached chunks are detached from magazines: no readInitInto can happen, so segment count
+    // can only grow (external releaseSegment returns) and never shrink. Once a chunk reaches
+    // full capacity (remainingCapacity == capacity), it stays fully free while in the cache.
+    private abstract static class SizeClassedChunkCache implements ChunkCache {
+        static SizeClassedChunkCache create(boolean isThreadLocal) {
+            return isThreadLocal ? new ThreadLocalSizeClassedChunkCache() : new SharedSizeClassedChunkCache();
+        }
+    }
 
-        private ConcurrentQueueChunkCache() {
-            queue = createSharedChunkQueue();
+    private static final class ThreadLocalSizeClassedChunkCache extends SizeClassedChunkCache {
+        private SizeClassedChunk[] chunks;
+        private int scanIdx;
+        private int capacityEnd;
+        private int size;
+        private long purgeBudget;
+
+        ThreadLocalSizeClassedChunkCache() {
+            chunks = new SizeClassedChunk[8];
+            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
         }
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
-            // we really don't care about size here since the sized class chunk q
-            // just care about segments of fixed size!
-            Queue<SizeClassedChunk> queue = this.queue;
-            for (int i = 0; i < CHUNK_REUSE_QUEUE; i++) {
-                SizeClassedChunk chunk = queue.poll();
-                if (chunk == null) {
+            if (--purgeBudget == 0) {
+                return runPurgeScan();
+            }
+            return scanForCapacity();
+        }
+
+        private SizeClassedChunk scanForCapacity() {
+            if (scanIdx < capacityEnd) {
+                SizeClassedChunk chunk = chunks[scanIdx];
+                assert chunk.hasRemainingCapacity();
+                chunks[scanIdx] = null;
+                scanIdx++;
+                return chunk;
+            }
+            for (int i = capacityEnd; i < size; i++) {
+                SizeClassedChunk chunk = chunks[i];
+                if (chunk != null && chunk.hasRemainingCapacity()) {
+                    int last = --size;
+                    chunks[i] = chunks[last];
+                    chunks[last] = null;
+                    return chunk;
+                }
+            }
+            return null;
+        }
+
+        private SizeClassedChunk runPurgeScan() {
+            SizeClassedChunk selected = null;
+            int capacityIdx = 0;
+            int noCapacityIdx = size;
+            for (int i = scanIdx; i < size; i++) {
+                SizeClassedChunk chunk = chunks[i];
+                int remaining = chunk.remainingCapacity();
+                if (remaining == chunk.capacity()) {
+                    chunk.purgeEpoch++;
+                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
+                        chunk.markToDeallocate();
+                        continue;
+                    }
+                } else {
+                    chunk.purgeEpoch = 0;
+                }
+                if (selected == null && remaining > 0) {
+                    selected = chunk;
+                    selected.purgeEpoch = 0;
+                    continue;
+                }
+                if (remaining > 0) {
+                    chunks[capacityIdx++] = chunk;
+                } else {
+                    chunks[--noCapacityIdx] = chunk;
+                }
+            }
+            int noCapacityCount = size - noCapacityIdx;
+            System.arraycopy(chunks, noCapacityIdx, chunks, capacityIdx, noCapacityCount);
+            int newSize = capacityIdx + noCapacityCount;
+            Arrays.fill(chunks, newSize, size, null);
+            size = newSize;
+            capacityEnd = capacityIdx;
+            scanIdx = 0;
+            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
+            return selected;
+        }
+
+        @Override
+        public boolean offerChunk(Chunk chunk) {
+            if (size == chunks.length) {
+                if (scanIdx > 0) {
+                    int live = size - scanIdx;
+                    System.arraycopy(chunks, scanIdx, chunks, 0, live);
+                    Arrays.fill(chunks, live, size, null);
+                    capacityEnd = Math.max(0, capacityEnd - scanIdx);
+                    size = live;
+                    scanIdx = 0;
+                } else {
+                    chunks = Arrays.copyOf(chunks, chunks.length * 2);
+                }
+            }
+            chunks[size++] = (SizeClassedChunk) chunk;
+            return true;
+        }
+    }
+
+    private static final class SharedSizeClassedChunkCache extends SizeClassedChunkCache {
+        private static final int SHARED_CACHE_CAPACITY = (int) CHUNK_PURGE_POLLS_SHARED;
+        private final Queue<SizeClassedChunk> queue;
+        private final AtomicLong purgeBudget;
+        private SizeClassedChunk[] noCapacityBuffer;
+        private long purgeGeneration;
+        private final AtomicLong scanGeneration = new AtomicLong();
+
+        SharedSizeClassedChunkCache() {
+            queue = PlatformDependent.newFixedMpmcQueue(SHARED_CACHE_CAPACITY);
+            purgeBudget = new AtomicLong(CHUNK_PURGE_POLLS_SHARED);
+            noCapacityBuffer = new SizeClassedChunk[8];
+        }
+
+        @Override
+        public SizeClassedChunk pollChunk(int size) {
+            long budget = purgeBudget.decrementAndGet();
+            if (budget == 0) {
+                return runPurgeScan();
+            }
+            return scanForCapacity();
+        }
+
+        private SizeClassedChunk scanForCapacity() {
+            SizeClassedChunk first = queue.poll();
+            if (first == null) {
+                return null;
+            }
+            if (first.hasRemainingCapacity()) {
+                return first;
+            }
+            long generation = scanGeneration.incrementAndGet();
+            first.lastScanGeneration = generation;
+            if (!queue.offer(first)) {
+                first.markToDeallocate();
+                return null;
+            }
+            SizeClassedChunk chunk;
+            while ((chunk = queue.poll()) != null) {
+                if (chunk.lastScanGeneration == generation) {
+                    if (!queue.offer(chunk)) {
+                        chunk.markToDeallocate();
+                    }
                     return null;
                 }
                 if (chunk.hasRemainingCapacity()) {
                     return chunk;
                 }
-                queue.offer(chunk);
+                if (!queue.offer(chunk)) {
+                    chunk.markToDeallocate();
+                }
             }
             return null;
+        }
+
+        private SizeClassedChunk runPurgeScan() {
+            long generation = ++purgeGeneration;
+            SizeClassedChunk selected = null;
+            int count = 0;
+            SizeClassedChunk[] buf = noCapacityBuffer;
+            SizeClassedChunk chunk;
+            while ((chunk = queue.poll()) != null) {
+                if (chunk.lastPurgeGeneration == generation) {
+                    if (!queue.offer(chunk)) {
+                        chunk.markToDeallocate();
+                    }
+                    break;
+                }
+                int remaining = chunk.remainingCapacity();
+                if (remaining == chunk.capacity()) {
+                    chunk.purgeEpoch++;
+                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
+                        chunk.markToDeallocate();
+                        continue;
+                    }
+                } else {
+                    chunk.purgeEpoch = 0;
+                }
+                if (remaining > 0) {
+                    if (selected == null) {
+                        selected = chunk;
+                        selected.purgeEpoch = 0;
+                    } else {
+                        chunk.lastPurgeGeneration = generation;
+                        if (!queue.offer(chunk)) {
+                            chunk.markToDeallocate();
+                        }
+                    }
+                } else {
+                    if (count == buf.length) {
+                        buf = Arrays.copyOf(buf, buf.length * 2);
+                        noCapacityBuffer = buf;
+                    }
+                    buf[count++] = chunk;
+                }
+            }
+            for (int i = 0; i < count; i++) {
+                buf[i].lastPurgeGeneration = generation;
+                if (!queue.offer(buf[i])) {
+                    buf[i].markToDeallocate();
+                }
+                buf[i] = null;
+            }
+            purgeBudget.lazySet(CHUNK_PURGE_POLLS_SHARED);
+            return selected;
         }
 
         @Override
@@ -679,7 +851,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public ChunkCache createChunkCache(boolean isThreadLocal) {
-            return new ConcurrentQueueChunkCache();
+            return SizeClassedChunkCache.create(isThreadLocal);
         }
     }
 
@@ -1285,6 +1457,9 @@ final class AdaptivePoolingAllocator {
         private final MpscIntQueue externalFreeList;
         private final IntStack localFreeList;
         private Thread ownerThread;
+        int purgeEpoch;
+        long lastPurgeGeneration;
+        long lastScanGeneration;
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine,
                          SizeClassChunkController controller) {
