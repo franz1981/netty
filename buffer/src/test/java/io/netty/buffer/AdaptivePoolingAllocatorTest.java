@@ -75,8 +75,6 @@ class AdaptivePoolingAllocatorTest implements Supplier<String> {
                 "Default polls-per-purge should be 1024");
         assertEquals(3, AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_PURGE_THRESHOLD,
                 "Default purge epoch threshold should be 3");
-        assertTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_CAPACITY >= 8,
-                "Queue capacity should be at least 8");
     }
 
     /**
