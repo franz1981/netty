@@ -18,9 +18,12 @@ package io.netty.buffer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AdaptivePoolingAllocatorTest implements Supplier<String> {
     private int i;
@@ -61,5 +64,80 @@ class AdaptivePoolingAllocatorTest implements Supplier<String> {
         for (; i <= maxSizeIncluded; i++) {
             assertEquals(expectedSizeBucket, AdaptivePoolingAllocator.sizeBucket(i), this);
         }
+    }
+
+    /**
+     * Verify the default values for the purge-strategy configuration properties.
+     */
+    @Test
+    void purgeConfigDefaults() {
+        assertEquals(1024L, AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_POLLS_PER_PURGE,
+                "Default polls-per-purge should be 1024");
+        assertEquals(3, AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_PURGE_THRESHOLD,
+                "Default purge epoch threshold should be 3");
+    }
+
+    /**
+     * Verifies that fully-free chunks in the shared cache are pruned after surviving
+     * {@link AdaptivePoolingAllocator#CHUNK_REUSE_QUEUE_PURGE_THRESHOLD} + 1 consecutive purge-scan cycles
+     * without being used.
+     * <p>
+     * The test uses the package-private {@code setPurgeBudgetForTesting()} helper to trigger scans
+     * at will, rather than waiting for the production cadence of 1024 polls.
+     */
+    @Test
+    void purgeScanShouldRemoveFullyFreeChunksAfterThreshold() {
+        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false);
+        AdaptivePoolingAllocator heapAlloc = allocator.heapAllocator();
+
+        // Allocate enough buffers to fill two full chunks so that, on release,
+        // at least one recycled chunk ends up in the shared cache queue (the second
+        // one cannot fit in magazine.nextInLine once the first one already occupies it).
+        //
+        // MIN_CHUNK_SIZE = 128 KiB, buffer size = 8 KiB  → 16 buffers per chunk.
+        // Round 1 (bufs1, 32 buffers, 2 chunks A + B):
+        //   - chunk A fills nextInLine on recycle
+        //   - chunk B ends up in the shared cache queue
+        int minChunkSize = 128 * 1024;
+        int bufSize = 8 * 1024;
+        int buffersPerChunk = minChunkSize / bufSize; // 16
+        List<ByteBuf> bufs1 = new ArrayList<>();
+        for (int j = 0; j < buffersPerChunk * 2; j++) {
+            bufs1.add(allocator.heapBuffer(bufSize));
+        }
+        for (ByteBuf b : bufs1) {
+            b.release();
+        }
+        bufs1.clear();
+
+        // After releasing, at least one chunk should be cached.
+        int cachedBefore = heapAlloc.cachedChunkCount();
+        assertTrue(cachedBefore > 0, "Expected at least one chunk in the cache after allocate/release. " +
+                "cachedBefore=" + cachedBefore);
+
+        long memBefore = allocator.usedHeapMemory();
+
+        // Trigger PURGE_EPOCH_THRESHOLD + 1 purge scans.
+        // Each scan increments purgeEpoch for fully-free chunks; once purgeEpoch > threshold, the chunk
+        // is deallocated.  We need threshold+1 scans for the first pruning to happen.
+        int scansNeeded = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_PURGE_THRESHOLD + 1;
+        for (int scan = 0; scan < scansNeeded; scan++) {
+            // Force the next pollChunk() to trigger a purge scan
+            heapAlloc.setPurgeBudgetForTesting(0L);
+            // Allocate then immediately release a buffer; this drives a pollChunk() call which
+            // will discover budget==0 and run the purge scan.  The buffer allocation itself may use
+            // a chunk already in magazine.nextInLine, but the poll will still happen for the queue.
+            // To ensure pollChunk() is actually called, we run enough allocations to exhaust
+            // any magazine-local chunks.
+            for (int j = 0; j < buffersPerChunk + 1; j++) {
+                ByteBuf tmp = allocator.heapBuffer(bufSize);
+                tmp.release();
+            }
+        }
+
+        long memAfter = allocator.usedHeapMemory();
+        assertTrue(memAfter < memBefore,
+                "Memory should decrease after " + scansNeeded + " purge scan(s). " +
+                "Before=" + memBefore + ", After=" + memAfter);
     }
 }
