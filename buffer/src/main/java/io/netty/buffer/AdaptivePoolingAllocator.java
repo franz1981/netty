@@ -39,10 +39,10 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
@@ -100,20 +100,52 @@ final class AdaptivePoolingAllocator {
             BUFS_PER_CHUNK * (1 << AllocationStatistics.HISTO_MAX_BUCKET_SHIFT); // 10 MiB.
 
     /**
-     * The capacity if the central queue that allow chunks to be shared across magazines.
-     * The default size is {@link NettyRuntime#availableProcessors()},
-     * and the maximum number of magazines is twice this.
+     * The capacity of the size-class concurrent chunk cache that allows chunks to be shared across magazines.
      * <p>
-     * This means the maximum amount of memory that we can have allocated-but-not-in-use is
-     * 5 * {@link NettyRuntime#availableProcessors()} * {@link #MAX_CHUNK_SIZE} bytes.
+     * The default is sized to accommodate up to four chunks per CPU, providing enough headroom for the pruning
+     * strategy to age chunks across multiple scan cycles before deallocating them.
+     * <p>
+     * For backward compatibility, the legacy {@code io.netty.allocator.centralQueueCapacity} property is also
+     * checked first when the new property is not set.
      */
-    private static final int CENTRAL_QUEUE_CAPACITY = SystemPropertyUtil.getInt(
-            "io.netty.allocator.centralQueueCapacity", NettyRuntime.availableProcessors());
+    static final int CHUNK_REUSE_QUEUE_CAPACITY;
+
+    static {
+        // Check legacy property for backward compatibility
+        int legacyCapacity = SystemPropertyUtil.getInt("io.netty.allocator.centralQueueCapacity", -1);
+        CHUNK_REUSE_QUEUE_CAPACITY = legacyCapacity >= 0 ? legacyCapacity :
+                SystemPropertyUtil.getInt(
+                        "io.netty.allocator.chunkReuseQueueCapacity",
+                        Math.max(NettyRuntime.availableProcessors() * 4, 8));
+    }
+
+    /**
+     * The number of {@link ConcurrentQueueChunkCache#pollChunk()} calls between consecutive purge-scan cycles.
+     * A purge scan walks the entire chunk cache, ages fully-free chunks, and deallocates those that have
+     * survived more than {@link #CHUNK_REUSE_QUEUE_PURGE_THRESHOLD} consecutive scans while staying fully free.
+     * <p>
+     * Higher values reduce the overhead of scanning but delay reclamation of idle chunks.
+     * Default: 1024.
+     */
+    static final long CHUNK_REUSE_QUEUE_POLLS_PER_PURGE = SystemPropertyUtil.getLong(
+            "io.netty.allocator.chunkReuseQueuePollsPerPurge", 1024L);
+
+    /**
+     * The number of consecutive purge-scan cycles a fully-free chunk must survive before being deallocated.
+     * A chunk is "fully free" when all buffers allocated from it have been released, i.e.
+     * {@code remainingCapacity() == capacity()}.  Chunks that are partially in use have their counter reset to zero.
+     * <p>
+     * Higher values give chunks more time to be reused before reclamation, reducing re-allocation churn at the
+     * cost of longer idle memory retention.
+     * Default: 3.
+     */
+    static final int CHUNK_REUSE_QUEUE_PURGE_THRESHOLD = SystemPropertyUtil.getInt(
+            "io.netty.allocator.chunkReuseQueuePurgeThreshold", 3);
 
     private static final Object NO_MAGAZINE = Boolean.TRUE;
 
     private final ChunkAllocator chunkAllocator;
-    private final Queue<Chunk> centralQueue;
+    private final ConcurrentQueueChunkCache chunkCache;
     private final StampedLock magazineExpandLock;
     private volatile Magazine[] magazines;
     private final FastThreadLocal<Object> threadLocalMagazine;
@@ -124,7 +156,8 @@ final class AdaptivePoolingAllocator {
         ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         ObjectUtil.checkNotNull(magazineCaching, "magazineCaching");
         this.chunkAllocator = chunkAllocator;
-        centralQueue = ObjectUtil.checkNotNull(createSharedChunkQueue(), "centralQueue");
+        chunkCache = new ConcurrentQueueChunkCache(
+                CHUNK_REUSE_QUEUE_CAPACITY, CHUNK_REUSE_QUEUE_POLLS_PER_PURGE, CHUNK_REUSE_QUEUE_PURGE_THRESHOLD);
         magazineExpandLock = new StampedLock();
         if (magazineCaching != MagazineCaching.None) {
             assert magazineCaching == MagazineCaching.EventLoopThreads ||
@@ -167,29 +200,6 @@ final class AdaptivePoolingAllocator {
         magazines = mags;
     }
 
-    /**
-     * Create a thread-safe multi-producer, multi-consumer queue to hold chunks that spill over from the
-     * internal Magazines.
-     * <p>
-     * Each Magazine can only hold two chunks at any one time: the chunk it currently allocates from,
-     * and the next-in-line chunk which will be used for allocation once the current one has been used up.
-     * This queue will be used by magazines to share any excess chunks they allocate, so that they don't need to
-     * allocate new chunks when their current and next-in-line chunks have both been used up.
-     * <p>
-     * The simplest implementation of this method is to return a new {@link ConcurrentLinkedQueue}.
-     * However, the {@code CLQ} is unbounded, and this means there's no limit to how many chunks can be cached in this
-     * queue.
-     * <p>
-     * Each chunk in this queue can be up to {@link #MAX_CHUNK_SIZE} in size, so it is recommended to use a bounded
-     * queue to limit the maximum memory usage.
-     * <p>
-     * The default implementation will create a bounded queue with a capacity of {@link #CENTRAL_QUEUE_CAPACITY}.
-     *
-     * @return A new multi-producer, multi-consumer queue.
-     */
-    private static Queue<Chunk> createSharedChunkQueue() {
-        return PlatformDependent.newFixedMpmcQueue(CENTRAL_QUEUE_CAPACITY);
-    }
 
     ByteBuf allocate(int size, int maxCapacity) {
         if (size <= MAX_CHUNK_SIZE) {
@@ -266,7 +276,7 @@ final class AdaptivePoolingAllocator {
 
     long usedMemory() {
         long sum = 0;
-        for (Chunk chunk : centralQueue) {
+        for (Chunk chunk : chunkCache.queue) {
             sum += chunk.capacity();
         }
         for (Magazine magazine : magazines) {
@@ -314,7 +324,7 @@ final class AdaptivePoolingAllocator {
         if (freed) {
             return false;
         }
-        return centralQueue.offer(buffer);
+        return chunkCache.offerChunk(buffer);
     }
 
     // Ensure that we release all previous pooled resources when this object is finalized. This is needed as otherwise
@@ -341,7 +351,7 @@ final class AdaptivePoolingAllocator {
             magazineExpandLock.unlockWrite(stamp);
         }
         for (;;) {
-            Chunk chunk = centralQueue.poll();
+            Chunk chunk = chunkCache.queue.poll();
             if (chunk == null) {
                 break;
             }
@@ -351,6 +361,26 @@ final class AdaptivePoolingAllocator {
 
     static int sizeBucket(int size) {
         return AllocationStatistics.sizeBucket(size);
+    }
+
+    /**
+     * Package-private for testing: directly sets the purge budget on the shared chunk cache.
+     * Setting it to {@code 0} causes the next {@link ConcurrentQueueChunkCache#pollChunk()} call to
+     * trigger a purge scan.
+     */
+    void setPurgeBudgetForTesting(long budget) {
+        chunkCache.purgeBudget.set(budget);
+    }
+
+    /**
+     * Package-private for testing: returns the number of chunks currently held in the shared chunk cache queue.
+     */
+    int cachedChunkCount() {
+        int count = 0;
+        for (Chunk ignored : chunkCache.queue) {
+            count++;
+        }
+        return count;
     }
 
     @SuppressWarnings("checkstyle:finalclass") // Checkstyle mistakenly believes this class should be final.
@@ -542,7 +572,7 @@ final class AdaptivePoolingAllocator {
                     return false;
                 }
             } else {
-                curr = parent.centralQueue.poll();
+                curr = parent.chunkCache.pollChunk();
                 if (curr == null) {
                     curr = newChunkAllocation(size);
                 }
@@ -647,6 +677,14 @@ final class AdaptivePoolingAllocator {
         private final int capacity;
         private final boolean pooled;
         private int allocatedBytes;
+        /**
+         * Number of consecutive purge-scan cycles during which this chunk was fully free
+         * (i.e. {@code remainingCapacity() == capacity()}).
+         * <p>
+         * Only accessed by the thread that wins the purge scan, while the chunk is temporarily dequeued,
+         * so no synchronization is required.
+         */
+        int purgeEpoch;
         private static final long REFCNT_FIELD_OFFSET =
                 ReferenceCountUpdater.getUnsafeOffset(Chunk.class, "refCnt");
         private static final AtomicIntegerFieldUpdater<Chunk> AIF_UPDATER =
@@ -742,9 +780,10 @@ final class AdaptivePoolingAllocator {
                 updater.resetRefCnt(this);
                 delegate.setIndex(0, 0);
                 allocatedBytes = 0;
+                purgeEpoch = 0; // Reset epoch so the recycled chunk is not immediately pruned
                 if (!mag.trySetNextInLine(this)) {
                     if (!parent.offerToQueue(this)) {
-                        // The central queue is full. Ensure we release again as we previously did use resetRefCnt()
+                        // The chunk cache is full. Ensure we release again as we previously did use resetRefCnt()
                         // which did increase the reference count by 1.
                         boolean released = updater.release(this);
                         delegate.release();
@@ -752,6 +791,17 @@ final class AdaptivePoolingAllocator {
                     }
                 }
             }
+        }
+
+        /**
+         * Immediately release the underlying memory without re-pooling.
+         * <p>
+         * This method is only safe to call when the chunk has been removed from all caches and is confirmed
+         * fully free ({@code remainingCapacity() == capacity()}), meaning no user buffers reference it.
+         */
+        void markToDeallocate() {
+            magazine.usedMemory.getAndAdd(-capacity());
+            delegate.release();
         }
 
         public void readInitInto(AdaptiveByteBuf buf, int size, int maxCapacity) {
@@ -777,6 +827,151 @@ final class AdaptivePoolingAllocator {
 
         public int capacity() {
             return capacity;
+        }
+    }
+
+    /**
+     * A thread-safe cache for size-class {@link Chunk}s that allows chunks to be shared across magazines.
+     * <p>
+     * In addition to the standard poll/offer operations, this cache periodically runs a <em>purge scan</em>
+     * that ages fully-free chunks (those where {@code remainingCapacity() == capacity()}) and deallocates
+     * any chunk whose "fully-free survival counter" ({@link Chunk#purgeEpoch}) exceeds the configured
+     * {@link #purgeEpochThreshold}.
+     * <p>
+     * A purge scan is triggered every {@link #pollsPerPurge} {@link #pollChunk()} calls.  Only one thread
+     * at a time performs the scan; all other threads stay on the fast poll path and may miss a trigger
+     * opportunity, which is intentional to minimise overhead.
+     * <p>
+     * During the scan the winner thread:
+     * <ol>
+     *   <li>Drains the entire queue, classifying each chunk as either:
+     *     <ul>
+     *       <li><em>Fully free</em> ({@code remainingCapacity() == capacity()}): {@code purgeEpoch} is
+     *           incremented; if it exceeds the threshold the chunk is deallocated via
+     *           {@link Chunk#markToDeallocate()}, otherwise it is deferred for re-offer.</li>
+     *       <li><em>Partially used</em>: {@code purgeEpoch} is reset to {@code 0}; the first such chunk
+     *           encountered becomes the return value so the caller's magazine can immediately use it;
+     *           any further partially-used chunks are deferred for re-offer.</li>
+     *     </ul>
+     *   </li>
+     *   <li>Re-offers all deferred chunks (fully-free survivors first, then partially-used extras).</li>
+     *   <li>Resets the purge budget so future polls can trigger the next scan.</li>
+     * </ol>
+     */
+    private static final class ConcurrentQueueChunkCache {
+
+        /**
+         * Encoding of {@link #purgeBudget}:
+         * <ul>
+         *   <li>{@code > 0}: remaining polls before the next scan is due.</li>
+         *   <li>{@code == 0}: scan is due; the first thread to CAS to {@code -1} performs it.</li>
+         *   <li>{@code < 0}: a scan is currently in progress; other threads skip the trigger check.</li>
+         * </ul>
+         */
+        private final AtomicLong purgeBudget;
+        private final long pollsPerPurge;
+        private final int purgeEpochThreshold;
+
+        /**
+         * The underlying MPMC queue.  Package-private so the enclosing allocator can iterate it for
+         * memory accounting and draining on shutdown.
+         */
+        final Queue<Chunk> queue;
+
+        ConcurrentQueueChunkCache(int capacity, long pollsPerPurge, int purgeEpochThreshold) {
+            queue = PlatformDependent.newFixedMpmcQueue(capacity);
+            this.pollsPerPurge = pollsPerPurge;
+            this.purgeEpochThreshold = purgeEpochThreshold;
+            purgeBudget = new AtomicLong(pollsPerPurge);
+        }
+
+        /**
+         * Poll a chunk with remaining capacity from the cache.
+         * <p>
+         * On the fast path (budget &gt; 0) this is a single queue poll.
+         * Periodically, the thread that decrements the budget to zero wins ownership of the purge scan and
+         * runs {@link #runPurgeScan()} instead; other threads that observe the budget at zero or below
+         * simply fall through to a direct poll.
+         *
+         * @return a chunk with remaining capacity, or {@code null} if the cache is empty or all cached
+         *         chunks are currently in use.
+         */
+        Chunk pollChunk() {
+            long budget = purgeBudget.get();
+            if (budget > 0) {
+                // Fast path: attempt to decrement the budget; under contention we may miss, which is fine.
+                purgeBudget.compareAndSet(budget, budget - 1);
+                return queue.poll();
+            }
+            if (budget == 0 && purgeBudget.compareAndSet(0L, -1L)) {
+                // This thread wins the purge scan.
+                return runPurgeScan();
+            }
+            // Another thread is currently scanning; just poll normally.
+            return queue.poll();
+        }
+
+        /**
+         * Offer a chunk to the cache.
+         *
+         * @return {@code true} if the chunk was accepted, {@code false} if the cache is full.
+         */
+        boolean offerChunk(Chunk chunk) {
+            return queue.offer(chunk);
+        }
+
+        /**
+         * Perform a full purge scan over all chunks currently in the queue.
+         * <p>
+         * The winning thread drains the queue, classifies each chunk, collects deferred chunks in a
+         * temporary {@link ArrayDeque}, and re-offers them at the end.  The scan budget is reset
+         * before returning so the next scan can be scheduled.
+         *
+         * @return the first partially-used chunk found (for immediate return to the calling magazine),
+         *         or {@code null} if every chunk was either fully free or pruned.
+         */
+        private Chunk runPurgeScan() {
+            Chunk selected = null;
+            // Use a thread-local ArrayDeque to avoid allocating on every scan; a single scan is single-threaded.
+            ArrayDeque<Chunk> deferred = new ArrayDeque<Chunk>();
+            try {
+                Chunk chunk;
+                while ((chunk = queue.poll()) != null) {
+                    int remaining = chunk.remainingCapacity();
+                    if (remaining == chunk.capacity()) {
+                        // Fully free chunk: no user buffers reference it.
+                        chunk.purgeEpoch++;
+                        if (chunk.purgeEpoch > purgeEpochThreshold) {
+                            // Survived too many purge cycles; release underlying memory immediately.
+                            // Safe because the chunk is fully free and has been removed from the queue.
+                            chunk.markToDeallocate();
+                        } else {
+                            // Defer for re-offer at the end so partially-used chunks are offered first.
+                            deferred.add(chunk);
+                        }
+                    } else {
+                        // Partially used: reset epoch so transient idleness does not cause premature pruning.
+                        chunk.purgeEpoch = 0;
+                        if (selected == null) {
+                            // Return the first partially-used chunk directly to the caller.
+                            selected = chunk;
+                        } else {
+                            deferred.add(chunk);
+                        }
+                    }
+                }
+            } finally {
+                // Re-offer deferred chunks.  If the queue is full (shouldn't happen with appropriate sizing)
+                // fall back to markToDeallocate so we never leak.
+                for (Chunk c : deferred) {
+                    if (!queue.offer(c)) {
+                        c.markToDeallocate();
+                    }
+                }
+                // Refill the budget so the next scan can be scheduled.
+                purgeBudget.set(pollsPerPurge);
+            }
+            return selected;
         }
     }
 

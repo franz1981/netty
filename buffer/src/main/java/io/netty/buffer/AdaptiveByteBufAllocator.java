@@ -75,6 +75,13 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return true;
     }
 
+    /**
+     * Package-private for testing: returns the internal heap {@link AdaptivePoolingAllocator}.
+     */
+    AdaptivePoolingAllocator heapAllocator() {
+        return heap;
+    }
+
     @Override
     public long usedHeapMemory() {
         return heap.usedMemory();
