@@ -440,10 +440,21 @@ public class AllocationPatternSimulator {
     int[] cumulativeFrequency;
     int sumFrequency;
     int count;
+    boolean useThreadLocal;
 
     public static void main(String[] args) throws Exception {
-        int[] pattern = args.length == 0 ? WEB_SOCKET_PROXY_PATTERN : buildPattern(args[0]);
+        boolean threadLocal = false;
+        String jfrFile = null;
+        for (String arg : args) {
+            if ("--thread-local".equals(arg)) {
+                threadLocal = true;
+            } else {
+                jfrFile = arg;
+            }
+        }
+        int[] pattern = jfrFile == null ? WEB_SOCKET_PROXY_PATTERN : buildPattern(jfrFile);
         AllocationPatternSimulator runner = new AllocationPatternSimulator();
+        runner.useThreadLocal = threadLocal;
         runner.setUp(pattern);
         runner.run(CONCURRENCY_LEVEL, RUNNING_TIME_SECONDS);
     }
@@ -581,14 +592,17 @@ public class AllocationPatternSimulator {
         private final String name;
 
         AllocConfig(boolean isAdaptive, int avgLiveBufs) {
-            allocator = isAdaptive ? new AdaptiveByteBufAllocator() : new PooledByteBufAllocator();
-            name = String.format(isAdaptive ? "Adaptive (%s)" : "Pooled (%s)", avgLiveBufs);
+            allocator = isAdaptive ?
+                    new AdaptiveByteBufAllocator(false, useThreadLocal) : new PooledByteBufAllocator();
+            String mode = useThreadLocal ? "TL" : "Shared";
+            name = String.format(isAdaptive ? "Adaptive-%s (%s)" : "Pooled (%s)", mode, avgLiveBufs);
             this.avgLiveBufs = avgLiveBufs;
             rng = new SplittableRandom(0xBEEFBEEFL);
         }
 
         Thread start(CountDownLatch startLatch, AtomicBoolean stopCondition) {
-            return new Workload(startLatch, allocator, rng.split(), stopCondition, avgLiveBufs).start(name);
+            return new Workload(startLatch, allocator, rng.split(), stopCondition, avgLiveBufs)
+                    .start(name, useThreadLocal);
         }
 
         long usedMemory() {
@@ -622,8 +636,11 @@ public class AllocationPatternSimulator {
             this.avgLiveBuffers = avgLiveBuffers;
         }
 
-        Thread start(String name) {
-            Thread thread = new Thread(this, name + '-' + THREAD_NAMES.compute(name, (n, c) -> c == null ? 1 : c + 1));
+        Thread start(String name, boolean useThreadLocal) {
+            String threadName = name + '-' + THREAD_NAMES.compute(name, (n, c) -> c == null ? 1 : c + 1);
+            Thread thread = useThreadLocal ?
+                    new io.netty.util.concurrent.FastThreadLocalThread(this, threadName) :
+                    new Thread(this, threadName);
             thread.start();
             return thread;
         }

@@ -665,10 +665,11 @@ final class AdaptivePoolingAllocator {
 
         private void runPurgeScan() {
             int mask = chunks.length - 1;
+            int scanned = count;
             int kept = 0;
             int survivors = count;
             boolean evicted = false;
-            for (int i = 0; i < count; i++) {
+            for (int i = 0; i < scanned; i++) {
                 int readIdx = (head + i) & mask;
                 SizeClassedChunk chunk = chunks[readIdx];
                 int remaining = chunk.remainingCapacity();
@@ -691,8 +692,18 @@ final class AdaptivePoolingAllocator {
             if (evicted) {
                 closeGap(kept);
             }
-            partition(evicted ? kept : count);
+            int swaps = partition(evicted ? kept : count);
             purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
+            if (PlatformDependent.isJfrEnabled() && ChunkCachePurgeScanEvent.isEventEnabled()) {
+                ChunkCachePurgeScanEvent event = new ChunkCachePurgeScanEvent();
+                event.threadLocal = true;
+                event.scanned = scanned;
+                event.evicted = scanned - kept;
+                event.kept = kept;
+                event.notEmptyCount = notEmptyCount;
+                event.partitionSwaps = swaps;
+                event.commit();
+            }
         }
 
         private void closeGap(int kept) {
@@ -706,10 +717,11 @@ final class AdaptivePoolingAllocator {
             count = kept;
         }
 
-        private void partition(int size) {
+        private int partition(int size) {
             int mask = chunks.length - 1;
             int lo = 0;
             int hi = size - 1;
+            int swaps = 0;
             while (lo <= hi) {
                 int loIdx = (head + lo) & mask;
                 if (chunks[loIdx].hasRemainingCapacity()) {
@@ -719,10 +731,12 @@ final class AdaptivePoolingAllocator {
                     SizeClassedChunk tmp = chunks[loIdx];
                     chunks[loIdx] = chunks[hiIdx];
                     chunks[hiIdx] = tmp;
+                    swaps++;
                     hi--;
                 }
             }
             notEmptyCount = lo;
+            return swaps;
         }
 
         @Override
@@ -837,6 +851,8 @@ final class AdaptivePoolingAllocator {
             long generation = ++purgeGeneration;
             SizeClassedChunk selected = null;
             int count = 0;
+            int scanned = 0;
+            int evicted = 0;
             int retained = 0;
             SizeClassedChunk[] buf = noCapacityBuffer;
             SizeClassedChunk chunk;
@@ -847,11 +863,13 @@ final class AdaptivePoolingAllocator {
                     }
                     break;
                 }
+                scanned++;
                 int remaining = chunk.remainingCapacity();
                 if (remaining == chunk.capacity()) {
                     chunk.purgeEpoch++;
                     if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && retained >= CHUNK_REUSE_QUEUE) {
                         chunk.markToDeallocate();
+                        evicted++;
                         continue;
                     }
                 } else {
@@ -876,6 +894,7 @@ final class AdaptivePoolingAllocator {
                     buf[count++] = chunk;
                 }
             }
+            int withCapacity = retained - count;
             for (int i = 0; i < count; i++) {
                 buf[i].lastPurgeGeneration = generation;
                 if (!queue.offer(buf[i])) {
@@ -884,6 +903,16 @@ final class AdaptivePoolingAllocator {
                 buf[i] = null;
             }
             purgeBudget.lazySet(CHUNK_PURGE_POLLS_SHARED);
+            if (PlatformDependent.isJfrEnabled() && ChunkCachePurgeScanEvent.isEventEnabled()) {
+                ChunkCachePurgeScanEvent event = new ChunkCachePurgeScanEvent();
+                event.threadLocal = false;
+                event.scanned = scanned;
+                event.evicted = evicted;
+                event.kept = retained;
+                event.notEmptyCount = withCapacity;
+                event.partitionSwaps = 0;
+                event.commit();
+            }
             return selected;
         }
 
