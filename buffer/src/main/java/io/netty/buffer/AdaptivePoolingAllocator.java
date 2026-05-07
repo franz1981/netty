@@ -121,7 +121,7 @@ final class AdaptivePoolingAllocator {
      * The default size is twice {@link NettyRuntime#availableProcessors()},
      * same as the maximum number of magazines per magazine group.
      */
-    private static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
+    static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
 
     static final long CHUNK_PURGE_POLLS_THREAD_LOCAL = SystemPropertyUtil.getLong(
@@ -501,7 +501,7 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private interface ChunkCache {
+    interface ChunkCache {
         Chunk pollChunk(int size);
         boolean offerChunk(Chunk chunk);
     }
@@ -509,17 +509,111 @@ final class AdaptivePoolingAllocator {
     // Cached chunks are detached from magazines: no readInitInto can happen, so segment count
     // can only grow (external releaseSegment returns) and never shrink. Once a chunk reaches
     // full capacity (remainingCapacity == capacity), it stays fully free while in the cache.
-    private abstract static class SizeClassedChunkCache implements ChunkCache {
+    abstract static class SizeClassedChunkCache implements ChunkCache {
         static SizeClassedChunkCache create(boolean isThreadLocal) {
             return isThreadLocal ? new ThreadLocalSizeClassedChunkCache() : new SharedSizeClassedChunkCache();
         }
+
+        @Override
+        public abstract SizeClassedChunk pollChunk(int size);
+
+        // Visible for testing: triggers a purge scan bypassing the budget counter.
+        abstract SizeClassedChunk forcePurge();
     }
 
-    private static final class ThreadLocalSizeClassedChunkCache extends SizeClassedChunkCache {
+    /**
+     * Ring buffer cache for thread-local chunk reuse (SPSC — only the owner thread accesses it).
+     *
+     * <p>Logical layout after purge:
+     * <pre>
+     *   head                          tail
+     *   v                             v
+     *   [..., notEmpty, notEmpty, ..., empty, empty, ..., null, ...]
+     *        |--- notEmptyCount ---|--- emptyCount --|
+     *        |------------ count ------------------|
+     * </pre>
+     *
+     * <p>Physical layout when the ring wraps:
+     * <pre>
+     *   0         tail          head          length
+     *   v         v             v             v
+     *   [...tail] [  unused  ]  [head................]
+     *             ^             |--- content wraps ---|
+     *             wrap point
+     * </pre>
+     *
+     * <p><b>scanForCapacity</b> — O(1) fast path takes from head while {@code notEmptyCount > 0}:
+     * <pre>
+     *   before: notEmptyCount=2, count=5
+     *   [NE, NE, E, E, E, _, _, _]
+     *    ^head            ^tail
+     *
+     *   after: returns NE, notEmptyCount=1, count=4
+     *   [_,  NE, E, E, E, _, _, _]
+     *        ^head        ^tail
+     * </pre>
+     * Fallback when {@code notEmptyCount == 0}: linear scan of the empty zone for chunks
+     * that gained capacity from external segment returns.
+     *
+     * <p><b>offerChunk</b> — write at tail, grow (double + linearize) if full:
+     * <pre>
+     *   before: count=4
+     *   [_,  NE, E, E, E, _, _, _]
+     *        ^head        ^tail
+     *
+     *   after: count=5
+     *   [_,  NE, E, E, E, X, _, _]
+     *        ^head           ^tail
+     * </pre>
+     *
+     * <p><b>runPurgeScan</b> (every {@link #CHUNK_PURGE_POLLS_THREAD_LOCAL} polls) —
+     * ages idle chunks, evicts past threshold. Never selects — selection is always
+     * {@code scanForCapacity}. Compact (closeGap) only runs when an eviction removed
+     * something. Partition always runs to pick up chunks that gained capacity externally.
+     *
+     * <p>Case 1 — no eviction, an empty chunk gained capacity externally (common):
+     * <pre>
+     *   before (E* gained capacity since last purge):
+     *   [NE, NE, E*, E, _, _, _, _]
+     *    ^head            ^tail
+     *    notEmptyCount=2
+     *
+     *   scan: age idle chunks. None past threshold. No eviction → no compact.
+     *   partition: E* now has capacity → swapped into notEmpty zone.
+     *
+     *   after:
+     *   [NE, NE, E*, E, _, _, _, _]
+     *    ^head            ^tail
+     *    notEmptyCount=3
+     * </pre>
+     *
+     * <p>Case 2 — eviction (uncommon, burst wind-down):
+     * <pre>
+     *   before (ring wraps, IDLE* = idle past threshold):
+     *   [E, NE, _,  IDLE*, NE, E, E, NE]
+     *          ^tail ^head
+     *
+     *   scan: IDLE* evicted (markToDeallocate). Remaining entries compacted → closeGap(kept).
+     *
+     *   after closeGap:
+     *   [NE, _, _,  NE, E, E, NE, E]
+     *       ^tail   ^head
+     *               |--- kept=6 ---|
+     *
+     *   after partition: notEmpty swapped to front, empty to back.
+     *   [NE, _, _,  NE, NE, E, E, E]
+     *       ^tail   ^head
+     *               notEmptyCount=2, count=6
+     * </pre>
+     * Idle chunks ({@code remainingCapacity == capacity}) age via purgeEpoch and are evicted
+     * past threshold, but at least {@link #CHUNK_REUSE_QUEUE} chunks are always retained.
+     */
+    static final class ThreadLocalSizeClassedChunkCache extends SizeClassedChunkCache {
         private SizeClassedChunk[] chunks;
-        private int scanIdx;
-        private int capacityEnd;
-        private int size;
+        private int head;
+        private int tail;
+        private int count;
+        private int notEmptyCount;
         private long purgeBudget;
 
         ThreadLocalSizeClassedChunkCache() {
@@ -528,92 +622,158 @@ final class AdaptivePoolingAllocator {
         }
 
         @Override
+        SizeClassedChunk forcePurge() {
+            runPurgeScan();
+            return scanForCapacity();
+        }
+
+        @Override
         public SizeClassedChunk pollChunk(int size) {
             if (--purgeBudget == 0) {
-                return runPurgeScan();
+                runPurgeScan();
             }
             return scanForCapacity();
         }
 
         private SizeClassedChunk scanForCapacity() {
-            if (scanIdx < capacityEnd) {
-                SizeClassedChunk chunk = chunks[scanIdx];
+            if (notEmptyCount > 0) {
+                SizeClassedChunk chunk = chunks[head];
                 assert chunk.hasRemainingCapacity();
-                chunks[scanIdx] = null;
-                scanIdx++;
+                chunks[head] = null;
+                head = (head + 1) & (chunks.length - 1);
+                count--;
+                notEmptyCount--;
                 return chunk;
             }
-            for (int i = capacityEnd; i < size; i++) {
-                SizeClassedChunk chunk = chunks[i];
-                if (chunk != null && chunk.hasRemainingCapacity()) {
-                    int last = --size;
-                    chunks[i] = chunks[last];
-                    chunks[last] = null;
+            int mask = chunks.length - 1;
+            int pos = (head + notEmptyCount) & mask;
+            int end = tail;
+            while (pos != end) {
+                SizeClassedChunk chunk = chunks[pos];
+                if (chunk.hasRemainingCapacity()) {
+                    int lastIdx = (tail - 1) & mask;
+                    chunks[pos] = chunks[lastIdx];
+                    chunks[lastIdx] = null;
+                    tail = lastIdx;
+                    count--;
                     return chunk;
                 }
+                pos = (pos + 1) & mask;
             }
             return null;
         }
 
-        private SizeClassedChunk runPurgeScan() {
-            SizeClassedChunk selected = null;
-            int capacityIdx = 0;
-            int noCapacityIdx = size;
-            for (int i = scanIdx; i < size; i++) {
-                SizeClassedChunk chunk = chunks[i];
+        private void runPurgeScan() {
+            int mask = chunks.length - 1;
+            int kept = 0;
+            int survivors = count;
+            boolean evicted = false;
+            for (int i = 0; i < count; i++) {
+                int readIdx = (head + i) & mask;
+                SizeClassedChunk chunk = chunks[readIdx];
                 int remaining = chunk.remainingCapacity();
                 if (remaining == chunk.capacity()) {
                     chunk.purgeEpoch++;
-                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
+                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && survivors > CHUNK_REUSE_QUEUE) {
                         chunk.markToDeallocate();
+                        survivors--;
+                        evicted = true;
                         continue;
                     }
                 } else {
                     chunk.purgeEpoch = 0;
                 }
-                if (selected == null && remaining > 0) {
-                    selected = chunk;
-                    selected.purgeEpoch = 0;
-                    continue;
+                if (evicted) {
+                    chunks[(head + kept) & mask] = chunk;
                 }
-                if (remaining > 0) {
-                    chunks[capacityIdx++] = chunk;
+                kept++;
+            }
+            if (evicted) {
+                closeGap(kept);
+            }
+            partition(evicted ? kept : count);
+            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
+        }
+
+        private void closeGap(int kept) {
+            int mask = chunks.length - 1;
+            int gapStart = (head + kept) & mask;
+            Arrays.fill(chunks, gapStart, gapStart <= tail ? tail : chunks.length, null);
+            if (gapStart > tail) {
+                Arrays.fill(chunks, 0, tail, null);
+            }
+            tail = (head + kept) & mask;
+            count = kept;
+        }
+
+        private void partition(int size) {
+            int mask = chunks.length - 1;
+            int lo = 0;
+            int hi = size - 1;
+            while (lo <= hi) {
+                int loIdx = (head + lo) & mask;
+                if (chunks[loIdx].hasRemainingCapacity()) {
+                    lo++;
                 } else {
-                    chunks[--noCapacityIdx] = chunk;
+                    int hiIdx = (head + hi) & mask;
+                    SizeClassedChunk tmp = chunks[loIdx];
+                    chunks[loIdx] = chunks[hiIdx];
+                    chunks[hiIdx] = tmp;
+                    hi--;
                 }
             }
-            int noCapacityCount = size - noCapacityIdx;
-            System.arraycopy(chunks, noCapacityIdx, chunks, capacityIdx, noCapacityCount);
-            int newSize = capacityIdx + noCapacityCount;
-            Arrays.fill(chunks, newSize, size, null);
-            size = newSize;
-            capacityEnd = capacityIdx;
-            scanIdx = 0;
-            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
-            return selected;
+            notEmptyCount = lo;
         }
 
         @Override
         public boolean offerChunk(Chunk chunk) {
-            if (size == chunks.length) {
-                if (scanIdx > 0) {
-                    int live = size - scanIdx;
-                    System.arraycopy(chunks, scanIdx, chunks, 0, live);
-                    Arrays.fill(chunks, live, size, null);
-                    capacityEnd = Math.max(0, capacityEnd - scanIdx);
-                    size = live;
-                    scanIdx = 0;
-                } else {
-                    chunks = Arrays.copyOf(chunks, chunks.length * 2);
+            if (count == chunks.length) {
+                SizeClassedChunk[] newChunks = new SizeClassedChunk[chunks.length * 2];
+                for (int i = 0; i < count; i++) {
+                    newChunks[i] = chunks[(head + i) & (chunks.length - 1)];
                 }
+                chunks = newChunks;
+                head = 0;
+                tail = count;
             }
-            chunks[size++] = (SizeClassedChunk) chunk;
+            chunks[tail] = (SizeClassedChunk) chunk;
+            tail = (tail + 1) & (chunks.length - 1);
+            count++;
             return true;
+        }
+
+        @Override
+        public String toString() {
+            int mask = chunks.length - 1;
+            StringBuilder sb = new StringBuilder();
+            sb.append("ThreadLocalCache[head=").append(head)
+              .append(", tail=").append(tail)
+              .append(", count=").append(count)
+              .append(", notEmpty=").append(notEmptyCount)
+              .append(", length=").append(chunks.length)
+              .append("]\n  ");
+            for (int i = 0; i < count; i++) {
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                if (i == notEmptyCount) {
+                    sb.append("| ");
+                }
+                SizeClassedChunk c = chunks[(head + i) & mask];
+                String region = i < notEmptyCount ? "notEmpty" : "empty";
+                String actual = c == null ? "null" :
+                        c.hasRemainingCapacity() ? "hasCap" : "noCap";
+                sb.append('[').append(region).append(':').append(actual)
+                  .append(",ep=").append(c == null ? -1 : c.purgeEpoch).append(']');
+            }
+            return sb.toString();
         }
     }
 
-    private static final class SharedSizeClassedChunkCache extends SizeClassedChunkCache {
-        private static final int SHARED_CACHE_CAPACITY = (int) CHUNK_PURGE_POLLS_SHARED;
+    static final class SharedSizeClassedChunkCache extends SizeClassedChunkCache {
+        // Must exceed CHUNK_REUSE_QUEUE (the retention floor) to leave room for burst absorption.
+        // TODO replace with an unbounded concurrent collection once available.
+        private static final int SHARED_CACHE_CAPACITY = Math.max(128, CHUNK_REUSE_QUEUE * 2);
         private final Queue<SizeClassedChunk> queue;
         private final AtomicLong purgeBudget;
         private SizeClassedChunk[] noCapacityBuffer;
@@ -624,6 +784,12 @@ final class AdaptivePoolingAllocator {
             queue = PlatformDependent.newFixedMpmcQueue(SHARED_CACHE_CAPACITY);
             purgeBudget = new AtomicLong(CHUNK_PURGE_POLLS_SHARED);
             noCapacityBuffer = new SizeClassedChunk[8];
+        }
+
+        @Override
+        SizeClassedChunk forcePurge() {
+            purgeBudget.set(CHUNK_PURGE_POLLS_SHARED);
+            return runPurgeScan();
         }
 
         @Override
@@ -671,6 +837,7 @@ final class AdaptivePoolingAllocator {
             long generation = ++purgeGeneration;
             SizeClassedChunk selected = null;
             int count = 0;
+            int retained = 0;
             SizeClassedChunk[] buf = noCapacityBuffer;
             SizeClassedChunk chunk;
             while ((chunk = queue.poll()) != null) {
@@ -683,13 +850,14 @@ final class AdaptivePoolingAllocator {
                 int remaining = chunk.remainingCapacity();
                 if (remaining == chunk.capacity()) {
                     chunk.purgeEpoch++;
-                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
+                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && retained >= CHUNK_REUSE_QUEUE) {
                         chunk.markToDeallocate();
                         continue;
                     }
                 } else {
                     chunk.purgeEpoch = 0;
                 }
+                retained++;
                 if (remaining > 0) {
                     if (selected == null) {
                         selected = chunk;
@@ -1239,7 +1407,7 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static class Chunk implements ChunkInfo {
+    static class Chunk implements ChunkInfo {
         protected final AbstractByteBuf delegate;
         protected Magazine magazine;
         private final AdaptivePoolingAllocator allocator;
@@ -1443,7 +1611,7 @@ final class AdaptivePoolingAllocator {
      * StoreLoad barrier via its {@code offer()}), then reads {@code state} — this guarantees
      * visibility of any preceding {@link #markToDeallocate()} write.
      */
-    private static final class SizeClassedChunk extends Chunk {
+    static class SizeClassedChunk extends Chunk {
         private static final int FREE_LIST_EMPTY = -1;
         private static final int AVAILABLE = -1;
         // Integer.MIN_VALUE so that `DEALLOCATED + externalFreeList.size()` can never equal `segments`,
