@@ -356,6 +356,9 @@ public final class IoUringIoHandler implements IoHandler {
 
     @Override
     public void prepareToDestroy() {
+        SubmissionQueue sq = ringBuffer.ioUringSubmissionQueue();
+        System.out.println("[IoUringIoHandler] prepareToDestroy: io_uring_enter total=" +
+                sq.enterTotal + " empty=" + sq.enterEmpty);
         shuttingDown = true;
         CompletionQueue completionQueue = ringBuffer.ioUringCompletionQueue();
         SubmissionQueue submissionQueue = ringBuffer.ioUringSubmissionQueue();

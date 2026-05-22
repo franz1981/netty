@@ -29,6 +29,7 @@ import java.util.StringJoiner;
 
 final class SubmissionQueue {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(SubmissionQueue.class);
+    private static final boolean SKIP_EMPTY_ENTER = Boolean.getBoolean("io.netty.uring.skipEmptyEnter");
 
     static final int SQE_SIZE = 64;
 
@@ -69,6 +70,8 @@ final class SubmissionQueue {
     private int tail;
 
     private boolean closed;
+    long enterTotal;
+    long enterEmpty;
 
     SubmissionQueue(ByteBuffer khead, ByteBuffer ktail, int ringMask, int ringEntries, ByteBuffer kflags,
                     ByteBuffer submissionQueueArray,
@@ -101,6 +104,7 @@ final class SubmissionQueue {
     }
 
     void close() {
+        System.out.println("[SQ ring=" + ringFd + "] io_uring_enter total=" + enterTotal + " empty=" + enterEmpty);
         closed = true;
     }
 
@@ -263,11 +267,19 @@ final class SubmissionQueue {
             return submit(submit, minComplete, Native.IORING_ENTER_GETEVENTS);
         }
         assert submit == 0;
+        if (SKIP_EMPTY_ENTER && minComplete == 0 && !cqRingNeedsFlush()) {
+            return 0;
+        }
         int ret = ioUringEnter(0, minComplete, Native.IORING_ENTER_GETEVENTS);
         if (ret < 0) {
             throw new UncheckedIOException(Errors.newIOException("io_uring_enter", ret));
         }
         return ret; // should be 0
+    }
+
+    private boolean cqRingNeedsFlush() {
+        int sqFlags = flags();
+        return (sqFlags & (Native.IORING_SQ_CQ_OVERFLOW | Native.IORING_SQ_TASKRUN)) != 0;
     }
 
     private int submit(int toSubmit, int minComplete, int flags) {
@@ -312,6 +324,10 @@ final class SubmissionQueue {
         if (logger.isTraceEnabled()) {
             logger.trace("io_uring_enter(ring={}, enterRing={}, toSubmit={}, minComplete={}, flags={}): {}",
                     ringFd, enterRingFd, toSubmit, minComplete, f, toString());
+        }
+        enterTotal++;
+        if (toSubmit == 0) {
+            enterEmpty++;
         }
         return Native.ioUringEnter(enterRingFd, toSubmit, minComplete, f);
     }
