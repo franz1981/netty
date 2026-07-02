@@ -882,154 +882,197 @@ final class AdaptivePoolingAllocator {
      * {@code scanForCapacity}'s job (called after purge via {@code pollChunk}).
      */
     static final class SharedSizeClassedChunkCache extends SizeClassedChunkCache {
-        // Must exceed CHUNK_REUSE_QUEUE (the retention floor) to leave room for burst absorption.
-        // TODO replace with an unbounded concurrent collection once available.
         private static final int SHARED_CACHE_CAPACITY = Math.max(128, CHUNK_REUSE_QUEUE * 2);
-        private final Queue<SizeClassedChunk> queue;
-        private final AtomicLong purgeBudget;
-        private final ArrayList<SizeClassedChunk> deferredBuffer = new ArrayList<>();
-        private long purgeGeneration;
-        private final AtomicLong scanGeneration = new AtomicLong();
+        private static final int STRIPES = Math.max(1,
+                Integer.highestOneBit(31 - Integer.numberOfLeadingZeros(NettyRuntime.availableProcessors())));
+
+        private final Stripe[] stripes;
 
         SharedSizeClassedChunkCache() {
-            queue = PlatformDependent.newFixedMpmcQueue(SHARED_CACHE_CAPACITY);
-            purgeBudget = new AtomicLong(CHUNK_PURGE_POLLS_SHARED);
+            stripes = new Stripe[STRIPES];
+            int perStripeCapacity = Math.max(16, SHARED_CACHE_CAPACITY / STRIPES);
+            for (int i = 0; i < STRIPES; i++) {
+                stripes[i] = new Stripe(perStripeCapacity);
+            }
+        }
+
+        private Stripe stripeForThread() {
+            int id = (int) Thread.currentThread().getId();
+            id ^= id >>> 16;
+            return stripes[id & (STRIPES - 1)];
         }
 
         @Override
         SizeClassedChunk forcePurge() {
-            purgeBudget.set(1);
-            return pollChunk(0);
+            Stripe stripe = stripeForThread();
+            stripe.purgeBudget.set(1);
+            return stripe.pollChunk();
         }
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
-            long budget = purgeBudget.decrementAndGet();
-            if (budget == 0) {
-                runPurgeScan();
-            }
-            return scanForCapacity();
-        }
-
-        private SizeClassedChunk scanForCapacity() {
-            SizeClassedChunk first = queue.poll();
-            if (first == null) {
-                return null;
-            }
-            if (first.purgeEpoch == 0 && first.hasRemainingCapacity()) {
-                return first;
-            }
-            long generation = scanGeneration.incrementAndGet();
-            first.lastScanGeneration = generation;
-            if (first.hasRemainingCapacity()) {
-                return scanForCapacitySlow(generation, first);
-            }
-            offerOrDeallocate(first);
-            return scanForCapacitySlow(generation, null);
-        }
-
-        private SizeClassedChunk scanForCapacitySlow(long generation, SizeClassedChunk fallback) {
-            SizeClassedChunk chunk;
-            while ((chunk = queue.poll()) != null) {
-                if (chunk.lastScanGeneration >= generation) {
-                    offerOrDeallocate(chunk);
-                    break;
-                }
-                if (chunk.hasRemainingCapacity()) {
-                    if (chunk.purgeEpoch == 0) {
-                        if (fallback != null) {
-                            offerOrDeallocate(fallback);
-                        }
-                        return chunk;
-                    }
-                    if (fallback == null) {
-                        fallback = chunk;
-                        continue;
-                    }
-                }
-                chunk.lastScanGeneration = generation;
-                offerOrDeallocate(chunk);
-            }
-            if (fallback != null) {
-                fallback.purgeEpoch = 0;
-                return fallback;
-            }
-            return null;
-        }
-
-        private boolean offerOrDeallocate(SizeClassedChunk chunk) {
-            if (!queue.offer(chunk)) {
-                chunk.markToDeallocate();
-                return false;
-            }
-            return true;
-        }
-
-        private boolean offerOrDeallocate(SizeClassedChunk chunk, long generation) {
-            chunk.lastPurgeGeneration = generation;
-            return offerOrDeallocate(chunk);
-        }
-
-        private void runPurgeScan() {
-            long generation = ++purgeGeneration;
-            int retained = 0;
-            ArrayList<SizeClassedChunk> deferred = deferredBuffer;
-            SizeClassedChunk chunk;
-            while ((chunk = queue.poll()) != null) {
-                if (chunk.lastPurgeGeneration == generation) {
-                    offerOrDeallocate(chunk, generation);
-                    break;
-                }
-                retained++;
-                if (chunk.hasFullCapacity()) {
-                    chunk.purgeEpoch++;
-                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
-                        deferred.add(chunk);
-                        continue;
-                    }
-                } else {
-                    chunk.purgeEpoch = 0;
-                }
-                int remaining = chunk.remainingCapacity();
-                if (remaining > 0) {
-                    if (!offerOrDeallocate(chunk, generation)) {
-                        retained--;
-                    }
-                } else {
-                    deferred.add(chunk);
-                }
-            }
-            for (int i = 0, size = deferred.size(); i < size; i++) {
-                chunk = deferred.get(i);
-                if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && retained > CHUNK_REUSE_QUEUE) {
-                    chunk.markToDeallocate();
-                    retained--;
-                } else {
-                    if (!offerOrDeallocate(chunk, generation)) {
-                        retained--;
-                    }
-                }
-            }
-            deferred.clear();
-            purgeBudget.lazySet(CHUNK_PURGE_POLLS_SHARED);
+            return stripeForThread().pollChunk();
         }
 
         @Override
         public boolean offerChunk(Chunk chunk) {
-            return queue.offer((SizeClassedChunk) chunk);
+            return stripeForThread().offerChunk(chunk);
         }
 
         @Override
         public void free() {
-            SizeClassedChunk chunk;
-            while ((chunk = queue.poll()) != null) {
-                chunk.markToDeallocate();
+            for (Stripe stripe : stripes) {
+                stripe.free();
             }
         }
 
         @Override
         public boolean isEmpty() {
-            return queue.isEmpty();
+            for (Stripe stripe : stripes) {
+                if (!stripe.isEmpty()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static final class Stripe {
+            private final Queue<SizeClassedChunk> queue;
+            final AtomicLong purgeBudget;
+            private final ArrayList<SizeClassedChunk> deferredBuffer = new ArrayList<>();
+            private long purgeGeneration;
+            private final AtomicLong scanGeneration = new AtomicLong();
+
+            Stripe(int capacity) {
+                queue = PlatformDependent.newFixedMpmcQueue(capacity);
+                purgeBudget = new AtomicLong(CHUNK_PURGE_POLLS_SHARED);
+            }
+
+            SizeClassedChunk pollChunk() {
+                long budget = purgeBudget.decrementAndGet();
+                if (budget == 0) {
+                    runPurgeScan();
+                }
+                return scanForCapacity();
+            }
+
+            private SizeClassedChunk scanForCapacity() {
+                SizeClassedChunk first = queue.poll();
+                if (first == null) {
+                    return null;
+                }
+                if (first.purgeEpoch == 0 && first.hasRemainingCapacity()) {
+                    return first;
+                }
+                long generation = scanGeneration.incrementAndGet();
+                first.lastScanGeneration = generation;
+                if (first.hasRemainingCapacity()) {
+                    return scanForCapacitySlow(generation, first);
+                }
+                offerOrDeallocate(first);
+                return scanForCapacitySlow(generation, null);
+            }
+
+            private SizeClassedChunk scanForCapacitySlow(long generation, SizeClassedChunk fallback) {
+                SizeClassedChunk chunk;
+                while ((chunk = queue.poll()) != null) {
+                    if (chunk.lastScanGeneration >= generation) {
+                        offerOrDeallocate(chunk);
+                        break;
+                    }
+                    if (chunk.hasRemainingCapacity()) {
+                        if (chunk.purgeEpoch == 0) {
+                            if (fallback != null) {
+                                offerOrDeallocate(fallback);
+                            }
+                            return chunk;
+                        }
+                        if (fallback == null) {
+                            fallback = chunk;
+                            continue;
+                        }
+                    }
+                    chunk.lastScanGeneration = generation;
+                    offerOrDeallocate(chunk);
+                }
+                if (fallback != null) {
+                    fallback.purgeEpoch = 0;
+                    return fallback;
+                }
+                return null;
+            }
+
+            private boolean offerOrDeallocate(SizeClassedChunk chunk) {
+                if (!queue.offer(chunk)) {
+                    chunk.markToDeallocate();
+                    return false;
+                }
+                return true;
+            }
+
+            private boolean offerOrDeallocate(SizeClassedChunk chunk, long generation) {
+                chunk.lastPurgeGeneration = generation;
+                return offerOrDeallocate(chunk);
+            }
+
+            private void runPurgeScan() {
+                long generation = ++purgeGeneration;
+                int retained = 0;
+                ArrayList<SizeClassedChunk> deferred = deferredBuffer;
+                SizeClassedChunk chunk;
+                while ((chunk = queue.poll()) != null) {
+                    if (chunk.lastPurgeGeneration == generation) {
+                        offerOrDeallocate(chunk, generation);
+                        break;
+                    }
+                    retained++;
+                    if (chunk.hasFullCapacity()) {
+                        chunk.purgeEpoch++;
+                        if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD) {
+                            deferred.add(chunk);
+                            continue;
+                        }
+                    } else {
+                        chunk.purgeEpoch = 0;
+                    }
+                    int remaining = chunk.remainingCapacity();
+                    if (remaining > 0) {
+                        if (!offerOrDeallocate(chunk, generation)) {
+                            retained--;
+                        }
+                    } else {
+                        deferred.add(chunk);
+                    }
+                }
+                for (int i = 0, size = deferred.size(); i < size; i++) {
+                    chunk = deferred.get(i);
+                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && retained > CHUNK_REUSE_QUEUE) {
+                        chunk.markToDeallocate();
+                        retained--;
+                    } else {
+                        if (!offerOrDeallocate(chunk, generation)) {
+                            retained--;
+                        }
+                    }
+                }
+                deferred.clear();
+                purgeBudget.lazySet(CHUNK_PURGE_POLLS_SHARED);
+            }
+
+            boolean offerChunk(Chunk chunk) {
+                return queue.offer((SizeClassedChunk) chunk);
+            }
+
+            void free() {
+                SizeClassedChunk chunk;
+                while ((chunk = queue.poll()) != null) {
+                    chunk.markToDeallocate();
+                }
+            }
+
+            boolean isEmpty() {
+                return queue.isEmpty();
+            }
         }
     }
 
