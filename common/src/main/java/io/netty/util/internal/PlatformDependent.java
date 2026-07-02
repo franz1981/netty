@@ -1350,7 +1350,10 @@ public final class PlatformDependent {
     }
 
     public static <T> Queue<T> newMpmcUnboundedXaddQueue(int chunkSize) {
-        return new MpmcUnboundedXaddArrayQueue<T>(chunkSize);
+        if (hasUnsafe()) {
+            return new MpmcUnboundedXaddArrayQueue<T>(chunkSize);
+        }
+        return new java.util.concurrent.ConcurrentLinkedQueue<T>();
     }
 
     /**
