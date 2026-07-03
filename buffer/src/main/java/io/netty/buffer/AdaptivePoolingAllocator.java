@@ -421,7 +421,7 @@ final class AdaptivePoolingAllocator {
         private boolean tryExpandScanLength() {
             int current = scanLength.get();
             if (current >= MAX_STRIPES) {
-                return true;
+                return false;
             }
             scanLength.compareAndSet(current, current << 1);
             return true;
@@ -898,7 +898,7 @@ final class AdaptivePoolingAllocator {
             if (first.hasRemainingCapacity()) {
                 return scanForCapacitySlow(generation, first);
             }
-            offerOrDeallocate(first);
+            reoffer(first);
             return scanForCapacitySlow(generation, null);
         }
 
@@ -906,13 +906,13 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk chunk;
             while ((chunk = queue.poll()) != null) {
                 if (chunk.lastScanGeneration >= generation) {
-                    offerOrDeallocate(chunk);
+                    reoffer(chunk);
                     break;
                 }
                 if (chunk.hasRemainingCapacity()) {
                     if (chunk.purgeEpoch == 0) {
                         if (fallback != null) {
-                            offerOrDeallocate(fallback);
+                            reoffer(fallback);
                         }
                         return chunk;
                     }
@@ -922,7 +922,7 @@ final class AdaptivePoolingAllocator {
                     }
                 }
                 chunk.lastScanGeneration = generation;
-                offerOrDeallocate(chunk);
+                reoffer(chunk);
             }
             if (fallback != null) {
                 fallback.purgeEpoch = 0;
@@ -931,11 +931,11 @@ final class AdaptivePoolingAllocator {
             return null;
         }
 
-        private void offerOrDeallocate(SizeClassedChunk chunk) {
+        private void reoffer(SizeClassedChunk chunk) {
             queue.offer(chunk);
         }
 
-        private void offerOrDeallocate(SizeClassedChunk chunk, long generation) {
+        private void reoffer(SizeClassedChunk chunk, long generation) {
             chunk.lastPurgeGeneration = generation;
             queue.offer(chunk);
         }
@@ -947,7 +947,7 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk chunk;
             while ((chunk = queue.poll()) != null) {
                 if (chunk.lastPurgeGeneration == generation) {
-                    offerOrDeallocate(chunk, generation);
+                    reoffer(chunk, generation);
                     break;
                 }
                 retained++;
@@ -962,7 +962,7 @@ final class AdaptivePoolingAllocator {
                 }
                 int remaining = chunk.remainingCapacity();
                 if (remaining > 0) {
-                    offerOrDeallocate(chunk, generation);
+                    reoffer(chunk, generation);
                 } else {
                     deferred.add(chunk);
                 }
@@ -973,7 +973,7 @@ final class AdaptivePoolingAllocator {
                     chunk.markToDeallocate();
                     retained--;
                 } else {
-                    offerOrDeallocate(chunk, generation);
+                    reoffer(chunk, generation);
                 }
             }
             deferred.clear();
@@ -1522,6 +1522,9 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean offerToQueue(Chunk chunk) {
+            if (group.freed) {
+                return false;
+            }
             if (chunkCache != null) {
                 if (chunk.hasUnprocessedFreelistEntries()) {
                     chunk.processFreelistEntries();
