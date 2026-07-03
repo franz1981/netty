@@ -1282,14 +1282,31 @@ final class AdaptivePoolingAllocator {
 
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
 
+        /**
+         * Holds the lazily initialized state of a shared magazine.
+         * All fields are final — JMM guarantees their visibility once the reference is non-null.
+         * Initialized under allocationLock on first tryAllocate.
+         */
+        private static final class MagazineState {
+            final ChunkController chunkController;
+            final ChunkCache chunkCache;
+            final AdaptiveRecycler recycler;
+
+            MagazineState(MagazineGroup group, boolean isThreadLocal) {
+                chunkController = group.chunkManagementStrategy.createController(group);
+                chunkCache = group.chunkManagementStrategy.createChunkCache(isThreadLocal);
+                recycler = isThreadLocal ? null : AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            }
+        }
+
         private Chunk current;
         @SuppressWarnings("unused") // updated via NEXT_IN_LINE
         private volatile Chunk nextInLine;
         private final MagazineGroup group;
-        private ChunkController chunkController;
         private final StampedLock allocationLock;
-        private ChunkCache chunkCache;
-        private AdaptiveRecycler recycler;
+        // For thread-local magazines: state is set eagerly in the constructor.
+        // For shared magazines: state is lazily initialized under allocationLock.
+        private MagazineState state;
 
         Magazine(MagazineGroup group, boolean shareable) {
             this.group = group;
@@ -1298,28 +1315,20 @@ final class AdaptivePoolingAllocator {
                 allocationLock = new StampedLock();
             } else {
                 allocationLock = null;
-                chunkController = group.chunkManagementStrategy.createController(group);
-                recycler = null;
+                state = new MagazineState(group, true);
             }
-        }
-
-        private void initLazy() {
-            chunkController = group.chunkManagementStrategy.createController(group);
-            chunkCache = group.chunkManagementStrategy.createChunkCache(false);
-            recycler = AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
         }
 
         public boolean tryAllocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
             if (allocationLock == null) {
-                // This magazine is not shared across threads, just allocate directly.
                 return allocate(size, maxCapacity, buf, reallocate);
             }
 
             long writeLock = allocationLock.tryWriteLock();
             if (writeLock != 0) {
                 try {
-                    if (recycler == null) {
-                        initLazy();
+                    if (state == null) {
+                        state = new MagazineState(group, false);
                     }
                     return allocate(size, maxCapacity, buf, reallocate);
                 } finally {
@@ -1330,7 +1339,8 @@ final class AdaptivePoolingAllocator {
         }
 
         private boolean allocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            if (chunkController == null) {
+            MagazineState s = this.state;
+            if (s == null) {
                 return false;
             }
             Chunk curr = NEXT_IN_LINE.getAndSet(this, null);
@@ -1340,7 +1350,7 @@ final class AdaptivePoolingAllocator {
                 return false;
             }
             if (curr == null) {
-                curr = chunkCache != null ? chunkCache.pollChunk(size) : group.pollChunk(size);
+                curr = group.pollChunk(size);
                 if (curr == null) {
                     return false;
                 }
@@ -1348,8 +1358,8 @@ final class AdaptivePoolingAllocator {
             }
             boolean allocated = false;
             int remainingCapacity = curr.remainingCapacity();
-            int startingCapacity = chunkController.computeBufferCapacity(
-                    size, maxCapacity, true /* never update stats as we don't hold the magazine lock */);
+            int startingCapacity = s.chunkController.computeBufferCapacity(
+                    size, maxCapacity, true);
             if (remainingCapacity >= size &&
                     curr.readInitInto(buf, size, Math.min(remainingCapacity, startingCapacity), maxCapacity)) {
                 allocated = true;
@@ -1369,7 +1379,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
-            int startingCapacity = chunkController.computeBufferCapacity(size, maxCapacity, reallocate);
+            int startingCapacity = state.chunkController.computeBufferCapacity(size, maxCapacity, reallocate);
             Chunk curr = current;
             if (curr != null) {
                 boolean success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
@@ -1425,9 +1435,9 @@ final class AdaptivePoolingAllocator {
             }
 
             // Now try to poll from the central queue first
-            curr = chunkCache != null ? chunkCache.pollChunk(size) : group.pollChunk(size);
+            MagazineState s = state; curr = s != null && s.chunkCache != null ? s.chunkCache.pollChunk(size) : group.pollChunk(size);
             if (curr == null) {
-                curr = chunkController.newChunkAllocation(size, this);
+                curr = state.chunkController.newChunkAllocation(size, this);
             } else {
                 curr.attachToMagazine(this);
 
@@ -1441,7 +1451,7 @@ final class AdaptivePoolingAllocator {
                         // This method will release curr if this is not the case
                         transferToNextInLineOrRelease(curr);
                     }
-                    curr = chunkController.newChunkAllocation(size, this);
+                    curr = state.chunkController.newChunkAllocation(size, this);
                 }
             }
 
@@ -1508,14 +1518,16 @@ final class AdaptivePoolingAllocator {
                     allocationLock.unlockWrite(stamp);
                 }
             }
-            if (chunkCache != null) {
-                chunkCache.free();
+            MagazineState s = this.state;
+            if (s != null && s.chunkCache != null) {
+                s.chunkCache.free();
             }
         }
 
         public AdaptiveByteBuf newBuffer() {
-            AdaptiveRecycler recycler = this.recycler;
-            AdaptiveByteBuf buf = recycler == null ? EVENT_LOOP_LOCAL_BUFFER_POOL.get() : recycler.get();
+            MagazineState s = this.state;
+            AdaptiveByteBuf buf = s == null || s.recycler == null ?
+                    EVENT_LOOP_LOCAL_BUFFER_POOL.get() : s.recycler.get();
             buf.resetRefCnt();
             buf.discardMarks();
             return buf;
@@ -1525,11 +1537,12 @@ final class AdaptivePoolingAllocator {
             if (group.freed) {
                 return false;
             }
-            if (chunkCache != null) {
+            MagazineState s = this.state;
+            if (s != null && s.chunkCache != null) {
                 if (chunk.hasUnprocessedFreelistEntries()) {
                     chunk.processFreelistEntries();
                 }
-                return chunkCache.offerChunk(chunk);
+                return s.chunkCache.offerChunk(chunk);
             }
             return group.offerChunk(chunk);
         }
