@@ -308,12 +308,15 @@ final class AdaptivePoolingAllocator {
         return buf;
     }
 
+    // TODO: This method force-initializes a full magazine just to reach magazine.group.allocator
+    //  (needed by the Chunk constructor for potential future ByteBuf.capacity(int) calls) and
+    //  to get a recycler for AdaptiveByteBuf wrappers. Neither requires the full magazine
+    //  allocation machinery. The allocator ref could be passed directly to the Chunk constructor,
+    //  and the recycler could live on MagazineGroup for non-thread-local code paths.
     private Magazine getFallbackMagazine(Thread currentThread) {
         SharedMagazineRef[] refs = largeBufferMagazineGroup.sharedRefs;
-        int id = (int) currentThread.getId();
-        id ^= id >>> 16;
         int mask = refs.length - 1;
-        int idx = id & mask;
+        int idx = threadIndex(currentThread) & mask;
         for (int i = 0; i < refs.length; i++) {
             Magazine mag = refs[(idx + i) & mask].magazine();
             if (mag != null) {
@@ -323,7 +326,7 @@ final class AdaptivePoolingAllocator {
         SharedMagazineRef ref = refs[idx];
         long stamp = ref.acquire();
         try {
-            return ref.getOrInit(largeBufferMagazineGroup);
+            return ref.getOrCreate(largeBufferMagazineGroup);
         } finally {
             ref.release(stamp);
         }
@@ -406,43 +409,22 @@ final class AdaptivePoolingAllocator {
                 return buf;
             }
 
-            int id = (int) currentThread.getId();
-            id ^= id >>> 16;
+            int index = threadIndex(currentThread);
             int expansions = 0;
+            int currentScanLength;
             do {
-                int currentScanLength = scanLength.get();
+                currentScanLength = scanLength.get();
                 int mask = currentScanLength - 1;
-                int index = id & mask;
-                int attempts = Math.max(3, Math.min(currentScanLength, 10));
-                for (int i = 0; i < attempts; i++) {
-                    SharedMagazineRef ref = sharedRefs[(index + i) & mask];
-                    long stamp = ref.tryAcquire();
-                    if (stamp != 0) {
-                        try {
-                            Magazine mag = ref.getOrInit(this);
-                            if (buf == null) {
-                                buf = mag.newBuffer();
-                            }
-                            if (mag.allocate(size, maxCapacity, buf, reallocate)) {
-                                return buf;
-                            }
-                        } finally {
-                            ref.release(stamp);
-                        }
-                    } else {
-                        Magazine mag = ref.magazine();
-                        if (mag != null) {
-                            if (buf == null) {
-                                buf = mag.newBuffer();
-                            }
-                            if (mag.allocateWithoutLock(size, maxCapacity, buf)) {
-                                return buf;
-                            }
-                        }
+                int start = index & mask;
+                for (int i = 0, m = currentScanLength << 1; i < m; i++) {
+                    SharedMagazineRef ref = sharedRefs[(start + i) & mask];
+                    AdaptiveByteBuf result = ref.tryAllocate(this, size, maxCapacity, buf, reallocate);
+                    if (result != null) {
+                        return result;
                     }
                 }
                 expansions++;
-            } while (expansions <= EXPANSION_ATTEMPTS && tryExpandScanLength());
+            } while (expansions <= EXPANSION_ATTEMPTS && tryExpandScanLength(currentScanLength));
 
             if (!reallocate && buf != null) {
                 buf.release();
@@ -450,8 +432,11 @@ final class AdaptivePoolingAllocator {
             return null;
         }
 
-        private boolean tryExpandScanLength() {
+        private boolean tryExpandScanLength(int observed) {
             int current = scanLength.get();
+            if (current > observed) {
+                return true;
+            }
             if (current >= MAX_STRIPES) {
                 return false;
             }
@@ -889,7 +874,7 @@ final class AdaptivePoolingAllocator {
      * {@code scanForCapacity}'s job (called after purge via {@code pollChunk}).
      */
     static final class SharedSizeClassedChunkCache extends SizeClassedChunkCache {
-        private static final int SHARED_CACHE_CAPACITY = Math.max(128, CHUNK_REUSE_QUEUE * 2);
+        private static final int SHARED_CACHE_CHUNK_SIZE = Math.max(128, CHUNK_REUSE_QUEUE * 2);
         private final Queue<SizeClassedChunk> queue;
         private final AtomicLong purgeBudget;
         private final ArrayList<SizeClassedChunk> deferredBuffer = new ArrayList<>();
@@ -897,7 +882,7 @@ final class AdaptivePoolingAllocator {
         private final AtomicLong scanGeneration = new AtomicLong();
 
         SharedSizeClassedChunkCache() {
-            queue = PlatformDependent.newMpmcUnboundedXaddQueue(SHARED_CACHE_CAPACITY);
+            queue = PlatformDependent.newMpmcUnboundedXaddQueue(SHARED_CACHE_CHUNK_SIZE);
             purgeBudget = new AtomicLong(CHUNK_PURGE_POLLS_SHARED);
         }
 
@@ -929,7 +914,7 @@ final class AdaptivePoolingAllocator {
             if (first.hasRemainingCapacity()) {
                 return scanForCapacitySlow(generation, first);
             }
-            reoffer(first);
+            queue.offer(first);
             return scanForCapacitySlow(generation, null);
         }
 
@@ -937,13 +922,13 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk chunk;
             while ((chunk = queue.poll()) != null) {
                 if (chunk.lastScanGeneration >= generation) {
-                    reoffer(chunk);
+                    queue.offer(chunk);
                     break;
                 }
                 if (chunk.hasRemainingCapacity()) {
                     if (chunk.purgeEpoch == 0) {
                         if (fallback != null) {
-                            reoffer(fallback);
+                            queue.offer(fallback);
                         }
                         return chunk;
                     }
@@ -953,22 +938,13 @@ final class AdaptivePoolingAllocator {
                     }
                 }
                 chunk.lastScanGeneration = generation;
-                reoffer(chunk);
+                queue.offer(chunk);
             }
             if (fallback != null) {
                 fallback.purgeEpoch = 0;
                 return fallback;
             }
             return null;
-        }
-
-        private void reoffer(SizeClassedChunk chunk) {
-            queue.offer(chunk);
-        }
-
-        private void reoffer(SizeClassedChunk chunk, long generation) {
-            chunk.lastPurgeGeneration = generation;
-            queue.offer(chunk);
         }
 
         private void runPurgeScan() {
@@ -978,7 +954,8 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk chunk;
             while ((chunk = queue.poll()) != null) {
                 if (chunk.lastPurgeGeneration == generation) {
-                    reoffer(chunk, generation);
+                    chunk.lastPurgeGeneration = generation;
+                    queue.offer(chunk);
                     break;
                 }
                 retained++;
@@ -993,7 +970,8 @@ final class AdaptivePoolingAllocator {
                 }
                 int remaining = chunk.remainingCapacity();
                 if (remaining > 0) {
-                    reoffer(chunk, generation);
+                    chunk.lastPurgeGeneration = generation;
+                    queue.offer(chunk);
                 } else {
                     deferred.add(chunk);
                 }
@@ -1004,7 +982,8 @@ final class AdaptivePoolingAllocator {
                     chunk.markToDeallocate();
                     retained--;
                 } else {
-                    reoffer(chunk, generation);
+                    chunk.lastPurgeGeneration = generation;
+                    queue.offer(chunk);
                 }
             }
             deferred.clear();
@@ -1288,19 +1267,62 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    private static int threadIndex(Thread t) {
+        int id = (int) t.getId();
+        return id ^ (id >>> 16);
+    }
+
     static final class SharedMagazineRef {
         private final StampedLock lock = new StampedLock();
-        private Magazine magazine;
+        private volatile Magazine magazine;
 
-        long tryAcquire() {
-            return lock.tryWriteLock();
+        AdaptiveByteBuf tryAllocate(MagazineGroup group, int size, int maxCapacity,
+                                    AdaptiveByteBuf buf, boolean reallocate) {
+            long stamp = lock.tryWriteLock();
+            if (stamp == 0) {
+                return tryAllocateWithoutLock(size, maxCapacity, buf);
+            }
+            try {
+                Magazine mag = getOrCreate(group);
+                boolean created = buf == null;
+                if (created) {
+                    buf = mag.newBuffer();
+                }
+                if (mag.allocate(size, maxCapacity, buf, reallocate)) {
+                    return buf;
+                }
+                if (created) {
+                    buf.release();
+                }
+            } finally {
+                lock.unlockWrite(stamp);
+            }
+            return null;
+        }
+
+        private AdaptiveByteBuf tryAllocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            Magazine mag = magazine;
+            if (mag == null) {
+                return null;
+            }
+            boolean created = buf == null;
+            if (created) {
+                buf = mag.newBuffer();
+            }
+            if (mag.allocateWithoutLock(size, maxCapacity, buf)) {
+                return buf;
+            }
+            if (created) {
+                buf.release();
+            }
+            return null;
         }
 
         long acquire() {
             return lock.writeLock();
         }
 
-        Magazine getOrInit(MagazineGroup group) {
+        Magazine getOrCreate(MagazineGroup group) {
             if (magazine == null) {
                 magazine = new Magazine(group, false);
             }
