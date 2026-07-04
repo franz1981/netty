@@ -379,6 +379,7 @@ final class AdaptivePoolingAllocator {
                 for (int i = 0; i < MAX_STRIPES; i++) {
                     sharedRefs[i] = new SharedMagazineRef();
                 }
+                sharedRefs[0].getOrCreate(this);
                 scanLength = new AtomicInteger(INITIAL_MAGAZINES);
             }
         }
