@@ -51,7 +51,6 @@ import java.util.Queue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.IntConsumer;
@@ -1337,12 +1336,6 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class Magazine {
-        private static final AtomicReferenceFieldUpdater<Magazine, Chunk> NEXT_IN_LINE;
-
-        static {
-            NEXT_IN_LINE = AtomicReferenceFieldUpdater.newUpdater(Magazine.class, Chunk.class, "nextInLine");
-        }
-
         private static final Chunk MAGAZINE_FREED = new Chunk();
 
         static final class AdaptiveRecycler extends Recycler<AdaptiveByteBuf> {
@@ -1383,8 +1376,7 @@ final class AdaptivePoolingAllocator {
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
 
         private Chunk current;
-        @SuppressWarnings("unused") // updated via NEXT_IN_LINE
-        private volatile Chunk nextInLine;
+        private Chunk nextInLine;
         private final MagazineGroup group;
         private final ChunkController chunkController;
         private final ChunkCache chunkCache;
@@ -1427,10 +1419,10 @@ final class AdaptivePoolingAllocator {
             //
             // In any case we will store the Chunk as the current so it will be used again for the next allocation and
             // thus be "reserved" by this Magazine for exclusive usage.
-            curr = NEXT_IN_LINE.getAndSet(this, null);
+            curr = nextInLine;
+            nextInLine = null;
             if (curr != null) {
                 if (curr == MAGAZINE_FREED) {
-                    // Allocation raced with a stripe-resize that freed this magazine.
                     restoreMagazineFreed();
                     return false;
                 }
@@ -1500,30 +1492,24 @@ final class AdaptivePoolingAllocator {
         }
 
         private void restoreMagazineFreed() {
-            Chunk next = NEXT_IN_LINE.getAndSet(this, MAGAZINE_FREED);
+            Chunk next = nextInLine;
+            nextInLine = MAGAZINE_FREED;
             if (next != null && next != MAGAZINE_FREED) {
-                // A chunk snuck in through a race. Release it after restoring MAGAZINE_FREED state.
                 next.releaseFromMagazine();
             }
         }
 
         private void transferToNextInLineOrRelease(Chunk chunk) {
-            if (NEXT_IN_LINE.compareAndSet(this, null, chunk)) {
+            Chunk next = nextInLine;
+            if (next == null) {
+                nextInLine = chunk;
                 return;
             }
-
-            Chunk nextChunk = NEXT_IN_LINE.get(this);
-            if (nextChunk != null && nextChunk != MAGAZINE_FREED
-                    && chunk.remainingCapacity() > nextChunk.remainingCapacity()) {
-                if (NEXT_IN_LINE.compareAndSet(this, nextChunk, chunk)) {
-                    nextChunk.releaseFromMagazine();
-                    return;
-                }
+            if (next != MAGAZINE_FREED && chunk.remainingCapacity() > next.remainingCapacity()) {
+                nextInLine = chunk;
+                next.releaseFromMagazine();
+                return;
             }
-            // Next-in-line is occupied. We don't try to add it to the central queue yet as it might still be used
-            // by some buffers and so is attached to a Magazine.
-            // Once a Chunk is completely released by Chunk.release() it will try to move itself to the queue
-            // as last resort.
             chunk.releaseFromMagazine();
         }
 
