@@ -433,14 +433,19 @@ final class AdaptivePoolingAllocator {
         }
 
         AdaptiveByteBuf newBufferFrom(Thread currentThread) {
-            return newSharedBuffer();
-        }
-
-        AdaptiveByteBuf newSharedBuffer() {
-            AdaptiveByteBuf buf = allocator.fallbackRecycler.get();
-            buf.resetRefCnt();
-            buf.discardMarks();
-            return buf;
+            SharedMagazineRef[] refs = sharedRefs;
+            if (refs == null) {
+                return null;
+            }
+            int mask = refs.length - 1;
+            int idx = threadIndex(currentThread) & mask;
+            for (int i = 0; i < refs.length; i++) {
+                Magazine mag = refs[(idx + i) & mask].magazine();
+                if (mag != null) {
+                    return mag.newBuffer();
+                }
+            }
+            return null;
         }
 
         Chunk pollChunk(int size) {
@@ -1279,7 +1284,7 @@ final class AdaptivePoolingAllocator {
                                     AdaptiveByteBuf buf, boolean reallocate) {
             long stamp = lock.tryWriteLock();
             if (stamp == 0) {
-                return tryAllocateWithoutLock(group, size, maxCapacity, buf);
+                return null;
             }
             try {
                 Magazine mag = getOrCreate(group);
@@ -1295,25 +1300,6 @@ final class AdaptivePoolingAllocator {
                 }
             } finally {
                 lock.unlockWrite(stamp);
-            }
-            return null;
-        }
-
-        private AdaptiveByteBuf tryAllocateWithoutLock(MagazineGroup group, int size, int maxCapacity,
-                                                      AdaptiveByteBuf buf) {
-            Magazine mag = magazine;
-            if (mag == null) {
-                return null;
-            }
-            boolean created = buf == null;
-            if (created) {
-                buf = group.newSharedBuffer();
-            }
-            if (mag.allocateWithoutLock(size, maxCapacity, buf)) {
-                return buf;
-            }
-            if (created) {
-                buf.release();
             }
             return null;
         }
@@ -1412,42 +1398,6 @@ final class AdaptivePoolingAllocator {
             this.chunkCache = group.chunkManagementStrategy.hasPerMagazineCache() ?
                     group.chunkManagementStrategy.createChunkCache(isThreadLocal) : null;
             this.recycler = isThreadLocal ? null : AdaptiveRecycler.sharedMpsc(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-        }
-
-        boolean allocateWithoutLock(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            Chunk curr = NEXT_IN_LINE.getAndSet(this, null);
-            if (curr == MAGAZINE_FREED) {
-                // Allocation raced with a stripe-resize that freed this magazine.
-                restoreMagazineFreed();
-                return false;
-            }
-            if (curr == null) {
-                curr = group.pollChunk(size);
-                if (curr == null) {
-                    return false;
-                }
-                curr.attachToMagazine(this);
-            }
-            boolean allocated = false;
-            int remainingCapacity = curr.remainingCapacity();
-            int startingCapacity = chunkController.computeBufferCapacity(
-                    size, maxCapacity, true);
-            if (remainingCapacity >= size &&
-                    curr.readInitInto(buf, size, Math.min(remainingCapacity, startingCapacity), maxCapacity)) {
-                allocated = true;
-                remainingCapacity = curr.remainingCapacity();
-            }
-            try {
-                if (remainingCapacity >= RETIRE_CAPACITY) {
-                    transferToNextInLineOrRelease(curr);
-                    curr = null;
-                }
-            } finally {
-                if (curr != null) {
-                    curr.releaseFromMagazine();
-                }
-            }
-            return allocated;
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
