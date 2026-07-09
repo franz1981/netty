@@ -309,14 +309,7 @@ final class AdaptivePoolingAllocator {
         if (originGroup == null) {
             originGroup = largeBufferMagazineGroup;
         }
-        AdaptiveByteBuf buf = originGroup.newBufferFrom(currentThread);
-        if (buf != null) {
-            return buf;
-        }
-        buf = fallbackRecycler.get();
-        buf.resetRefCnt();
-        buf.discardMarks();
-        return buf;
+        return originGroup.newBufferFrom();
     }
 
     /**
@@ -432,20 +425,11 @@ final class AdaptivePoolingAllocator {
             return true;
         }
 
-        AdaptiveByteBuf newBufferFrom(Thread currentThread) {
-            SharedMagazineRef[] refs = sharedRefs;
-            if (refs == null) {
-                return null;
-            }
-            int mask = refs.length - 1;
-            int idx = threadIndex(currentThread) & mask;
-            for (int i = 0; i < refs.length; i++) {
-                Magazine mag = refs[(idx + i) & mask].magazine();
-                if (mag != null) {
-                    return mag.newBuffer();
-                }
-            }
-            return null;
+        AdaptiveByteBuf newBufferFrom() {
+            AdaptiveByteBuf buf = allocator.fallbackRecycler.get();
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
         }
 
         Chunk pollChunk(int size) {
@@ -1390,7 +1374,7 @@ final class AdaptivePoolingAllocator {
             this.chunkController = group.chunkManagementStrategy.createController(group);
             this.chunkCache = group.chunkManagementStrategy.hasPerMagazineCache() ?
                     group.chunkManagementStrategy.createChunkCache(isThreadLocal) : null;
-            this.recycler = isThreadLocal ? null : AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            this.recycler = isThreadLocal ? null : AdaptiveRecycler.sharedMpsc(MAGAZINE_BUFFER_QUEUE_CAPACITY);
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
