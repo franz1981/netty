@@ -1390,7 +1390,7 @@ final class AdaptivePoolingAllocator {
             this.chunkController = group.chunkManagementStrategy.createController(group);
             this.chunkCache = group.chunkManagementStrategy.hasPerMagazineCache() ?
                     group.chunkManagementStrategy.createChunkCache(isThreadLocal) : null;
-            this.recycler = isThreadLocal ? null : AdaptiveRecycler.sharedMpsc(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            this.recycler = isThreadLocal ? null : AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
