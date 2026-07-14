@@ -1918,7 +1918,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         protected void _setLongLE(int index, long value) {
-            rootParent().setLongLE(idx(index), value);
+            rootParent()._setLongLE(idx(index), value);
         }
 
         @Override
