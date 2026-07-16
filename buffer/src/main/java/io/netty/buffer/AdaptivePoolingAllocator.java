@@ -117,7 +117,7 @@ final class AdaptivePoolingAllocator {
     private static final int MAX_POOLED_BUF_SIZE = MAX_CHUNK_SIZE / BUFS_PER_CHUNK;
 
     /**
-     * The capacity of the chunk reuse queues, that allow chunks to be shared across magazines in a slot.
+     * The capacity of the chunk reuse queues, that allow chunks to be shared across magazines in a stripe.
      * The default size is twice {@link NettyRuntime#availableProcessors()}.
      */
     static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
@@ -544,7 +544,7 @@ final class AdaptivePoolingAllocator {
     }
 
     // Striped heap holding all size-class magazines under one lock.
-    // One StampedLock per stripe covers ALL size classes, like mimalloc's unified-slot model.
+    // One StampedLock per stripe covers ALL size classes.
     private static final class StripedHeap {
         final StampedLock lock = new StampedLock();
         Magazine[] magazines;
@@ -720,7 +720,7 @@ final class AdaptivePoolingAllocator {
     // 2. EVICTION: idle chunks with epoch > CHUNK_PURGE_THRESHOLD are evicted (markToDeallocate).
     //    Eviction is immediate — all segments are in, no outstanding references.
     //    Non-idle chunks are never evicted (deallocation would be deferred, not immediate).
-    //    Evicted chunks are offered to the slot's recycled pool for cross-size-class reuse.
+    //    Evicted chunks are offered to the stripe's recycled pool for cross-size-class reuse.
     //
     // 3. SCAN RESET: scanForCapacity resets purgeEpoch = 0 on the chunk it picks. The scan
     //    knows the chunk is being used. The chunk gets allocated from, becomes non-idle, and
@@ -828,7 +828,7 @@ final class AdaptivePoolingAllocator {
      *              notEmptyCount=2, count=6
      * </pre>
      * Idle chunks ({@code remainingCapacity == capacity}) age via purgeEpoch and are evicted
-     * past threshold. Evicted chunks are offered to the slot's recycled pool.
+     * past threshold. Evicted chunks are offered to the stripe's recycled pool.
      */
     static final class ThreadLocalSizeClassedChunkCache extends SizeClassedChunkCache {
         SizeClassedChunk[] chunks; // package-private for testing
@@ -1348,7 +1348,7 @@ final class AdaptivePoolingAllocator {
         final SizeClassChunkRecycler chunkRecycler;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
 
-        // Size-classed magazine constructor (both thread-local and shared-slot)
+        // Size-classed magazine constructor (both thread-local and shared-stripe)
         Magazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
                  SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
                  Thread ownerThread, AdaptiveRecycler bufRecycler) {
