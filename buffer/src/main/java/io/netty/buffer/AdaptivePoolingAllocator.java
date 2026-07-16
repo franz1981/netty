@@ -1936,18 +1936,16 @@ final class AdaptivePoolingAllocator {
                 if (recycler.offerBuffer(delegate, sizeClassIndex)) {
                     delegate = null;
                 }
-                if (externalFreeList != null && recycler.offerFreelist(externalFreeList)) {
-                    externalFreeList = null;
+                if (externalFreeList != null) {
+                    recycler.offerFreelist(externalFreeList);
                 }
-                if (localFreeList != null && recycler.offerLocalFreelist(localFreeList)) {
-                    localFreeList = null;
+                if (localFreeList != null) {
+                    recycler.offerLocalFreelist(localFreeList);
                 }
             }
-            allocator.chunkRegistry.remove(this);
-            if (delegate != null) {
-                delegate.release();
-                delegate = null;
-            }
+            externalFreeList = null;
+            localFreeList = null;
+            markToDeallocate();
         }
 
         @Override
