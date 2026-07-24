@@ -706,6 +706,9 @@ final class AdaptivePoolingAllocator {
         void free();
 
         boolean isEmpty();
+
+        default void tickPurge() {
+        }
     }
 
     // Cached chunks are detached from magazines: no readInitInto can happen, so segment count
@@ -786,7 +789,7 @@ final class AdaptivePoolingAllocator {
      *        ^head           ^tail
      * </pre>
      *
-     * <p><b>runPurgeScan</b> (every {@link #CHUNK_PURGE_POLLS_THREAD_LOCAL} polls) —
+     * <p><b>runPurgeScan</b> (triggered by the per-magazine allocation counter) —
      * two passes. Pass 1: age idle chunks (full → epoch++, non-full → epoch=0), evict
      * past threshold, compact survivors (nulls stale slots inline). Pass 2: partition
      * hasCap to front / noCap to back, then three-way Dutch-flag within hasCap into
@@ -836,30 +839,30 @@ final class AdaptivePoolingAllocator {
         int tail;
         int count;
         int notEmptyCount;
-        private long purgeBudget;
 
         SizeClassChunkRecycler chunkRecycler;
         int sizeClassIndex;
 
         ThreadLocalSizeClassedChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
             chunks = new SizeClassedChunk[8];
-            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
             this.chunkRecycler = chunkRecycler;
             this.sizeClassIndex = sizeClassIndex;
         }
 
         @Override
         SizeClassedChunk forcePurge() {
-            purgeBudget = 1;
-            return pollChunk(0);
+            runPurgeScan();
+            return scanForCapacity();
         }
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
-            if (--purgeBudget == 0) {
-                runPurgeScan();
-            }
             return scanForCapacity();
+        }
+
+        @Override
+        public void tickPurge() {
+            runPurgeScan();
         }
 
         private SizeClassedChunk scanForCapacity() {
@@ -925,7 +928,6 @@ final class AdaptivePoolingAllocator {
             tail = (head + kept) & mask;
             count = kept;
             partition(kept);
-            purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
         }
 
         private void partition(int size) {
@@ -1347,6 +1349,8 @@ final class AdaptivePoolingAllocator {
         final int sizeClassIndex;
         final SizeClassChunkRecycler chunkRecycler;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
+        private final int purgeTickThreshold;
+        private int allocCount;
 
         // Size-classed magazine constructor (both thread-local and shared-stripe)
         Magazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
@@ -1359,6 +1363,8 @@ final class AdaptivePoolingAllocator {
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
             this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex);
+            this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
+                    CHUNK_PURGE_POLLS_THREAD_LOCAL * (strategy.chunkSize / strategy.segmentSize));
         }
 
         // Buddy (large buffer) magazine constructor
@@ -1371,6 +1377,14 @@ final class AdaptivePoolingAllocator {
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
             this.chunkCache = allocator.sharedBuddyCache;
+            this.purgeTickThreshold = 0;
+        }
+
+        private void tickAllocPurge() {
+            if (purgeTickThreshold > 0 && ++allocCount >= purgeTickThreshold) {
+                allocCount = 0;
+                chunkCache.tickPurge();
+            }
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
@@ -1387,6 +1401,7 @@ final class AdaptivePoolingAllocator {
                     curr.releaseFromMagazine();
                 }
                 if (success) {
+                    tickAllocPurge();
                     return true;
                 }
             }
@@ -1413,6 +1428,7 @@ final class AdaptivePoolingAllocator {
                         curr.readInitInto(buf, size, startingCapacity, maxCapacity)) {
                     // We have a Chunk that has some space left.
                     current = curr;
+                    tickAllocPurge();
                     return true;
                 }
 
@@ -1420,7 +1436,11 @@ final class AdaptivePoolingAllocator {
                     if (remainingCapacity >= size) {
                         // At this point we know that this will be the last time curr will be used, so directly set it
                         // to null and release it once we are done.
-                        return curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
+                        boolean allocated = curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
+                        if (allocated) {
+                            tickAllocPurge();
+                        }
+                        return allocated;
                     }
                 } finally {
                     // Release in a finally block so even if readInitInto(...) would throw we would still correctly
@@ -1468,6 +1488,9 @@ final class AdaptivePoolingAllocator {
                     curr.releaseFromMagazine();
                     current = null;
                 }
+            }
+            if (success) {
+                tickAllocPurge();
             }
             return success;
         }
