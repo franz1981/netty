@@ -97,8 +97,8 @@ final class AdaptivePoolingAllocator {
      * chunk size, which itself is a whole multiple of popular page sizes like 4 KiB, 16 KiB, and 64 KiB.
      */
     static final int MIN_CHUNK_SIZE = 128 * 1024;
-    private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> SLOT_SCAN_LENGTH =
-            AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "slotScanLength");
+    private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
+            AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
     private static final int MAX_STRIPES = IS_LOW_MEM ? 1 :
             MathUtil.safeFindNextPositivePowerOfTwo(NettyRuntime.availableProcessors() * 2);
@@ -213,7 +213,7 @@ final class AdaptivePoolingAllocator {
     private final ChunkRegistry chunkRegistry;
     private final SizeClassChunkManagementStrategy[] sizeClassStrategies;
     private final StripedHeap[] stripedHeaps;
-    private volatile int slotScanLength;
+    private volatile int stripeScanLength;
     private final BuddyChunkManagementStrategy buddyStrategy;
     private final ChunkCache sharedBuddyCache;
     private final Magazine.AdaptiveRecycler fallbackRecycler;
@@ -230,7 +230,7 @@ final class AdaptivePoolingAllocator {
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new StripedHeap();
         }
-        slotScanLength = INITIAL_MAGAZINES;
+        stripeScanLength = INITIAL_MAGAZINES;
         buddyStrategy = new BuddyChunkManagementStrategy();
         sharedBuddyCache = buddyStrategy.createChunkCache();
         fallbackRecycler = Magazine.AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
@@ -289,32 +289,32 @@ final class AdaptivePoolingAllocator {
         int expansions = 0;
         int currentScanLen;
         do {
-            currentScanLen = slotScanLength;
+            currentScanLen = stripeScanLength;
             int mask = currentScanLen - 1;
             int start = threadIdx & mask;
             for (int i = 0, m = currentScanLen << 1; i < m; i++) {
-                StripedHeap slot = stripedHeaps[(start + i) & mask];
-                AdaptiveByteBuf result = slot.tryAllocate(
+                StripedHeap stripe = stripedHeaps[(start + i) & mask];
+                AdaptiveByteBuf result = stripe.tryAllocate(
                         sizeClassIndex, size, maxCapacity, buf, reallocate, this);
                 if (result != null) {
                     return result;
                 }
             }
             expansions++;
-        } while (expansions <= EXPANSION_ATTEMPTS && tryExpandSlotScanLength(currentScanLen));
+        } while (expansions <= EXPANSION_ATTEMPTS && tryExpandStripeScanLength(currentScanLen));
 
         return null;
     }
 
-    private boolean tryExpandSlotScanLength(int observed) {
-        int current = slotScanLength;
+    private boolean tryExpandStripeScanLength(int observed) {
+        int current = stripeScanLength;
         if (current > observed) {
             return true;
         }
         if (current >= MAX_STRIPES) {
             return false;
         }
-        SLOT_SCAN_LENGTH.compareAndSet(this, current, current << 1);
+        STRIPE_SCAN_LENGTH.compareAndSet(this, current, current << 1);
         return true;
     }
 
@@ -388,8 +388,8 @@ final class AdaptivePoolingAllocator {
     }
 
     private void free() {
-        for (StripedHeap slot : stripedHeaps) {
-            slot.freeSlot();
+        for (StripedHeap stripe : stripedHeaps) {
+            stripe.freeStripe();
         }
         sharedBuddyCache.free();
     }
@@ -597,7 +597,7 @@ final class AdaptivePoolingAllocator {
             return mag;
         }
 
-        void freeSlot() {
+        void freeStripe() {
             final StampedLock l = lock;
             long stamp = l.writeLock();
             try {

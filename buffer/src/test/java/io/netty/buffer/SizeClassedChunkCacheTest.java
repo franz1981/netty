@@ -287,7 +287,7 @@ public class SizeClassedChunkCacheTest {
     // --- bursty traffic: idle chunks are eventually evicted ---
 
     @Test
-    void cacheSettlesAtRetentionFloorAfterBurstThreadLocal() {
+    void cacheEvictsExcessIdleChunksAfterBurst() {
         ThreadLocalSizeClassedChunkCache cache = new ThreadLocalSizeClassedChunkCache(null, 0);
 
         int floor = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE;
