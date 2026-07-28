@@ -572,7 +572,7 @@ final class AdaptivePoolingAllocator {
 
         private Magazine createMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             if (recycler == null) {
-                recycler = Magazine.AdaptiveRecycler.sharedMpsc(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+                recycler = Magazine.AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
             Magazine mag = new Magazine(allocator, strategy, chunkRecycler, sizeClassIndex, null, recycler);
@@ -590,7 +590,7 @@ final class AdaptivePoolingAllocator {
 
         private Magazine createBuddyMagazine(AdaptivePoolingAllocator allocator) {
             if (recycler == null) {
-                recycler = Magazine.AdaptiveRecycler.sharedMpsc(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+                recycler = Magazine.AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             Magazine mag = new Magazine(allocator, allocator.buddyStrategy, recycler);
             buddyMagazine = mag;
@@ -1315,9 +1315,9 @@ final class AdaptivePoolingAllocator {
                 super(maxCapacity, unguarded);
             }
 
-            private AdaptiveRecycler(int maxCapacity, boolean unguarded, boolean mpsc) {
-                // doesn't use fast thread local, shared MPSC
-                super(maxCapacity, unguarded, mpsc);
+            private AdaptiveRecycler(int maxCapacity, boolean unguarded, boolean exclusiveGet) {
+                // doesn't use fast thread local, exclusive-get mode
+                super(maxCapacity, unguarded, exclusiveGet);
             }
 
             @Override
@@ -1333,7 +1333,7 @@ final class AdaptivePoolingAllocator {
                 return new AdaptiveRecycler(maxCapacity, true);
             }
 
-            public static AdaptiveRecycler sharedMpsc(int maxCapacity) {
+            public static AdaptiveRecycler sharedExclusiveGet(int maxCapacity) {
                 return new AdaptiveRecycler(maxCapacity, true, true);
             }
         }

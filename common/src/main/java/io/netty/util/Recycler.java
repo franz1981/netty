@@ -139,7 +139,7 @@ public abstract class Recycler<T> {
     }
 
     @SuppressWarnings("unchecked")
-    protected Recycler(int maxCapacity, boolean unguarded, boolean mpsc) {
+    protected Recycler(int maxCapacity, boolean unguarded, boolean exclusiveGet) {
         if (maxCapacity <= 0) {
             maxCapacity = 0;
         } else {
@@ -148,7 +148,7 @@ public abstract class Recycler<T> {
         threadLocalPool = null;
         if (maxCapacity == 0) {
             localPool = (LocalPool<?, T>) NOOP_LOCAL_POOL;
-        } else if (mpsc && unguarded) {
+        } else if (exclusiveGet && unguarded) {
             localPool = new UnguardedLocalPool<>(maxCapacity, true);
         } else {
             localPool = unguarded ? new UnguardedLocalPool<>(maxCapacity) : new GuardedLocalPool<>(maxCapacity);
@@ -487,8 +487,8 @@ public abstract class Recycler<T> {
             handle = maxCapacity == 0? null : new LocalPoolHandle<>(this);
         }
 
-        UnguardedLocalPool(int maxCapacity, boolean mpsc) {
-            super(maxCapacity, mpsc);
+        UnguardedLocalPool(int maxCapacity, boolean exclusiveGet) {
+            super(maxCapacity, exclusiveGet);
             handle = maxCapacity == 0? null : new LocalPoolHandle<>(this);
         }
 
@@ -525,12 +525,12 @@ public abstract class Recycler<T> {
         }
 
         @SuppressWarnings("unchecked")
-        LocalPool(int maxCapacity, boolean mpsc) {
+        LocalPool(int maxCapacity, boolean exclusiveGet) {
             this.ratioInterval = maxCapacity == 0? -1 : 0;
             this.owner = null;
             batch = null;
             batchSize = 0;
-            pooledHandles = mpsc ? (MessagePassingQueue<H>) newFixedMpscQueue(maxCapacity)
+            pooledHandles = exclusiveGet ? (MessagePassingQueue<H>) newFixedMpscQueue(maxCapacity)
                     : createExternalMcPool(maxCapacity);
             ratioCounter = 0;
         }
