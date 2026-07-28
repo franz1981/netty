@@ -80,7 +80,9 @@ import java.util.function.IntConsumer;
 @UnstableApi
 final class AdaptivePoolingAllocator {
     private static final int LOW_MEM_THRESHOLD = 512 * 1024 * 1024;
-    private static final boolean IS_LOW_MEM = Runtime.getRuntime().maxMemory() <= LOW_MEM_THRESHOLD;
+    private static final boolean IS_LOW_MEM = SystemPropertyUtil.getBoolean(
+            "io.netty.allocator.lowMemory",
+            Runtime.getRuntime().maxMemory() <= LOW_MEM_THRESHOLD);
 
     /**
      * Whether the IS_LOW_MEM setting should disable thread-local magazines.
