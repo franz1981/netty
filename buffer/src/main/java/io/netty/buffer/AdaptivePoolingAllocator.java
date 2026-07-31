@@ -654,7 +654,7 @@ final class AdaptivePoolingAllocator {
         ThreadLocalSizeClassedChunkCache(int chunkSize) {
             chunks = new SizeClassedChunk[8];
             purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
-            maxCachedChunks = Math.max(CHUNK_REUSE_QUEUE,
+            maxCachedChunks = Math.max(2,
                     THREAD_LOCAL_CACHE_MAX_BYTES / chunkSize);
         }
 
