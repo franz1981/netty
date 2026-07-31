@@ -136,6 +136,9 @@ final class AdaptivePoolingAllocator {
     static final int CHUNK_PURGE_THRESHOLD = Math.max(1, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkPurgeThreshold", 3));
 
+    static final int THREAD_LOCAL_CACHE_MAX_BYTES = SystemPropertyUtil.getInt(
+            "io.netty.allocator.threadLocalChunkCacheMaxBytes", 8 * 1024 * 1024);
+
     /**
      * The capacity if the magazine local buffer queue. This queue just pools the outer ByteBuf instance and not
      * the actual memory and so helps to reduce GC pressure.
@@ -540,8 +543,9 @@ final class AdaptivePoolingAllocator {
     //    Shared: approximate, converges over multiple cycles (FIFO queue ordering,
     //    LRU preference in scan, retained counter in purge).
     abstract static class SizeClassedChunkCache implements ChunkCache {
-        static SizeClassedChunkCache create(boolean isThreadLocal) {
-            return isThreadLocal ? new ThreadLocalSizeClassedChunkCache() : new SharedSizeClassedChunkCache();
+        static SizeClassedChunkCache create(boolean isThreadLocal, int chunkSize) {
+            return isThreadLocal ? new ThreadLocalSizeClassedChunkCache(chunkSize) :
+                    new SharedSizeClassedChunkCache();
         }
 
         @Override
@@ -647,10 +651,13 @@ final class AdaptivePoolingAllocator {
         int count;
         int notEmptyCount;
         private long purgeBudget;
+        private final int maxCachedChunks;
 
-        ThreadLocalSizeClassedChunkCache() {
+        ThreadLocalSizeClassedChunkCache(int chunkSize) {
             chunks = new SizeClassedChunk[8];
             purgeBudget = CHUNK_PURGE_POLLS_THREAD_LOCAL;
+            maxCachedChunks = Math.max(CHUNK_REUSE_QUEUE,
+                    THREAD_LOCAL_CACHE_MAX_BYTES / chunkSize);
         }
 
         @Override
@@ -789,8 +796,13 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean offerChunk(Chunk chunk) {
+            if (count >= maxCachedChunks) {
+                return false;
+            }
             if (count == chunks.length) {
-                SizeClassedChunk[] newChunks = new SizeClassedChunk[chunks.length * 2];
+                int newLen = Math.min(chunks.length * 2,
+                        Integer.highestOneBit(maxCachedChunks - 1) << 1);
+                SizeClassedChunk[] newChunks = new SizeClassedChunk[newLen];
                 for (int i = 0; i < count; i++) {
                     newChunks[i] = chunks[(head + i) & (chunks.length - 1)];
                 }
@@ -1165,7 +1177,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public ChunkCache createChunkCache(boolean isThreadLocal) {
-            return SizeClassedChunkCache.create(isThreadLocal);
+            return SizeClassedChunkCache.create(isThreadLocal, chunkSize);
         }
     }
 
