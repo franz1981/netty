@@ -187,10 +187,6 @@ final class AdaptivePoolingAllocator {
     private static final int SIZE_CLASSES_COUNT = SIZE_CLASSES.length;
     private static final byte[] SIZE_INDEXES = new byte[SIZE_CLASSES[SIZE_CLASSES_COUNT - 1] / 32 + 1];
 
-    private static final byte[] SIZE_CLASS_TO_CHUNK_POOL; // sizeClassIndex -> poolIndex
-    private static final int CHUNK_POOL_COUNT;           // number of distinct pools
-    private static final int[] CHUNK_SIZES;              // chunkSize per pool index
-
     static {
         if (MAGAZINE_BUFFER_QUEUE_CAPACITY < 2) {
             throw new IllegalArgumentException("MAGAZINE_BUFFER_QUEUE_CAPACITY: " + MAGAZINE_BUFFER_QUEUE_CAPACITY
@@ -205,25 +201,6 @@ final class AdaptivePoolingAllocator {
             Arrays.fill(SIZE_INDEXES, lastIndex + 1, sizeIndex + 1, (byte) i);
             lastIndex = sizeIndex;
         }
-
-        // Precompute per-chunkSize pool mapping for O(1) recycled chunk routing.
-        // Each size class maps to a chunkSize = max(MIN_CHUNK_SIZE, segmentSize * 32).
-        // Multiple small size classes share the same chunkSize (MIN_CHUNK_SIZE),
-        // while larger ones get their own pool.
-        int[] chunkSizesTemp = new int[SIZE_CLASSES_COUNT];
-        byte[] mappingTemp = new byte[SIZE_CLASSES_COUNT];
-        int poolCount = 0;
-        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int chunkSize = Math.max(MIN_CHUNK_SIZE, SIZE_CLASSES[i] * 32);
-            if (poolCount == 0 || chunkSizesTemp[poolCount - 1] != chunkSize) {
-                chunkSizesTemp[poolCount] = chunkSize;
-                poolCount++;
-            }
-            mappingTemp[i] = (byte) (poolCount - 1);
-        }
-        CHUNK_POOL_COUNT = poolCount;
-        CHUNK_SIZES = Arrays.copyOf(chunkSizesTemp, poolCount);
-        SIZE_CLASS_TO_CHUNK_POOL = mappingTemp;
     }
 
     private final ChunkAllocator chunkAllocator;
@@ -411,155 +388,6 @@ final class AdaptivePoolingAllocator {
         sharedBuddyCache.free();
     }
 
-    private static final int FREELIST_POOL_COUNT; // number of distinct freelist capacity buckets
-    static {
-        // Compute the number of distinct power-of-2 freelist capacities across all size classes.
-        // Capacities are chunkSize/segmentSize, and chunkSize = max(MIN_CHUNK_SIZE, segmentSize * 32).
-        // Min capacity is 32 (2^5), max varies. We index by numberOfTrailingZeros(capacity) - 5.
-        int maxCapBits = 0;
-        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int segmentSize = SIZE_CLASSES[i];
-            int chunkSize = Math.max(MIN_CHUNK_SIZE, segmentSize * 32);
-            int cap = chunkSize / segmentSize;
-            int bits = Integer.numberOfTrailingZeros(Integer.highestOneBit(cap));
-            if (bits > maxCapBits) {
-                maxCapBits = bits;
-            }
-        }
-        FREELIST_POOL_COUNT = maxCapBits - 5 + 1; // indices 0..(maxCapBits-5)
-    }
-
-    private static final class RecycleStack<T> {
-        private final Object[] elements;
-        private int size;
-
-        RecycleStack(int capacity) {
-            elements = new Object[capacity];
-        }
-
-        @SuppressWarnings("unchecked")
-        T poll() {
-            if (size == 0) {
-                return null;
-            }
-            int idx = --size;
-            T element = (T) elements[idx];
-            elements[idx] = null; // help GC
-            return element;
-        }
-
-        boolean offer(T element) {
-            if (size >= elements.length) {
-                return false;
-            }
-            elements[size++] = element;
-            return true;
-        }
-
-        void forEach(java.util.function.Consumer<T> action) {
-            for (int i = 0; i < size; i++) {
-                @SuppressWarnings("unchecked")
-                T element = (T) elements[i];
-                action.accept(element);
-                elements[i] = null;
-            }
-            size = 0;
-        }
-
-        void clear() {
-            for (int i = 0; i < size; i++) {
-                elements[i] = null;
-            }
-            size = 0;
-        }
-    }
-
-    private static final class SizeClassChunkRecycler {
-        @SuppressWarnings("unchecked")
-        private final RecycleStack<AbstractByteBuf>[] bufferPools = new RecycleStack[CHUNK_POOL_COUNT];
-        private final MpscIntQueue[] freelistSlots = new MpscIntQueue[FREELIST_POOL_COUNT];
-        private final IntStack[] localFreelistSlots = new IntStack[FREELIST_POOL_COUNT];
-
-        private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
-
-        SizeClassChunkRecycler() {
-            for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
-                bufferPools[i] = new RecycleStack<>(Math.max(1, TARGET_RECYCLED_BYTES / CHUNK_SIZES[i]));
-            }
-        }
-
-        AbstractByteBuf pollBuffer(int sizeClassIndex) {
-            int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].poll();
-        }
-
-        boolean offerBuffer(AbstractByteBuf delegate, int sizeClassIndex) {
-            int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].offer(delegate);
-        }
-
-        private static int freelistPoolIndex(int capacity) {
-            return Integer.numberOfTrailingZeros(Integer.highestOneBit(Math.max(32, capacity))) - 5;
-        }
-
-        MpscIntQueue pollFreelist(int capacity) {
-            int idx = freelistPoolIndex(MathUtil.safeFindNextPositivePowerOfTwo(capacity));
-            if (idx < 0 || idx >= freelistSlots.length) {
-                return null;
-            }
-            MpscIntQueue fl = freelistSlots[idx];
-            freelistSlots[idx] = null;
-            return fl;
-        }
-
-        boolean offerFreelist(MpscIntQueue freelist) {
-            int idx = freelistPoolIndex(freelist.capacity());
-            if (idx < 0 || idx >= freelistSlots.length) {
-                return false;
-            }
-            if (freelistSlots[idx] != null) {
-                return false;
-            }
-            freelistSlots[idx] = freelist;
-            return true;
-        }
-
-        IntStack pollLocalFreelist(int capacity) {
-            int idx = freelistPoolIndex(capacity);
-            if (idx < 0 || idx >= localFreelistSlots.length) {
-                return null;
-            }
-            IntStack fl = localFreelistSlots[idx];
-            localFreelistSlots[idx] = null;
-            return fl;
-        }
-
-        boolean offerLocalFreelist(IntStack freelist) {
-            int idx = freelistPoolIndex(freelist.capacity());
-            if (idx < 0 || idx >= localFreelistSlots.length) {
-                return false;
-            }
-            if (localFreelistSlots[idx] != null) {
-                return false;
-            }
-            localFreelistSlots[idx] = freelist;
-            return true;
-        }
-
-        void freeAll() {
-            for (RecycleStack<AbstractByteBuf> pool : bufferPools) {
-                pool.forEach(new java.util.function.Consumer<AbstractByteBuf>() {
-                    @Override
-                    public void accept(AbstractByteBuf buf) {
-                        buf.release();
-                    }
-                });
-            }
-            java.util.Arrays.fill(freelistSlots, null);
-            java.util.Arrays.fill(localFreelistSlots, null);
-        }
-    }
-
     // Striped heap holding all size-class magazines under one lock.
     // One StampedLock per stripe covers ALL size classes.
     private static final class StripedHeap {
@@ -567,7 +395,6 @@ final class AdaptivePoolingAllocator {
         Magazine[] magazines;
         Magazine buddyMagazine;
         Magazine.AdaptiveRecycler recycler;
-        SizeClassChunkRecycler chunkRecycler;
 
         Magazine getOrCreateMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             Magazine[] mags = magazines;
@@ -583,7 +410,6 @@ final class AdaptivePoolingAllocator {
 
         private Magazine createFirstMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             magazines = new Magazine[SIZE_CLASSES_COUNT];
-            chunkRecycler = new SizeClassChunkRecycler();
             return createMagazine(sizeClassIndex, allocator);
         }
 
@@ -592,7 +418,7 @@ final class AdaptivePoolingAllocator {
                 recycler = Magazine.AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
-            Magazine mag = new Magazine(allocator, strategy, chunkRecycler, sizeClassIndex, null, recycler);
+            Magazine mag = new Magazine(allocator, strategy, null, recycler);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -631,9 +457,6 @@ final class AdaptivePoolingAllocator {
                     buddyMagazine.free();
                     buddyMagazine = null;
                 }
-                if (chunkRecycler != null) {
-                    chunkRecycler.freeAll();
-                }
             } finally {
                 l.unlockWrite(stamp);
             }
@@ -669,7 +492,6 @@ final class AdaptivePoolingAllocator {
 
     private static final class ThreadLocalSizeClassHeap {
         private final Magazine[] magazines = new Magazine[SIZE_CLASSES_COUNT];
-        private final SizeClassChunkRecycler chunkRecycler = new SizeClassChunkRecycler();
         private final AdaptivePoolingAllocator allocator;
 
         ThreadLocalSizeClassHeap(AdaptivePoolingAllocator allocator) {
@@ -698,7 +520,7 @@ final class AdaptivePoolingAllocator {
         private Magazine createMagazine(int sizeClassIndex) {
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
             Magazine mag = new Magazine(allocator, strategy,
-                                       chunkRecycler, sizeClassIndex, Thread.currentThread(), null);
+                                       Thread.currentThread(), null);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -711,7 +533,6 @@ final class AdaptivePoolingAllocator {
                     magazines[i] = null;
                 }
             }
-            chunkRecycler.freeAll();
         }
     }
 
@@ -857,15 +678,11 @@ final class AdaptivePoolingAllocator {
         int count;
         int notEmptyCount;
 
-        SizeClassChunkRecycler chunkRecycler;
-        int sizeClassIndex;
         final int maxCachedChunks;
         final int purgeRetentionFloor;
 
-        ThreadLocalSizeClassedChunkCache(int chunkSize, SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
+        ThreadLocalSizeClassedChunkCache(int chunkSize) {
             chunks = new SizeClassedChunk[8];
-            this.chunkRecycler = chunkRecycler;
-            this.sizeClassIndex = sizeClassIndex;
             maxCachedChunks = Math.max(1, THREAD_LOCAL_CACHE_MAX_BYTES / chunkSize);
             purgeRetentionFloor = Math.min(maxCachedChunks, Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize));
         }
@@ -931,7 +748,7 @@ final class AdaptivePoolingAllocator {
                     assert chunk.hasFullCapacity();
                     chunk.purgeEpoch++;
                     if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && survivors > purgeRetentionFloor) {
-                        chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+                        chunk.markToDeallocate();
                         chunks[readIdx] = null;
                         survivors--;
                         continue;
@@ -1005,11 +822,17 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        // Diagnostic counters — remove after investigation
+        static volatile long offerRejectedByCapCount;
+        static volatile long offerAcceptedCount;
+
         @Override
         public boolean offerChunk(Chunk chunk) {
             if (count >= maxCachedChunks) {
+                offerRejectedByCapCount++;
                 return false;
             }
+            offerAcceptedCount++;
             if (count == chunks.length) {
                 SizeClassedChunk[] newChunks = new SizeClassedChunk[chunks.length * 2];
                 for (int i = 0; i < count; i++) {
@@ -1194,8 +1017,8 @@ final class AdaptivePoolingAllocator {
                     allocator.chunkAllocator, allocator.chunkRegistry, segmentSize, chunkSize);
         }
 
-        ChunkCache createChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
-            return new ThreadLocalSizeClassedChunkCache(chunkSize, chunkRecycler, sizeClassIndex);
+        ChunkCache createChunkCache() {
+            return new ThreadLocalSizeClassedChunkCache(chunkSize);
         }
     }
 
@@ -1248,24 +1071,6 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public Chunk newChunkAllocation(int promptingSize, Magazine magazine) {
-            if (magazine.chunkRecycler != null) {
-                // Try recycled buffer
-                AbstractByteBuf recycledBuf = magazine.chunkRecycler.pollBuffer(magazine.sizeClassIndex);
-                if (recycledBuf != null) {
-                    int neededSegments = chunkSize / segmentSize;
-                    // Try recycled freelist of matching capacity
-                    MpscIntQueue recycledFL = magazine.chunkRecycler.pollFreelist(neededSegments);
-                    if (recycledFL == null) {
-                        recycledFL = MpscIntQueue.create(neededSegments, SizeClassedChunk.FREE_LIST_EMPTY);
-                    }
-                    IntStack recycledLocal = (magazine.ownerThread != null) ?
-                            magazine.chunkRecycler.pollLocalFreelist(neededSegments) : null;
-                    SizeClassedChunk chunk = new SizeClassedChunk(
-                            recycledBuf, recycledFL, recycledLocal, magazine, this);
-                    chunkRegistry.add(chunk);
-                    return chunk;
-                }
-            }
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
             SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this);
@@ -1370,25 +1175,16 @@ final class AdaptivePoolingAllocator {
         final Thread ownerThread;
         private final ChunkController chunkController;
         private final ChunkCache chunkCache;
-        final int sizeClassIndex;
-        final SizeClassChunkRecycler chunkRecycler;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
-        private final int purgeTickThreshold;
-        private int allocCount;
 
         // Size-classed magazine constructor (both thread-local and shared-stripe)
         Magazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
-                 SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
                  Thread ownerThread, AdaptiveRecycler bufRecycler) {
             this.allocator = allocator;
             this.ownerThread = ownerThread;
-            this.sizeClassIndex = sizeClassIndex;
-            this.chunkRecycler = chunkRecycler;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
-            this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex);
-            this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
-                    CHUNK_PURGE_POLLS_THREAD_LOCAL * (strategy.chunkSize / strategy.segmentSize));
+            this.chunkCache = strategy.createChunkCache();
         }
 
         // Buddy (large buffer) magazine constructor
@@ -1396,19 +1192,9 @@ final class AdaptivePoolingAllocator {
                  BuddyChunkManagementStrategy strategy, AdaptiveRecycler bufRecycler) {
             this.allocator = allocator;
             this.ownerThread = null;
-            this.sizeClassIndex = -1;
-            this.chunkRecycler = null;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
             this.chunkCache = allocator.sharedBuddyCache;
-            this.purgeTickThreshold = 0;
-        }
-
-        private void tickAllocPurge() {
-            if (purgeTickThreshold > 0 && ++allocCount >= purgeTickThreshold) {
-                allocCount = 0;
-                chunkCache.tickPurge();
-            }
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
@@ -1425,7 +1211,6 @@ final class AdaptivePoolingAllocator {
                     curr.releaseFromMagazine();
                 }
                 if (success) {
-                    tickAllocPurge();
                     return true;
                 }
             }
@@ -1452,7 +1237,6 @@ final class AdaptivePoolingAllocator {
                         curr.readInitInto(buf, size, startingCapacity, maxCapacity)) {
                     // We have a Chunk that has some space left.
                     current = curr;
-                    tickAllocPurge();
                     return true;
                 }
 
@@ -1460,11 +1244,7 @@ final class AdaptivePoolingAllocator {
                     if (remainingCapacity >= size) {
                         // At this point we know that this will be the last time curr will be used, so directly set it
                         // to null and release it once we are done.
-                        boolean allocated = curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
-                        if (allocated) {
-                            tickAllocPurge();
-                        }
-                        return allocated;
+                        return curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
                     }
                 } finally {
                     // Release in a finally block so even if readInitInto(...) would throw we would still correctly
@@ -1512,9 +1292,6 @@ final class AdaptivePoolingAllocator {
                     curr.releaseFromMagazine();
                     current = null;
                 }
-            }
-            if (success) {
-                tickAllocPurge();
             }
             return success;
         }
@@ -1829,32 +1606,6 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /**
-         * Constructor for recycled parts: reuses a recycled delegate buffer and a recycled freelist.
-         */
-        SizeClassedChunk(AbstractByteBuf recycledDelegate, MpscIntQueue recycledFreeList,
-                         IntStack recycledLocalFreeList,
-                         Magazine magazine, SizeClassChunkController controller) {
-            super(recycledDelegate, magazine, true);
-            this.externalFreeList = recycledFreeList;
-            segmentSize = controller.segmentSize;
-            segments = controller.chunkSize / segmentSize;
-            STATE.lazySet(this, AVAILABLE);
-            ownerThread = magazine.ownerThread;
-            if (ownerThread != null) {
-                if (recycledLocalFreeList != null && recycledLocalFreeList.capacity() >= segments) {
-                    localFreeList = recycledLocalFreeList;
-                    localFreeList.refill(segments, segmentSize);
-                } else {
-                    localFreeList = controller.createLocalFreeList();
-                }
-                recycledFreeList.resetAndFill(0, segmentSize);
-            } else {
-                localFreeList = null;
-                recycledFreeList.resetAndFill(segments, segmentSize);
-            }
-        }
-
         @Override
         public boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
             assert state == AVAILABLE;
@@ -1976,23 +1727,6 @@ final class AdaptivePoolingAllocator {
             if (totalFreeSegments == segments && STATE.compareAndSet(this, localSize, DEALLOCATED)) {
                 deallocate();
             }
-        }
-
-        void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
-            if (recycler != null) {
-                if (recycler.offerBuffer(delegate, sizeClassIndex)) {
-                    delegate = null;
-                }
-                if (externalFreeList != null) {
-                    recycler.offerFreelist(externalFreeList);
-                }
-                if (localFreeList != null) {
-                    recycler.offerLocalFreelist(localFreeList);
-                }
-            }
-            externalFreeList = null;
-            localFreeList = null;
-            markToDeallocate();
         }
 
         @Override
