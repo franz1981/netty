@@ -281,6 +281,26 @@ public final class HttpConversionUtil {
     }
 
     /**
+     * <a href="https://datatracker.ietf.org/doc/html/rfc9113#section-8.3.1">[RFC 9113], 8.3.1</a> requires that the
+     * {@code :authority} pseudo-header must not include the deprecated "userinfo" subcomponent for {@code http} or
+     * {@code https} schemed requests. Translating such an authority into an HTTP/1.x {@code Host} header would allow
+     * a single authority value to be interpreted differently by downstream components (e.g. one treating everything
+     * before the {@code @} as userinfo and routing/authorizing on the host that follows it).
+     */
+    private static void validateAuthorityHasNoUserInfo(int streamId, Http2Headers headers) throws Http2Exception {
+        CharSequence scheme = headers.scheme();
+        CharSequence authority = headers.authority();
+        if (scheme == null || authority == null ||
+                !(contentEqualsIgnoreCase(scheme, HTTP.name()) || contentEqualsIgnoreCase(scheme, HTTPS.name()))) {
+            return;
+        }
+        if (indexOf(authority, '@', 0) != -1) {
+            throw streamError(streamId, PROTOCOL_ERROR,
+                    "HTTP/2 :authority for http/https requests must not contain the userinfo subcomponent");
+        }
+    }
+
+    /**
      * Create a new object to contain the request data
      *
      * @param streamId The stream associated with the request
@@ -298,6 +318,12 @@ public final class HttpConversionUtil {
         // HTTP/2 does not define a way to carry the version identifier that is included in the HTTP/1.1 request line.
         final CharSequence method = checkNotNull(http2Headers.method(),
                 "method header cannot be null in conversion to HTTP/1.x");
+        try {
+            validateAuthorityHasNoUserInfo(streamId, http2Headers);
+        } catch (Http2Exception e) {
+            content.release();
+            throw e;
+        }
         final CharSequence path = extractPath(method, http2Headers);
         FullHttpRequest msg = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.valueOf(method
                         .toString()), path.toString(), content, validateHttpHeaders);
@@ -330,6 +356,7 @@ public final class HttpConversionUtil {
         // HTTP/2 does not define a way to carry the version identifier that is included in the HTTP/1.1 request line.
         final CharSequence method = checkNotNull(http2Headers.method(),
                 "method header cannot be null in conversion to HTTP/1.x");
+        validateAuthorityHasNoUserInfo(streamId, http2Headers);
         final CharSequence path = extractPath(method, http2Headers);
         HttpRequest msg = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.valueOf(method.toString()),
                 path.toString(), validateHttpHeaders);

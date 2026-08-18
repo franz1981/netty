@@ -24,6 +24,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.EncoderException;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
@@ -325,6 +326,46 @@ public class Http2StreamFrameToHttpObjectCodecTest {
 
         assertNull(ch.readInbound());
         assertFalse(ch.finish());
+    }
+
+    @Test
+    public void testDowngradeHeadersRejectsHttpsAuthorityWithUserInfo() {
+        final EmbeddedChannel ch = new EmbeddedChannel(new Http2StreamFrameToHttpObjectCodec(true));
+        final Http2Headers headers = new DefaultHttp2Headers();
+        headers.method("GET");
+        headers.scheme("https");
+        headers.authority("trusted.example@attacker.example");
+        headers.path("/admin");
+
+        try {
+            DecoderException exception = assertThrows(DecoderException.class,
+                () -> ch.writeInbound(new DefaultHttp2HeadersFrame(headers)));
+            assertThat(exception.getCause()).isInstanceOf(Http2Exception.class);
+            assertEquals(Http2Error.PROTOCOL_ERROR, ((Http2Exception) exception.getCause()).error());
+            assertNull(ch.readInbound());
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    public void testDowngradeFullHeadersRejectsHttpAuthorityWithUserInfo() {
+        final EmbeddedChannel ch = new EmbeddedChannel(new Http2StreamFrameToHttpObjectCodec(true));
+        final Http2Headers headers = new DefaultHttp2Headers();
+        headers.method("GET");
+        headers.scheme("http");
+        headers.authority("trusted.example@attacker.example");
+        headers.path("/admin");
+
+        try {
+            DecoderException exception = assertThrows(DecoderException.class,
+                () -> ch.writeInbound(new DefaultHttp2HeadersFrame(headers, true)));
+            assertThat(exception.getCause()).isInstanceOf(Http2Exception.class);
+            assertEquals(Http2Error.PROTOCOL_ERROR, ((Http2Exception) exception.getCause()).error());
+            assertNull(ch.readInbound());
+        } finally {
+            ch.finishAndReleaseAll();
+        }
     }
 
     @Test
