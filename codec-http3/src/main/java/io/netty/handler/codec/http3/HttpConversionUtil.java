@@ -51,6 +51,7 @@ import static io.netty.handler.codec.http.HttpScheme.HTTP;
 import static io.netty.handler.codec.http.HttpScheme.HTTPS;
 import static io.netty.handler.codec.http.HttpUtil.isAsteriskForm;
 import static io.netty.handler.codec.http.HttpUtil.isOriginForm;
+import static io.netty.handler.codec.http3.Http3CodecUtils.isHttpOrHttpsScheme;
 import static io.netty.util.AsciiString.EMPTY_STRING;
 import static io.netty.util.AsciiString.contentEqualsIgnoreCase;
 import static io.netty.util.AsciiString.indexOf;
@@ -588,6 +589,7 @@ public final class HttpConversionUtil {
         private final long streamId;
         private final HttpHeaders output;
         private final CharSequenceMap<AsciiString> translations;
+        private final boolean request;
 
         /**
          * Create a new instance
@@ -599,18 +601,33 @@ public final class HttpConversionUtil {
         Http3ToHttpHeaderTranslator(long streamId, HttpHeaders output, boolean request) {
             this.streamId = streamId;
             this.output = output;
+            this.request = request;
             translations = request ? REQUEST_HEADER_TRANSLATIONS : RESPONSE_HEADER_TRANSLATIONS;
         }
 
-        void translateHeaders(Iterable<Entry<CharSequence, CharSequence>> inputHeaders) throws Http3Exception {
+        void translateHeaders(Http3Headers inputHeaders) throws Http3Exception {
+            // See https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1 and
+            // https://www.rfc-editor.org/rfc/rfc9110#section-4.2.4: the deprecated
+            //"userinfo" subcomponent of the authority must not be generated in {@code http} and {@code https} URIs.
+            //
+            final boolean checkAuthorityUserinfo = request && isHttpOrHttpsScheme(inputHeaders.scheme());
+
             // lazily created as needed
             StringBuilder cookies = null;
-
             for (Entry<CharSequence, CharSequence> entry : inputHeaders) {
                 final CharSequence name = entry.getKey();
                 final CharSequence value = entry.getValue();
                 AsciiString translatedName = translations.get(name);
                 if (translatedName != null) {
+                    if (checkAuthorityUserinfo && translatedName.contentEqualsIgnoreCase(HttpHeaderNames.HOST) &&
+                            indexOf(value, '@', 0) != -1) {
+                        // https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1 forbids the deprecated userinfo
+                        // subcomponent for "http" and "https" schemed requests. Reject it here instead of
+                        // forwarding it into the HTTP/1.x Host header, which would create an authority/Host
+                        // confusion between Netty and any downstream component parsing the Host value.
+                        throw streamError(streamId, Http3ErrorCode.H3_MESSAGE_ERROR,
+                                "authority: " + value + " contains a forbidden userinfo component", null);
+                    }
                     output.add(translatedName, AsciiString.of(value));
                 } else if (!Http3Headers.PseudoHeaderName.isPseudoHeader(name)) {
                     // https://tools.ietf.org/html/rfc7540#section-8.1.2.3

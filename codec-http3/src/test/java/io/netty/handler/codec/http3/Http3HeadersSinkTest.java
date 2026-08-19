@@ -183,6 +183,46 @@ public class Http3HeadersSinkTest {
         sink.finish();
     }
 
+    @Test
+    public void testAuthorityWithUserinfoRejectedForHttpsScheme() {
+        Http3HeadersSink sink = new Http3HeadersSink(new DefaultHttp3Headers(), 512, true, false);
+        sink.accept(Http3Headers.PseudoHeaderName.METHOD.value(), "GET");
+        sink.accept(Http3Headers.PseudoHeaderName.PATH.value(), "/admin");
+        sink.accept(Http3Headers.PseudoHeaderName.SCHEME.value(), "https");
+        sink.accept(Http3Headers.PseudoHeaderName.AUTHORITY.value(), "trusted.example@attacker.example");
+        assertThrows(Http3HeadersValidationException.class, () -> sink.finish());
+    }
+
+    @Test
+    public void testAuthorityWithUserinfoRejectedForHttpScheme() {
+        Http3HeadersSink sink = new Http3HeadersSink(new DefaultHttp3Headers(), 512, true, false);
+        sink.accept(Http3Headers.PseudoHeaderName.METHOD.value(), "GET");
+        sink.accept(Http3Headers.PseudoHeaderName.PATH.value(), "/admin");
+        sink.accept(Http3Headers.PseudoHeaderName.SCHEME.value(), "http");
+        sink.accept(Http3Headers.PseudoHeaderName.AUTHORITY.value(), "trusted.example@attacker.example");
+        assertThrows(Http3HeadersValidationException.class, () -> sink.finish());
+    }
+
+    @Test
+    public void testAuthorityWithoutUserinfoAcceptedForHttpsScheme() throws Http3Exception {
+        Http3HeadersSink sink = new Http3HeadersSink(new DefaultHttp3Headers(), 512, true, false);
+        sink.accept(Http3Headers.PseudoHeaderName.METHOD.value(), "GET");
+        sink.accept(Http3Headers.PseudoHeaderName.PATH.value(), "/admin");
+        sink.accept(Http3Headers.PseudoHeaderName.SCHEME.value(), "https");
+        sink.accept(Http3Headers.PseudoHeaderName.AUTHORITY.value(), "trusted.example");
+        sink.finish();
+    }
+
+    @Test
+    public void testAuthorityWithUserinfoAcceptedForConnect() throws Http3Exception {
+        // CONNECT requests don't carry a :scheme, so the userinfo restriction (which only applies to "http" and
+        // "https" URIs) must not reject them.
+        Http3HeadersSink sink = new Http3HeadersSink(new DefaultHttp3Headers(), 512, true, false);
+        sink.accept(Http3Headers.PseudoHeaderName.METHOD.value(), "CONNECT");
+        sink.accept(Http3Headers.PseudoHeaderName.AUTHORITY.value(), "trusted.example@attacker.example");
+        sink.finish();
+    }
+
     private static void addMandatoryPseudoHeaders(Http3HeadersSink sink, boolean req) {
         if (req) {
             sink.accept(Http3Headers.PseudoHeaderName.METHOD.value(), "GET");
