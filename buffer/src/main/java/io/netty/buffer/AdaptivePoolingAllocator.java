@@ -1568,6 +1568,10 @@ final class AdaptivePoolingAllocator {
          *
          * <p>Called on the allocation slow path only, right before {@link ChunkCache#pollChunk},
          * which is once per chunk-worth of allocations.
+         *
+         * <p>This magazine's own cache is skipped: {@code pollChunk} drains it on the very next
+         * line, which is both the last moment before the poll and therefore the freshest - it also
+         * catches notes that landed while the other size classes were being drained.
          */
         private void drainHeapPending() {
             Magazine[] mags = heapMagazines;
@@ -1576,7 +1580,7 @@ final class AdaptivePoolingAllocator {
             }
             for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
                 Magazine mag = mags[i];
-                if (mag != null) {
+                if (mag != null && mag != this) {
                     ((SizeClassedChunkCache) mag.chunkCache).drainPending();
                 }
             }
