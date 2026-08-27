@@ -48,6 +48,7 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.IntConsumer;
@@ -128,17 +129,15 @@ final class AdaptivePoolingAllocator {
     static final long CHUNK_PURGE_POLLS_THREAD_LOCAL = Math.max(1, SystemPropertyUtil.getLong(
             "io.netty.allocator.chunkPurgePollsThreadLocal", 16L));
 
-    static final int CHUNK_PURGE_THRESHOLD = Math.max(1, SystemPropertyUtil.getInt(
-            "io.netty.allocator.chunkPurgeThreshold", 3));
-
     /**
-     * Per-size-class upper bound (in bytes) on the thread-local chunk cache.
+     * Reference size (in bytes) from which the per-size-class retention floor is derived.
+     * This is <em>not</em> a cap: {@link SizeClassedChunkCache#offerChunk} never refuses.
      */
     static final int THREAD_LOCAL_CACHE_MAX_BYTES = Math.max(1, SystemPropertyUtil.getInt(
             "io.netty.allocator.threadLocalChunkCacheMaxBytes", 8 * 1024 * 1024));
 
     /**
-     * Per-size-class lower bound (in bytes) on the thread-local chunk cache.
+     * Per-size-class retention floor (in bytes): the cache will not evict below this much.
      * Clamped to {@link #THREAD_LOCAL_CACHE_MAX_BYTES} if the configured value exceeds it.
      */
     static final int THREAD_LOCAL_CACHE_MIN_BYTES = Math.min(THREAD_LOCAL_CACHE_MAX_BYTES,
@@ -592,7 +591,7 @@ final class AdaptivePoolingAllocator {
                 recycler = Magazine.AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
-            Magazine mag = new Magazine(allocator, strategy, chunkRecycler, sizeClassIndex, null, recycler);
+            Magazine mag = new Magazine(allocator, strategy, chunkRecycler, sizeClassIndex, null, recycler, lock);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -698,7 +697,7 @@ final class AdaptivePoolingAllocator {
         private Magazine createMagazine(int sizeClassIndex) {
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
             Magazine mag = new Magazine(allocator, strategy,
-                                       chunkRecycler, sizeClassIndex, Thread.currentThread(), null);
+                                       chunkRecycler, sizeClassIndex, Thread.currentThread(), null, null);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -728,347 +727,451 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    // Cached chunks are detached from magazines: no readInitInto can happen, so segment count
-    // can only grow (external releaseSegment returns) and never shrink. Once a chunk reaches
-    // full capacity (hasFullCapacity), it stays idle while in the cache.
+    // Cached chunks are detached from magazines: no readInitInto can happen while a chunk sits in
+    // the cache, so its free-segment count can only grow (segment returns) and never shrink. Once
+    // a cached chunk reaches full capacity it stays fully free until something polls it out.
     //
-    // Epoch-based aging invariants (both caches):
+    // ADMISSION IS UNBOUNDED. offerChunk never refuses, for any reason. Growth is bounded on the
+    // way out instead: a chunk whose last outstanding segment comes back is fully free and is
+    // evicted right there on the release path, provided the cache stays at or above
+    // purgeRetentionFloor chunks. The floor is the only bound.
     //
-    // 1. CLASSIFICATION: purge scans all chunks. Idle (hasFullCapacity) → epoch++.
-    //    Non-idle → epoch = 0. Only idle chunks can accumulate epoch.
+    // LAYOUT -- flat array, swap-partitioned, with the slot index stored on the chunk:
     //
-    // 2. EVICTION: idle chunks with epoch > CHUNK_PURGE_THRESHOLD are evicted (markToDeallocate).
-    //    Eviction is immediate — all segments are in, no outstanding references.
-    //    Non-idle chunks are never evicted (deallocation would be deferred, not immediate).
-    //    Evicted chunks are offered to the stripe's recycled pool for cross-size-class reuse.
+    //     chunks: [ r r r r | e e e e e ] null null null
+    //               ^0      ^reusableCount ^count
     //
-    // 3. SCAN RESET: scanForCapacity resets purgeEpoch = 0 on the chunk it picks. The scan
-    //    knows the chunk is being used. The chunk gets allocated from, becomes non-idle, and
-    //    the next purge resets its epoch anyway (non-idle → 0). The scan reset covers the case
-    //    where all segments return before the next purge (short-lived buffers).
+    //     [0, reusableCount)      known to hold at least one free segment ("reusable")
+    //     [reusableCount, count)  known to be exhausted when last classified
     //
-    // 4. CONVERGENCE: idle chunks that are never picked by scan age undisturbed across
-    //    purge cycles. After CHUNK_PURGE_THRESHOLD + 1 consecutive cycles of being idle and
-    //    unpolled, they are evicted. Chunks picked by scan get epoch reset — aging interrupted.
-    //    Partition orders [epoch=0 | 0<epoch<T | epoch>=T | noCap]. Scan takes
-    //    from head (epoch=0 first). Chunks with epoch>=threshold are placed at the back of
-    //    the hasCap zone so scan doesn't reach them — they age to threshold+1 and get evicted.
-    abstract static class SizeClassedChunkCache implements ChunkCache {
-        @Override
-        public abstract SizeClassedChunk pollChunk(int size);
+    // SizeClassedChunk.cacheIndex is the chunk's own slot, so any cached chunk is located in O(1)
+    // with no search. Everything the cache does is then O(1):
+    //
+    //   * move exhausted -> reusable: swap with the element sitting on the boundary, boundary++.
+    //   * remove from the exhausted region: fill the hole from slot count-1.
+    //   * remove from the reusable region: fill the hole from slot reusableCount-1, then fill the
+    //     hole that leaves on the boundary from slot count-1.
+    //
+    // Each of those touches at most three slots and rewrites at most two cacheIndex fields; no
+    // other element moves, so every other chunk's index stays valid. Growth is Arrays.copyOf,
+    // which preserves positions, so it does not invalidate indices either.
+    //
+    // ACCESS. chunks/count/reusableCount and every cacheIndex are mutated only by the owner thread
+    // of a thread-local cache, or under the stripe lock of a shared cache -- never by a releasing
+    // thread that failed to take the lock. That path touches only the chunk's MPSC free list and
+    // its pendingNext link, both of which are safe for any thread.
+    static final class SizeClassedChunkCache implements ChunkCache {
+        /**
+         * Slot value meaning "not in any cache". Also the initial value of
+         * {@link SizeClassedChunk#cacheIndex}.
+         */
+        static final int NOT_CACHED = -1;
 
-        // Visible for testing: triggers a purge scan bypassing the budget counter.
-        abstract SizeClassedChunk forcePurge();
-    }
+        /**
+         * How many exhausted chunks {@link #probeExhausted()} will look at before giving up.
+         * A bound on work done, not on anything found.
+         */
+        private static final int MAX_EXHAUSTED_PROBE = 8;
 
-    /**
-     * Ring buffer cache for thread-local chunk reuse (SPSC — only the owner thread accesses it).
-     *
-     * <p>Logical layout after purge:
-     * <pre>
-     *   head                          tail
-     *   v                             v
-     *   [..., notEmpty, notEmpty, ..., empty, empty, ..., null, ...]
-     *        |--- notEmptyCount ---|--- emptyCount --|
-     *        |------------ count ------------------|
-     * </pre>
-     *
-     * <p>Physical layout when the ring wraps:
-     * <pre>
-     *   0         tail          head          length
-     *   v         v             v             v
-     *   [...tail] [  unused  ]  [head................]
-     *             ^             |--- content wraps ---|
-     *             wrap point
-     * </pre>
-     *
-     * <p><b>scanForCapacity</b> — O(1) fast path takes from head while {@code notEmptyCount > 0}:
-     * <pre>
-     *   before: notEmptyCount=2, count=5
-     *   [NE, NE, E, E, E, _, _, _]
-     *    ^head            ^tail
-     *
-     *   after: returns NE, notEmptyCount=1, count=4
-     *   [_,  NE, E, E, E, _, _, _]
-     *        ^head        ^tail
-     * </pre>
-     * Fallback when {@code notEmptyCount == 0}: linear scan of the empty zone for chunks
-     * that gained capacity from external segment returns.
-     *
-     * <p><b>offerChunk</b> — write at tail, grow (double + linearize) if full:
-     * <pre>
-     *   before: count=4
-     *   [_,  NE, E, E, E, _, _, _]
-     *        ^head        ^tail
-     *
-     *   after: count=5
-     *   [_,  NE, E, E, E, X, _, _]
-     *        ^head           ^tail
-     * </pre>
-     *
-     * <p><b>runPurgeScan</b> (triggered by the per-magazine allocation counter) —
-     * two passes. Pass 1: age idle chunks (full → epoch++, non-full → epoch=0), evict
-     * past threshold, compact survivors (nulls stale slots inline). Pass 2: partition
-     * hasCap to front / noCap to back, then three-way Dutch-flag within hasCap into
-     * [epoch=0 | 0&lt;epoch&lt;threshold | epoch&gt;=threshold]. Chunks with epoch&gt;=threshold
-     * are placed at the back of hasCap so scan doesn't reach them — they age to
-     * threshold+1 and get evicted. Never selects — selection is always
-     * {@code scanForCapacity}.
-     *
-     * <p>Case 1 — no eviction, an empty chunk gained capacity externally (common):
-     * <pre>
-     *   before (E* gained capacity since last purge):
-     *   [NE, NE, E*, E, _, _, _, _]
-     *    ^head            ^tail
-     *    notEmptyCount=2
-     *
-     *   pass 1: age idle chunks. None past threshold. No compaction needed.
-     *   pass 2 (partition): E* now has capacity → placed in notEmpty zone.
-     *
-     *   after:
-     *   [NE, NE, E*, E, _, _, _, _]
-     *    ^head            ^tail
-     *    notEmptyCount=3
-     * </pre>
-     *
-     * <p>Case 2 — eviction (uncommon, burst wind-down):
-     * <pre>
-     *   before (ring wraps, IDLE* = idle past threshold):
-     *   [E, NE, _,  IDLE*, NE, E, E, NE]
-     *          ^tail ^head
-     *
-     *   pass 1: IDLE* evicted (markToDeallocate), survivors compacted, stale slots nulled.
-     *   [_, _, _,  NE, E, E, NE, E]
-     *     ^tail    ^head
-     *              |--- kept=6 ---|
-     *
-     *   pass 2 (partition): [epoch=0 hasCap | 0&lt;epoch&lt;T hasCap | epoch&gt;=T hasCap | noCap].
-     *   [_, _, _,  NE, NE, E, E, E]
-     *     ^tail    ^head
-     *              notEmptyCount=2, count=6
-     * </pre>
-     * Idle chunks ({@code remainingCapacity == capacity}) age via purgeEpoch and are evicted
-     * past threshold. Evicted chunks are offered to the stripe's recycled pool.
-     */
-    static final class ThreadLocalSizeClassedChunkCache extends SizeClassedChunkCache {
+        private static final AtomicReferenceFieldUpdater<SizeClassedChunkCache, SizeClassedChunk> PENDING_HEAD =
+                AtomicReferenceFieldUpdater.newUpdater(
+                        SizeClassedChunkCache.class, SizeClassedChunk.class, "pendingHead");
+
         SizeClassedChunk[] chunks; // package-private for testing
-        int head;
-        int tail;
-        int count;
-        int notEmptyCount;
+        int count;                 // package-private for testing
+        int reusableCount;         // package-private for testing
 
-        SizeClassChunkRecycler chunkRecycler;
-        int sizeClassIndex;
-        final int maxCachedChunks;
-        final int purgeRetentionFloor;
+        /** Treiber stack of chunks a lock-less releaser wants looked at. */
+        private volatile SizeClassedChunk pendingHead;
 
-        ThreadLocalSizeClassedChunkCache(int chunkSize, SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
+        /** The lock that guards this cache, or {@code null} for a thread-local (owner-only) cache. */
+        private final StampedLock stripeLock;
+        private final SizeClassChunkRecycler chunkRecycler;
+        private final int sizeClassIndex;
+        final int purgeRetentionFloor; // package-private for testing
+
+        SizeClassedChunkCache(int chunkSize, SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
+            this(chunkSize, chunkRecycler, sizeClassIndex, null);
+        }
+
+        SizeClassedChunkCache(int chunkSize, SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
+                              StampedLock stripeLock) {
             chunks = new SizeClassedChunk[8];
             this.chunkRecycler = chunkRecycler;
             this.sizeClassIndex = sizeClassIndex;
-            maxCachedChunks = Math.max(1, THREAD_LOCAL_CACHE_MAX_BYTES / chunkSize);
-            purgeRetentionFloor = Math.min(maxCachedChunks, Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize));
+            this.stripeLock = stripeLock;
+            purgeRetentionFloor = Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize);
         }
 
-        @Override
+        // --- array bookkeeping -------------------------------------------------------------------
+
+        private void place(SizeClassedChunk chunk, int idx) {
+            chunks[idx] = chunk;
+            chunk.cacheIndex = idx;
+        }
+
+        private void grow() {
+            // Arrays.copyOf preserves positions, so no cacheIndex has to be rewritten.
+            chunks = Arrays.copyOf(chunks, chunks.length * 2);
+        }
+
+        private void addToExhausted(SizeClassedChunk chunk) {
+            if (count == chunks.length) {
+                grow();
+            }
+            place(chunk, count);
+            count++;
+        }
+
+        private void addToReusable(SizeClassedChunk chunk) {
+            if (count == chunks.length) {
+                grow();
+            }
+            int boundary = reusableCount;
+            if (boundary != count) {
+                // Push the first exhausted chunk to the end to make room on the boundary.
+                place(chunks[boundary], count);
+            }
+            count++;
+            place(chunk, boundary);
+            reusableCount = boundary + 1;
+        }
+
+        /** Exhausted -> reusable, in place: one swap with the element on the boundary. */
+        void moveToReusable(SizeClassedChunk chunk) {
+            int idx = chunk.cacheIndex;
+            assert idx >= reusableCount && idx < count && chunks[idx] == chunk;
+            int boundary = reusableCount;
+            if (idx != boundary) {
+                place(chunks[boundary], idx);
+                place(chunk, boundary);
+            }
+            reusableCount = boundary + 1;
+        }
+
+        private void removeFromExhausted(SizeClassedChunk chunk) {
+            int idx = chunk.cacheIndex;
+            assert idx >= reusableCount && idx < count && chunks[idx] == chunk;
+            int last = count - 1;
+            if (idx != last) {
+                place(chunks[last], idx);
+            }
+            chunks[last] = null;
+            count = last;
+            chunk.cacheIndex = NOT_CACHED;
+        }
+
+        private void removeFromReusable(SizeClassedChunk chunk) {
+            int idx = chunk.cacheIndex;
+            assert idx >= 0 && idx < reusableCount && chunks[idx] == chunk;
+            int lastReusable = reusableCount - 1;
+            if (idx != lastReusable) {
+                place(chunks[lastReusable], idx);
+            }
+            // The hole is now on the boundary; close it with the last element of the array.
+            int last = count - 1;
+            if (lastReusable != last) {
+                place(chunks[last], lastReusable);
+            }
+            chunks[last] = null;
+            count = last;
+            reusableCount = lastReusable;
+            chunk.cacheIndex = NOT_CACHED;
+        }
+
+        // --- eviction ----------------------------------------------------------------------------
+
+        /**
+         * Drop {@code chunk} if it is fully free and the cache can spare it. The chunk must be in
+         * the reusable region (a fully free chunk always has capacity).
+         */
+        void evictIfAboveFloor(SizeClassedChunk chunk) {
+            if (count <= purgeRetentionFloor || !chunk.hasFullCapacity()) {
+                return;
+            }
+            assert chunk.cacheIndex < reusableCount;
+            removeFromReusable(chunk);
+            chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+        }
+
+        // --- Notification queue: cross-thread segment returns that could not take the lock -------
+        //
+        // Invariant N (notification completeness): every segment return is either observed by a
+        // later cache decision about that chunk, or leaves an outstanding note that is processed
+        // after that decision. Nothing scans the array looking for capacity, so a lost signal means
+        // a chunk with capacity sits in the exhausted region forever -- never reusable, and never
+        // seen as fully free either, so it is never evicted. Four properties carry the invariant:
+        //
+        //  1. Offer before notify. releaseSegment puts the segment in the MPSC free list first, so
+        //     a drainer that pops the note is guaranteed to see the segment.
+        //  2. Notes are state-independent: "look at this chunk", never "this specific thing
+        //     changed". One note therefore covers any number of later returns, and a note left
+        //     while the chunk was not in the cache stays correct once the chunk is filed. This is
+        //     also why a releaser that finds the claim already taken can simply walk away: the
+        //     in-flight note covers its return too.
+        //  3. Re-arm before processing (see drainPending).
+        //  4. Classification and drain cannot interleave. offerChunk's (read capacity, insert) pair
+        //     and the drain both run under the same stripe lock, or on the same owner thread. That
+        //     is what covers a return landing right after offerChunk read the capacity but before
+        //     the insert: the chunk is filed as exhausted while holding capacity, and the note --
+        //     which cannot be consumed in between -- is what fixes it.
+        //
+        // A drain that finds NOT_CACHED and no-ops is benign, not a lost signal: the chunk is in a
+        // magazine, which consumes its own returned segments through nextAvailableSegmentOffset.
+
+        /**
+         * Queue {@code chunk} for the next drain. Called by a releasing thread that holds no lock,
+         * <em>after</em> the segment has been offered to the chunk's external free list.
+         *
+         * <p>This path must never read {@code cacheIndex} or the array: those belong to the owner
+         * thread / stripe lock holder. The note only says "look at this chunk". The chunk finds
+         * this cache through its {@code final owningCache} field, so no racy reference read is
+         * involved.
+         *
+         * <p>{@link SizeClassedChunk#pendingNext} doubles as the dedup claim, so a return on a
+         * chunk that is already queued costs a single volatile read.
+         */
+        void notifyHasCapacity(SizeClassedChunk chunk) {
+            if (chunk.pendingNext != null) {
+                return;
+            }
+            final SizeClassedChunk sentinel = SizeClassedChunk.PENDING_SENTINEL;
+            // Claim: only the thread that moves the link off null owns the push.
+            if (!SizeClassedChunk.PENDING_NEXT.compareAndSet(chunk, null, sentinel)) {
+                return;
+            }
+            SizeClassedChunk head;
+            do {
+                head = pendingHead;
+                SizeClassedChunk.PENDING_NEXT.lazySet(chunk, head == null ? sentinel : head);
+            } while (!PENDING_HEAD.compareAndSet(this, head, chunk));
+        }
+
+        /**
+         * Apply every queued notification. Caller must hold the stripe lock, or be the owner thread
+         * of a thread-local cache.
+         */
+        void drainPending() {
+            if (pendingHead == null) {
+                // Cheap when there is nothing to do: one volatile read, no atomic RMW.
+                return;
+            }
+            SizeClassedChunk cur = PENDING_HEAD.getAndSet(this, null);
+            final SizeClassedChunk sentinel = SizeClassedChunk.PENDING_SENTINEL;
+            while (cur != null && cur != sentinel) {
+                SizeClassedChunk next = cur.pendingNext;
+                // Re-arm BEFORE processing. A return that lands while we are inside processPending
+                // must be able to queue the chunk again; re-arming afterwards would lose it and
+                // strand the chunk until some later, unrelated notification.
+                //
+                // A full volatile store on purpose, not a lazySet: it is the store half of a Dekker
+                // pair with the releaser, which offers the segment (MPSC offer ends in a CAS on the
+                // producer index, hence a StoreLoad) and only then reads pendingNext.
+                // processPending reads the free lists right after this store; without the StoreLoad
+                // here both sides could miss each other and the chunk would be stranded.
+                SizeClassedChunk.PENDING_NEXT.set(cur, null);
+                processPending(cur);
+                cur = next == sentinel ? null : next;
+            }
+        }
+
+        // Visible for testing: how many chunks are queued for the next drain.
+        int pendingCount() {
+            int n = 0;
+            SizeClassedChunk cur = pendingHead;
+            while (cur != null && cur != SizeClassedChunk.PENDING_SENTINEL) {
+                n++;
+                cur = cur.pendingNext;
+            }
+            return n;
+        }
+
+        private void processPending(SizeClassedChunk chunk) {
+            int idx = chunk.cacheIndex;
+            if (idx == NOT_CACHED) {
+                // Attached to a magazine, already polled, or gone: not ours to move. Checked first,
+                // because such a chunk may have had its free lists stripped by recycleOrDeallocate.
+                return;
+            }
+            if (idx >= reusableCount) {
+                if (!chunk.hasRemainingCapacity()) {
+                    return;
+                }
+                moveToReusable(chunk);
+            }
+            evictIfAboveFloor(chunk);
+        }
+
+        // --- release-path entry points ------------------------------------------------------------
+
+        /**
+         * Try to take exclusive access to this cache so a releasing thread can place a segment and
+         * apply any resulting transition. Returns 0 when unavailable: a cache with no lock has no
+         * exclusive mode to take, and a contended stripe lock is not waited on.
+         *
+         * <p>A non-zero result must be passed to {@link #unlockAfterRelease(long)}; a zero result
+         * must not be. {@link StampedLock} is not reentrant, so a thread that already holds the
+         * stripe lock simply fails here and takes the note path -- no deadlock.
+         */
+        long tryLockForRelease() {
+            return stripeLock == null ? 0 : stripeLock.tryWriteLock();
+        }
+
+        /**
+         * Release the exclusive access taken by {@link #tryLockForRelease()}.
+         *
+         * @param stamp a non-zero stamp from {@code tryLockForRelease}. Zero is not a stamp -- it is
+         *              how that method reports failure -- so passing it here is a caller bug.
+         */
+        void unlockAfterRelease(long stamp) {
+            assert stamp != 0 : "unlockAfterRelease(0): tryLockForRelease did not grant the lock";
+            stripeLock.unlockWrite(stamp);
+        }
+
+        /**
+         * Apply the transition implied by a segment return on a cached chunk. Caller is the owner
+         * thread, or holds the stamp from {@link #tryLockForRelease()}, and has already placed the
+         * segment.
+         *
+         * <p>Also drains any outstanding notes. Notes are otherwise only consumed by allocating
+         * threads, which is exactly what a workload that goes idle after a burst stops doing.
+         */
+        void transitionAfterRelease(SizeClassedChunk chunk) {
+            if (chunk.cacheIndex >= reusableCount) {
+                moveToReusable(chunk);
+            }
+            evictIfAboveFloor(chunk);
+            drainPending();
+        }
+
+        // --- ChunkCache ---------------------------------------------------------------------------
+
+        /** Visible for testing: runs a purge tick bypassing the budget counter, then polls. */
         SizeClassedChunk forcePurge() {
-            runPurgeScan();
-            return scanForCapacity();
+            tickPurge();
+            return pollChunkInternal();
         }
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
-            return scanForCapacity();
+            // Slow path only (once per chunk-worth of allocations), which is exactly where a chunk
+            // is wanted.
+            drainPending();
+            return pollChunkInternal();
         }
 
-        @Override
-        public void tickPurge() {
-            runPurgeScan();
-        }
-
-        private SizeClassedChunk scanForCapacity() {
-            if (notEmptyCount > 0) {
-                SizeClassedChunk chunk = chunks[head];
-                assert chunk.hasRemainingCapacity();
-                chunk.purgeEpoch = 0;
-                chunks[head] = null;
-                head = (head + 1) & (chunks.length - 1);
-                count--;
-                notEmptyCount--;
+        /**
+         * O(1) and unconditional: every chunk in the reusable region has capacity, and keeps it for
+         * as long as it stays cached (nothing allocates out of a cached chunk, so its capacity can
+         * only grow). The exhausted region is never searched beyond the bounded probe below -- a
+         * chunk leaves it only when a notification says it gained capacity.
+         */
+        private SizeClassedChunk pollChunkInternal() {
+            if (reusableCount > 0) {
+                SizeClassedChunk chunk = chunks[0];
+                removeFromReusable(chunk);
                 return chunk;
             }
-            return scanForCapacityFallback();
+            return probeExhausted();
         }
 
-        private SizeClassedChunk scanForCapacityFallback() {
-            int mask = chunks.length - 1;
-            int emptyCount = count - notEmptyCount;
-            int pos = (head + notEmptyCount) & mask;
-            for (int i = 0; i < emptyCount; i++) {
-                SizeClassedChunk chunk = chunks[pos];
+        /**
+         * Last resort before the caller allocates a fresh chunk: look at a bounded number of
+         * exhausted chunks in case one regained capacity from a return whose notification has not
+         * been drained yet.
+         *
+         * <p>An empty reusable region means "no usable chunk is <em>known</em>", not "none exists".
+         * {@code drainPending} runs immediately before the poll, so it catches every note pushed
+         * before its {@code getAndSet} -- but a note pushed concurrently with the drain, or by a
+         * releaser that has claimed its link and not yet published it, is not seen. Without this
+         * probe the caller would allocate a new chunk while a usable one sat in the exhausted
+         * region, which is the chunk-count growth this cache exists to avoid.
+         */
+        private SizeClassedChunk probeExhausted() {
+            int end = Math.min(count, reusableCount + MAX_EXHAUSTED_PROBE);
+            for (int i = reusableCount; i < end; i++) {
+                SizeClassedChunk chunk = chunks[i];
                 if (chunk.hasRemainingCapacity()) {
-                    chunk.purgeEpoch = 0;
-                    int lastIdx = (tail - 1) & mask;
-                    chunks[pos] = chunks[lastIdx];
-                    chunks[lastIdx] = null;
-                    tail = lastIdx;
-                    count--;
+                    removeFromExhausted(chunk);
                     return chunk;
                 }
-                pos = (pos + 1) & mask;
             }
             return null;
         }
 
-        private void runPurgeScan() {
-            int mask = chunks.length - 1;
-            int kept = 0;
-            int survivors = count;
-            for (int i = 0; i < count; i++) {
-                int readIdx = (head + i) & mask;
-                SizeClassedChunk chunk = chunks[readIdx];
-                if (chunk.purgeEpoch > 0) {
-                    assert chunk.hasFullCapacity();
-                    chunk.purgeEpoch++;
-                    if (chunk.purgeEpoch > CHUNK_PURGE_THRESHOLD && survivors > purgeRetentionFloor) {
-                        chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
-                        chunks[readIdx] = null;
-                        survivors--;
-                        continue;
-                    }
-                } else if (chunk.hasFullCapacity()) {
-                    chunk.purgeEpoch = 1;
-                }
-                int writeIdx = (head + kept) & mask;
-                if (writeIdx != readIdx) {
-                    chunks[writeIdx] = chunk;
-                    chunks[readIdx] = null;
-                }
-                kept++;
-            }
-            tail = (head + kept) & mask;
-            count = kept;
-            partition(kept);
-        }
-
-        private void partition(int size) {
-            int mask = chunks.length - 1;
-            // Pass 1: hasCapacity to front, noCapacity to back.
-            int lo = 0;
-            int hi = size - 1;
-            while (lo <= hi) {
-                int loIdx = (head + lo) & mask;
-                if (chunks[loIdx].hasRemainingCapacity()) {
-                    lo++;
-                } else {
-                    int hiIdx = (head + hi) & mask;
-                    SizeClassedChunk tmp = chunks[loIdx];
-                    chunks[loIdx] = chunks[hiIdx];
-                    chunks[hiIdx] = tmp;
-                    hi--;
-                }
-            }
-            notEmptyCount = lo;
-            // Pass 2: three-way Dutch-flag within notEmpty:
-            //   [epoch=0 | 0<epoch<threshold | epoch>=threshold]
-            //
-            // Epoch=0 (recently used) at head — scan picks these first.
-            // Epoch>=threshold (about to be evicted) at back — scan doesn't reach them,
-            // so they age one more cycle to threshold+1 and get evicted.
-            //
-            // This ordering guarantees convergence regardless of count/polls ratio.
-            // Without it (e.g., a simple epoch=0/epoch>0 split with mid++), when
-            // count/polls == threshold the groups rotate perfectly and max epoch never
-            // exceeds threshold — eviction stalls at threshold * polls chunks.
-            int elo = 0;
-            int emid = 0;
-            int ehi = lo - 1;
-            while (emid <= ehi) {
-                int emidIdx = (head + emid) & mask;
-                SizeClassedChunk c = chunks[emidIdx];
-                if (c.purgeEpoch == 0) {
-                    if (elo != emid) {
-                        int eloIdx = (head + elo) & mask;
-                        chunks[emidIdx] = chunks[eloIdx];
-                        chunks[eloIdx] = c;
-                    }
-                    elo++;
-                    emid++;
-                } else if (c.purgeEpoch < CHUNK_PURGE_THRESHOLD) {
-                    emid++;
-                } else {
-                    int ehiIdx = (head + ehi) & mask;
-                    chunks[emidIdx] = chunks[ehiIdx];
-                    chunks[ehiIdx] = c;
-                    ehi--;
+        @Override
+        public void tickPurge() {
+            // Exhausted -> reusable is applied by the drain. All that is left is evicting
+            // fully-free reusable chunks above the retention floor.
+            drainPending();
+            // Walk the reusable region backwards: removeFromReusable only ever moves elements from
+            // slots >= i into slot i, and those have already been visited, so nothing is skipped.
+            for (int i = reusableCount - 1; i >= 0 && count > purgeRetentionFloor; i--) {
+                SizeClassedChunk chunk = chunks[i];
+                if (chunk.hasFullCapacity()) {
+                    removeFromReusable(chunk);
+                    chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                 }
             }
         }
 
+        /**
+         * Never refuses. There is no ceiling on what the cache will hold; the retention floor plus
+         * release-path eviction is what bounds it.
+         */
         @Override
         public boolean offerChunk(Chunk chunk) {
-            if (count >= maxCachedChunks) {
-                return false;
+            SizeClassedChunk sc = (SizeClassedChunk) chunk;
+            assert sc.cacheIndex == NOT_CACHED;
+            if (sc.hasRemainingCapacity()) {
+                addToReusable(sc);
+            } else {
+                addToExhausted(sc);
             }
-            if (count == chunks.length) {
-                SizeClassedChunk[] newChunks = new SizeClassedChunk[chunks.length * 2];
-                for (int i = 0; i < count; i++) {
-                    newChunks[i] = chunks[(head + i) & (chunks.length - 1)];
-                }
-                chunks = newChunks;
-                head = 0;
-                tail = count;
-            }
-            chunks[tail] = (SizeClassedChunk) chunk;
-            tail = (tail + 1) & (chunks.length - 1);
-            count++;
             return true;
         }
 
         @Override
+        public void free() {
+            // Drop any outstanding notes: every chunk they point at is about to be marked for
+            // deallocation, and this cache is dead afterwards.
+            PENDING_HEAD.lazySet(this, null);
+            for (int i = 0; i < count; i++) {
+                SizeClassedChunk chunk = chunks[i];
+                chunks[i] = null;
+                chunk.cacheIndex = NOT_CACHED;
+                chunk.markToDeallocate();
+            }
+            count = 0;
+            reusableCount = 0;
+        }
+
+        @Override
+        public boolean isEmpty() {
+            return count == 0;
+        }
+
+        @Override
         public String toString() {
-            int mask = chunks.length - 1;
             StringBuilder sb = new StringBuilder();
-            sb.append("ThreadLocalCache[head=").append(head)
-                    .append(", tail=").append(tail)
-                    .append(", count=").append(count)
-                    .append(", notEmpty=").append(notEmptyCount)
+            sb.append("SizeClassedChunkCache[count=").append(count)
+                    .append(", reusable=").append(reusableCount)
+                    .append(", floor=").append(purgeRetentionFloor)
                     .append(", length=").append(chunks.length)
                     .append("]\n  ");
             for (int i = 0; i < count; i++) {
                 if (i > 0) {
                     sb.append(", ");
                 }
-                if (i == notEmptyCount) {
+                if (i == reusableCount) {
                     sb.append("| ");
                 }
-                SizeClassedChunk c = chunks[(head + i) & mask];
-                String region = i < notEmptyCount ? "notEmpty" : "empty";
-                String actual = c == null ? "null" :
-                        c.hasRemainingCapacity() ? "hasCap" : "noCap";
-                sb.append('[').append(region).append(':').append(actual)
-                        .append(",ep=").append(c == null ? -1 : c.purgeEpoch).append(']');
+                SizeClassedChunk c = chunks[i];
+                sb.append('[').append(i < reusableCount ? "reusable" : "exhausted").append(':')
+                        .append(c == null ? "null" : c.hasRemainingCapacity() ? "hasCap" : "noCap")
+                        .append(']');
             }
             return sb.toString();
-        }
-
-        @Override
-        public void free() {
-            int mask = chunks.length - 1;
-            for (int i = 0; i < count; i++) {
-                int idx = (head + i) & mask;
-                chunks[idx].markToDeallocate();
-                chunks[idx] = null;
-            }
-            head = 0;
-            tail = 0;
-            count = 0;
-            notEmptyCount = 0;
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return count == 0;
         }
     }
 
@@ -1194,8 +1297,9 @@ final class AdaptivePoolingAllocator {
                     allocator.chunkAllocator, allocator.chunkRegistry, segmentSize, chunkSize);
         }
 
-        ChunkCache createChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex) {
-            return new ThreadLocalSizeClassedChunkCache(chunkSize, chunkRecycler, sizeClassIndex);
+        ChunkCache createChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
+                                    StampedLock stripeLock) {
+            return new SizeClassedChunkCache(chunkSize, chunkRecycler, sizeClassIndex, stripeLock);
         }
     }
 
@@ -1376,17 +1480,19 @@ final class AdaptivePoolingAllocator {
         private final int purgeTickThreshold;
         private int allocCount;
 
-        // Size-classed magazine constructor (both thread-local and shared-stripe)
+        // Size-classed magazine constructor (both thread-local and shared-stripe).
+        // stripeLock is the lock that guards this magazine's cache, or null when the magazine is
+        // owned by a single thread and needs no lock.
         Magazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
                  SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
-                 Thread ownerThread, AdaptiveRecycler bufRecycler) {
+                 Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock) {
             this.allocator = allocator;
             this.ownerThread = ownerThread;
             this.sizeClassIndex = sizeClassIndex;
             this.chunkRecycler = chunkRecycler;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
-            this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex);
+            this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
                     CHUNK_PURGE_POLLS_THREAD_LOCAL * (strategy.chunkSize / strategy.segmentSize));
         }
@@ -1811,7 +1917,45 @@ final class AdaptivePoolingAllocator {
         MpscIntQueue externalFreeList;
         private IntStack localFreeList;
         private final Thread ownerThread;
-        int purgeEpoch;
+
+        // --- Cache membership -----------------------------------------------------------------
+        /**
+         * This chunk's slot in {@link #owningCache}'s array, or
+         * {@link SizeClassedChunkCache#NOT_CACHED}. Read and written only by the cache's owner
+         * thread or under its stripe lock.
+         */
+        int cacheIndex = SizeClassedChunkCache.NOT_CACHED;
+        /**
+         * The one cache this chunk can ever live in. A chunk object is created by exactly one
+         * magazine and is only ever offered to, and polled from, that magazine's cache, so this
+         * never changes.
+         */
+        final SizeClassedChunkCache owningCache;
+
+        // --- Pending-notification link (see SizeClassedChunkCache#notifyHasCapacity) -----------
+
+        /**
+         * Marks the end of the pending-notification list, so {@code null} keeps its meaning of
+         * "not queued". Never a usable chunk.
+         */
+        static final SizeClassedChunk PENDING_SENTINEL = new SizeClassedChunk();
+        static final AtomicReferenceFieldUpdater<SizeClassedChunk, SizeClassedChunk> PENDING_NEXT =
+                AtomicReferenceFieldUpdater.newUpdater(
+                        SizeClassedChunk.class, SizeClassedChunk.class, "pendingNext");
+        /**
+         * {@code null} = not queued for attention, non-null = queued (or in the middle of being
+         * queued). This field <em>is</em> the dedup claim: whoever moves it off {@code null} owns
+         * the push, so no separate flag is needed.
+         */
+        volatile SizeClassedChunk pendingNext;
+
+        /** Constructor only used by {@link #PENDING_SENTINEL}. */
+        private SizeClassedChunk() {
+            segmentSize = 0;
+            segments = 0;
+            ownerThread = null;
+            owningCache = null;
+        }
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine,
                          SizeClassChunkController controller) {
@@ -1820,6 +1964,7 @@ final class AdaptivePoolingAllocator {
             segments = controller.chunkSize / segmentSize;
             STATE.lazySet(this, AVAILABLE);
             ownerThread = magazine.ownerThread;
+            owningCache = (SizeClassedChunkCache) magazine.chunkCache;
             if (ownerThread == null) {
                 externalFreeList = controller.createFreeList();
                 localFreeList = null;
@@ -1841,6 +1986,7 @@ final class AdaptivePoolingAllocator {
             segments = controller.chunkSize / segmentSize;
             STATE.lazySet(this, AVAILABLE);
             ownerThread = magazine.ownerThread;
+            owningCache = (SizeClassedChunkCache) magazine.chunkCache;
             if (ownerThread != null) {
                 if (recycledLocalFreeList != null && recycledLocalFreeList.capacity() >= segments) {
                     localFreeList = recycledLocalFreeList;
@@ -1941,23 +2087,79 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        /**
+         * Three-way: owner thread applies the cache transition inline; a foreign thread that wins
+         * the stripe lock applies it inline too; a foreign thread that loses the lock offers the
+         * segment first and then leaves a note.
+         */
         @Override
         void releaseSegment(int startIndex, int size) {
             IntStack localFreeList = this.localFreeList;
             if (localFreeList != null && Thread.currentThread() == ownerThread) {
                 localFreeList.push(startIndex);
-                int state = this.state;
-                if (state != AVAILABLE) {
-                    updateStateOnLocalReleaseSegment(state, localFreeList);
+                afterOwnerRelease(localFreeList);
+                return;
+            }
+            final SizeClassedChunkCache cache = owningCache;
+            final long stamp = cache.tryLockForRelease();
+            if (stamp != 0) {
+                try {
+                    boolean segmentReturned = externalFreeList.offer(startIndex);
+                    assert segmentReturned;
+                    afterLockedRelease(cache);
+                } finally {
+                    cache.unlockAfterRelease(stamp);
                 }
+                return;
+            }
+            boolean segmentReturned = externalFreeList.offer(startIndex);
+            assert segmentReturned;
+            // implicit StoreLoad barrier from MPSC offer()
+            int state = this.state;
+            if (state != AVAILABLE) {
+                deallocateIfNeeded(state);
             } else {
-                boolean segmentReturned = externalFreeList.offer(startIndex);
-                assert segmentReturned;
-                // implicit StoreLoad barrier from MPSC offer()
-                int state = this.state;
-                if (state != AVAILABLE) {
-                    deallocateIfNeeded(state);
-                }
+                // The chunk may have just gained capacity, but we could not take the lock to apply
+                // the resulting transition. Leave a note; the next drain applies it. A chunk whose
+                // state is not AVAILABLE is never in a cache, so there is nothing to notify about
+                // on that branch.
+                cache.notifyHasCapacity(this);
+            }
+        }
+
+        /**
+         * Cold: apply the deallocation bookkeeping or cache transition implied by a segment
+         * returned by the owner thread. Split out of {@link #releaseSegment} so the common case --
+         * push the segment, find nothing else to do -- stays a few lines.
+         */
+        private void afterOwnerRelease(IntStack localFreeList) {
+            int state = this.state;
+            if (state != AVAILABLE) {
+                updateStateOnLocalReleaseSegment(state, localFreeList);
+                return;
+            }
+            if (cacheIndex != SizeClassedChunkCache.NOT_CACHED) {
+                owningCache.transitionAfterRelease(this);
+            }
+        }
+
+        /**
+         * Locked counterpart of {@link #afterOwnerRelease(IntStack)}; caller holds the stripe lock,
+         * which is what makes the plain {@code cacheIndex} read and the cache mutation safe.
+         */
+        private void afterLockedRelease(SizeClassedChunkCache cache) {
+            int state = this.state;
+            if (state != AVAILABLE) {
+                deallocateIfNeeded(state);
+                return;
+            }
+            if (cacheIndex != SizeClassedChunkCache.NOT_CACHED) {
+                cache.transitionAfterRelease(this);
+            } else {
+                // Not in the cache, but other chunks may have notes outstanding and this thread
+                // holds the lock. Consuming them here is what lets a workload that has stopped
+                // allocating still shrink.
+                cache.drainPending();
             }
         }
 
