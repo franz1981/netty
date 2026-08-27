@@ -539,7 +539,13 @@ final class AdaptivePoolingAllocator {
 
         void freeAll() {
             for (RecycleStack<AbstractByteBuf> pool : bufferPools) {
-                pool.forEach(AbstractByteBuf::release);
+                pool.forEach(new Consumer<AbstractByteBuf>() {
+                    @Override
+                    public void accept(AbstractByteBuf buf) {
+                        AllocTelemetry.inc(AllocTelemetry.recyclerFreeAllReleased);
+                        buf.release();
+                    }
+                });
             }
             Arrays.fill(freelistSlots, null);
             Arrays.fill(localFreelistSlots, null);
@@ -807,6 +813,7 @@ final class AdaptivePoolingAllocator {
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
         final int purgeRetentionFloor;
+        final int maxCachedChunks; // ablation B only
         /**
          * The lock guarding this cache's lists, or {@code null} when there is nothing to guard.
          *
@@ -827,6 +834,7 @@ final class AdaptivePoolingAllocator {
             this.sizeClassIndex = sizeClassIndex;
             this.stripeLock = stripeLock;
             purgeRetentionFloor = Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize);
+            maxCachedChunks = Math.max(1, THREAD_LOCAL_CACHE_MAX_BYTES / chunkSize);
         }
 
         private int totalCount() {
@@ -896,11 +904,20 @@ final class AdaptivePoolingAllocator {
         }
 
         void evictIfAboveFloor(SizeClassedChunk chunk) {
-            if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
-                removeFromReusable(chunk);
-                detachFromCache(chunk);
-                chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+            AllocTelemetry.inc(AllocTelemetry.evictCalls);
+            if (!chunk.hasFullCapacity()) {
+                AllocTelemetry.inc(AllocTelemetry.evictNotFull);
+                return;
             }
+            if (totalCount() <= purgeRetentionFloor) {
+                AllocTelemetry.inc(AllocTelemetry.evictAtFloor);
+                return;
+            }
+            AllocTelemetry.inc(AllocTelemetry.evictDone);
+            AllocTelemetry.stamp(AllocTelemetry.firstEvictNanos, AllocTelemetry.lastEvictNanos);
+            removeFromReusable(chunk);
+            detachFromCache(chunk);
+            chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
         }
 
         // --- Notification queue: cross-thread segment returns that could not take the lock ---
@@ -1040,6 +1057,7 @@ final class AdaptivePoolingAllocator {
          * from {@link #tryLockForRelease()} and must have already placed the segment.
          */
         void transitionAfterRelease(SizeClassedChunk chunk, int cls) {
+            AllocTelemetry.inc(AllocTelemetry.transitionCalls);
             if (cls == SizeClassedChunk.CACHE_EXHAUSTED) {
                 moveToReusable(chunk);
             }
@@ -1054,6 +1072,8 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public SizeClassedChunk pollChunk(int size) {
+            AllocTelemetry.sample(AllocTelemetry.cacheSizeSum, AllocTelemetry.cacheSizeSamples,
+                    totalCount());
             // Slow-path only (once per chunk-worth of allocations), which is exactly where a chunk is
             // wanted. Draining per allocation is what made the old notification cache expensive.
             drainPending();
@@ -1071,9 +1091,15 @@ final class AdaptivePoolingAllocator {
                 SizeClassedChunk chunk = reusableHead;
                 removeFromReusable(chunk);
                 detachFromCache(chunk);
+                AllocTelemetry.inc(AllocTelemetry.cachePollHit);
+                AllocTelemetry.sample(AllocTelemetry.pollFreeSegsSum, AllocTelemetry.pollFreeSegsN,
+                        chunk.remainingCapacity() / chunk.segmentSize);
                 return chunk;
             }
-            return probeExhausted();
+            SizeClassedChunk probed = probeExhausted();
+            AllocTelemetry.inc(probed != null ?
+                    AllocTelemetry.cachePollHit : AllocTelemetry.cachePollMiss);
+            return probed;
         }
 
         /**
@@ -1123,6 +1149,7 @@ final class AdaptivePoolingAllocator {
             while (cur != null && total > purgeRetentionFloor) {
                 SizeClassedChunk next = cur.nextInCache;
                 if (cur.hasFullCapacity()) {
+                    AllocTelemetry.inc(AllocTelemetry.tickPurgeEvicted);
                     removeFromReusable(cur);
                     detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
@@ -1134,6 +1161,11 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean offerChunk(Chunk chunk) {
+            if (AllocTelemetry.CACHE_CAP && totalCount() >= maxCachedChunks) {
+                AllocTelemetry.inc(AllocTelemetry.cacheOfferRejectCap);
+                return false;
+            }
+            AllocTelemetry.inc(AllocTelemetry.offerCalls);
             SizeClassedChunk sc = (SizeClassedChunk) chunk;
             if (sc.hasRemainingCapacity()) {
                 addToReusable(sc);
@@ -1356,9 +1388,11 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public Chunk newChunkAllocation(int promptingSize, Magazine magazine) {
-            if (magazine.chunkRecycler != null) {
+            if (magazine.chunkRecycler != null && !AllocTelemetry.NO_RECYCLER) {
                 // Try recycled buffer
                 AbstractByteBuf recycledBuf = magazine.chunkRecycler.pollBuffer(magazine.sizeClassIndex);
+                AllocTelemetry.inc(recycledBuf != null ?
+                        AllocTelemetry.recyclerPollHit : AllocTelemetry.recyclerPollMiss);
                 if (recycledBuf != null) {
                     int neededSegments = chunkSize / segmentSize;
                     // Try recycled freelist of matching capacity
@@ -1374,6 +1408,7 @@ final class AdaptivePoolingAllocator {
                     return chunk;
                 }
             }
+            AllocTelemetry.inc(AllocTelemetry.freshAlloc);
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
             SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this);
@@ -1593,11 +1628,15 @@ final class AdaptivePoolingAllocator {
                 boolean success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
                 int remainingCapacity = curr.remainingCapacity();
                 if (!success && remainingCapacity > 0) {
+                    AllocTelemetry.inc(AllocTelemetry.magTransferNoRoom);
                     current = null;
                     transferToNextInLineOrRelease(curr);
                 } else if (remainingCapacity == 0) {
+                    AllocTelemetry.inc(AllocTelemetry.magDry);
                     current = null;
                     curr.releaseFromMagazine();
+                } else {
+                    AllocTelemetry.inc(AllocTelemetry.magKept);
                 }
                 if (success) {
                     return true;
@@ -1777,7 +1816,13 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
         }
 
-        Chunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled) {
+        /**
+         * @param recycled {@code true} when {@code delegate} is a memory buffer taken from the chunk
+         *                 recycler rather than freshly allocated. A {@code Chunk} is constructed on
+         *                 both paths, so without this flag an {@code AllocateChunk} event cannot be
+         *                 read as "memory was allocated".
+         */
+        Chunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled, boolean recycled) {
             this.delegate = delegate;
             this.pooled = pooled;
             capacity = delegate.capacity();
@@ -1792,6 +1837,7 @@ final class AdaptivePoolingAllocator {
                     event.fill(this, AdaptiveByteBufAllocator.class);
                     event.pooled = pooled;
                     event.threadLocal = magazine.ownerThread != null;
+                    event.recycled = recycled;
                     event.commit();
                 }
             }
@@ -1837,6 +1883,11 @@ final class AdaptivePoolingAllocator {
         }
 
         protected void deallocate() {
+            AllocTelemetry.inc(delegate != null ?
+                    AllocTelemetry.deallocWithDelegate : AllocTelemetry.deallocWithoutDelegate);
+            if (delegate != null) {
+                AllocTelemetry.stamp(AllocTelemetry.firstFreeNanos, AllocTelemetry.lastFreeNanos);
+            }
             if (delegate != null) {
                 // Only when the buffer is actually being freed. recycleOrDeallocate hands the
                 // buffer to SizeClassChunkRecycler and nulls the field, and a FreeChunk event for
@@ -2029,7 +2080,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine,
                          SizeClassChunkController controller) {
-            super(delegate, magazine, true);
+            super(delegate, magazine, true, false);
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
             STATE.lazySet(this, AVAILABLE);
@@ -2050,7 +2101,7 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk(AbstractByteBuf recycledDelegate, MpscIntQueue recycledFreeList,
                          IntStack recycledLocalFreeList,
                          Magazine magazine, SizeClassChunkController controller) {
-            super(recycledDelegate, magazine, true);
+            super(recycledDelegate, magazine, true, true);
             this.externalFreeList = recycledFreeList;
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
@@ -2097,8 +2148,10 @@ final class AdaptivePoolingAllocator {
         private int nextAvailableSegmentOffset() {
             IntStack localFreeList = this.localFreeList;
             if (!localFreeList.isEmpty()) {
+                AllocTelemetry.inc(AllocTelemetry.segFromLocal);
                 return localFreeList.pop();
             }
+            AllocTelemetry.inc(AllocTelemetry.segFromExternal);
             return externalFreeList.poll();
         }
 
@@ -2206,12 +2259,15 @@ final class AdaptivePoolingAllocator {
         }
 
         private void detectCacheTransition(int cls) {
+            AllocTelemetry.inc(AllocTelemetry.transitionCalls);
             if (cls == CACHE_EXHAUSTED) {
                 owningCache.moveToReusable(this);
                 if (hasFullCapacity()) {
+                    AllocTelemetry.inc(AllocTelemetry.transitionFull);
                     owningCache.evictIfAboveFloor(this);
                 }
             } else if (cls == CACHE_REUSABLE && hasFullCapacity()) {
+                AllocTelemetry.inc(AllocTelemetry.transitionFull);
                 owningCache.evictIfAboveFloor(this);
             }
         }
@@ -2253,9 +2309,18 @@ final class AdaptivePoolingAllocator {
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
+            if (AllocTelemetry.NO_RECYCLER) {
+                recycler = null;
+            }
             if (recycler != null) {
                 if (recycler.offerBuffer(delegate, sizeClassIndex)) {
+                    AllocTelemetry.inc(AllocTelemetry.recyclerOfferAccept);
                     delegate = null;
+                } else {
+                    AllocTelemetry.inc(AllocTelemetry.recyclerOfferReject);
+                    AllocTelemetry.inc(AllocTelemetry.rejectReachedDealloc);
+                    AllocTelemetry.stamp(AllocTelemetry.firstRejectNanos,
+                            AllocTelemetry.lastRejectNanos);
                 }
                 if (externalFreeList != null) {
                     recycler.offerFreelist(externalFreeList);
@@ -2300,7 +2365,7 @@ final class AdaptivePoolingAllocator {
         private final int freeListCapacity;
 
         BuddyChunk(AbstractByteBuf delegate, Magazine magazine) {
-            super(delegate, magazine, true);
+            super(delegate, magazine, true, false);
             freeListCapacity = delegate.capacity() / MIN_BUDDY_SIZE;
             int maxShift = Integer.numberOfTrailingZeros(freeListCapacity);
             assert maxShift <= 30; // The top 2 bits are used for marking.
