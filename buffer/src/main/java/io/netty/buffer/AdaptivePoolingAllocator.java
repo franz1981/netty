@@ -911,7 +911,7 @@ final class AdaptivePoolingAllocator {
      * of segments or is freed. The active chunk is the magazine's, not a retention candidate: no cache
      * decision touches it (the release paths and the drain act only on chunks filed on a queue,
      * and {@link #tickPurge} walks the lists only), and it is not counted against
-     * {@link #purgeRetentionFloor}.
+     * the retention floor ({@link #atOrBelowFloor}).
      *
      * <p><b>Why the reusable list is trustworthy.</b> A cached chunk other than the active one can
      * only <em>gain</em> capacity: segments are handed out only by {@code readInitInto} on the active
@@ -980,7 +980,6 @@ final class AdaptivePoolingAllocator {
 
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
-        final int purgeRetentionFloor;
         /**
          * The lock guarding this cache's lists, or {@code null} when there is nothing to guard.
          *
@@ -1000,15 +999,16 @@ final class AdaptivePoolingAllocator {
             this.chunkRecycler = chunkRecycler;
             this.sizeClassIndex = sizeClassIndex;
             this.stripeLock = stripeLock;
-            purgeRetentionFloor = Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize);
         }
 
         /**
-         * The chunks that count against {@link #purgeRetentionFloor}: every linked chunk. The active one is not
-         * linked: it is the magazine's to use and is not a retention candidate.
+         * {@code true} when the two queues hold at most one chunk between them. This is the retention floor:
+         * eviction must never take the last chunk of a size class besides the active one, which is what mimalloc's
+         * {@code pageRetire} does by refusing to free the only page left in a bin. Every other chunk that empties
+         * goes to the heap's {@link SizeClassChunkRecycler}, whose byte budget is what bounds idle memory.
          */
-        private int totalCount() {
-            return exhausted.size + reusable.size;
+        private boolean atOrBelowFloor() {
+            return exhausted.size + reusable.size <= 1;
         }
 
         // Signal A (see refile): exhausted → reusable
@@ -1020,7 +1020,7 @@ final class AdaptivePoolingAllocator {
         void evictIfAboveFloor(SizeClassedChunk chunk) {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
-            if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
+            if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1211,14 +1211,12 @@ final class AdaptivePoolingAllocator {
             drainPending();
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
-            int total = totalCount();
             SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
-            while (cur != null && total > purgeRetentionFloor) {
+            while (cur != null && !atOrBelowFloor()) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
-                    total--;
                 }
                 cur = next;
             }

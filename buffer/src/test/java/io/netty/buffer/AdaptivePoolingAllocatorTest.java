@@ -65,23 +65,25 @@ class AdaptivePoolingAllocatorTest {
      * instead of a bound per chunk size (43 chunk buffers over the trace instead of 59, same used memory), and both
      * columns when the size classes from 32 KiB up went from 32 to 8 segments per chunk: the trace's 64 KiB buffers
      * come from chunks a quarter of the size, so less memory is used at every checkpoint and more chunk buffers are
-     * allocated (73).
+     * allocated (73). The used-memory column moved once more when the retention floor became "never give up the last
+     * chunk of a size class" instead of 4 MiB per class: the same 73 chunk buffers are allocated, the peaks are the
+     * same, and the troughs hold 7 to 13 MiB instead of 15 to 19.
      */
     private static final long[][] EXPECTED_SHARED = {
             {0, 0}, {38, 17563648}, {67, 31981568}, {67, 29360128},
-            {67, 15204352}, {67, 21495808}, {70, 36175872}, {70, 36175872},
-            {70, 19398656}, {70, 27262976}, {70, 27262976}, {70, 19398656},
-            {70, 18874368}, {70, 25690112}, {73, 37355520}, {73, 35782656},
-            {73, 19529728}, {73, 25821184}, {73, 36306944}, {73, 34734080},
-            {73, 19529728}, {73, 19529728}, {73, 19529728},
+            {67, 7208960}, {67, 19267584}, {70, 36044800}, {70, 36175872},
+            {70, 13500416}, {70, 25559040}, {70, 25690112}, {70, 17956864},
+            {70, 11403264}, {70, 23986176}, {73, 37355520}, {73, 35782656},
+            {73, 11403264}, {73, 23461888}, {73, 36175872}, {73, 34603008},
+            {73, 11403264}, {73, 11403264}, {73, 11403264},
     };
     private static final long[][] EXPECTED_THREAD_LOCAL = {
             {0, 0}, {38, 17563648}, {67, 31981568}, {67, 30932992},
-            {67, 15728640}, {67, 21495808}, {70, 36175872}, {70, 36175872},
-            {70, 18874368}, {70, 27262976}, {70, 27262976}, {70, 19398656},
-            {70, 18874368}, {70, 25690112}, {73, 37355520}, {73, 35782656},
-            {73, 19529728}, {73, 25821184}, {73, 36306944}, {73, 34734080},
-            {73, 19529728}, {73, 19529728}, {73, 19529728},
+            {67, 7208960}, {67, 19267584}, {70, 36044800}, {70, 36175872},
+            {70, 12976128}, {70, 25559040}, {70, 25690112}, {70, 18481152},
+            {70, 11403264}, {70, 23986176}, {73, 37355520}, {73, 35782656},
+            {73, 11403264}, {73, 23461888}, {73, 36175872}, {73, 34603008},
+            {73, 11403264}, {73, 11403264}, {73, 11403264},
     };
 
     private static final int[] TRACE_SIZES = {64, 1024, 4096, 16384, 65536};
