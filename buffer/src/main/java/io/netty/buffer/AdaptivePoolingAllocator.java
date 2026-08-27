@@ -801,12 +801,12 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk reusableHead;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
         private volatile SizeClassedChunk pendingHead;
-        int exhaustedCount;
-        int reusableCount;
+        // No counts are kept: the retention floor is "one chunk", which is an O(1) predicate over
+        // the two heads (see atOrBelowFloor). A cached count would be derived state maintained by
+        // hand, i.e. state that can silently disagree with the links it describes.
 
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
-        final int purgeRetentionFloor;
         /**
          * The lock guarding this cache's lists, or {@code null} when there is nothing to guard.
          *
@@ -826,11 +826,18 @@ final class AdaptivePoolingAllocator {
             this.chunkRecycler = chunkRecycler;
             this.sizeClassIndex = sizeClassIndex;
             this.stripeLock = stripeLock;
-            purgeRetentionFloor = Math.max(1, THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize);
         }
 
-        private int totalCount() {
-            return exhaustedCount + reusableCount;
+        /**
+         * {@code true} when the cache holds at most one chunk. This is the retention floor: eviction
+         * must never take the last chunk of a size class, which is what mimalloc's {@code pageRetire}
+         * does by refusing to free the only page left in a bin.
+         */
+        private boolean atOrBelowFloor() {
+            if (reusableHead == null) {
+                return exhaustedHead == null || exhaustedHead.nextInCache == null;
+            }
+            return exhaustedHead == null && reusableHead.nextInCache == null;
         }
 
         // --- Intrusive doubly-linked list operations ---
@@ -843,7 +850,6 @@ final class AdaptivePoolingAllocator {
                 exhaustedHead.prevInCache = chunk;
             }
             exhaustedHead = chunk;
-            exhaustedCount++;
         }
 
         private void addToReusable(SizeClassedChunk chunk) {
@@ -854,7 +860,6 @@ final class AdaptivePoolingAllocator {
                 reusableHead.prevInCache = chunk;
             }
             reusableHead = chunk;
-            reusableCount++;
         }
 
         private void removeFromExhausted(SizeClassedChunk chunk) {
@@ -868,7 +873,6 @@ final class AdaptivePoolingAllocator {
             }
             chunk.prevInCache = null;
             chunk.nextInCache = null;
-            exhaustedCount--;
         }
 
         private void removeFromReusable(SizeClassedChunk chunk) {
@@ -882,7 +886,6 @@ final class AdaptivePoolingAllocator {
             }
             chunk.prevInCache = null;
             chunk.nextInCache = null;
-            reusableCount--;
         }
 
         private void detachFromCache(SizeClassedChunk chunk) {
@@ -896,7 +899,7 @@ final class AdaptivePoolingAllocator {
         }
 
         void evictIfAboveFloor(SizeClassedChunk chunk) {
-            if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
+            if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
                 removeFromReusable(chunk);
                 detachFromCache(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
@@ -1118,15 +1121,13 @@ final class AdaptivePoolingAllocator {
             drainPending();
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
-            int total = totalCount();
             SizeClassedChunk cur = reusableHead;
-            while (cur != null && total > purgeRetentionFloor) {
+            while (cur != null && !atOrBelowFloor()) {
                 SizeClassedChunk next = cur.nextInCache;
                 if (cur.hasFullCapacity()) {
                     removeFromReusable(cur);
                     detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
-                    total--;
                 }
                 cur = next;
             }
@@ -1150,10 +1151,8 @@ final class AdaptivePoolingAllocator {
             PENDING_HEAD.lazySet(this, null);
             freeList(exhaustedHead);
             exhaustedHead = null;
-            exhaustedCount = 0;
             freeList(reusableHead);
             reusableHead = null;
-            reusableCount = 0;
         }
 
         private static void freeList(SizeClassedChunk head) {
@@ -1170,7 +1169,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean isEmpty() {
-            return totalCount() == 0;
+            return reusableHead == null && exhaustedHead == null;
         }
     }
 
