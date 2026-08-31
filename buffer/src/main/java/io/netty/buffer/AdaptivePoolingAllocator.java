@@ -104,8 +104,8 @@ final class AdaptivePoolingAllocator {
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
-    private static final int MAX_STRIPES = IS_LOW_MEM ? 1 :
-            MathUtil.safeFindNextPositivePowerOfTwo(NettyRuntime.availableProcessors() * 2);
+    private static final int MAX_STRIPES = SystemPropertyUtil.getInt("io.netty.expt.stripes", IS_LOW_MEM ? 1 :
+            MathUtil.safeFindNextPositivePowerOfTwo(NettyRuntime.availableProcessors() * 2));
     private static final int INITIAL_MAGAZINES = 1;
     private static final int RETIRE_CAPACITY = 256;
     private static final int BUFS_PER_CHUNK = 8; // For large buffers, aim to have about this many buffers per chunk.
@@ -212,7 +212,7 @@ final class AdaptivePoolingAllocator {
         byte[] mappingTemp = new byte[SIZE_CLASSES_COUNT];
         int poolCount = 0;
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int chunkSize = Math.max(MIN_CHUNK_SIZE, SIZE_CLASSES[i] * 32);
+            int chunkSize = Math.max(MIN_CHUNK_SIZE, SIZE_CLASSES[i] * SystemPropertyUtil.getInt("io.netty.expt.minSegs", 32));
             if (poolCount == 0 || chunkSizesTemp[poolCount - 1] != chunkSize) {
                 chunkSizesTemp[poolCount] = chunkSize;
                 poolCount++;
@@ -465,13 +465,21 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    // EXPERIMENT: one recycler shared by every stripe (methods synchronized), to test whether
+    // chunk supply is fragmented across the per-stripe recyclers.
+    private static final boolean SHARED_RECYCLER_ON = SystemPropertyUtil.getBoolean("io.netty.expt.sharedRecycler", false);
+    private static final SizeClassChunkRecycler SHARED_RECYCLER = SHARED_RECYCLER_ON ? new SizeClassChunkRecycler() : null;
+
     private static final class SizeClassChunkRecycler {
         @SuppressWarnings("unchecked")
         private final RecycleStack<AbstractByteBuf>[] bufferPools = new RecycleStack[CHUNK_POOL_COUNT];
         private final MpscIntQueue[] freelistSlots = new MpscIntQueue[FREELIST_POOL_COUNT];
         private final IntStack[] localFreelistSlots = new IntStack[FREELIST_POOL_COUNT];
 
-        private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
+        // EXPERIMENT: made configurable to test whether the recycler pool size is what drives
+        // chunk churn (and therefore RSS). Default unchanged at 4 MiB.
+        private static final int TARGET_RECYCLED_BYTES = SystemPropertyUtil.getInt(
+                "io.netty.expt.targetRecycledBytes", 4 * 1024 * 1024);
 
         SizeClassChunkRecycler() {
             for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
@@ -480,11 +488,29 @@ final class AdaptivePoolingAllocator {
         }
 
         AbstractByteBuf pollBuffer(int sizeClassIndex) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doPollBuffer(sizeClassIndex);
+                }
+            }
+            return doPollBuffer(sizeClassIndex);
+        }
+
+        private AbstractByteBuf doPollBuffer(int sizeClassIndex) {
             int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             return bufferPools[poolIdx].poll();
         }
 
         boolean offerBuffer(AbstractByteBuf delegate, int sizeClassIndex) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doOfferBuffer(delegate, sizeClassIndex);
+                }
+            }
+            return doOfferBuffer(delegate, sizeClassIndex);
+        }
+
+        private boolean doOfferBuffer(AbstractByteBuf delegate, int sizeClassIndex) {
             int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             return bufferPools[poolIdx].offer(delegate);
         }
@@ -494,6 +520,15 @@ final class AdaptivePoolingAllocator {
         }
 
         MpscIntQueue pollFreelist(int capacity) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doPollFreelist(capacity);
+                }
+            }
+            return doPollFreelist(capacity);
+        }
+
+        private MpscIntQueue doPollFreelist(int capacity) {
             int idx = freelistPoolIndex(MathUtil.safeFindNextPositivePowerOfTwo(capacity));
             if (idx < 0 || idx >= freelistSlots.length) {
                 return null;
@@ -504,6 +539,15 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean offerFreelist(MpscIntQueue freelist) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doOfferFreelist(freelist);
+                }
+            }
+            return doOfferFreelist(freelist);
+        }
+
+        private boolean doOfferFreelist(MpscIntQueue freelist) {
             int idx = freelistPoolIndex(freelist.capacity());
             if (idx < 0 || idx >= freelistSlots.length) {
                 return false;
@@ -516,6 +560,15 @@ final class AdaptivePoolingAllocator {
         }
 
         IntStack pollLocalFreelist(int capacity) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doPollLocalFreelist(capacity);
+                }
+            }
+            return doPollLocalFreelist(capacity);
+        }
+
+        private IntStack doPollLocalFreelist(int capacity) {
             int idx = freelistPoolIndex(capacity);
             if (idx < 0 || idx >= localFreelistSlots.length) {
                 return null;
@@ -526,6 +579,15 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean offerLocalFreelist(IntStack freelist) {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    return doOfferLocalFreelist(freelist);
+                }
+            }
+            return doOfferLocalFreelist(freelist);
+        }
+
+        private boolean doOfferLocalFreelist(IntStack freelist) {
             int idx = freelistPoolIndex(freelist.capacity());
             if (idx < 0 || idx >= localFreelistSlots.length) {
                 return false;
@@ -538,6 +600,16 @@ final class AdaptivePoolingAllocator {
         }
 
         void freeAll() {
+            if (SHARED_RECYCLER_ON) {
+                synchronized (this) {
+                    doFreeAll();
+                }
+                return;
+            }
+            doFreeAll();
+        }
+
+        private void doFreeAll() {
             for (RecycleStack<AbstractByteBuf> pool : bufferPools) {
                 pool.forEach(AbstractByteBuf::release);
             }
@@ -569,7 +641,7 @@ final class AdaptivePoolingAllocator {
 
         private Magazine createFirstMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             magazines = new Magazine[SIZE_CLASSES_COUNT];
-            chunkRecycler = new SizeClassChunkRecycler();
+            chunkRecycler = SHARED_RECYCLER != null ? SHARED_RECYCLER : new SizeClassChunkRecycler();
             return createMagazine(sizeClassIndex, allocator);
         }
 
@@ -898,7 +970,16 @@ final class AdaptivePoolingAllocator {
             addToReusable(chunk);
         }
 
+        // EXPERIMENT: when set, a fully-free chunk is NOT evicted on the release path; it stays
+        // on the reusable list and only the periodic tick may evict it. Tests whether eager
+        // eviction (copied from mimalloc, where a page-free is free) is what drives chunk churn
+        // here, where a chunk-free the recycler cannot absorb is a byte[] handed to the GC.
+        private static final boolean LAZY_EVICT = SystemPropertyUtil.getBoolean("io.netty.expt.lazyEvict", false);
+
         void evictIfAboveFloor(SizeClassedChunk chunk) {
+            if (LAZY_EVICT) {
+                return;
+            }
             if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
                 removeFromReusable(chunk);
                 detachFromCache(chunk);
@@ -1281,7 +1362,7 @@ final class AdaptivePoolingAllocator {
         // To amortize activation/deactivation of chunks, we should have a minimum number of segments per chunk.
         // We choose 32 because it seems neither too small nor too big.
         // For segments of 16 KiB, the chunks will be half a megabyte.
-        private static final int MIN_SEGMENTS_PER_CHUNK = 32;
+        private static final int MIN_SEGMENTS_PER_CHUNK = SystemPropertyUtil.getInt("io.netty.expt.minSegs", 32);
         private final int segmentSize;
         private final int chunkSize;
 
@@ -1776,7 +1857,13 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
         }
 
-        Chunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled) {
+        /**
+         * @param recycled {@code true} when {@code delegate} is a memory buffer taken from the chunk
+         *                 recycler rather than freshly allocated. A {@code Chunk} is constructed on
+         *                 both paths, so without this flag an {@code AllocateChunk} event cannot be
+         *                 read as "memory was allocated".
+         */
+        Chunk(AbstractByteBuf delegate, Magazine magazine, boolean pooled, boolean recycled) {
             this.delegate = delegate;
             this.pooled = pooled;
             capacity = delegate.capacity();
@@ -1791,6 +1878,7 @@ final class AdaptivePoolingAllocator {
                     event.fill(this, AdaptiveByteBufAllocator.class);
                     event.pooled = pooled;
                     event.threadLocal = magazine.ownerThread != null;
+                    event.recycled = recycled;
                     event.commit();
                 }
             }
@@ -2028,7 +2116,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassedChunk(AbstractByteBuf delegate, Magazine magazine,
                          SizeClassChunkController controller) {
-            super(delegate, magazine, true);
+            super(delegate, magazine, true, false);
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
             STATE.lazySet(this, AVAILABLE);
@@ -2049,7 +2137,7 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk(AbstractByteBuf recycledDelegate, MpscIntQueue recycledFreeList,
                          IntStack recycledLocalFreeList,
                          Magazine magazine, SizeClassChunkController controller) {
-            super(recycledDelegate, magazine, true);
+            super(recycledDelegate, magazine, true, true);
             this.externalFreeList = recycledFreeList;
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
@@ -2299,7 +2387,7 @@ final class AdaptivePoolingAllocator {
         private final int freeListCapacity;
 
         BuddyChunk(AbstractByteBuf delegate, Magazine magazine) {
-            super(delegate, magazine, true);
+            super(delegate, magazine, true, false);
             freeListCapacity = delegate.capacity() / MIN_BUDDY_SIZE;
             int maxShift = Integer.numberOfTrailingZeros(freeListCapacity);
             assert maxShift <= 30; // The top 2 bits are used for marking.

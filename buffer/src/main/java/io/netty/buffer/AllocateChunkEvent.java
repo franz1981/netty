@@ -38,4 +38,6 @@ final class AllocateChunkEvent extends AbstractChunkEvent {
     public boolean pooled;
     @Description("Is this chunk part of a thread-local magazine or arena?")
     public boolean threadLocal;
+    @Description("Did this chunk reuse a recycled memory buffer, rather than allocating a fresh one?")
+    public boolean recycled;
 }
