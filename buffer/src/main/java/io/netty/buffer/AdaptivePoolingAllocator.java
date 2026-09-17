@@ -51,7 +51,6 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
-import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
 /**
@@ -415,140 +414,115 @@ final class AdaptivePoolingAllocator {
         sharedBuddyCache.free();
     }
 
-    private static final int FREELIST_POOL_COUNT; // number of distinct freelist capacity buckets
-    static {
-        // Compute the number of distinct power-of-2 freelist capacities across all size classes.
-        // Capacities are chunkSize/segmentSize, and chunkSize = max(MIN_CHUNK_SIZE, segmentSize * 32).
-        // Min capacity is 32 (2^5), max varies. We index by numberOfTrailingZeros(capacity) - 5.
-        int maxCapBits = 0;
-        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int segmentSize = SIZE_CLASSES[i];
-            int chunkSize = Math.max(MIN_CHUNK_SIZE, segmentSize * 32);
-            int cap = chunkSize / segmentSize;
-            int bits = Integer.numberOfTrailingZeros(Integer.highestOneBit(cap));
-            if (bits > maxCapBits) {
-                maxCapBits = bits;
-            }
-        }
-        FREELIST_POOL_COUNT = maxCapBits - 5 + 1; // indices 0..(maxCapBits-5)
-    }
-
-    private static final class RecycleStack<T> {
-        private final Object[] elements;
-        private int size;
-
-        RecycleStack(int capacity) {
-            elements = new Object[capacity];
-        }
-
-        @SuppressWarnings("unchecked")
-        T poll() {
-            if (size == 0) {
-                return null;
-            }
-            int idx = --size;
-            T element = (T) elements[idx];
-            elements[idx] = null; // help GC
-            return element;
-        }
-
-        boolean offer(T element) {
-            if (size >= elements.length) {
-                return false;
-            }
-            elements[size++] = element;
-            return true;
-        }
-
-        void forEach(Consumer<T> action) {
-            for (int i = 0; i < size; i++) {
-                @SuppressWarnings("unchecked")
-                T element = (T) elements[i];
-                action.accept(element);
-                elements[i] = null;
-            }
-            size = 0;
-        }
-    }
-
-    private static final class SizeClassChunkRecycler {
-        @SuppressWarnings("unchecked")
-        private final RecycleStack<AbstractByteBuf>[] bufferPools = new RecycleStack[CHUNK_POOL_COUNT];
-        private final MpscIntQueue[] freelistSlots = new MpscIntQueue[FREELIST_POOL_COUNT];
-        private final IntStack[] localFreelistSlots = new IntStack[FREELIST_POOL_COUNT];
-
+    /**
+     * Per-heap pool of chunk buffers that were fully free when their chunk was evicted, kept for the next
+     * chunk of the same chunk size on this heap. A buffer travels with the two free lists of the chunk
+     * that owned it, so re-creating a chunk from the pool allocates nothing: the lists have exactly the
+     * lifetime and count of the buffers, which is what makes the pool sizing a single number.
+     * <p>
+     * Pools are keyed by chunk size, not size class: several small size classes share one chunk size, and a
+     * buffer freed by one of them serves the next. The free lists are sized for the class that freed them; a
+     * class that needs more segments than they hold replaces them (see {@link SizeClassedChunk}).
+     * <p>
+     * Accessed only under the owning stripe lock, or by the owner thread of a thread-local heap.
+     */
+    static final class SizeClassChunkRecycler {
         private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
+
+        private final AbstractByteBuf[][] buffers = new AbstractByteBuf[CHUNK_POOL_COUNT][];
+        private final MpscIntQueue[][] freeLists = new MpscIntQueue[CHUNK_POOL_COUNT][];
+        private final IntStack[][] localFreeLists = new IntStack[CHUNK_POOL_COUNT][];
+        private final int[] sizes = new int[CHUNK_POOL_COUNT];
+
+        // What the last successful poll() returned, read once by the caller.
+        private AbstractByteBuf polledBuffer;
+        private MpscIntQueue polledFreeList;
+        private IntStack polledLocalFreeList;
 
         SizeClassChunkRecycler() {
             for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
-                bufferPools[i] = new RecycleStack<>(Math.max(1, TARGET_RECYCLED_BYTES / CHUNK_SIZES[i]));
+                int capacity = Math.max(1, TARGET_RECYCLED_BYTES / CHUNK_SIZES[i]);
+                buffers[i] = new AbstractByteBuf[capacity];
+                freeLists[i] = new MpscIntQueue[capacity];
+                localFreeLists[i] = new IntStack[capacity];
             }
         }
 
-        AbstractByteBuf pollBuffer(int sizeClassIndex) {
-            int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].poll();
+        static int poolCapacity(int sizeClassIndex) {
+            return Math.max(1, TARGET_RECYCLED_BYTES / CHUNK_SIZES[SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex]]);
         }
 
-        boolean offerBuffer(AbstractByteBuf delegate, int sizeClassIndex) {
-            int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].offer(delegate);
-        }
-
-        private static int freelistPoolIndex(int capacity) {
-            return Integer.numberOfTrailingZeros(Integer.highestOneBit(Math.max(32, capacity))) - 5;
-        }
-
-        MpscIntQueue pollFreelist(int capacity) {
-            int idx = freelistPoolIndex(MathUtil.safeFindNextPositivePowerOfTwo(capacity));
-            if (idx < 0 || idx >= freelistSlots.length) {
-                return null;
-            }
-            MpscIntQueue fl = freelistSlots[idx];
-            freelistSlots[idx] = null;
-            return fl;
-        }
-
-        boolean offerFreelist(MpscIntQueue freelist) {
-            int idx = freelistPoolIndex(freelist.capacity());
-            if (idx < 0 || idx >= freelistSlots.length) {
+        /**
+         * Take a buffer, and the free lists that came with it, for a chunk of {@code sizeClassIndex}.
+         * On {@code true}, read them through {@link #takeBuffer()}, {@link #takeFreeList()} and
+         * {@link #takeLocalFreeList()} before the next poll.
+         */
+        boolean poll(int sizeClassIndex) {
+            int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+            int size = sizes[pool];
+            if (size == 0) {
                 return false;
             }
-            if (freelistSlots[idx] != null) {
-                return false;
-            }
-            freelistSlots[idx] = freelist;
+            int idx = --size;
+            sizes[pool] = size;
+            polledBuffer = buffers[pool][idx];
+            polledFreeList = freeLists[pool][idx];
+            polledLocalFreeList = localFreeLists[pool][idx];
+            buffers[pool][idx] = null;
+            freeLists[pool][idx] = null;
+            localFreeLists[pool][idx] = null;
             return true;
         }
 
-        IntStack pollLocalFreelist(int capacity) {
-            int idx = freelistPoolIndex(capacity);
-            if (idx < 0 || idx >= localFreelistSlots.length) {
-                return null;
-            }
-            IntStack fl = localFreelistSlots[idx];
-            localFreelistSlots[idx] = null;
+        AbstractByteBuf takeBuffer() {
+            AbstractByteBuf buf = polledBuffer;
+            polledBuffer = null;
+            return buf;
+        }
+
+        MpscIntQueue takeFreeList() {
+            MpscIntQueue fl = polledFreeList;
+            polledFreeList = null;
             return fl;
         }
 
-        boolean offerLocalFreelist(IntStack freelist) {
-            int idx = freelistPoolIndex(freelist.capacity());
-            if (idx < 0 || idx >= localFreelistSlots.length) {
+        IntStack takeLocalFreeList() {
+            IntStack fl = polledLocalFreeList;
+            polledLocalFreeList = null;
+            return fl;
+        }
+
+        /**
+         * Keep {@code delegate} and its free lists for the next chunk of this chunk size, or refuse when the
+         * pool for that chunk size is full. Either list may be {@code null}.
+         */
+        boolean offer(AbstractByteBuf delegate, MpscIntQueue freeList, IntStack localFreeList, int sizeClassIndex) {
+            int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+            int size = sizes[pool];
+            if (size >= buffers[pool].length) {
                 return false;
             }
-            if (localFreelistSlots[idx] != null) {
-                return false;
-            }
-            localFreelistSlots[idx] = freelist;
+            buffers[pool][size] = delegate;
+            freeLists[pool][size] = freeList;
+            localFreeLists[pool][size] = localFreeList;
+            sizes[pool] = size + 1;
             return true;
+        }
+
+        int size(int sizeClassIndex) {
+            return sizes[SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex]];
         }
 
         void freeAll() {
-            for (RecycleStack<AbstractByteBuf> pool : bufferPools) {
-                pool.forEach(AbstractByteBuf::release);
+            for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
+                for (int i = 0; i < sizes[pool]; i++) {
+                    buffers[pool][i].release();
+                    buffers[pool][i] = null;
+                    freeLists[pool][i] = null;
+                    localFreeLists[pool][i] = null;
+                }
+                sizes[pool] = 0;
             }
-            Arrays.fill(freelistSlots, null);
-            Arrays.fill(localFreelistSlots, null);
         }
     }
 
@@ -1363,17 +1337,17 @@ final class AdaptivePoolingAllocator {
         @Override
         public Chunk newChunkAllocation(int promptingSize, Magazine magazine) {
             if (magazine.chunkRecycler != null) {
-                // Try recycled buffer
-                AbstractByteBuf recycledBuf = magazine.chunkRecycler.pollBuffer(magazine.sizeClassIndex);
-                if (recycledBuf != null) {
+                SizeClassChunkRecycler recycler = magazine.chunkRecycler;
+                if (recycler.poll(magazine.sizeClassIndex)) {
+                    AbstractByteBuf recycledBuf = recycler.takeBuffer();
+                    MpscIntQueue recycledFL = recycler.takeFreeList();
+                    IntStack recycledLocal = recycler.takeLocalFreeList();
                     int neededSegments = chunkSize / segmentSize;
-                    // Try recycled freelist of matching capacity
-                    MpscIntQueue recycledFL = magazine.chunkRecycler.pollFreelist(neededSegments);
-                    if (recycledFL == null) {
+                    // The lists were sized by the class that freed the buffer, which in a shared pool may be a
+                    // smaller one than ours.
+                    if (recycledFL == null || recycledFL.capacity() < neededSegments) {
                         recycledFL = MpscIntQueue.create(neededSegments, SizeClassedChunk.FREE_LIST_EMPTY);
                     }
-                    IntStack recycledLocal = (magazine.ownerThread != null) ?
-                            magazine.chunkRecycler.pollLocalFreelist(neededSegments) : null;
                     SizeClassedChunk chunk = new SizeClassedChunk(
                             recycledBuf, recycledFL, recycledLocal, magazine, this);
                     chunkRegistry.add(chunk);
@@ -2255,16 +2229,8 @@ final class AdaptivePoolingAllocator {
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
-            if (recycler != null) {
-                if (recycler.offerBuffer(delegate, sizeClassIndex)) {
-                    delegate = null;
-                }
-                if (externalFreeList != null) {
-                    recycler.offerFreelist(externalFreeList);
-                }
-                if (localFreeList != null) {
-                    recycler.offerLocalFreelist(localFreeList);
-                }
+            if (recycler != null && recycler.offer(delegate, externalFreeList, localFreeList, sizeClassIndex)) {
+                delegate = null;
             }
             externalFreeList = null;
             localFreeList = null;
