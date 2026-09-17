@@ -437,7 +437,9 @@ final class AdaptivePoolingAllocator {
         private final Object[] elements;
         private int size;
 
+        int[] tags; // TELEMETRY
         RecycleStack(int capacity) {
+            tags = new int[capacity]; // TELEMETRY
             elements = new Object[capacity];
         }
 
@@ -485,14 +487,44 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        // TELEMETRY: [pool][0]=same-class polls, [1]=cross-class polls, [2]=misses, [3]=offers refused, [4]=offers accepted
+        static final java.util.concurrent.atomic.LongAdder[][] TELE = new java.util.concurrent.atomic.LongAdder[CHUNK_POOL_COUNT][5];
+        static final java.util.concurrent.atomic.LongAdder[][] TELE_XCLASS = new java.util.concurrent.atomic.LongAdder[SIZE_CLASSES_COUNT][SIZE_CLASSES_COUNT];
+        static {
+            for (int i = 0; i < CHUNK_POOL_COUNT; i++) { for (int j = 0; j < 5; j++) { TELE[i][j] = new java.util.concurrent.atomic.LongAdder(); } }
+            for (int i = 0; i < SIZE_CLASSES_COUNT; i++) { for (int j = 0; j < SIZE_CLASSES_COUNT; j++) { TELE_XCLASS[i][j] = new java.util.concurrent.atomic.LongAdder(); } }
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder sb = new StringBuilder("TELE recycler pools: pool chunkSize same cross miss refused accepted\n");
+                for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
+                    sb.append("TELE ").append(i).append(' ').append(CHUNK_SIZES[i]);
+                    for (int j = 0; j < 5; j++) { sb.append(' ').append(TELE[i][j].sum()); }
+                    sb.append('\n');
+                }
+                sb.append("TELE cross-class transfers (from -> to: count)\n");
+                for (int i = 0; i < SIZE_CLASSES_COUNT; i++) { for (int j = 0; j < SIZE_CLASSES_COUNT; j++) {
+                    long c = TELE_XCLASS[i][j].sum(); if (c > 0 && i != j) { sb.append("TELE ").append(SIZE_CLASSES[i]).append(" -> ").append(SIZE_CLASSES[j]).append(": ").append(c).append('\n'); } } }
+                System.err.print(sb);
+            }));
+        }
+
         AbstractByteBuf pollBuffer(int sizeClassIndex) {
             int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].poll();
+            RecycleStack<AbstractByteBuf> st = bufferPools[poolIdx];
+            if (st.size == 0) { TELE[poolIdx][2].increment(); return null; }
+            int from = st.tags[st.size - 1];
+            AbstractByteBuf b = st.poll();
+            TELE[poolIdx][from == sizeClassIndex ? 0 : 1].increment();
+            TELE_XCLASS[from][sizeClassIndex].increment();
+            return b;
         }
 
         boolean offerBuffer(AbstractByteBuf delegate, int sizeClassIndex) {
             int poolIdx = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
-            return bufferPools[poolIdx].offer(delegate);
+            RecycleStack<AbstractByteBuf> st = bufferPools[poolIdx];
+            boolean ok = st.offer(delegate);
+            if (ok) { st.tags[st.size - 1] = sizeClassIndex; }
+            TELE[poolIdx][ok ? 4 : 3].increment();
+            return ok;
         }
 
         private static int freelistPoolIndex(int capacity) {
