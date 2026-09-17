@@ -203,7 +203,7 @@ final class AdaptivePoolingAllocator {
     static final int[] CHUNK_SIZE_CLASSES = chunkSizeClasses();
 
     private static int[] chunkSizeClasses() {
-        int[] sizes = { MIN_CHUNK_SIZE, MIN_CHUNK_SIZE * 8, MIN_CHUNK_SIZE * 32 };
+        int[] sizes = { MIN_CHUNK_SIZE, MIN_CHUNK_SIZE * 4, MIN_CHUNK_SIZE * 16, MIN_CHUNK_SIZE * 32 };
         int count = 0;
         for (int size : sizes) {
             if (size <= MAX_CHUNK_SIZE && (count == 0 || sizes[count - 1] != size)) {
