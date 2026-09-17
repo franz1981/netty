@@ -287,8 +287,8 @@ public class JfrEventsTest {
             stream.startAsync();
             ByteBufAllocator allocator = newAdaptiveAllocator(false);
             int bufSize = 16896;
-            int minSegmentsPerChunk = 32; // See AdaptivePoolingAllocator.SizeClassChunkController.
-            int bufsToAllocate = 1 + minSegmentsPerChunk;
+            int segmentsPerChunk = AdaptivePoolingAllocator.chunkSizeFor(bufSize) / bufSize;
+            int bufsToAllocate = 1 + segmentsPerChunk;
             List<ByteBuf> buffers = new ArrayList<>(bufsToAllocate);
             for (int i = 0; i < bufsToAllocate; ++i) {
                 buffers.add(allocator.heapBuffer(bufSize, bufSize));
