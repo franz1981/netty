@@ -384,11 +384,10 @@ final class AdaptivePoolingAllocator {
         }
         // Create a one-off chunk for this allocation.
         AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);
-        Chunk chunk = new Chunk(innerChunk, this);
+        UnpooledChunk chunk = new UnpooledChunk(innerChunk, this);
         chunkRegistry.add(chunk);
         try {
-            boolean success = chunk.readInitInto(buf, size, size, maxCapacity);
-            assert success : "Failed to initialize ByteBuf with dedicated chunk";
+            chunk.readInitInto(buf, size, maxCapacity);
         } finally {
             // As the chunk is an one-off we need to always call release explicitly as readInitInto(...)
             // will take care of retain once when successful. Once The AdaptiveByteBuf is released it will
@@ -1247,7 +1246,7 @@ final class AdaptivePoolingAllocator {
                 Chunk toDeallocate = null;
                 for (IntEntry<Chunk> entry : chunks) {
                     Chunk candidate = entry.getValue();
-                    if (candidate != null && RefCnt.refCnt(candidate.refCnt) == 1) {
+                    if (candidate != null && RefCnt.refCnt(((BuddyChunk) candidate).refCnt) == 1) {
                         toDeallocate = candidate;
                         key = entry.getKey();
                         break;
@@ -1437,7 +1436,7 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class Magazine {
-        private static final Chunk MAGAZINE_FREED = new Chunk();
+        private static final Chunk MAGAZINE_FREED = BuddyChunk.newMagazineFreedSentinel();
 
         static final class AdaptiveRecycler extends Recycler<AdaptiveByteBuf> {
 
@@ -1750,13 +1749,10 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    static class Chunk implements ChunkInfo {
+    abstract static class Chunk implements ChunkInfo {
         protected AbstractByteBuf delegate;
         protected Magazine magazine;
         final AdaptivePoolingAllocator allocator;
-        // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
-        // This is safe to do even on native-image.
-        final RefCnt refCnt = new RefCnt();
         private final int capacity;
         private final boolean pooled;
         protected int allocatedBytes;
@@ -1816,25 +1812,9 @@ final class AdaptivePoolingAllocator {
         /**
          * Called when a ByteBuf is done using its allocation in this chunk.
          */
-        void releaseSegment(int ignoredSegmentId, int size) {
-            release();
-        }
+        abstract void releaseSegment(int startIndex, int size);
 
-        void markToDeallocate() {
-            release();
-        }
-
-        private void retain() {
-            RefCnt.retain(refCnt);
-        }
-
-        protected boolean release() {
-            boolean deallocate = RefCnt.release(refCnt);
-            if (deallocate) {
-                deallocate();
-            }
-            return deallocate;
-        }
+        abstract void markToDeallocate();
 
         protected void deallocate() {
             if (delegate != null) {
@@ -1862,25 +1842,7 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        public boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
-            int startIndex = allocatedBytes;
-            allocatedBytes = startIndex + startingCapacity;
-            Chunk chunk = this;
-            chunk.retain();
-            try {
-                buf.init(delegate, chunk, 0, 0, startIndex, size, startingCapacity, maxCapacity);
-                chunk = null;
-            } finally {
-                if (chunk != null) {
-                    // If chunk is not null we know that buf.init(...) failed and so we need to manually release
-                    // the chunk again as we retained it before calling buf.init(...). Beside this we also need to
-                    // restore the old allocatedBytes value.
-                    allocatedBytes = startIndex;
-                    chunk.release();
-                }
-            }
-            return true;
-        }
+        public abstract boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity);
 
         public int remainingCapacity() {
             return capacity - allocatedBytes;
@@ -1906,6 +1868,59 @@ final class AdaptivePoolingAllocator {
         @Override
         public long memoryAddress() {
             return delegate._memoryAddress();
+        }
+    }
+
+    /**
+     * A one-off chunk holding exactly one buffer, for allocations that are not pooled. It belongs to no
+     * magazine and is never cached: it is released when its buffer is.
+     */
+    private static final class UnpooledChunk extends Chunk {
+        // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
+        // This is safe to do even on native-image.
+        private final RefCnt refCnt = new RefCnt();
+
+        UnpooledChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
+            super(delegate, allocator);
+        }
+
+        /**
+         * Initialize {@code buf} over the whole chunk. On success the buffer holds a reference to this chunk;
+         * the caller still owns the one it got at construction and must {@link #release()} it.
+         */
+        void readInitInto(AdaptiveByteBuf buf, int size, int maxCapacity) {
+            RefCnt.retain(refCnt);
+            boolean initialized = false;
+            try {
+                buf.init(delegate, this, 0, 0, 0, size, size, maxCapacity);
+                initialized = true;
+            } finally {
+                if (!initialized) {
+                    // buf.init(...) failed: drop the reference taken for the buffer.
+                    release();
+                }
+            }
+        }
+
+        @Override
+        public boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
+            throw new UnsupportedOperationException("an unpooled chunk is never allocated from by a magazine");
+        }
+
+        @Override
+        void releaseSegment(int startIndex, int size) {
+            release();
+        }
+
+        @Override
+        void markToDeallocate() {
+            release();
+        }
+
+        void release() {
+            if (RefCnt.release(refCnt)) {
+                deallocate();
+            }
         }
     }
 
@@ -2291,10 +2306,26 @@ final class AdaptivePoolingAllocator {
         private static final int PACK_OFFSET_MASK = 0xFFFF;
         private static final int PACK_SIZE_SHIFT = Integer.SIZE - Integer.numberOfLeadingZeros(PACK_OFFSET_MASK);
 
+        // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
+        // This is safe to do even on native-image.
+        final RefCnt refCnt = new RefCnt();
         private final MpscIntQueue freeList;
         // The bits of each buddy: [1: is claimed][1: has claimed children][30: MIN_BUDDY_SIZE shift to get size]
         private final byte[] buddies;
         private final int freeListCapacity;
+
+        /**
+         * Constructor only used by the magazine's {@code MAGAZINE_FREED} sentinel. Never a usable chunk.
+         */
+        private BuddyChunk() {
+            freeList = null;
+            buddies = null;
+            freeListCapacity = 0;
+        }
+
+        static BuddyChunk newMagazineFreedSentinel() {
+            return new BuddyChunk();
+        }
 
         BuddyChunk(AbstractByteBuf delegate, Magazine magazine) {
             super(delegate, magazine, true);
@@ -2327,7 +2358,7 @@ final class AdaptivePoolingAllocator {
             if (startIndex == -1) {
                 return false;
             }
-            Chunk chunk = this;
+            BuddyChunk chunk = this;
             chunk.retain();
             try {
                 buf.init(delegate, this, 0, 0, startIndex, size, startingCapacity, maxCapacity);
@@ -2368,6 +2399,21 @@ final class AdaptivePoolingAllocator {
             int packed = packedOffset | packedSize;
             freeList.offer(packed);
             release();
+        }
+
+        @Override
+        void markToDeallocate() {
+            release();
+        }
+
+        private void retain() {
+            RefCnt.retain(refCnt);
+        }
+
+        private void release() {
+            if (RefCnt.release(refCnt)) {
+                deallocate();
+            }
         }
 
         @Override
