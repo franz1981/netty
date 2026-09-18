@@ -1175,7 +1175,13 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class ConcurrentSkipListChunkCache implements ChunkCache {
+        // EXPERIMENT: chunks offered with no free space never enter the map (their key would be stale at 0);
+        // they wait in a queue and a bounded number are re-examined on every poll.
+        private static final int EXHAUSTED_PROBE = 8;
         private final ConcurrentSkipListIntObjMultimap<Chunk> chunks;
+        private final java.util.concurrent.ConcurrentLinkedQueue<Chunk> exhausted =
+                new java.util.concurrent.ConcurrentLinkedQueue<Chunk>();
+        private final java.util.concurrent.atomic.AtomicInteger freeChunks = new java.util.concurrent.atomic.AtomicInteger();
 
         private ConcurrentSkipListChunkCache() {
             chunks = new ConcurrentSkipListIntObjMultimap<>(-1);
@@ -1183,70 +1189,58 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public Chunk pollChunk(int size) {
+            probeExhausted();
             if (chunks.isEmpty()) {
                 return null;
             }
             IntEntry<Chunk> entry = chunks.pollCeilingEntry(size);
-            if (entry != null) {
-                Chunk chunk = entry.getValue();
+            if (entry == null) {
+                return null;
+            }
+            Chunk chunk = entry.getValue();
+            if (entry.getKey() == chunk.capacity()) {
+                freeChunks.decrementAndGet();
+            }
+            if (chunk.hasUnprocessedFreelistEntries()) {
+                chunk.processFreelistEntries();
+            }
+            return chunk;
+        }
+
+        private void probeExhausted() {
+            for (int i = 0; i < EXHAUSTED_PROBE; i++) {
+                Chunk chunk = exhausted.poll();
+                if (chunk == null) {
+                    return;
+                }
                 if (chunk.hasUnprocessedFreelistEntries()) {
                     chunk.processFreelistEntries();
                 }
-                return chunk;
+                file(chunk);
             }
+        }
 
-            Chunk bestChunk = null;
-            int bestRemainingCapacity = 0;
-            Iterator<IntEntry<Chunk>> itr = chunks.iterator();
-            while (itr.hasNext()) {
-                entry = itr.next();
-                final Chunk chunk;
-                if (entry != null && (chunk = entry.getValue()).hasUnprocessedFreelistEntries()) {
-                    if (!chunks.remove(entry.getKey(), entry.getValue())) {
-                        continue;
-                    }
-                    chunk.processFreelistEntries();
-                    int remainingCapacity = chunk.remainingCapacity();
-                    if (remainingCapacity >= size &&
-                            (bestChunk == null || remainingCapacity > bestRemainingCapacity)) {
-                        if (bestChunk != null) {
-                            chunks.put(bestRemainingCapacity, bestChunk);
-                        }
-                        bestChunk = chunk;
-                        bestRemainingCapacity = remainingCapacity;
-                    } else {
-                        chunks.put(remainingCapacity, chunk);
-                    }
+        // Place a chunk that belongs to no magazine: fully free ones are kept up to the cap and deallocated beyond it,
+        // chunks with space go into the map under their current free bytes, full ones wait in the queue.
+        private void file(Chunk chunk) {
+            int remaining = chunk.remainingCapacity();
+            if (remaining == chunk.capacity()) {
+                if (freeChunks.incrementAndGet() > CHUNK_REUSE_QUEUE) {
+                    freeChunks.decrementAndGet();
+                    chunk.markToDeallocate();
+                    return;
                 }
+                chunks.put(remaining, chunk);
+            } else if (remaining > 0) {
+                chunks.put(remaining, chunk);
+            } else {
+                exhausted.offer(chunk);
             }
-
-            return bestChunk;
         }
 
         @Override
         public boolean offerChunk(Chunk chunk) {
-            chunks.put(chunk.remainingCapacity(), chunk);
-
-            int size = chunks.size();
-            while (size > CHUNK_REUSE_QUEUE) {
-                int key = -1;
-                Chunk toDeallocate = null;
-                for (IntEntry<Chunk> entry : chunks) {
-                    Chunk candidate = entry.getValue();
-                    if (candidate != null && RefCnt.refCnt(candidate.refCnt) == 1) {
-                        toDeallocate = candidate;
-                        key = entry.getKey();
-                        break;
-                    }
-                }
-                if (toDeallocate == null) {
-                    break;
-                }
-                if (chunks.remove(key, toDeallocate)) {
-                    toDeallocate.markToDeallocate();
-                }
-                size = chunks.size();
-            }
+            file(chunk);
             return true;
         }
 
@@ -1258,11 +1252,15 @@ final class AdaptivePoolingAllocator {
                     chunk.markToDeallocate();
                 }
             }
+            Chunk chunk;
+            while ((chunk = exhausted.poll()) != null) {
+                chunk.markToDeallocate();
+            }
         }
 
         @Override
         public boolean isEmpty() {
-            return chunks.isEmpty();
+            return chunks.isEmpty() && exhausted.isEmpty();
         }
     }
 
