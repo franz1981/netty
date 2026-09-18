@@ -230,7 +230,6 @@ final class AdaptivePoolingAllocator {
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
     private final BuddyChunkManagementStrategy buddyStrategy;
-    private final ChunkCache sharedBuddyCache;
     private final Magazine.AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
@@ -247,7 +246,6 @@ final class AdaptivePoolingAllocator {
         }
         stripeScanLength = INITIAL_MAGAZINES;
         buddyStrategy = new BuddyChunkManagementStrategy();
-        sharedBuddyCache = buddyStrategy.createChunkCache();
         fallbackRecycler = Magazine.AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
 
         boolean disableThreadLocalGroups = IS_LOW_MEM && DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM;
@@ -406,7 +404,6 @@ final class AdaptivePoolingAllocator {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
         }
-        sharedBuddyCache.free();
     }
 
     private static final int FREELIST_POOL_COUNT; // number of distinct freelist capacity buckets
@@ -1524,7 +1521,9 @@ final class AdaptivePoolingAllocator {
             this.chunkRecycler = null;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
-            this.chunkCache = allocator.sharedBuddyCache;
+            // One cache per buddy magazine, i.e. per stripe: it is only used under the stripe lock, like the
+            // size-classed caches, instead of being contended by every stripe at once.
+            this.chunkCache = strategy.createChunkCache();
             this.purgeTickThreshold = 0;
         }
 
@@ -1710,9 +1709,7 @@ final class AdaptivePoolingAllocator {
                 current.releaseFromMagazine();
                 current = null;
             }
-            if (chunkCache != allocator.sharedBuddyCache) {
-                chunkCache.free();
-            }
+            chunkCache.free();
         }
 
         public AdaptiveByteBuf newBuffer() {
