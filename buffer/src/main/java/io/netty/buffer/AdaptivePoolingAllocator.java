@@ -1601,16 +1601,21 @@ final class AdaptivePoolingAllocator {
             if (curr == null) {
                 curr = chunkController.newChunkAllocation(this);
             } else {
-                // Unlike the buddy cache, the size-class cache only hands out chunks with a free segment, and a
-                // segment always fits the size, so there is no "too small" chunk to put back here.
                 curr.attachToMagazine(this);
+                // The size-class cache only hands out chunks with a free segment, and a segment always fits the size,
+                // so this never happens; if that invariant ever broke, fall back to a fresh chunk rather than fail.
+                if (curr.remainingCapacity() < size) {
+                    assert false : "the cache handed out a chunk without a free segment";
+                    curr.releaseFromMagazine();
+                    curr = chunkController.newChunkAllocation(this);
+                }
             }
 
             current = curr;
             boolean success;
             try {
                 int remainingCapacity = curr.remainingCapacity();
-                assert remainingCapacity >= size : "the cache handed out a chunk without a free segment";
+                assert remainingCapacity >= size;
                 if (remainingCapacity > startingCapacity) {
                     success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
                     curr = null;
