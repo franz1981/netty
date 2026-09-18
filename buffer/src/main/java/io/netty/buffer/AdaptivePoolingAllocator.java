@@ -931,9 +931,16 @@ final class AdaptivePoolingAllocator {
 
         void evictIfAboveFloor(SizeClassedChunk chunk) {
             if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
-                removeFromReusable(chunk);
-                detachFromCache(chunk);
-                chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+                // EXPERIMENT: keep the oldest fully-free chunks; evict the newest one instead of this one.
+                SizeClassedChunk victim = chunk;
+                for (SizeClassedChunk c = reusableHead; c != null; c = c.nextInCache) {
+                    if (c.hasFullCapacity() && c.seq > victim.seq) {
+                        victim = c;
+                    }
+                }
+                removeFromReusable(victim);
+                detachFromCache(victim);
+                victim.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
         }
 
@@ -2032,6 +2039,8 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk prevInCache;
         SizeClassedChunk nextInCache;
         int cacheListState;
+        static final java.util.concurrent.atomic.AtomicLong SEQ = new java.util.concurrent.atomic.AtomicLong(); // EXPERIMENT
+        final long seq = SEQ.getAndIncrement(); // EXPERIMENT: allocation order
         final SizeClassedChunkCache owningCache;
 
         // --- Pending-notification link (see SizeClassedChunkCache#notifyHasCapacity) ---
