@@ -1524,7 +1524,7 @@ final class AdaptivePoolingAllocator {
             this.chunkRecycler = null;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
-            this.chunkCache = allocator.sharedBuddyCache;
+            this.chunkCache = strategy.createChunkCache(); // EXPERIMENT: one buddy cache per stripe, same structure
             this.purgeTickThreshold = 0;
         }
 
