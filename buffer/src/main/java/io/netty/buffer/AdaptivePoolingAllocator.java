@@ -234,6 +234,34 @@ final class AdaptivePoolingAllocator {
     private final ChunkRegistry chunkRegistry;
     private final SizeClassChunkManagementStrategy[] sizeClassStrategies;
     private final StripedHeap[] stripedHeaps;
+
+    // TELEMETRY (throwaway): where does each retained chunk live?
+    public String dumpRetention() {
+        StringBuilder sb = new StringBuilder();
+        for (int si = 0; si < stripedHeaps.length; si++) {
+            StripedHeap sh = stripedHeaps[si];
+            Magazine[] mags = sh.magazines;
+            if (mags == null) { continue; }
+            for (int ci = 0; ci < mags.length; ci++) {
+                Magazine m = mags[ci];
+                if (m == null) { continue; }
+                if (m.current != null && m.current.delegate != null) { sb.append("stripe=").append(si).append(" class=").append(SIZE_CLASSES[ci]).append(" where=current addr=0x").append(Long.toHexString(m.current.delegate.memoryAddress())).append('\n'); }
+                if (m.nextInLine != null && m.nextInLine != Magazine.MAGAZINE_FREED && m.nextInLine.delegate != null) { sb.append("stripe=").append(si).append(" class=").append(SIZE_CLASSES[ci]).append(" where=nextInLine addr=0x").append(Long.toHexString(m.nextInLine.delegate.memoryAddress())).append('\n'); }
+                if (m.chunkCache instanceof SizeClassedChunkCache) {
+                    SizeClassedChunkCache cache = (SizeClassedChunkCache) m.chunkCache;
+                    for (SizeClassedChunk c = cache.reusableHead; c != null; c = c.nextInCache) { if (c.delegate != null) { sb.append("stripe=").append(si).append(" class=").append(SIZE_CLASSES[ci]).append(" where=cache.reusable addr=0x").append(Long.toHexString(c.delegate.memoryAddress())).append('\n'); } }
+                    for (SizeClassedChunk c = cache.exhaustedHead; c != null; c = c.nextInCache) { if (c.delegate != null) { sb.append("stripe=").append(si).append(" class=").append(SIZE_CLASSES[ci]).append(" where=cache.exhausted addr=0x").append(Long.toHexString(c.delegate.memoryAddress())).append('\n'); } }
+                }
+            }
+            if (sh.chunkRecycler != null) {
+                for (int pi = 0; pi < CHUNK_POOL_COUNT; pi++) {
+                    RecycleStack<AbstractByteBuf> pool = sh.chunkRecycler.bufferPools[pi];
+                    for (int i = 0; i < pool.size; i++) { sb.append("stripe=").append(si).append(" pool=").append(CHUNK_SIZES[pi]).append(" where=recycler addr=0x").append(Long.toHexString(((AbstractByteBuf) pool.elements[i]).memoryAddress())).append('\n'); }
+                }
+            }
+        }
+        return sb.toString();
+    }
     private volatile int stripeScanLength;
     private final BuddyChunkManagementStrategy buddyStrategy;
     private final ChunkCache sharedBuddyCache;
