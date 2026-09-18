@@ -1325,27 +1325,27 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Compute the "fast max capacity" value for the buffer.
+         * Compute the "fast max capacity" value for the buffer: one segment, or less if the buffer may not grow
+         * that far.
          */
-        int computeBufferCapacity(int requestedSize, int maxCapacity) {
+        int computeBufferCapacity(int maxCapacity) {
             return Math.min(segmentSize, maxCapacity);
         }
 
         /**
-         * Allocate a new {@link SizeClassedChunk} for the given {@link SizeClassMagazine}.
+         * Allocate a new {@link SizeClassedChunk} for the given {@link SizeClassMagazine}: re-create one from a
+         * buffer of its heap's {@link SizeClassChunkRecycler}, or allocate a new buffer.
          */
-        SizeClassedChunk newChunkAllocation(int promptingSize, SizeClassMagazine magazine) {
-            if (magazine.chunkRecycler != null) {
-                SizeClassChunkRecycler recycler = magazine.chunkRecycler;
-                if (recycler.poll(magazine.sizeClassIndex)) {
-                    AbstractByteBuf recycledBuf = recycler.takeBuffer();
-                    MpscIntQueue recycledFL = recycler.takeFreeList();
-                    IntStack recycledLocal = recycler.takeLocalFreeList();
-                    SizeClassedChunk chunk = new SizeClassedChunk(
-                            recycledBuf, recycledFL, recycledLocal, magazine, this);
-                    chunkRegistry.add(chunk);
-                    return chunk;
-                }
+        SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
+            SizeClassChunkRecycler recycler = magazine.chunkRecycler;
+            if (recycler.poll(magazine.sizeClassIndex)) {
+                AbstractByteBuf recycledBuf = recycler.takeBuffer();
+                MpscIntQueue recycledFL = recycler.takeFreeList();
+                IntStack recycledLocal = recycler.takeLocalFreeList();
+                SizeClassedChunk chunk = new SizeClassedChunk(
+                        recycledBuf, recycledFL, recycledLocal, magazine, this);
+                chunkRegistry.add(chunk);
+                return chunk;
             }
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
@@ -1542,7 +1542,7 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            int startingCapacity = chunkController.computeBufferCapacity(size, maxCapacity);
+            int startingCapacity = chunkController.computeBufferCapacity(maxCapacity);
             SizeClassedChunk curr = current;
             SizeClassedChunk raced = null;
             if (curr != null) {
@@ -1599,22 +1599,18 @@ final class AdaptivePoolingAllocator {
             drainHeapPending();
             curr = chunkCache.pollChunk(size);
             if (curr == null) {
-                curr = chunkController.newChunkAllocation(size, this);
+                curr = chunkController.newChunkAllocation(this);
             } else {
+                // Unlike the buddy cache, the size-class cache only hands out chunks with a free segment, and a
+                // segment always fits the size, so there is no "too small" chunk to put back here.
                 curr.attachToMagazine(this);
-
-                int remainingCapacity = curr.remainingCapacity();
-                if (remainingCapacity == 0 || remainingCapacity < size) {
-                    curr.releaseFromMagazine();
-                    curr = chunkController.newChunkAllocation(size, this);
-                }
             }
 
             current = curr;
             boolean success;
             try {
                 int remainingCapacity = curr.remainingCapacity();
-                assert remainingCapacity >= size;
+                assert remainingCapacity >= size : "the cache handed out a chunk without a free segment";
                 if (remainingCapacity > startingCapacity) {
                     success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
                     curr = null;
@@ -2066,6 +2062,11 @@ final class AdaptivePoolingAllocator {
         private IntStack localFreeList;
         private final Thread ownerThread;
         private SizeClassMagazine magazine;
+        /**
+         * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free lists.
+         * Segments returned since then are not subtracted, so {@code capacity - allocatedBytes} never counts a
+         * segment that is not free.
+         */
         private int allocatedBytes;
 
         // Intrusive doubly-linked list pointers for cache membership
@@ -2205,9 +2206,10 @@ final class AdaptivePoolingAllocator {
             return externalFreeList.poll();
         }
 
-        // this can be used by the ConcurrentQueueChunkCache to find the first buffer to use:
-        // it doesn't update the remaining capacity and it's not consider a single segmentSize
-        // case as not suitable to be reused
+        /**
+         * Whether this chunk has a free segment, as the cache files it (reusable or exhausted) and probes it.
+         * Unlike {@link #remainingCapacity()} it never refreshes the snapshot.
+         */
         public boolean hasRemainingCapacity() {
             int remaining = capacity - allocatedBytes;
             if (remaining > 0) {
@@ -2221,6 +2223,12 @@ final class AdaptivePoolingAllocator {
             return localSize == segments || localSize + externalFreeList.size() == segments;
         }
 
+        /**
+         * The free bytes of this chunk as the magazine sees it after each allocation. While the snapshot is above
+         * one segment it is returned as is, without touching the free lists; at or below one segment the free lists
+         * are counted and the snapshot refreshed. Before the first refresh the snapshot also counts the tail of the
+         * chunk that is too small for a segment, when the chunk size is not a multiple of the segment size.
+         */
         public int remainingCapacity() {
             int remaining = capacity - allocatedBytes;
             return remaining > segmentSize ? remaining : updateRemainingCapacity(remaining);
