@@ -1153,16 +1153,20 @@ final class AdaptivePoolingAllocator {
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
             int total = totalCount();
+            // EXPERIMENT: evict from the tail of the list instead of the head.
             SizeClassedChunk cur = reusableHead;
+            while (cur != null && cur.nextInCache != null) {
+                cur = cur.nextInCache;
+            }
             while (cur != null && total > purgeRetentionFloor) {
-                SizeClassedChunk next = cur.nextInCache;
+                SizeClassedChunk prev = cur.prevInCache;
                 if (cur.hasFullCapacity()) {
                     removeFromReusable(cur);
                     detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                     total--;
                 }
-                cur = next;
+                cur = prev;
             }
         }
 
