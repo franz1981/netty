@@ -180,6 +180,12 @@ final class AdaptivePoolingAllocator {
             8704, // 8192 + 512
             16384,
             16896, // 16384 + 512
+            32768,
+            33792, // 32768 + 1024
+            65536,
+            67584, // 65536 + 2048
+            131072,
+            135168, // 131072 + 4096
     };
 
     private static final int SIZE_CLASSES_COUNT = SIZE_CLASSES.length;
