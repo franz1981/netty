@@ -1176,6 +1176,43 @@ final class AdaptivePoolingAllocator {
 
     private static final class ConcurrentSkipListChunkCache implements ChunkCache {
         private final ConcurrentSkipListIntObjMultimap<Chunk> chunks;
+        // TELEMETRY (throwaway)
+        static final java.util.concurrent.atomic.LongAdder T_POLL = new java.util.concurrent.atomic.LongAdder(),
+                T_POLL_CEIL = new java.util.concurrent.atomic.LongAdder(), T_POLL_FALLBACK = new java.util.concurrent.atomic.LongAdder(),
+                T_FALLBACK_VISITED = new java.util.concurrent.atomic.LongAdder(), T_OFFER = new java.util.concurrent.atomic.LongAdder(),
+                T_OVER_CAP = new java.util.concurrent.atomic.LongAdder(), T_SCAN_VISITED = new java.util.concurrent.atomic.LongAdder(),
+                T_EVICT = new java.util.concurrent.atomic.LongAdder(), T_SERVE_OK = new java.util.concurrent.atomic.LongAdder(),
+                T_SERVE_SHORT = new java.util.concurrent.atomic.LongAdder(), T_NEW_CHUNK = new java.util.concurrent.atomic.LongAdder();
+        static final java.util.concurrent.ConcurrentLinkedQueue<String> T_SNAPS = new java.util.concurrent.ConcurrentLinkedQueue<>();
+        static {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder b = new StringBuilder("TELE buddy-cache");
+                b.append(" polls=").append(T_POLL.sum()).append(" ceilHit=").append(T_POLL_CEIL.sum())
+                 .append(" fallbackScans=").append(T_POLL_FALLBACK.sum()).append(" fallbackVisited=").append(T_FALLBACK_VISITED.sum())
+                 .append(" offers=").append(T_OFFER.sum()).append(" offersOverCap=").append(T_OVER_CAP.sum())
+                 .append(" evictScanVisited=").append(T_SCAN_VISITED.sum()).append(" evictions=").append(T_EVICT.sum())
+                 .append(" polledServed=").append(T_SERVE_OK.sum()).append(" polledTooSmall=").append(T_SERVE_SHORT.sum())
+                 .append(" newChunks=").append(T_NEW_CHUNK.sum()).append('\n');
+                for (String sn : T_SNAPS) { b.append("TELE snap ").append(sn).append('\n'); }
+                System.err.print(b);
+            }));
+        }
+        private void snapshot() {
+            java.util.TreeMap<Integer, Integer> runs = new java.util.TreeMap<>();
+            int n = 0, free = 0; long cap = 0;
+            for (IntEntry<Chunk> e : chunks) {
+                Chunk c = e.getValue();
+                if (c == null) { continue; }
+                n++; runs.merge(e.getKey(), 1, Integer::sum);
+                if (RefCnt.refCnt(c.refCnt) == 1) { free++; }
+                cap = Math.max(cap, c.capacity());
+            }
+            int maxRun = 0, maxKey = 0;
+            for (java.util.Map.Entry<Integer, Integer> r : runs.entrySet()) { if (r.getValue() > maxRun) { maxRun = r.getValue(); maxKey = r.getKey(); } }
+            T_SNAPS.add("entries=" + n + " distinctKeys=" + runs.size() + " maxRun=" + maxRun + "@key" + maxKey
+                    + " fullyFree=" + free + " chunkCap=" + cap + " lowestKeys=" + runs.headMap(runs.isEmpty() ? 0 : runs.firstKey() + 1, true)
+                    + " firstKeys=" + new java.util.ArrayList<>(runs.entrySet()).subList(0, Math.min(5, runs.size())));
+        }
 
         private ConcurrentSkipListChunkCache() {
             chunks = new ConcurrentSkipListIntObjMultimap<>(-1);
@@ -1183,11 +1220,13 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public Chunk pollChunk(int size) {
+            T_POLL.increment();
             if (chunks.isEmpty()) {
                 return null;
             }
             IntEntry<Chunk> entry = chunks.pollCeilingEntry(size);
             if (entry != null) {
+                T_POLL_CEIL.increment();
                 Chunk chunk = entry.getValue();
                 if (chunk.hasUnprocessedFreelistEntries()) {
                     chunk.processFreelistEntries();
@@ -1197,9 +1236,11 @@ final class AdaptivePoolingAllocator {
 
             Chunk bestChunk = null;
             int bestRemainingCapacity = 0;
+            T_POLL_FALLBACK.increment();
             Iterator<IntEntry<Chunk>> itr = chunks.iterator();
             while (itr.hasNext()) {
                 entry = itr.next();
+                T_FALLBACK_VISITED.increment();
                 final Chunk chunk;
                 if (entry != null && (chunk = entry.getValue()).hasUnprocessedFreelistEntries()) {
                     if (!chunks.remove(entry.getKey(), entry.getValue())) {
@@ -1226,12 +1267,16 @@ final class AdaptivePoolingAllocator {
         @Override
         public boolean offerChunk(Chunk chunk) {
             chunks.put(chunk.remainingCapacity(), chunk);
+            T_OFFER.increment();
+            if ((T_OFFER.sum() & 16383) == 0) { snapshot(); }
 
             int size = chunks.size();
+            if (size > CHUNK_REUSE_QUEUE) { T_OVER_CAP.increment(); }
             while (size > CHUNK_REUSE_QUEUE) {
                 int key = -1;
                 Chunk toDeallocate = null;
                 for (IntEntry<Chunk> entry : chunks) {
+                    T_SCAN_VISITED.increment();
                     Chunk candidate = entry.getValue();
                     if (candidate != null && RefCnt.refCnt(candidate.refCnt) == 1) {
                         toDeallocate = candidate;
@@ -1243,6 +1288,7 @@ final class AdaptivePoolingAllocator {
                     break;
                 }
                 if (chunks.remove(key, toDeallocate)) {
+                    T_EVICT.increment();
                     toDeallocate.markToDeallocate();
                 }
                 size = chunks.size();
@@ -1641,13 +1687,17 @@ final class AdaptivePoolingAllocator {
             // Now try to poll from the cache first
             drainHeapPending();
             curr = chunkCache.pollChunk(size);
+            boolean buddyTele = chunkCache == allocator.sharedBuddyCache;
             if (curr == null) {
+                if (buddyTele) { ConcurrentSkipListChunkCache.T_NEW_CHUNK.increment(); }
                 curr = chunkController.newChunkAllocation(size, this);
             } else {
                 curr.attachToMagazine(this);
 
                 int remainingCapacity = curr.remainingCapacity();
+                if (buddyTele) { (remainingCapacity == 0 || remainingCapacity < size ? ConcurrentSkipListChunkCache.T_SERVE_SHORT : ConcurrentSkipListChunkCache.T_SERVE_OK).increment(); }
                 if (remainingCapacity == 0 || remainingCapacity < size) {
+                    if (buddyTele) { ConcurrentSkipListChunkCache.T_NEW_CHUNK.increment(); }
                     // Check if we either retain the chunk in the nextInLine cache or releasing it.
                     if (remainingCapacity < RETIRE_CAPACITY) {
                         curr.releaseFromMagazine();
