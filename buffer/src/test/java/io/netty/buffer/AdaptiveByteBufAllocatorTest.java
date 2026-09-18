@@ -403,8 +403,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
         int caches = sizeClassChunkCaches(allocator).size();
         int floor = Math.max(1, AdaptivePoolingAllocator.THREAD_LOCAL_CACHE_MIN_BYTES / BURST_CHUNK_SIZE);
-        // Per cache: the floor it is allowed to retain, plus the magazine's current and next-in-line
-        // chunk, plus slack.
+        // Per cache: the floor it is allowed to retain, plus the magazine's current chunk, plus slack.
         long bound = (long) caches * (floor + 4) * BURST_CHUNK_SIZE;
         long settled = allocator.usedHeapMemory();
 
