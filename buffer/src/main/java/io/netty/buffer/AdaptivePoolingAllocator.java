@@ -382,16 +382,15 @@ final class AdaptivePoolingAllocator {
         if (buf == null) {
             buf = newFallbackBuffer();
         }
-        // Create a one-off chunk for this allocation.
+        // Create a one-shot chunk for this allocation.
         AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);
-        UnpooledChunk chunk = new UnpooledChunk(innerChunk, this);
+        BuddyChunk chunk = new BuddyChunk(innerChunk, this);
         chunkRegistry.add(chunk);
         try {
-            chunk.readInitInto(buf, size, maxCapacity);
+            chunk.readInitOneShot(buf, size, maxCapacity);
         } finally {
-            // As the chunk is an one-off we need to always call release explicitly as readInitInto(...)
-            // will take care of retain once when successful. Once The AdaptiveByteBuf is released it will
-            // completely release the Chunk and so the contained innerChunk.
+            // Drop the reference the chunk got at construction: readInitOneShot(...) took one for the buffer
+            // when successful, so the chunk and its innerChunk are freed when the AdaptiveByteBuf is released.
             chunk.release();
         }
         return buf;
@@ -1935,7 +1934,7 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Constructor for an unpooled chunk.
+         * Constructor for an unpooled chunk: a one-shot {@link BuddyChunk}.
          */
         Chunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
             this.delegate = delegate;
@@ -2017,49 +2016,6 @@ final class AdaptivePoolingAllocator {
         @Override
         public long memoryAddress() {
             return delegate._memoryAddress();
-        }
-    }
-
-    /**
-     * A one-off chunk holding exactly one buffer, for allocations that are not pooled. It belongs to no
-     * magazine and is never cached: it is released when its buffer is.
-     */
-    private static final class UnpooledChunk extends Chunk {
-        // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
-        // This is safe to do even on native-image.
-        private final RefCnt refCnt = new RefCnt();
-
-        UnpooledChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
-            super(delegate, allocator);
-        }
-
-        /**
-         * Initialize {@code buf} over the whole chunk. On success the buffer holds a reference to this chunk;
-         * the caller still owns the one it got at construction and must {@link #release()} it.
-         */
-        void readInitInto(AdaptiveByteBuf buf, int size, int maxCapacity) {
-            RefCnt.retain(refCnt);
-            boolean initialized = false;
-            try {
-                buf.init(delegate, this, 0, 0, 0, size, size, maxCapacity);
-                initialized = true;
-            } finally {
-                if (!initialized) {
-                    // buf.init(...) failed: drop the reference taken for the buffer.
-                    release();
-                }
-            }
-        }
-
-        @Override
-        void releaseSegment(int startIndex, int size) {
-            release();
-        }
-
-        void release() {
-            if (RefCnt.release(refCnt)) {
-                deallocate();
-            }
         }
     }
 
@@ -2475,6 +2431,13 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    /**
+     * A ref-counted chunk handing out power-of-two blocks from a buddy tree, for sizes above the size classes.
+     * <p>
+     * A chunk without a tree is <em>one-shot</em>: it holds exactly one buffer spanning the whole chunk, for
+     * allocations that are not pooled. It belongs to no magazine, is never cached, and is freed when its buffer
+     * is released.
+     */
     private static final class BuddyChunk extends Chunk implements IntConsumer {
         private static final int MIN_BUDDY_SIZE = 32768;
         private static final byte IS_CLAIMED = (byte) (1 << 7);
@@ -2486,8 +2449,10 @@ final class AdaptivePoolingAllocator {
         // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
         // This is safe to do even on native-image.
         final RefCnt refCnt = new RefCnt();
+        // null for a one-shot chunk.
         private final MpscIntQueue freeList;
-        // The bits of each buddy: [1: is claimed][1: has claimed children][30: MIN_BUDDY_SIZE shift to get size]
+        // The bits of each buddy: [1: is claimed][1: has claimed children][30: MIN_BUDDY_SIZE shift to get size].
+        // null for a one-shot chunk.
         private final byte[] buddies;
         private final int freeListCapacity;
         private BuddyMagazine magazine;
@@ -2504,6 +2469,17 @@ final class AdaptivePoolingAllocator {
 
         static BuddyChunk newMagazineFreedSentinel() {
             return new BuddyChunk();
+        }
+
+        /**
+         * Constructor for a one-shot chunk: no tree, no magazine. The caller owns the reference it gets here and
+         * must {@link #release()} it once {@link #readInitOneShot} returned.
+         */
+        BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
+            super(delegate, allocator);
+            freeList = null;
+            buddies = null;
+            freeListCapacity = 0;
         }
 
         BuddyChunk(AbstractByteBuf delegate, BuddyMagazine magazine) {
@@ -2569,6 +2545,25 @@ final class AdaptivePoolingAllocator {
             return true;
         }
 
+        /**
+         * Initialize {@code buf} over the whole of this one-shot chunk. On success the buffer holds a reference to
+         * this chunk.
+         */
+        void readInitOneShot(AdaptiveByteBuf buf, int size, int maxCapacity) {
+            assert buddies == null : "not a one-shot chunk";
+            retain();
+            boolean initialized = false;
+            try {
+                buf.init(delegate, this, 0, 0, 0, size, size, maxCapacity);
+                initialized = true;
+            } finally {
+                if (!initialized) {
+                    // buf.init(...) failed: drop the reference taken for the buffer.
+                    release();
+                }
+            }
+        }
+
         @Override
         public void accept(int packed) {
             // Called by allocating thread when draining freeList.
@@ -2588,10 +2583,12 @@ final class AdaptivePoolingAllocator {
 
         @Override
         void releaseSegment(int startingIndex, int size) {
-            int packedOffset = startingIndex / MIN_BUDDY_SIZE;
-            int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
-            int packed = packedOffset | packedSize;
-            freeList.offer(packed);
+            MpscIntQueue freeList = this.freeList;
+            if (freeList != null) {
+                int packedOffset = startingIndex / MIN_BUDDY_SIZE;
+                int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
+                freeList.offer(packedOffset | packedSize);
+            }
             release();
         }
 
@@ -2603,7 +2600,7 @@ final class AdaptivePoolingAllocator {
             RefCnt.retain(refCnt);
         }
 
-        private void release() {
+        void release() {
             if (RefCnt.release(refCnt)) {
                 deallocate();
             }
@@ -2700,6 +2697,9 @@ final class AdaptivePoolingAllocator {
         @Override
         public String toString() {
             int capacity = delegate.capacity();
+            if (buddies == null) {
+                return "BuddyChunk[one-shot, capacity: " + capacity + ']';
+            }
             int remaining = capacity - allocatedBytes;
             return "BuddyChunk[capacity: " + capacity +
                     ", remaining: " + remaining +
