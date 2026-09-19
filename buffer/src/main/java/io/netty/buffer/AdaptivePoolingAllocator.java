@@ -1411,13 +1411,15 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public int computeBufferCapacity(int requestedSize, int maxCapacity) {
-            return MathUtil.safeFindNextPositivePowerOfTwo(requestedSize);
+            int c = MathUtil.safeFindNextPositivePowerOfTwo(requestedSize);
+            return EXPT_NO_SIZE_CLASSES ? Math.max(c, BuddyChunk.MIN_BUDDY_SIZE) : c; // EXPERIMENT
         }
 
         @Override
         public Chunk newChunkAllocation(int promptingSize, Magazine magazine) {
             int maxChunkSize = this.maxChunkSize.get();
             int proposedChunkSize = MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize);
+            if (EXPT_NO_SIZE_CLASSES) { proposedChunkSize = Math.max(proposedChunkSize, MIN_CHUNK_SIZE); } // EXPERIMENT
             int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(maxChunkSize, proposedChunkSize));
             if (chunkSize > maxChunkSize) {
                 // Update our stored max chunk size. It's fine that this is racy.
@@ -2338,7 +2340,7 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class BuddyChunk extends Chunk implements IntConsumer {
-        private static final int MIN_BUDDY_SIZE = 32768;
+        static final int MIN_BUDDY_SIZE = 32768;
         private static final byte IS_CLAIMED = (byte) (1 << 7);
         private static final byte HAS_CLAIMED_CHILDREN = 1 << 6;
         private static final byte SHIFT_MASK = ~(IS_CLAIMED | HAS_CLAIMED_CHILDREN);
