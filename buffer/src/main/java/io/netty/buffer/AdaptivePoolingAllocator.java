@@ -2619,120 +2619,92 @@ final class AdaptivePoolingAllocator {
      * The buddy tree of a {@link BuddyChunk}: hands out power-of-two blocks of at least {@link #MIN_BLOCK_SIZE} from
      * a capacity that is a power-of-two multiple of it, and merges freed buddies back. Not thread-safe: used by the
      * chunk's magazine only (frees from other threads reach it through the chunk's free list).
+     * <p>
+     * An implicit binary tree over the blocks: node 1 is the whole chunk, the children of node {@code i} are its two
+     * halves {@code 2i} and {@code 2i + 1}, and the leaves are the {@link #MIN_BLOCK_SIZE} blocks. Each node stores
+     * the order of the largest free block in its subtree plus one, 0 when nothing in it is free (order {@code k} is a
+     * block of {@code MIN_BLOCK_SIZE << k}). A claim follows the leftmost child that fits down to the order asked
+     * for, and a release walks up merging buddies: both are one pass along a root-to-leaf path.
      */
     static final class BuddyTree {
         static final int MIN_BLOCK_SIZE = 32768;
-        private static final byte IS_CLAIMED = (byte) (1 << 7);
-        private static final byte HAS_CLAIMED_CHILDREN = 1 << 6;
-        private static final byte SHIFT_MASK = ~(IS_CLAIMED | HAS_CLAIMED_CHILDREN);
 
-        // The bits of each buddy: [1: is claimed][1: has claimed children][6: MIN_BLOCK_SIZE shift to get size].
-        private final byte[] buddies;
+        private final byte[] nodes;
+        private final int maxOrder;
 
         BuddyTree(int capacity) {
             int leaves = capacity / MIN_BLOCK_SIZE;
             assert leaves > 0 && (leaves & leaves - 1) == 0 : "capacity " + capacity;
-            int maxShift = Integer.numberOfTrailingZeros(leaves);
-            buddies = new byte[leaves << 1];
-
-            // Generate the buddies entries.
-            int index = 1;
-            int runLength = 1;
-            int currentRun = 0;
-            while (maxShift > 0) {
-                buddies[index++] = (byte) maxShift;
-                if (++currentRun == runLength) {
-                    currentRun = 0;
-                    runLength <<= 1;
-                    maxShift--;
-                }
+            maxOrder = Integer.numberOfTrailingZeros(leaves);
+            byte[] nodes = new byte[leaves << 1];
+            // All free: the nodes at depth d, [2^d, 2^(d+1)), are whole blocks of order maxOrder - d.
+            // One constant per level. A loop computing each node's order (numberOfLeadingZeros of its index) into
+            // the byte array was miscompiled by JDK 21's C2 (SuperWord), which built corrupt trees.
+            for (int depth = 0; depth <= maxOrder; depth++) {
+                Arrays.fill(nodes, 1 << depth, 2 << depth, (byte) (maxOrder - depth + 1));
             }
+            this.nodes = nodes;
         }
 
         /**
-         * Claim the leftmost free block of {@code size}, a power of two of at least {@link #MIN_BLOCK_SIZE}, and
-         * return its offset, or -1 if there is none.
+         * Claim the leftmost free block of {@code size} and return its offset, or -1 if there is none. Blocks are
+         * powers of two of at least {@link #MIN_BLOCK_SIZE}: any other size is never claimed, and returns -1.
          */
         int claim(int size) {
-            return chooseFirstFreeBuddy(1, size, 0);
+            if (size < MIN_BLOCK_SIZE || (size & size - 1) != 0) {
+                // BuddyMagazine asks for a chunk's remaining capacity, which is the sum of its free blocks.
+                return -1;
+            }
+            int order = Integer.numberOfTrailingZeros(size / MIN_BLOCK_SIZE);
+            byte[] nodes = this.nodes;
+            int wanted = order + 1;
+            if (order > maxOrder || nodes[1] < wanted) {
+                return -1;
+            }
+            int index = 1;
+            for (int depth = maxOrder - order; depth > 0; depth--) {
+                index <<= 1;
+                if (nodes[index] < wanted) {
+                    index++;
+                }
+            }
+            nodes[index] = 0;
+            updateAncestors(index, order);
+            return (index - (1 << maxOrder - order)) * size;
         }
 
         /**
          * Give back the block of {@code size} at {@code offset}, claimed earlier.
          */
         void release(int offset, int size) {
-            unreserveMatchingBuddy(1, size, offset, 0);
+            int order = Integer.numberOfTrailingZeros(size / MIN_BLOCK_SIZE);
+            if ((offset & size - 1) != 0) {
+                throw new IllegalStateException("No block of size " + size + " at offset " + offset);
+            }
+            int index = (1 << maxOrder - order) + offset / size;
+            assert nodes[index] == 0 : "no block of size " + size + " claimed at offset " + offset;
+            nodes[index] = (byte) (order + 1);
+            updateAncestors(index, order);
         }
 
         /**
-         * Claim a suitable buddy and return its start offset into the delegate chunk, or return -1 if nothing claimed.
+         * Recompute the ancestors of {@code index}, a node of {@code order}, after its value changed; stops at the
+         * first ancestor whose value stays the same.
          */
-        private int chooseFirstFreeBuddy(int index, int size, int currOffset) {
-            byte[] buddies = this.buddies;
-            while (index < buddies.length) {
-                byte buddy = buddies[index];
-                int currValue = MIN_BLOCK_SIZE << (buddy & SHIFT_MASK);
-                if (currValue < size || (buddy & IS_CLAIMED) == IS_CLAIMED) {
-                    return -1;
+        private void updateAncestors(int index, int order) {
+            byte[] nodes = this.nodes;
+            while (index > 1) {
+                index >>= 1;
+                order++;
+                int left = nodes[index << 1];
+                int right = nodes[(index << 1) + 1];
+                // Two whole free halves (each of this node's order minus one, stored plus one) merge into one block.
+                int value = left == order && right == order ? order + 1 : Math.max(left, right);
+                if (nodes[index] == value) {
+                    return;
                 }
-                if (currValue == size && (buddy & HAS_CLAIMED_CHILDREN) == 0) {
-                    buddies[index] |= IS_CLAIMED;
-                    return currOffset;
-                }
-                int found = chooseFirstFreeBuddy(index << 1, size, currOffset);
-                if (found != -1) {
-                    buddies[index] |= HAS_CLAIMED_CHILDREN;
-                    return found;
-                }
-                index = (index << 1) + 1;
-                currOffset += currValue >> 1; // Bump offset to skip first half of this layer.
+                nodes[index] = (byte) value;
             }
-            return -1;
-        }
-
-        /**
-         * Un-reserve the matching buddy and return whether there are any other child or sibling reservations.
-         */
-        private boolean unreserveMatchingBuddy(int index, int size, int offset, int currOffset) {
-            byte[] buddies = this.buddies;
-            if (buddies.length <= index) {
-                return false;
-            }
-            byte buddy = buddies[index];
-            int currSize = MIN_BLOCK_SIZE << (buddy & SHIFT_MASK);
-
-            if (currSize == size) {
-                // We're at the right size level.
-                if (currOffset == offset) {
-                    buddies[index] &= SHIFT_MASK;
-                    return false;
-                }
-                throw new IllegalStateException("The intended segment was not found at index " +
-                        index + ", for size " + size + " and offset " + offset);
-            }
-
-            // We're at a parent size level. Use the target offset to guide our drill-down path.
-            boolean claims;
-            int siblingIndex;
-            if (offset < currOffset + (currSize >> 1)) {
-                // Must be down the left path.
-                claims = unreserveMatchingBuddy(index << 1, size, offset, currOffset);
-                siblingIndex = (index << 1) + 1;
-            } else {
-                // Must be down the rigth path.
-                claims = unreserveMatchingBuddy((index << 1) + 1, size, offset, currOffset + (currSize >> 1));
-                siblingIndex = index << 1;
-            }
-            if (!claims) {
-                // No other claims down the path we took. Check if the sibling has claims.
-                byte sibling = buddies[siblingIndex];
-                if ((sibling & SHIFT_MASK) == sibling) {
-                    // No claims in the sibling. We can clear this level as well.
-                    buddies[index] &= SHIFT_MASK;
-                    return false;
-                }
-            }
-            return true;
         }
     }
 
