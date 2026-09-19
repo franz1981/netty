@@ -724,6 +724,43 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
+     * An intrusive doubly linked list of chunks, newest first, like mimalloc's page queue. The links live on the
+     * chunk, so removing any chunk is O(1). Not concurrent: the cache that owns it guards it with its magazine's
+     * lock, or uses it from its owner thread only.
+     */
+    static final class ChunkQueue {
+        SizeClassedChunk head;
+        int size;
+
+        void pushFront(SizeClassedChunk chunk) {
+            SizeClassedChunk head = this.head;
+            chunk.prevInQueue = null;
+            chunk.nextInQueue = head;
+            if (head != null) {
+                head.prevInQueue = chunk;
+            }
+            this.head = chunk;
+            size++;
+        }
+
+        void remove(SizeClassedChunk chunk) {
+            SizeClassedChunk prev = chunk.prevInQueue;
+            SizeClassedChunk next = chunk.nextInQueue;
+            if (prev != null) {
+                prev.nextInQueue = next;
+            } else {
+                head = next;
+            }
+            if (next != null) {
+                next.prevInQueue = prev;
+            }
+            chunk.prevInQueue = null;
+            chunk.nextInQueue = null;
+            size--;
+        }
+    }
+
+    /**
      * Two-list chunk cache: answers "give me a chunk to carve from" and "release what is idle".
      *
      * <p><b>Access.</b> The lists, the counters and {@code cacheListState} are touched only by the
@@ -789,7 +826,7 @@ final class AdaptivePoolingAllocator {
      * un-full a page cannot be lost either.
      *
      * <p><b>Eviction only ever operates on the reusable list</b> — {@link #evictIfAboveFloor} calls
-     * {@code removeFromReusable} unconditionally, and every caller either walks {@code reusableHead}
+     * {@code reusable.remove} unconditionally, and every caller either walks the reusable list
      * or moves the chunk there first. So an exhausted-list chunk never has its free lists stripped,
      * and {@link #probeExhausted()} cannot encounter one that does.
      *
@@ -809,8 +846,8 @@ final class AdaptivePoolingAllocator {
         /** Bound on the last-resort probe of the exhausted list; see {@link #probeExhausted()}. */
         private static final int MAX_EXHAUSTED_PROBE = 8;
 
-        SizeClassedChunk exhaustedHead;
-        SizeClassedChunk reusableHead;
+        final ChunkQueue exhausted = new ChunkQueue();
+        final ChunkQueue reusable = new ChunkQueue();
         /**
          * The chunk the magazine allocates from ({@link SizeClassedChunk#CACHE_ACTIVE}), or {@code null}. It is on
          * neither list: the cache owns it, so the purge and the drain can see it, but only the magazine allocates
@@ -819,8 +856,6 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
         private volatile SizeClassedChunk pendingHead;
-        int exhaustedCount;
-        int reusableCount;
 
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
@@ -852,59 +887,17 @@ final class AdaptivePoolingAllocator {
          * linked: it is the magazine's to use and is not a retention candidate.
          */
         private int totalCount() {
-            return exhaustedCount + reusableCount;
+            return exhausted.size + reusable.size;
         }
-
-        // --- Intrusive doubly-linked list operations ---
 
         private void addToExhausted(SizeClassedChunk chunk) {
             chunk.cacheListState = SizeClassedChunk.CACHE_EXHAUSTED;
-            chunk.prevInCache = null;
-            chunk.nextInCache = exhaustedHead;
-            if (exhaustedHead != null) {
-                exhaustedHead.prevInCache = chunk;
-            }
-            exhaustedHead = chunk;
-            exhaustedCount++;
+            exhausted.pushFront(chunk);
         }
 
         private void addToReusable(SizeClassedChunk chunk) {
             chunk.cacheListState = SizeClassedChunk.CACHE_REUSABLE;
-            chunk.prevInCache = null;
-            chunk.nextInCache = reusableHead;
-            if (reusableHead != null) {
-                reusableHead.prevInCache = chunk;
-            }
-            reusableHead = chunk;
-            reusableCount++;
-        }
-
-        private void removeFromExhausted(SizeClassedChunk chunk) {
-            if (chunk.prevInCache != null) {
-                chunk.prevInCache.nextInCache = chunk.nextInCache;
-            } else {
-                exhaustedHead = chunk.nextInCache;
-            }
-            if (chunk.nextInCache != null) {
-                chunk.nextInCache.prevInCache = chunk.prevInCache;
-            }
-            chunk.prevInCache = null;
-            chunk.nextInCache = null;
-            exhaustedCount--;
-        }
-
-        private void removeFromReusable(SizeClassedChunk chunk) {
-            if (chunk.prevInCache != null) {
-                chunk.prevInCache.nextInCache = chunk.nextInCache;
-            } else {
-                reusableHead = chunk.nextInCache;
-            }
-            if (chunk.nextInCache != null) {
-                chunk.nextInCache.prevInCache = chunk.prevInCache;
-            }
-            chunk.prevInCache = null;
-            chunk.nextInCache = null;
-            reusableCount--;
+            reusable.pushFront(chunk);
         }
 
         private void detachFromCache(SizeClassedChunk chunk) {
@@ -913,7 +906,7 @@ final class AdaptivePoolingAllocator {
 
         // Called from releaseSegment (Signal A): exhausted → reusable
         void moveToReusable(SizeClassedChunk chunk) {
-            removeFromExhausted(chunk);
+            exhausted.remove(chunk);
             addToReusable(chunk);
         }
 
@@ -921,7 +914,7 @@ final class AdaptivePoolingAllocator {
             // Every caller filters on CACHE_REUSABLE, which the active chunk (CACHE_ACTIVE) never is.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
-                removeFromReusable(chunk);
+                reusable.remove(chunk);
                 detachFromCache(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1102,9 +1095,9 @@ final class AdaptivePoolingAllocator {
         private SizeClassedChunk pollChunkInternal() {
             // The magazine gives up its active chunk before it asks for another one.
             assert active == null : "poll with an active chunk";
-            if (reusableHead != null) {
-                SizeClassedChunk chunk = reusableHead;
-                removeFromReusable(chunk);
+            SizeClassedChunk chunk = reusable.head;
+            if (chunk != null) {
+                reusable.remove(chunk);
                 detachFromCache(chunk);
                 return chunk;
             }
@@ -1133,13 +1126,13 @@ final class AdaptivePoolingAllocator {
          * the only kind that holds when nothing matches.
          */
         private SizeClassedChunk probeExhausted() {
-            SizeClassedChunk cur = exhaustedHead;
+            SizeClassedChunk cur = exhausted.head;
             int visited = 0;
             while (cur != null && visited < MAX_EXHAUSTED_PROBE) {
-                SizeClassedChunk next = cur.nextInCache;
+                SizeClassedChunk next = cur.nextInQueue;
                 visited++;
                 if (cur.hasRemainingCapacity()) {
-                    removeFromExhausted(cur);
+                    exhausted.remove(cur);
                     detachFromCache(cur);
                     return cur;
                 }
@@ -1153,11 +1146,11 @@ final class AdaptivePoolingAllocator {
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
             int total = totalCount();
-            SizeClassedChunk cur = reusableHead;
+            SizeClassedChunk cur = reusable.head;
             while (cur != null && total > purgeRetentionFloor) {
-                SizeClassedChunk next = cur.nextInCache;
+                SizeClassedChunk next = cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
-                    removeFromReusable(cur);
+                    reusable.remove(cur);
                     detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                     total--;
@@ -1225,29 +1218,22 @@ final class AdaptivePoolingAllocator {
             PENDING_HEAD.lazySet(this, null);
             // The magazine gives up its active chunk before it frees its cache.
             assert active == null : "free with an active chunk";
-            freeList(exhaustedHead);
-            exhaustedHead = null;
-            exhaustedCount = 0;
-            freeList(reusableHead);
-            reusableHead = null;
-            reusableCount = 0;
+            freeAll(exhausted);
+            freeAll(reusable);
         }
 
-        private static void freeList(SizeClassedChunk head) {
-            SizeClassedChunk cur = head;
-            while (cur != null) {
-                SizeClassedChunk next = cur.nextInCache;
+        private static void freeAll(ChunkQueue queue) {
+            SizeClassedChunk cur;
+            while ((cur = queue.head) != null) {
+                queue.remove(cur);
                 cur.cacheListState = SizeClassedChunk.CACHE_NONE;
-                cur.prevInCache = null;
-                cur.nextInCache = null;
                 cur.markToDeallocate();
-                cur = next;
             }
         }
 
         // Visible for testing: no chunk linked on either list.
         boolean isEmpty() {
-            return exhaustedCount + reusableCount == 0;
+            return exhausted.size + reusable.size == 0;
         }
     }
 
@@ -2099,8 +2085,9 @@ final class AdaptivePoolingAllocator {
         static final int CACHE_ACTIVE = 1;
         static final int CACHE_EXHAUSTED = 2;
         static final int CACHE_REUSABLE = 3;
-        SizeClassedChunk prevInCache;
-        SizeClassedChunk nextInCache;
+        // Links of the ChunkQueue this chunk is on, if any.
+        SizeClassedChunk prevInQueue;
+        SizeClassedChunk nextInQueue;
         int cacheListState;
         final SizeClassedChunkCache owningCache;
 
