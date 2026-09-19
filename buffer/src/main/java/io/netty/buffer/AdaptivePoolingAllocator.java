@@ -2612,6 +2612,20 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
+         * The order of the largest free block, or -1 when no block is free: exact, it is the root's value.
+         */
+        int largestFreeOrder() {
+            return nodes[1] - 1;
+        }
+
+        /**
+         * Whether no block is claimed.
+         */
+        boolean isWhollyFree() {
+            return nodes[1] == maxOrder + 1;
+        }
+
+        /**
          * Claim the leftmost free block of {@code size} and return its offset, or -1 if there is none. Blocks are
          * powers of two of at least {@link #MIN_BLOCK_SIZE}: any other size is never claimed, and returns -1.
          */
