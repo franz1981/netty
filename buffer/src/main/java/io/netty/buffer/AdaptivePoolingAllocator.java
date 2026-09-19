@@ -125,7 +125,7 @@ final class AdaptivePoolingAllocator {
     private static final int MAX_POOLED_BUF_SIZE = MAX_CHUNK_SIZE / BUFS_PER_CHUNK;
 
     /**
-     * The capacity of the buddy chunk cache (large buffer reuse).
+     * The capacity of each stripe's buddy chunk cache (large buffer reuse).
      */
     static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
@@ -250,7 +250,6 @@ final class AdaptivePoolingAllocator {
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
     private final BuddyChunkManagementStrategy buddyStrategy;
-    private final ConcurrentSkipListChunkCache sharedBuddyCache;
     private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
@@ -267,7 +266,6 @@ final class AdaptivePoolingAllocator {
         }
         stripeScanLength = INITIAL_MAGAZINES;
         buddyStrategy = new BuddyChunkManagementStrategy();
-        sharedBuddyCache = buddyStrategy.createChunkCache();
         fallbackRecycler = AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
 
         boolean disableThreadLocalGroups = IS_LOW_MEM && DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM;
@@ -432,7 +430,6 @@ final class AdaptivePoolingAllocator {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
         }
-        sharedBuddyCache.free();
     }
 
     /**
@@ -1732,8 +1729,8 @@ final class AdaptivePoolingAllocator {
 
     /**
      * The magazine for buffers above the largest size class, one per stripe, guarded by the stripe lock. It carves
-     * power-of-two buddies out of {@link BuddyChunk}s and shares one {@link ConcurrentSkipListChunkCache} with every
-     * other buddy magazine of the allocator.
+     * power-of-two buddies out of {@link BuddyChunk}s and keeps the chunks it gave up in its own
+     * {@link ConcurrentSkipListChunkCache}, used only under the stripe lock.
      */
     private static final class BuddyMagazine {
         private static final BuddyChunk MAGAZINE_FREED = BuddyChunk.newMagazineFreedSentinel();
@@ -1750,7 +1747,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             this.bufRecycler = bufRecycler;
             this.chunkController = strategy.createController(allocator);
-            this.chunkCache = allocator.sharedBuddyCache;
+            this.chunkCache = strategy.createChunkCache();
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -1880,7 +1877,8 @@ final class AdaptivePoolingAllocator {
                 current.releaseFromMagazine();
                 current = null;
             }
-            // The chunk cache is shared by every buddy magazine of the allocator, which frees it.
+            // After current and nextInLine, which go to the cache when released.
+            chunkCache.free();
         }
 
         AdaptiveByteBuf newBuffer() {
