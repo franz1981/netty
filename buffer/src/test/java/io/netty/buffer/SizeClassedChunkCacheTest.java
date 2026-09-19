@@ -609,7 +609,7 @@ public class SizeClassedChunkCacheTest {
         cache.notifyHasCapacity(chunk);
         assertEquals(1, cache.pendingCount());
 
-        // A cross-thread return lands while the drain is inside processPending. Re-arming the link
+        // A cross-thread return lands while the drain is inside refile. Re-arming the link
         // only after processing would swallow this notification and strand the chunk.
         when(chunk.hasRemainingCapacity()).thenAnswer(new Answer<Boolean>() {
             @Override
@@ -683,7 +683,7 @@ public class SizeClassedChunkCacheTest {
         cache.notifyHasCapacity(chunk);
 
         // The first drain looks before the segment is visible, and the release completes while
-        // processPending is running -- so the drain must leave the chunk queued for another look.
+        // refile is running -- so the drain must leave the chunk queued for another look.
         when(chunk.hasRemainingCapacity()).thenAnswer(new Answer<Boolean>() {
             private boolean landed;
 

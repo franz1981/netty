@@ -974,7 +974,7 @@ final class AdaptivePoolingAllocator {
             return exhausted.size + reusable.size;
         }
 
-        // Called from releaseSegment (Signal A): exhausted → reusable
+        // Signal A (see refile): exhausted → reusable
         void moveToReusable(SizeClassedChunk chunk) {
             exhausted.remove(chunk);
             reusable.pushFront(chunk);
@@ -1046,7 +1046,7 @@ final class AdaptivePoolingAllocator {
             while (cur != null) {
                 // Re-arm BEFORE processing (property 3): see PendingChunks#rearm.
                 SizeClassedChunk next = PendingChunks.rearm(cur);
-                processPending(cur);
+                refile(cur);
                 cur = next;
             }
         }
@@ -1056,21 +1056,28 @@ final class AdaptivePoolingAllocator {
             return pending.size();
         }
 
-        private void processPending(SizeClassedChunk chunk) {
+        /**
+         * Move {@code chunk} to the queue its capacity calls for, after it may have gained capacity: a segment
+         * return, by the owner thread or under the lock, or a note of one. An exhausted chunk with a free segment
+         * becomes reusable; a fully free reusable chunk is evicted above the retention floor. Caller holds the
+         * stripe lock or is the owner thread.
+         */
+        void refile(SizeClassedChunk chunk) {
             ChunkQueue queue = chunk.queue;
-            if (queue == null) {
+            if (queue == exhausted) {
+                // A note may be stale; a return by the owner or under the lock has just pushed the segment.
+                if (!chunk.hasRemainingCapacity()) {
+                    return;
+                }
+                moveToReusable(chunk);
+            } else if (queue != reusable) {
                 // On no queue: either gone (evicted, recycled, or its cache freed), not ours to move - checked
                 // first, because such a chunk may have had its free lists stripped by recycleOrDeallocate - or
                 // the active chunk, which consumes its own returned segments and is filed by capacity when the
                 // magazine gives it up (see deactivate). A polled chunk is activated before any drain can run.
                 return;
             }
-            if (queue == exhausted && chunk.hasRemainingCapacity()) {
-                moveToReusable(chunk);
-            }
-            if (chunk.queue == reusable) {
-                evictIfAboveFloor(chunk);
-            }
+            evictIfAboveFloor(chunk);
         }
 
         /**
@@ -1095,17 +1102,6 @@ final class AdaptivePoolingAllocator {
         void unlockAfterRelease(long stamp) {
             assert stamp != 0 : "unlockAfterRelease(0): tryLockForRelease did not grant the lock";
             stripeLock.unlockWrite(stamp);
-        }
-
-        /**
-         * Apply the list transition implied by a segment return. Caller must hold the stamp
-         * from {@link #tryLockForRelease()} and must have already placed the segment.
-         */
-        void transitionAfterRelease(SizeClassedChunk chunk, ChunkQueue queue) {
-            if (queue == exhausted) {
-                moveToReusable(chunk);
-            }
-            evictIfAboveFloor(chunk);
         }
 
         /** Visible for testing: runs a purge tick bypassing the budget counter, then polls. */
@@ -1217,7 +1213,7 @@ final class AdaptivePoolingAllocator {
          *
          * <p>Invariant N holds across this step as it does for any {@code offerChunk}. While the chunk was
          * active, a return that could not synchronise left a note, and the drain ignored it
-         * ({@code processPending} skips chunks on no queue). Such a note was either
+         * ({@code refile} skips chunks on no queue). Such a note was either
          * <ul>
          *   <li>consumed before this call: then the segment was offered before the note was pushed (property
          *       1), the push happens-before the drain that popped it, and that drain ran on this thread or
@@ -2321,11 +2317,10 @@ final class AdaptivePoolingAllocator {
                 updateStateOnLocalReleaseSegment(state);
                 return;
             }
-            ChunkQueue queue = this.queue;
             // Neither a chunk out of the cache nor the magazine's active chunk is ever moved or evicted
             // by a segment return: the active chunk consumes its own returned segments.
             if (queue != null) {
-                detectCacheTransition(queue);
+                owningCache.refile(this);
             }
         }
 
@@ -2336,20 +2331,8 @@ final class AdaptivePoolingAllocator {
                 updateStateOnLockedReleaseSegment(state);
                 return;
             }
-            ChunkQueue queue = this.queue;
             if (queue != null) {
-                cache.transitionAfterRelease(this, queue);
-            }
-        }
-
-        private void detectCacheTransition(ChunkQueue queue) {
-            if (queue == owningCache.exhausted) {
-                owningCache.moveToReusable(this);
-                if (hasFullCapacity()) {
-                    owningCache.evictIfAboveFloor(this);
-                }
-            } else if (queue == owningCache.reusable && hasFullCapacity()) {
-                owningCache.evictIfAboveFloor(this);
+                cache.refile(this);
             }
         }
 
