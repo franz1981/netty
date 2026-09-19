@@ -131,6 +131,34 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(2 * expectedUsedMemory(allocator, capacity), metric.usedHeapMemory());
     }
 
+    /**
+     * Buffers above the largest pooled size get a one-shot chunk of their own: accounted while the buffer lives,
+     * replaced on growth with the content kept, and freed as soon as the buffer is released.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void oneShotChunkIsFreedWithItsBuffer(boolean direct) {
+        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        ByteBufAllocatorMetric metric = allocator.metric();
+        int size = 2 * 1024 * 1024;
+        ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
+                allocator.heapBuffer(size, Integer.MAX_VALUE);
+        assertEquals(size, buffer.capacity());
+        assertEquals(size, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        buffer.writeLong(0x0123456789ABCDEFL);
+        buffer.setLong(size - 8, 0xFEDCBA9876543210L);
+
+        buffer.capacity(2 * size);
+        assertEquals(2 * size, buffer.capacity());
+        // The first chunk was freed when the buffer moved to the second.
+        assertEquals(2 * size, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        assertEquals(0x0123456789ABCDEFL, buffer.getLong(0));
+        assertEquals(0xFEDCBA9876543210L, buffer.getLong(size - 8));
+
+        assertTrue(buffer.release());
+        assertEquals(0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+    }
+
     @Test
     void adaptiveChunkMustDeallocateOrReuseWthBufferRelease() throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(false);
