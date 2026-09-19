@@ -725,8 +725,9 @@ final class AdaptivePoolingAllocator {
 
     /**
      * An intrusive doubly linked list of chunks, newest first, like mimalloc's page queue. The links live on the
-     * chunk, so removing any chunk is O(1). Not concurrent: the cache that owns it guards it with its magazine's
-     * lock, or uses it from its owner thread only.
+     * chunk, so removing any chunk is O(1), and so does the chunk's membership: {@code chunk.queue} is the queue it
+     * is on, or {@code null}. Not concurrent: the cache that owns it guards it with its magazine's lock, or uses it
+     * from its owner thread only.
      */
     static final class ChunkQueue {
         SizeClassedChunk head;
@@ -740,6 +741,7 @@ final class AdaptivePoolingAllocator {
                 head.prevInQueue = chunk;
             }
             this.head = chunk;
+            chunk.queue = this;
             size++;
         }
 
@@ -756,6 +758,7 @@ final class AdaptivePoolingAllocator {
             }
             chunk.prevInQueue = null;
             chunk.nextInQueue = null;
+            chunk.queue = null;
             size--;
         }
     }
@@ -763,7 +766,7 @@ final class AdaptivePoolingAllocator {
     /**
      * Two-list chunk cache: answers "give me a chunk to carve from" and "release what is idle".
      *
-     * <p><b>Access.</b> The lists, the counters and {@code cacheListState} are touched only by the
+     * <p><b>Access.</b> The queues and each chunk's {@code queue} are touched only by the
      * owner thread (thread-local magazines) or under the stripe write lock (shared magazines) —
      * one magazine's caches all share that one lock. The only exception is {@link #pendingHead},
      * which any releasing thread may push to; it is the sole concurrent structure here.
@@ -780,11 +783,11 @@ final class AdaptivePoolingAllocator {
      * </ul>
      *
      * <p><b>The active chunk.</b> The chunk the magazine allocates from is the cache's {@link #active}
-     * chunk, with state {@code CACHE_ACTIVE} and on neither list; the magazine's {@code current} field is
+     * chunk, on neither queue; the magazine's {@code current} field is
      * only the fast path's alias of it. {@link #activate} makes a polled or freshly allocated chunk active,
      * and {@link #deactivate} files it by capacity, like {@link #offerChunk}, when the magazine runs it out
      * of segments or is freed. The active chunk is the magazine's, not a retention candidate: no cache
-     * decision touches it (the release paths and the drain act only on states above {@code CACHE_ACTIVE},
+     * decision touches it (the release paths and the drain act only on chunks filed on a queue,
      * and {@link #tickPurge} walks the lists only), and it is not counted against
      * {@link #purgeRetentionFloor}.
      *
@@ -849,7 +852,7 @@ final class AdaptivePoolingAllocator {
         final ChunkQueue exhausted = new ChunkQueue();
         final ChunkQueue reusable = new ChunkQueue();
         /**
-         * The chunk the magazine allocates from ({@link SizeClassedChunk#CACHE_ACTIVE}), or {@code null}. It is on
+         * The chunk the magazine allocates from, or {@code null}. It is on
          * neither list: the cache owns it, so the purge and the drain can see it, but only the magazine allocates
          * from it, until {@link #deactivate} files it by capacity like any other chunk.
          */
@@ -890,32 +893,17 @@ final class AdaptivePoolingAllocator {
             return exhausted.size + reusable.size;
         }
 
-        private void addToExhausted(SizeClassedChunk chunk) {
-            chunk.cacheListState = SizeClassedChunk.CACHE_EXHAUSTED;
-            exhausted.pushFront(chunk);
-        }
-
-        private void addToReusable(SizeClassedChunk chunk) {
-            chunk.cacheListState = SizeClassedChunk.CACHE_REUSABLE;
-            reusable.pushFront(chunk);
-        }
-
-        private void detachFromCache(SizeClassedChunk chunk) {
-            chunk.cacheListState = SizeClassedChunk.CACHE_NONE;
-        }
-
         // Called from releaseSegment (Signal A): exhausted → reusable
         void moveToReusable(SizeClassedChunk chunk) {
             exhausted.remove(chunk);
-            addToReusable(chunk);
+            reusable.pushFront(chunk);
         }
 
         void evictIfAboveFloor(SizeClassedChunk chunk) {
-            // Every caller filters on CACHE_REUSABLE, which the active chunk (CACHE_ACTIVE) never is.
+            // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
                 reusable.remove(chunk);
-                detachFromCache(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
         }
@@ -932,7 +920,7 @@ final class AdaptivePoolingAllocator {
         //     drainer that pops the note is guaranteed to see the segment.
         //  2. Notes are state-independent: "look at this chunk", never "this specific thing changed".
         //     One note therefore covers any number of later returns, and a note left while the chunk
-        //     was still active (or CACHE_NONE) stays correct once the chunk is classified. Do not optimise the
+        //     was still active (or on no queue) stays correct once the chunk is filed. Do not optimise the
         //     note to carry state. This is also why a releaser that finds the claim already taken can
         //     simply walk away: the in-flight note covers its return too.
         //  3. Re-arm before processing (see drainPending).
@@ -942,13 +930,13 @@ final class AdaptivePoolingAllocator {
         //     insert: the chunk is filed as exhausted while holding capacity, and the note -- which
         //     cannot be consumed in between -- is what fixes it.
         //
-        // A drain that finds CACHE_ACTIVE and no-ops is benign, not a lost signal: the chunk is the
+        // A drain that finds the active chunk and no-ops is benign, not a lost signal: the chunk is the
         // magazine's, which consumes its own returned segments through nextAvailableSegmentOffset, and
         // when the magazine gives it up, deactivate files it by capacity -- an offerChunk, so property 4
         // covers it: a note consumed before deactivate made its segment visible to deactivate's capacity
         // read, and a note still outstanding is processed after it, against the list it was filed on.
         // That includes a return that lands from another thread while the chunk is being deactivated.
-        // A drain that finds CACHE_NONE is benign too: the chunk is gone (evicted, recycled, or its cache
+        // A drain that finds a chunk on no queue is benign too: the chunk is gone (evicted, recycled, or its cache
         // freed). A polled chunk is never seen in that state, because pollChunk and activate run back to
         // back under the same lock or on the same owner thread, with no drain in between.
 
@@ -957,7 +945,7 @@ final class AdaptivePoolingAllocator {
          * <em>after</em> the segment has been offered to the chunk's external free list, so a drainer
          * that pops the note is guaranteed to also see the segment.
          *
-         * <p>This path must never read {@code cacheListState} or any list link: those belong to the
+         * <p>This path must never read {@code queue} or any list link: those belong to the
          * owner thread / stripe lock holder. The note only says "look at this chunk". The chunk finds
          * this cache through its {@code final owningCache} field, so no racy reference read is involved.
          *
@@ -1021,19 +1009,18 @@ final class AdaptivePoolingAllocator {
         }
 
         private void processPending(SizeClassedChunk chunk) {
-            int cls = chunk.cacheListState;
-            if (cls <= SizeClassedChunk.CACHE_ACTIVE) {
-                // CACHE_NONE: gone (evicted, recycled, or its cache freed), not ours to move; a polled chunk
-                // is activated before any drain can run. Checked first, because such a chunk may have had
-                // its free lists stripped by recycleOrDeallocate.
-                // CACHE_ACTIVE: the magazine's chunk, which consumes its own returned segments; it is
-                // filed by capacity when the magazine gives it up (see deactivate).
+            ChunkQueue queue = chunk.queue;
+            if (queue == null) {
+                // On no queue: either gone (evicted, recycled, or its cache freed), not ours to move - checked
+                // first, because such a chunk may have had its free lists stripped by recycleOrDeallocate - or
+                // the active chunk, which consumes its own returned segments and is filed by capacity when the
+                // magazine gives it up (see deactivate). A polled chunk is activated before any drain can run.
                 return;
             }
-            if (cls == SizeClassedChunk.CACHE_EXHAUSTED && chunk.hasRemainingCapacity()) {
+            if (queue == exhausted && chunk.hasRemainingCapacity()) {
                 moveToReusable(chunk);
             }
-            if (chunk.cacheListState == SizeClassedChunk.CACHE_REUSABLE) {
+            if (chunk.queue == reusable) {
                 evictIfAboveFloor(chunk);
             }
         }
@@ -1066,8 +1053,8 @@ final class AdaptivePoolingAllocator {
          * Apply the list transition implied by a segment return. Caller must hold the stamp
          * from {@link #tryLockForRelease()} and must have already placed the segment.
          */
-        void transitionAfterRelease(SizeClassedChunk chunk, int cls) {
-            if (cls == SizeClassedChunk.CACHE_EXHAUSTED) {
+        void transitionAfterRelease(SizeClassedChunk chunk, ChunkQueue queue) {
+            if (queue == exhausted) {
                 moveToReusable(chunk);
             }
             evictIfAboveFloor(chunk);
@@ -1098,7 +1085,6 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk chunk = reusable.head;
             if (chunk != null) {
                 reusable.remove(chunk);
-                detachFromCache(chunk);
                 return chunk;
             }
             return probeExhausted();
@@ -1133,7 +1119,6 @@ final class AdaptivePoolingAllocator {
                 visited++;
                 if (cur.hasRemainingCapacity()) {
                     exhausted.remove(cur);
-                    detachFromCache(cur);
                     return cur;
                 }
                 cur = next;
@@ -1151,7 +1136,6 @@ final class AdaptivePoolingAllocator {
                 SizeClassedChunk next = cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     reusable.remove(cur);
-                    detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                     total--;
                 }
@@ -1161,9 +1145,9 @@ final class AdaptivePoolingAllocator {
 
         boolean offerChunk(SizeClassedChunk chunk) {
             if (chunk.hasRemainingCapacity()) {
-                addToReusable(chunk);
+                reusable.pushFront(chunk);
             } else {
-                addToExhausted(chunk);
+                exhausted.pushFront(chunk);
             }
             return true;
         }
@@ -1175,8 +1159,7 @@ final class AdaptivePoolingAllocator {
          */
         void activate(SizeClassedChunk chunk) {
             assert active == null : "the magazine already has an active chunk";
-            assert chunk.cacheListState == SizeClassedChunk.CACHE_NONE;
-            chunk.cacheListState = SizeClassedChunk.CACHE_ACTIVE;
+            assert chunk.queue == null : "the chunk is filed on a queue";
             active = chunk;
         }
 
@@ -1186,7 +1169,7 @@ final class AdaptivePoolingAllocator {
          *
          * <p>Invariant N holds across this step as it does for any {@code offerChunk}. While the chunk was
          * active, a return that could not synchronise left a note, and the drain ignored it
-         * ({@code processPending} skips {@code CACHE_ACTIVE}). Such a note was either
+         * ({@code processPending} skips chunks on no queue). Such a note was either
          * <ul>
          *   <li>consumed before this call: then the segment was offered before the note was pushed (property
          *       1), the push happens-before the drain that popped it, and that drain ran on this thread or
@@ -1208,7 +1191,6 @@ final class AdaptivePoolingAllocator {
         void deactivate(SizeClassedChunk chunk) {
             assert chunk == active : "not the active chunk";
             active = null;
-            detachFromCache(chunk);
             offerChunk(chunk);
         }
 
@@ -1226,7 +1208,6 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk cur;
             while ((cur = queue.head) != null) {
                 queue.remove(cur);
-                cur.cacheListState = SizeClassedChunk.CACHE_NONE;
                 cur.markToDeallocate();
             }
         }
@@ -2074,21 +2055,15 @@ final class AdaptivePoolingAllocator {
          */
         private int allocatedBytes;
 
-        // Intrusive doubly-linked list pointers for cache membership
-        static final int CACHE_NONE = 0;
         /**
-         * On no list, serving its magazine's allocations: the cache's {@code active} chunk, the magazine's
-         * {@code current}. Ordered right after {@link #CACHE_NONE} so the release paths can tell "a cache
-         * decision may be due" ({@code cacheListState > CACHE_ACTIVE}) with the one compare they paid when
-         * the magazine's chunk was {@code CACHE_NONE}.
+         * The queue of {@link #owningCache} this chunk is filed on, or {@code null}: the cache's active chunk, a
+         * chunk just polled, or one that left the cache. The release paths take a cache decision only when it is
+         * on a queue, with one null check.
          */
-        static final int CACHE_ACTIVE = 1;
-        static final int CACHE_EXHAUSTED = 2;
-        static final int CACHE_REUSABLE = 3;
+        ChunkQueue queue;
         // Links of the ChunkQueue this chunk is on, if any.
         SizeClassedChunk prevInQueue;
         SizeClassedChunk nextInQueue;
-        int cacheListState;
         final SizeClassedChunkCache owningCache;
 
         // --- Pending-notification link (see SizeClassedChunkCache#notifyHasCapacity) ---
@@ -2306,11 +2281,11 @@ final class AdaptivePoolingAllocator {
                 updateStateOnLocalReleaseSegment(state);
                 return;
             }
-            int cls = cacheListState;
+            ChunkQueue queue = this.queue;
             // Neither a chunk out of the cache nor the magazine's active chunk is ever moved or evicted
             // by a segment return: the active chunk consumes its own returned segments.
-            if (cls > CACHE_ACTIVE) {
-                detectCacheTransition(cls);
+            if (queue != null) {
+                detectCacheTransition(queue);
             }
         }
 
@@ -2321,19 +2296,19 @@ final class AdaptivePoolingAllocator {
                 updateStateOnLockedReleaseSegment(state);
                 return;
             }
-            int cls = cacheListState;
-            if (cls > CACHE_ACTIVE) {
-                cache.transitionAfterRelease(this, cls);
+            ChunkQueue queue = this.queue;
+            if (queue != null) {
+                cache.transitionAfterRelease(this, queue);
             }
         }
 
-        private void detectCacheTransition(int cls) {
-            if (cls == CACHE_EXHAUSTED) {
+        private void detectCacheTransition(ChunkQueue queue) {
+            if (queue == owningCache.exhausted) {
                 owningCache.moveToReusable(this);
                 if (hasFullCapacity()) {
                     owningCache.evictIfAboveFloor(this);
                 }
-            } else if (cls == CACHE_REUSABLE && hasFullCapacity()) {
+            } else if (queue == owningCache.reusable && hasFullCapacity()) {
                 owningCache.evictIfAboveFloor(this);
             }
         }
