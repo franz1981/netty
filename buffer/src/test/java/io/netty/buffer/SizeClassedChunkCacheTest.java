@@ -253,10 +253,10 @@ public class SizeClassedChunkCacheTest {
         verify(workingSet, never()).recycleOrDeallocate(null, 0);
     }
 
-    // --- Active chunk should not be evicted ---
+    // --- A chunk that is not fully free is never evicted ---
 
     @Test
-    void activeChunkWithCapacityIsNotEvicted() {
+    void chunkThatIsNotFullyFreeIsNotEvictedAboveTheFloor() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
 
         // Pad above retention floor
@@ -264,19 +264,19 @@ public class SizeClassedChunkCacheTest {
             cache.offerChunk(chunkWithoutCapacity());
         }
 
-        // Active chunk: has capacity but is NOT fully free
-        SizeClassedChunk active = chunkWithCapacity();
-        cache.offerChunk(active);
+        // Has capacity but is NOT fully free
+        SizeClassedChunk chunk = chunkWithCapacity();
+        cache.offerChunk(chunk);
 
         // Poll and re-offer multiple times
         for (int cycle = 0; cycle < 10; cycle++) {
             SizeClassedChunk polled = cache.forcePurge();
-            assertSame(active, polled, "cycle " + cycle + ": active chunk should be polled");
-            cache.offerChunk(active);
+            assertSame(chunk, polled, "cycle " + cycle + ": the chunk should be polled");
+            cache.offerChunk(chunk);
         }
 
-        verify(active, never()).recycleOrDeallocate(null, 0);
-        verify(active, never()).markToDeallocate();
+        verify(chunk, never()).recycleOrDeallocate(null, 0);
+        verify(chunk, never()).markToDeallocate();
     }
 
     // --- The magazine's active chunk lives at the head of the reusable list ---
@@ -311,7 +311,7 @@ public class SizeClassedChunkCacheTest {
     }
 
     @Test
-    void activeChunkIsNeverEvictedByTheDrainOrThePurge() {
+    void activeChunkIsNotEvictedByTheDrainOrThePurge() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
         // Well above the retention floor, so any fully-free reusable chunk would be evicted.
         for (int i = 0; i < cache.purgeRetentionFloor + 2; i++) {
@@ -383,9 +383,10 @@ public class SizeClassedChunkCacheTest {
     }
 
     // Invariant N on the active chunk, first half: a note drained while the chunk is active is dropped,
-    // which is only safe because deactivate reads the capacity afterwards and sees the returned segment.
+    // which is only safe because deactivate files the chunk by its capacity. The capacity is stubbed here,
+    // so this checks the filing (offerChunk's classification after deactivation), not the memory ordering.
     @Test
-    void noteDrainedWhileActiveIsCoveredByTheCapacityReadAtDeactivation() {
+    void deactivateFilesTheChunkByCapacityAfterItsNoteWasDroppedWhileActive() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
         SizeClassedChunk active = chunkWithoutCapacity();
         cache.activate(active);
@@ -402,10 +403,10 @@ public class SizeClassedChunkCacheTest {
     }
 
     // Invariant N on the active chunk, second half: a foreign-thread return lands while the magazine
-    // is deactivating the chunk, just after the capacity read that files it. The chunk goes to the
-    // exhausted list with a free segment, and the note the releaser left is what moves it back.
+    // is deactivating the chunk, just after the capacity read that files it (simulated with a stub). The
+    // chunk goes to the exhausted list with a free segment, and the note left behind is what moves it back.
     @Test
-    void returnLandingWhileTheActiveChunkIsDeactivatedIsNotLost() {
+    void noteLeftDuringDeactivationMovesTheChunkBackToReusable() {
         final SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
         final SizeClassedChunk active = chunkWithoutCapacity();
         cache.activate(active);
@@ -707,7 +708,7 @@ public class SizeClassedChunkCacheTest {
     }
 
     @Test
-    void drainIgnoresChunksThatLeftTheCache() {
+    void pollAppliesAPendingNoteBeforeTakingTheChunk() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
@@ -715,7 +716,7 @@ public class SizeClassedChunkCacheTest {
         when(chunk.hasRemainingCapacity()).thenReturn(true);
         cache.notifyHasCapacity(chunk);
 
-        // Polled into a magazine before the drain got to it: the note is now stale.
+        // The poll drains first: the note moves the chunk to the reusable list, and the poll takes it.
         assertSame(chunk, cache.pollChunk(256));
         assertEquals(SizeClassedChunk.CACHE_NONE, chunk.cacheListState);
         assertEquals(0, cache.pendingCount());
