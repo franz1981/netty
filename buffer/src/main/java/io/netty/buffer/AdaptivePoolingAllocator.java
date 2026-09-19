@@ -764,11 +764,96 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
+     * Chunks that a releasing thread asked their cache to look at: the chunk gained capacity while the thread could
+     * not take the cache's lock (see Invariant N in {@link SizeClassedChunkCache}). A lock-free (Treiber) stack
+     * that any thread pushes to and the cache's owner takes whole. A chunk's {@code pendingNext} is both its link
+     * and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
+     * volatile read.
+     */
+    static final class PendingChunks {
+        private static final AtomicReferenceFieldUpdater<PendingChunks, SizeClassedChunk> HEAD =
+                AtomicReferenceFieldUpdater.newUpdater(PendingChunks.class, SizeClassedChunk.class, "head");
+        private static final AtomicReferenceFieldUpdater<SizeClassedChunk, SizeClassedChunk> NEXT =
+                AtomicReferenceFieldUpdater.newUpdater(SizeClassedChunk.class, SizeClassedChunk.class, "pendingNext");
+        /**
+         * Ends the stack, so that a {@code null} link keeps its meaning of "not queued". Never a usable chunk.
+         */
+        private static final SizeClassedChunk END = new SizeClassedChunk();
+
+        private volatile SizeClassedChunk head;
+
+        /**
+         * Queue {@code chunk}, unless it is queued already. Any thread, no lock.
+         */
+        void push(SizeClassedChunk chunk) {
+            if (chunk.pendingNext != null) {
+                return;
+            }
+            // Claim: only the thread that moves the link off null owns the push.
+            if (!NEXT.compareAndSet(chunk, null, END)) {
+                return;
+            }
+            SizeClassedChunk head;
+            do {
+                head = this.head;
+                NEXT.lazySet(chunk, head == null ? END : head);
+            } while (!HEAD.compareAndSet(this, head, chunk));
+        }
+
+        /**
+         * Take every queued chunk: the first one, whose successors {@link #rearm} returns, or {@code null}. Owner
+         * only. Cheap when nothing is queued: one volatile read, no atomic read-modify-write; the heap-wide drain
+         * pays this per size class.
+         */
+        SizeClassedChunk takeAll() {
+            if (head == null) {
+                return null;
+            }
+            return HEAD.getAndSet(this, null);
+        }
+
+        /**
+         * Unlink {@code chunk}, taken by {@link #takeAll}, and make it queueable again; return the next taken chunk,
+         * or {@code null}. Call it BEFORE processing the chunk: a return that lands while the chunk is processed must
+         * be able to queue it again, and re-arming afterwards would lose that note and strand the chunk until some
+         * later, unrelated one.
+         * <p>
+         * The store is a full volatile store on purpose, not a lazySet: it is the store half of a Dekker pair with
+         * the releaser, which offers the segment (the MPSC offer ends in a CAS on the producer index, a StoreLoad)
+         * and only then reads {@code pendingNext}. The processing reads the free lists right after this store;
+         * without the StoreLoad here both sides could miss each other and the chunk would be stranded.
+         */
+        static SizeClassedChunk rearm(SizeClassedChunk chunk) {
+            SizeClassedChunk next = chunk.pendingNext;
+            NEXT.set(chunk, null);
+            return next == END ? null : next;
+        }
+
+        /**
+         * Drop every queued chunk; for a cache being freed, whose chunks are all about to be deallocated.
+         */
+        void clear() {
+            HEAD.lazySet(this, null);
+        }
+
+        // Visible for testing: how many chunks are queued.
+        int size() {
+            int count = 0;
+            SizeClassedChunk cur = head;
+            while (cur != null && cur != END) {
+                count++;
+                cur = cur.pendingNext;
+            }
+            return count;
+        }
+    }
+
+    /**
      * Two-list chunk cache: answers "give me a chunk to carve from" and "release what is idle".
      *
      * <p><b>Access.</b> The queues and each chunk's {@code queue} are touched only by the
      * owner thread (thread-local magazines) or under the stripe write lock (shared magazines) —
-     * one magazine's caches all share that one lock. The only exception is {@link #pendingHead},
+     * one magazine's caches all share that one lock. The only exception is {@link #pending},
      * which any releasing thread may push to; it is the sole concurrent structure here.
      *
      * <p><b>The two lists.</b>
@@ -842,10 +927,6 @@ final class AdaptivePoolingAllocator {
      * {@link SizeClassChunkRecycler}, which every size class on the heap draws from.
      */
     static final class SizeClassedChunkCache {
-        private static final AtomicReferenceFieldUpdater<SizeClassedChunkCache, SizeClassedChunk>
-                PENDING_HEAD = AtomicReferenceFieldUpdater.newUpdater(
-                        SizeClassedChunkCache.class, SizeClassedChunk.class, "pendingHead");
-
         /** Bound on the last-resort probe of the exhausted list; see {@link #probeExhausted()}. */
         private static final int MAX_EXHAUSTED_PROBE = 8;
 
@@ -858,7 +939,7 @@ final class AdaptivePoolingAllocator {
          */
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
-        private volatile SizeClassedChunk pendingHead;
+        final PendingChunks pending = new PendingChunks();
 
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
@@ -953,19 +1034,7 @@ final class AdaptivePoolingAllocator {
          * that is already queued costs a single volatile read.
          */
         void notifyHasCapacity(SizeClassedChunk chunk) {
-            if (chunk.pendingNext != null) {
-                return;
-            }
-            final SizeClassedChunk sentinel = SizeClassedChunk.PENDING_SENTINEL;
-            // Claim: only the thread that moves the link off null owns the push.
-            if (!SizeClassedChunk.PENDING_NEXT.compareAndSet(chunk, null, sentinel)) {
-                return;
-            }
-            SizeClassedChunk head;
-            do {
-                head = pendingHead;
-                SizeClassedChunk.PENDING_NEXT.lazySet(chunk, head == null ? sentinel : head);
-            } while (!PENDING_HEAD.compareAndSet(this, head, chunk));
+            pending.push(chunk);
         }
 
         /**
@@ -973,39 +1042,18 @@ final class AdaptivePoolingAllocator {
          * a thread-local cache.
          */
         void drainPending() {
-            if (pendingHead == null) {
-                // Cheap when there is nothing to do: one volatile read, no atomic RMW. The heap-wide
-                // drain pays this per size class, so it has to stay a plain read.
-                return;
-            }
-            SizeClassedChunk cur = PENDING_HEAD.getAndSet(this, null);
-            final SizeClassedChunk sentinel = SizeClassedChunk.PENDING_SENTINEL;
-            while (cur != null && cur != sentinel) {
-                SizeClassedChunk next = cur.pendingNext;
-                // Re-arm BEFORE processing. A return that lands while we are inside processPending must
-                // be able to queue the chunk again; re-arming afterwards would lose it and strand the
-                // chunk until some later, unrelated notification.
-                //
-                // This is a full volatile store on purpose, not a lazySet: it is the store half of a
-                // Dekker pair with the releaser, which offers the segment (MPSC offer ends in a CAS on
-                // the producer index, so a StoreLoad) and only then reads pendingNext. processPending
-                // reads the free lists right after this store; without the StoreLoad here both sides
-                // could miss each other and the chunk would be stranded.
-                SizeClassedChunk.PENDING_NEXT.set(cur, null);
+            SizeClassedChunk cur = pending.takeAll();
+            while (cur != null) {
+                // Re-arm BEFORE processing (property 3): see PendingChunks#rearm.
+                SizeClassedChunk next = PendingChunks.rearm(cur);
                 processPending(cur);
-                cur = next == sentinel ? null : next;
+                cur = next;
             }
         }
 
         // Visible for testing: how many chunks are queued for the next drain.
         int pendingCount() {
-            int count = 0;
-            SizeClassedChunk cur = pendingHead;
-            while (cur != null && cur != SizeClassedChunk.PENDING_SENTINEL) {
-                count++;
-                cur = cur.pendingNext;
-            }
-            return count;
+            return pending.size();
         }
 
         private void processPending(SizeClassedChunk chunk) {
@@ -1197,7 +1245,7 @@ final class AdaptivePoolingAllocator {
         void free() {
             // Drop any outstanding notes: every chunk they point at is about to be marked for
             // deallocation, and this cache is dead afterwards.
-            PENDING_HEAD.lazySet(this, null);
+            pending.clear();
             // The magazine gives up its active chunk before it frees its cache.
             assert active == null : "free with an active chunk";
             freeAll(exhausted);
@@ -1874,7 +1922,7 @@ final class AdaptivePoolingAllocator {
         private final boolean pooled;
 
         Chunk() {
-            // Constructor only used by sentinel instances (MAGAZINE_FREED, PENDING_SENTINEL).
+            // Constructor only used by sentinel instances (MAGAZINE_FREED, the PendingChunks end marker).
             delegate = null;
             allocator = null;
             capacity = 0;
@@ -2066,16 +2114,8 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk nextInQueue;
         final SizeClassedChunkCache owningCache;
 
-        // --- Pending-notification link (see SizeClassedChunkCache#notifyHasCapacity) ---
+        // --- Link in its cache's PendingChunks ---
 
-        /**
-         * Marks the end of the pending-notification list, so that {@code null} can keep its meaning of
-         * "not queued". Never a usable chunk.
-         */
-        static final SizeClassedChunk PENDING_SENTINEL = new SizeClassedChunk();
-        static final AtomicReferenceFieldUpdater<SizeClassedChunk, SizeClassedChunk> PENDING_NEXT =
-                AtomicReferenceFieldUpdater.newUpdater(
-                        SizeClassedChunk.class, SizeClassedChunk.class, "pendingNext");
         /**
          * {@code null} = not queued for attention, non-null = queued (or in the middle of being queued).
          * This field <em>is</em> the dedup claim: whoever moves it off {@code null} owns the push, so no
@@ -2084,7 +2124,7 @@ final class AdaptivePoolingAllocator {
         volatile SizeClassedChunk pendingNext;
 
         /**
-         * Constructor only used by {@link #PENDING_SENTINEL}.
+         * Constructor only used by {@link PendingChunks}' end marker.
          */
         private SizeClassedChunk() {
             segmentSize = 0;
