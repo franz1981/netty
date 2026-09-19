@@ -256,6 +256,129 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
+     * Blocks released on another thread make their buddy chunks usable again for the thread that allocates: a second
+     * round of the same allocations after a foreign release needs no new memory.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void buddyChunksReleasedByAnotherThreadAreReused(boolean direct) throws Exception {
+        final AdaptiveByteBufAllocator allocator = newAllocator(true);
+        ByteBufAllocatorMetric metric = allocator.metric();
+        final int size = 512 * 1024; // above the largest size class, below the unpooled fallback
+        final ByteBuf[] bufs = new ByteBuf[24];
+        for (int i = 0; i < bufs.length; i++) {
+            bufs[i] = direct ? allocator.directBuffer(size, size) : allocator.heapBuffer(size, size);
+        }
+        long used = direct ? metric.usedDirectMemory() : metric.usedHeapMemory();
+        Thread releaser = new Thread(() -> {
+            for (ByteBuf buf : bufs) {
+                buf.release();
+            }
+        });
+        releaser.start();
+        releaser.join();
+        for (int i = 0; i < bufs.length; i++) {
+            bufs[i] = direct ? allocator.directBuffer(size, size) : allocator.heapBuffer(size, size);
+        }
+        assertEquals(used, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+    }
+
+    /**
+     * Wholly free buddy chunks are not kept beyond the reuse limit: after a burst is released, the next allocations
+     * leave at most {@link AdaptivePoolingAllocator#CHUNK_REUSE_QUEUE} idle chunks plus the ones in use.
+     */
+    @Test
+    void idleBuddyChunksAboveTheReuseLimitAreFreed() {
+        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        int size = 256 * 1024; // 2 MiB chunks: 8 buffers each
+        int chunkSize = 2 * 1024 * 1024;
+        int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 8;
+        ByteBuf[] bufs = new ByteBuf[chunks * 8];
+        for (int i = 0; i < bufs.length; i++) {
+            bufs[i] = allocator.heapBuffer(size, size);
+        }
+        long peak = allocator.usedHeapMemory();
+        assertTrue(peak >= (long) chunks * chunkSize, "peak " + peak);
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        // One chunk's worth and one more: the last one needs the slow path, which applies the releases.
+        List<ByteBuf> again = new ArrayList<ByteBuf>();
+        for (int i = 0; i < 9; i++) {
+            again.add(allocator.heapBuffer(size, size));
+        }
+        long settled = allocator.usedHeapMemory();
+        assertTrue(settled <= (long) (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 2) * chunkSize,
+                "peak " + peak + ", settled " + settled);
+        for (ByteBuf buf : again) {
+            buf.release();
+        }
+    }
+
+    /**
+     * Several threads allocate buddy-sized buffers and hand them to each other to check and release, so blocks go
+     * back through the chunks' free lists from threads that did not allocate them while the stripe's magazine keeps
+     * allocating: every buffer keeps its content until it is released, and nothing fails (run with assertions on).
+     */
+    @DisabledForSlowLeakDetection
+    @Test
+    void buddyBuffersReleasedAcrossThreadsKeepTheirContent() throws Throwable {
+        final AdaptiveByteBufAllocator allocator = newAllocator(true);
+        final int[] sizes = {140 * 1024, 256 * 1024, 300 * 1024, 512 * 1024, 700 * 1024, 1024 * 1024};
+        final int threads = 8;
+        final int rounds = 3000;
+        final BlockingQueue<ByteBuf> handoff = new ArrayBlockingQueue<ByteBuf>(64);
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        List<Thread> workers = new ArrayList<Thread>();
+        for (int t = 0; t < threads; t++) {
+            final int seed = t;
+            Thread worker = new Thread(() -> {
+                SplittableRandom rng = new SplittableRandom(seed);
+                try {
+                    for (int i = 0; i < rounds && failure.get() == null; i++) {
+                        int size = sizes[rng.nextInt(sizes.length)];
+                        ByteBuf buf = rng.nextBoolean() ? allocator.heapBuffer(size, size) :
+                                allocator.directBuffer(size, size);
+                        byte mark = (byte) rng.nextInt();
+                        buf.writerIndex(size);
+                        buf.setByte(0, mark);
+                        buf.setByte(size - 1, mark);
+                        buf.setByte(size / 2, mark);
+                        if (!handoff.offer(buf)) {
+                            buf.release();
+                        }
+                        ByteBuf other = handoff.poll();
+                        if (other != null) {
+                            int n = other.capacity();
+                            byte m = other.getByte(0);
+                            assertEquals(m, other.getByte(n - 1));
+                            assertEquals(m, other.getByte(n / 2));
+                            other.release();
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                }
+            });
+            workers.add(worker);
+            worker.start();
+        }
+        for (Thread worker : workers) {
+            worker.join();
+        }
+        ByteBuf left;
+        while ((left = handoff.poll()) != null) {
+            left.release();
+        }
+        if (failure.get() != null) {
+            throw failure.get();
+        }
+    }
+
+    /**
      * Buddy chunks given up by a magazine are reused by it: allocating and releasing the same set of large buffers
      * over and over from one thread does not grow the memory held after the first round.
      */
