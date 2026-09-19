@@ -1639,19 +1639,24 @@ final class AdaptivePoolingAllocator {
             // Now try to poll from the cache first
             drainHeapPending();
             curr = chunkCache.pollChunk(size);
-            if (curr == null) {
-                curr = chunkController.newChunkAllocation(this);
-            } else {
+            if (curr != null) {
                 curr.attachToMagazine(this);
+                chunkCache.activate(curr);
                 // The size-class cache only hands out chunks with a free segment, and a segment always fits the size,
                 // so this never happens; if that invariant ever broke, fall back to a fresh chunk rather than fail.
                 if (curr.remainingCapacity() < size) {
                     assert false : "the cache handed out a chunk without a free segment";
                     curr.releaseFromMagazine();
-                    curr = chunkController.newChunkAllocation(this);
+                    curr = null;
                 }
             }
+            if (curr == null) {
+                curr = chunkController.newChunkAllocation(this);
+                chunkCache.activate(curr);
+            }
 
+            // The active chunk stays in the cache, at the head of its reusable list; current is only the fast
+            // path's alias of it.
             current = curr;
             boolean success;
             try {
@@ -1689,8 +1694,9 @@ final class AdaptivePoolingAllocator {
             return buf;
         }
 
-        void offerToCache(SizeClassedChunk chunk) {
-            chunkCache.offerChunk(chunk);
+        /** The magazine gave up its active chunk: the cache files it by capacity like any other chunk. */
+        void deactivate(SizeClassedChunk chunk) {
+            chunkCache.deactivate(chunk);
         }
     }
 
@@ -2220,12 +2226,13 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Called when a magazine is done using this chunk, probably because it was emptied.
+         * Called when a magazine is done using this chunk, probably because it was emptied: it stops being the
+         * cache's active chunk and is filed by capacity.
          */
         void releaseFromMagazine() {
             SizeClassMagazine mag = magazine;
             magazine = null;
-            mag.offerToCache(this);
+            mag.deactivate(this);
         }
 
         @Override
