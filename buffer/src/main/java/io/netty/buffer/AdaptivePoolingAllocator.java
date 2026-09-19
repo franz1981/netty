@@ -101,6 +101,8 @@ final class AdaptivePoolingAllocator {
      * chunk size, which itself is a whole multiple of popular page sizes like 4 KiB, 16 KiB, and 64 KiB.
      */
     static final int MIN_CHUNK_SIZE = 128 * 1024;
+    // EXPERIMENT (throwaway): route every size through the buddy path.
+    static final boolean EXPT_NO_SIZE_CLASSES = Boolean.getBoolean("expt.noSizeClasses");
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
@@ -276,7 +278,7 @@ final class AdaptivePoolingAllocator {
     private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
         AdaptiveByteBuf allocated = null;
         if (size <= MAX_POOLED_BUF_SIZE) {
-            final int index = sizeClassIndexOf(size);
+            final int index = EXPT_NO_SIZE_CLASSES ? SIZE_CLASSES_COUNT : sizeClassIndexOf(size); // EXPERIMENT
             if (index < SIZE_CLASSES_COUNT) {
                 ThreadLocalSizeClassHeap heap = null;
                 if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
