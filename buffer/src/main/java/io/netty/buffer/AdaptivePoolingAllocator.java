@@ -1544,16 +1544,11 @@ final class AdaptivePoolingAllocator {
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
             int startingCapacity = chunkController.computeBufferCapacity(maxCapacity);
             SizeClassedChunk curr = current;
-            SizeClassedChunk raced = null;
             if (curr != null) {
                 boolean success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
-                int remainingCapacity = curr.remainingCapacity();
-                if (!success && remainingCapacity > 0) {
-                    // Both free lists were empty when readInitInto polled them, and a segment came back
-                    // before the capacity read: give the chunk one more try before going to the cache.
-                    current = null;
-                    raced = curr;
-                } else if (remainingCapacity == 0) {
+                if (!success || curr.remainingCapacity() == 0) {
+                    // Exhausted. If a segment came back from another thread right after the failed poll, the cache
+                    // files the chunk as reusable by its capacity, so the poll below can hand it straight back.
                     current = null;
                     curr.releaseFromMagazine();
                 }
@@ -1561,39 +1556,17 @@ final class AdaptivePoolingAllocator {
                     return true;
                 }
             }
-            return allocateSlow(size, maxCapacity, buf, startingCapacity, raced);
+            return allocateSlow(size, maxCapacity, buf, startingCapacity);
         }
 
         /**
-         * The current chunk (if any) had no room. Retry the chunk that raced with a segment return, if any,
-         * then the cache, then fall back to allocating a fresh chunk. Whichever chunk ends up serving the
-         * allocation is stashed in {@link #current}, "reserving" it for this magazine's exclusive use.
+         * The current chunk (if any) had no room. Poll the cache, then fall back to allocating a fresh chunk.
+         * Whichever chunk ends up serving the allocation is stashed in {@link #current}, "reserving" it for this
+         * magazine's exclusive use.
          */
-        private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity,
-                                     SizeClassedChunk raced) {
+        private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity) {
             assert current == null;
-            SizeClassedChunk curr = raced;
-            if (curr != null) {
-                int remainingCapacity = curr.remainingCapacity();
-                if (remainingCapacity > startingCapacity &&
-                        curr.readInitInto(buf, size, startingCapacity, maxCapacity)) {
-                    // We have a Chunk that has some space left.
-                    current = curr;
-                    return true;
-                }
-
-                try {
-                    if (remainingCapacity >= size) {
-                        // At this point we know that this will be the last time curr will be used, so directly set it
-                        // to null and release it once we are done.
-                        return curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
-                    }
-                } finally {
-                    // Release in a finally block so even if readInitInto(...) would throw we would still correctly
-                    // release the current chunk before null it out.
-                    curr.releaseFromMagazine();
-                }
-            }
+            SizeClassedChunk curr;
 
             // Now try to poll from the cache first
             drainHeapPending();
