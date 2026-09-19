@@ -1663,8 +1663,6 @@ final class AdaptivePoolingAllocator {
         private final ChunkQueue full = new ChunkQueue();
         /** Chunks with no block claimed; the only ones the magazine can free while it holds more than it may keep. */
         private final ChunkQueue whollyFree = new ChunkQueue();
-        /** Chunks filed on any queue. */
-        private int filed;
         /** The chunk the magazine allocates from, on no queue; {@code null} before the first allocation. */
         private BuddyChunk active;
 
@@ -1760,12 +1758,13 @@ final class AdaptivePoolingAllocator {
 
         /**
          * File {@code chunk}, on no queue, by its tree once its free list is applied. A wholly free chunk is freed
-         * instead when the magazine already holds {@link #CHUNK_REUSE_QUEUE} chunks.
+         * instead when the magazine already keeps {@link #CHUNK_REUSE_QUEUE} wholly free chunks: the limit is on idle
+         * chunks, whatever the number of chunks in use.
          */
         private void file(BuddyChunk chunk) {
             chunk.processFreelistEntries();
             if (chunk.isWhollyFree()) {
-                if (filed >= CHUNK_REUSE_QUEUE) {
+                if (whollyFree.size >= CHUNK_REUSE_QUEUE) {
                     chunk.markToDeallocate();
                     return;
                 }
@@ -1779,12 +1778,10 @@ final class AdaptivePoolingAllocator {
                     ordersInUse |= 1 << order;
                 }
             }
-            filed++;
         }
 
         private void unfile(Chunk chunk) {
             chunk.queue.remove(chunk);
-            filed--;
         }
 
         /**
