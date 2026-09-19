@@ -933,9 +933,9 @@ final class AdaptivePoolingAllocator {
         final ChunkQueue exhausted = new ChunkQueue();
         final ChunkQueue reusable = new ChunkQueue();
         /**
-         * The chunk the magazine allocates from, or {@code null}. It is on
-         * neither list: the cache owns it, so the purge and the drain can see it, but only the magazine allocates
-         * from it, until {@link #deactivate} files it by capacity like any other chunk.
+         * The chunk the magazine allocates from, or {@code null}. It is on neither queue, and neither the purge nor
+         * the drain acts on it: only the magazine allocates from it, until {@link #deactivate} files it by capacity
+         * like any other chunk.
          */
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
@@ -1071,8 +1071,8 @@ final class AdaptivePoolingAllocator {
                 }
                 moveToReusable(chunk);
             } else if (queue != reusable) {
-                // On no queue: either gone (evicted, recycled, or its cache freed), not ours to move - checked
-                // first, because such a chunk may have had its free lists stripped by recycleOrDeallocate - or
+                // On no queue: either gone (evicted, recycled, or its cache freed), not ours to move - its capacity
+                // is never read, because such a chunk may have had its free lists stripped by recycleOrDeallocate - or
                 // the active chunk, which consumes its own returned segments and is filed by capacity when the
                 // magazine gives it up (see deactivate). A polled chunk is activated before any drain can run.
                 return;
@@ -1227,8 +1227,8 @@ final class AdaptivePoolingAllocator {
          *       drain already popped, the releaser read the link before that drain's re-arm store: the releaser
          *       offered first (a CAS on the MPSC queue) and read {@code pendingNext} second, and the drain's
          *       full volatile re-arm store precedes every later volatile read of the queue indices on the
-         *       draining side, this call's capacity read included. So the segment is visible here (see the
-         *       comment on the re-arm in {@link #drainPending}).</li>
+         *       draining side, this call's capacity read included. So the segment is visible here (see
+         *       {@link PendingChunks#rearm}).</li>
          * </ul>
          * A return that took the lock or came from the owner thread cannot interleave with this call at all.
          */
@@ -2122,7 +2122,7 @@ final class AdaptivePoolingAllocator {
         /**
          * Constructor only used by {@link PendingChunks}' end marker.
          */
-        private SizeClassedChunk() {
+        SizeClassedChunk() {
             segmentSize = 0;
             segments = 0;
             ownerThread = null;
