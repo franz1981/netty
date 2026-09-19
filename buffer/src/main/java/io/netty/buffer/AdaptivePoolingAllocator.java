@@ -972,8 +972,9 @@ final class AdaptivePoolingAllocator {
         // covers it: a note consumed before deactivate made its segment visible to deactivate's capacity
         // read, and a note still outstanding is processed after it, against the list it was filed on.
         // That includes a return that lands from another thread while the chunk is being deactivated.
-        // A drain that finds CACHE_NONE is benign too: the chunk has been polled (and is about to be
-        // activated, under the same lock or on the same owner thread) or it is gone.
+        // A drain that finds CACHE_NONE is benign too: the chunk is gone (evicted, recycled, or its cache
+        // freed). A polled chunk is never seen in that state, because pollChunk and activate run back to
+        // back under the same lock or on the same owner thread, with no drain in between.
 
         /**
          * Queue {@code chunk} for the next drain. Called by a releasing thread that holds no lock,
@@ -1046,8 +1047,9 @@ final class AdaptivePoolingAllocator {
         private void processPending(SizeClassedChunk chunk) {
             int cls = chunk.cacheListState;
             if (cls <= SizeClassedChunk.CACHE_ACTIVE) {
-                // CACHE_NONE: polled, or gone: not ours to move. Checked first, because such a chunk may
-                // have had its free lists stripped by recycleOrDeallocate.
+                // CACHE_NONE: gone (evicted, recycled, or its cache freed), not ours to move; a polled chunk
+                // is activated before any drain can run. Checked first, because such a chunk may have had
+                // its free lists stripped by recycleOrDeallocate.
                 // CACHE_ACTIVE: the magazine's chunk, which consumes its own returned segments; it is
                 // filed by capacity when the magazine gives it up (see deactivate).
                 return;
@@ -1219,7 +1221,14 @@ final class AdaptivePoolingAllocator {
          *       allocated it again, or the capacity read below sees it and files the chunk reusable; or</li>
          *   <li>still outstanding (or pushed after this call started): the drain that pops it runs after
          *       this call, under the same lock or on the same owner thread (property 4), and finds the
-         *       chunk on the list this call filed it on, so an exhausted-but-not-really chunk is moved.</li>
+         *       chunk on the list this call filed it on, so an exhausted-but-not-really chunk is moved; or</li>
+         *   <li>never pushed: the releaser found {@code pendingNext} already non-null and walked away. If that
+         *       link is a note still outstanding, the previous case covers this segment too. If it is a note a
+         *       drain already popped, the releaser read the link before that drain's re-arm store: the releaser
+         *       offered first (a CAS on the MPSC queue) and read {@code pendingNext} second, and the drain's
+         *       full volatile re-arm store precedes every later volatile read of the queue indices on the
+         *       draining side, this call's capacity read included. So the segment is visible here (see the
+         *       comment on the re-arm in {@link #drainPending}).</li>
          * </ul>
          * A return that took the lock or came from the owner thread cannot interleave with this call at all.
          */
@@ -1235,7 +1244,8 @@ final class AdaptivePoolingAllocator {
             // Drop any outstanding notes: every chunk they point at is about to be marked for
             // deallocation, and this cache is dead afterwards.
             PENDING_HEAD.lazySet(this, null);
-            active = null;
+            // The magazine gives up its active chunk before it frees its cache.
+            assert active == null : "free with an active chunk";
             freeList(exhaustedHead);
             exhaustedHead = null;
             exhaustedCount = 0;
@@ -1635,8 +1645,11 @@ final class AdaptivePoolingAllocator {
             if (curr != null) {
                 boolean success = curr.readInitInto(buf, size, startingCapacity, maxCapacity);
                 if (!success || curr.remainingCapacity() == 0) {
-                    // Exhausted. If a segment came back from another thread right after the failed poll, the cache
-                    // files the chunk as reusable by its capacity, so the poll below can hand it straight back.
+                    // Out of segments: give the chunk up. If a segment comes back from another thread after the
+                    // count above, deactivate files the chunk as reusable by its capacity, so a later poll can hand
+                    // it back. The !success case is defensive: the previous call left remainingCapacity() > 0,
+                    // which counts only free segments, and this magazine is the only consumer of its chunk's free
+                    // lists, so the read above always finds a segment.
                     current = null;
                     curr.releaseFromMagazine();
                 }
@@ -1655,6 +1668,7 @@ final class AdaptivePoolingAllocator {
         private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity) {
             assert current == null;
             SizeClassedChunk curr;
+            boolean polledChunkWithoutSegment = false;
 
             // Now try to poll from the cache first
             drainHeapPending();
@@ -1664,7 +1678,7 @@ final class AdaptivePoolingAllocator {
                 // The size-class cache only hands out chunks with a free segment, and a segment always fits the size,
                 // so this never happens; if that invariant ever broke, fall back to a fresh chunk rather than fail.
                 if (curr.remainingCapacity() < size) {
-                    assert false : "the cache handed out a chunk without a free segment";
+                    polledChunkWithoutSegment = true;
                     curr.releaseFromMagazine();
                     curr = null;
                 }
@@ -1677,6 +1691,9 @@ final class AdaptivePoolingAllocator {
             // The active chunk stays in the cache, at the head of its reusable list; current is only the fast
             // path's alias of it.
             current = curr;
+            // Checked only now, with the fallback chunk active and aliased, so that with assertions enabled the
+            // failure leaves the magazine and its cache consistent.
+            assert !polledChunkWithoutSegment : "the cache handed out a chunk without a free segment";
             boolean success;
             try {
                 int remainingCapacity = curr.remainingCapacity();
