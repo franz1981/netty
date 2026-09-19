@@ -48,6 +48,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -330,6 +331,126 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertTrue(memoryAfterSettled < memoryDuringBurst,
                 "Memory should decrease after burst release. " +
                 "During burst: " + memoryDuringBurst + ", after settled: " + memoryAfterSettled);
+    }
+
+    /**
+     * The chunk a size-class magazine allocates from is the cache's active chunk: the head of its reusable
+     * list. It must survive becoming fully free, whichever path the return takes and whatever the purge does,
+     * even with the cache above its retention floor - exactly as when it lived outside the cache - and it
+     * must move to the exhausted list once its last segment is handed out.
+     *
+     * <ul>
+     *   <li>{@code owner}: thread-local heap, released by its owner thread (inline, no lock).</li>
+     *   <li>{@code locked}: shared stripe, released by another thread that wins the stripe lock.</li>
+     *   <li>{@code notified}: thread-local heap, released by another thread, which leaves a note that the
+     *       owner drains.</li>
+     * </ul>
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"owner", "locked", "notified"})
+    void activeChunkStaysInTheCacheAndIsNotEvictedWhenFullyFree(String releasePath) throws Exception {
+        final boolean threadLocal = !"locked".equals(releasePath);
+        final boolean foreignRelease = !"owner".equals(releasePath);
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        Runnable test = () -> {
+            try {
+                assertActiveChunkLifecycle(allocator, foreignRelease);
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        };
+        if (threadLocal) {
+            FastThreadLocalThread.runWithFastThreadLocal(test);
+        } else {
+            test.run();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    private static void assertActiveChunkLifecycle(AdaptiveByteBufAllocator allocator, boolean foreignRelease)
+            throws Exception {
+        List<ByteBuf> held = new ArrayList<ByteBuf>();
+        try {
+            ByteBuf first = allocator.heapBuffer(BURST_BUF_SIZE);
+            held.add(first);
+            SizeClassedChunk firstChunk = chunkOf(first);
+            SizeClassedChunkCache cache = firstChunk.owningCache;
+            assertSame(firstChunk, cache.active);
+            assertSame(firstChunk, cache.reusableHead);
+            assertEquals(SizeClassedChunk.CACHE_ACTIVE, firstChunk.cacheListState);
+
+            // Hand out the rest of its segments: the last one moves it to the exhausted list.
+            for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
+                assertEquals(SizeClassedChunk.CACHE_ACTIVE, firstChunk.cacheListState);
+                held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+            }
+            assertEquals(SizeClassedChunk.CACHE_EXHAUSTED, firstChunk.cacheListState);
+            assertSame(firstChunk, cache.exhaustedHead);
+            assertNull(cache.active);
+
+            // Fill the cache above its retention floor with exhausted chunks.
+            int floor = cache.purgeRetentionFloor;
+            for (int i = BURST_SEGMENTS_PER_CHUNK; i < (floor + 1) * BURST_SEGMENTS_PER_CHUNK; i++) {
+                held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+            }
+            assertEquals(floor + 1, cache.exhaustedCount);
+            assertNull(cache.active);
+
+            // One segment of a fresh active chunk, returned: the active chunk is fully free, above the floor.
+            ByteBuf probe = allocator.heapBuffer(BURST_BUF_SIZE);
+            SizeClassedChunk active = chunkOf(probe);
+            assertSame(active, cache.active);
+            assertSame(active, cache.reusableHead);
+            long used = allocator.usedHeapMemory();
+            release(probe, foreignRelease);
+            cache.drainPending();
+            assertTrue(active.hasFullCapacity());
+            assertSame(active, cache.active, "a fully free active chunk must not be evicted on release");
+            assertSame(active, cache.reusableHead);
+            assertEquals(SizeClassedChunk.CACHE_ACTIVE, active.cacheListState);
+            assertEquals(used, allocator.usedHeapMemory());
+
+            cache.tickPurge();
+            assertSame(active, cache.active, "a fully free active chunk must not be evicted by the purge");
+            assertEquals(SizeClassedChunk.CACHE_ACTIVE, active.cacheListState);
+            assertEquals(used, allocator.usedHeapMemory());
+
+            // Control: in the same state, a fully free chunk that is not active is evicted on release, so the
+            // assertions above are about the active chunk and not about a cache that would evict nothing.
+            for (int i = 0; i < BURST_SEGMENTS_PER_CHUNK; i++) {
+                release(held.get(i), foreignRelease);
+            }
+            held.subList(0, BURST_SEGMENTS_PER_CHUNK).clear();
+            cache.drainPending();
+            assertEquals(SizeClassedChunk.CACHE_NONE, firstChunk.cacheListState);
+            assertEquals(used - BURST_CHUNK_SIZE, allocator.usedHeapMemory());
+            assertSame(active, cache.active);
+        } finally {
+            for (ByteBuf buf : held) {
+                buf.release();
+            }
+        }
+    }
+
+    private static SizeClassedChunk chunkOf(ByteBuf buf) {
+        // Unwrap the leak-aware wrapper, if any.
+        while (!(buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf)) {
+            buf = buf.unwrap();
+        }
+        return (SizeClassedChunk) ((AdaptivePoolingAllocator.AdaptiveByteBuf) buf).chunk;
+    }
+
+    private static void release(ByteBuf buf, boolean foreignThread) throws InterruptedException {
+        if (!foreignThread) {
+            buf.release();
+            return;
+        }
+        Thread t = new Thread(buf::release);
+        t.start();
+        t.join();
     }
 
     // Regression: on the shared (striped) path a segment returned after the allocator was
