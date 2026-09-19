@@ -294,7 +294,8 @@ final class AdaptivePoolingAllocator {
     private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
         AdaptiveByteBuf allocated = null;
         if (size <= MAX_POOLED_BUF_SIZE) {
-            final int index = sizeClassIndexOf(size);
+            // EXPERIMENT (throwaway): pool only the striped heap PR's 16 size classes, the rest goes to buddy.
+            final int index = size > 16896 ? SIZE_CLASSES_COUNT : sizeClassIndexOf(size);
             if (index < POOLED_SIZE_CLASSES_COUNT) {
                 ThreadLocalSizeClassHeap heap = null;
                 if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
