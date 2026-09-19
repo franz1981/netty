@@ -739,17 +739,31 @@ final class AdaptivePoolingAllocator {
      * <ul>
      *   <li><b>Reusable</b> — chunks known to have free segments. {@link #pollChunk} takes the
      *       head, O(1). Fully-free chunks at or below the retention floor stay here rather than
-     *       being evicted, so a burst does not have to re-allocate immediately after draining.</li>
+     *       being evicted, so a burst does not have to re-allocate immediately after draining.
+     *       While the magazine has a chunk to allocate from, that chunk is here too, as the head:
+     *       the <em>active</em> chunk ({@code CACHE_ACTIVE}), see below.</li>
      *   <li><b>Exhausted</b> — chunks with no free segments when they were filed. Primarily an
      *       ownership registry: it keeps chunks reachable for {@link #free()} and gives the
      *       notification drain somewhere to move a chunk out of. It is <em>not</em> the discovery
      *       mechanism, and is never walked.</li>
      * </ul>
      *
-     * <p><b>Why the reusable list is trustworthy.</b> A cached chunk can only <em>gain</em>
-     * capacity: segments are handed out only by {@code readInitInto} on a magazine's chunk, and
-     * {@link #pollChunk} removes a chunk from the cache before it is attached to a magazine. So a
-     * chunk filed with capacity still has it, and the head of the reusable list is always usable.
+     * <p><b>The active chunk.</b> The chunk the magazine allocates from is linked at the head of the
+     * reusable list with state {@code CACHE_ACTIVE}; the magazine's {@code current} field is only the
+     * fast path's alias of it. {@link #activate} makes a polled or freshly allocated chunk active, and
+     * {@link #deactivate} unlinks it and files it by capacity, like {@link #offerChunk}, when the
+     * magazine runs it out of segments or is freed. Every chunk linked into the reusable list while
+     * one is active goes after it. The active chunk is the magazine's, not a retention candidate: no
+     * cache decision touches it (the release paths and the drain act only on states above
+     * {@code CACHE_ACTIVE}, and {@link #tickPurge} skips it), and it is left out of the count that is
+     * compared with {@link #purgeRetentionFloor}.
+     *
+     * <p><b>Why the reusable list is trustworthy.</b> A cached chunk other than the active one can
+     * only <em>gain</em> capacity: segments are handed out only by {@code readInitInto} on the active
+     * chunk, and a chunk becomes active only through {@link #activate}, after the magazine gave up the
+     * previous one. So a non-active chunk filed with capacity still has it, and the head of the
+     * reusable list is always usable when there is no active chunk, which is the only time
+     * {@link #pollChunk} runs.
      *
      * <p><b>Why the exhausted list is not.</b> {@code offerChunk} files a chunk by reading its
      * capacity, and a cross-thread return landing just after that read leaves it filed as exhausted
@@ -942,7 +956,7 @@ final class AdaptivePoolingAllocator {
         //     drainer that pops the note is guaranteed to see the segment.
         //  2. Notes are state-independent: "look at this chunk", never "this specific thing changed".
         //     One note therefore covers any number of later returns, and a note left while the chunk
-        //     was still CACHE_NONE stays correct once the chunk is classified. Do not optimise the
+        //     was still active (or CACHE_NONE) stays correct once the chunk is classified. Do not optimise the
         //     note to carry state. This is also why a releaser that finds the claim already taken can
         //     simply walk away: the in-flight note covers its return too.
         //  3. Re-arm before processing (see drainPending).
@@ -952,8 +966,14 @@ final class AdaptivePoolingAllocator {
         //     insert: the chunk is filed as exhausted while holding capacity, and the note -- which
         //     cannot be consumed in between -- is what fixes it.
         //
-        // A drain that finds CACHE_NONE and no-ops is benign, not a lost signal: the chunk is in a
-        // magazine, which consumes its own returned segments through nextAvailableSegmentOffset.
+        // A drain that finds CACHE_ACTIVE and no-ops is benign, not a lost signal: the chunk is the
+        // magazine's, which consumes its own returned segments through nextAvailableSegmentOffset, and
+        // when the magazine gives it up, deactivate files it by capacity -- an offerChunk, so property 4
+        // covers it: a note consumed before deactivate made its segment visible to deactivate's capacity
+        // read, and a note still outstanding is processed after it, against the list it was filed on.
+        // That includes a return that lands from another thread while the chunk is being deactivated.
+        // A drain that finds CACHE_NONE is benign too: the chunk has been polled (and is about to be
+        // activated, under the same lock or on the same owner thread) or it is gone.
 
         /**
          * Queue {@code chunk} for the next drain. Called by a releasing thread that holds no lock,
@@ -1520,9 +1540,9 @@ final class AdaptivePoolingAllocator {
 
     /**
      * The magazine of one size class, on a shared stripe (guarded by the stripe lock) or on a thread-local heap
-     * (used by its owner thread only). It carves fixed-size segments out of {@link SizeClassedChunk}s, keeps the
-     * chunks it is not using in its own {@link SizeClassedChunkCache}, and feeds evicted chunk buffers to the
-     * {@link SizeClassChunkRecycler} of its heap.
+     * (used by its owner thread only). It carves fixed-size segments out of {@link SizeClassedChunk}s, keeps its
+     * chunks in its own {@link SizeClassedChunkCache} (the one it allocates from as the cache's active chunk, which
+     * {@link #current} aliases), and feeds evicted chunk buffers to the {@link SizeClassChunkRecycler} of its heap.
      */
     private static final class SizeClassMagazine {
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
@@ -1629,8 +1649,8 @@ final class AdaptivePoolingAllocator {
 
         /**
          * The current chunk (if any) had no room. Poll the cache, then fall back to allocating a fresh chunk.
-         * Whichever chunk ends up serving the allocation is stashed in {@link #current}, "reserving" it for this
-         * magazine's exclusive use.
+         * Whichever chunk ends up serving the allocation becomes the cache's active chunk, which no cache decision
+         * touches, and is aliased by {@link #current} for the fast path.
          */
         private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity) {
             assert current == null;
