@@ -730,11 +730,11 @@ final class AdaptivePoolingAllocator {
      * from its owner thread only.
      */
     static final class ChunkQueue {
-        SizeClassedChunk head;
+        Chunk head;
         int size;
 
-        void pushFront(SizeClassedChunk chunk) {
-            SizeClassedChunk head = this.head;
+        void pushFront(Chunk chunk) {
+            Chunk head = this.head;
             chunk.prevInQueue = null;
             chunk.nextInQueue = head;
             if (head != null) {
@@ -745,9 +745,9 @@ final class AdaptivePoolingAllocator {
             size++;
         }
 
-        void remove(SizeClassedChunk chunk) {
-            SizeClassedChunk prev = chunk.prevInQueue;
-            SizeClassedChunk next = chunk.nextInQueue;
+        void remove(Chunk chunk) {
+            Chunk prev = chunk.prevInQueue;
+            Chunk next = chunk.nextInQueue;
             if (prev != null) {
                 prev.nextInQueue = next;
             } else {
@@ -771,21 +771,21 @@ final class AdaptivePoolingAllocator {
      * volatile read.
      */
     static final class PendingChunks {
-        private static final AtomicReferenceFieldUpdater<PendingChunks, SizeClassedChunk> HEAD =
-                AtomicReferenceFieldUpdater.newUpdater(PendingChunks.class, SizeClassedChunk.class, "head");
-        private static final AtomicReferenceFieldUpdater<SizeClassedChunk, SizeClassedChunk> NEXT =
-                AtomicReferenceFieldUpdater.newUpdater(SizeClassedChunk.class, SizeClassedChunk.class, "pendingNext");
+        private static final AtomicReferenceFieldUpdater<PendingChunks, Chunk> HEAD =
+                AtomicReferenceFieldUpdater.newUpdater(PendingChunks.class, Chunk.class, "head");
+        private static final AtomicReferenceFieldUpdater<Chunk, Chunk> NEXT =
+                AtomicReferenceFieldUpdater.newUpdater(Chunk.class, Chunk.class, "pendingNext");
         /**
          * Ends the stack, so that a {@code null} link keeps its meaning of "not queued". Never a usable chunk.
          */
-        private static final SizeClassedChunk END = new SizeClassedChunk();
+        private static final Chunk END = new SizeClassedChunk();
 
-        private volatile SizeClassedChunk head;
+        private volatile Chunk head;
 
         /**
          * Queue {@code chunk}, unless it is queued already. Any thread, no lock.
          */
-        void push(SizeClassedChunk chunk) {
+        void push(Chunk chunk) {
             if (chunk.pendingNext != null) {
                 return;
             }
@@ -793,7 +793,7 @@ final class AdaptivePoolingAllocator {
             if (!NEXT.compareAndSet(chunk, null, END)) {
                 return;
             }
-            SizeClassedChunk head;
+            Chunk head;
             do {
                 head = this.head;
                 NEXT.lazySet(chunk, head == null ? END : head);
@@ -805,7 +805,7 @@ final class AdaptivePoolingAllocator {
          * only. Cheap when nothing is queued: one volatile read, no atomic read-modify-write; the heap-wide drain
          * pays this per size class.
          */
-        SizeClassedChunk takeAll() {
+        Chunk takeAll() {
             if (head == null) {
                 return null;
             }
@@ -823,8 +823,8 @@ final class AdaptivePoolingAllocator {
          * and only then reads {@code pendingNext}. The processing reads the free lists right after this store;
          * without the StoreLoad here both sides could miss each other and the chunk would be stranded.
          */
-        static SizeClassedChunk rearm(SizeClassedChunk chunk) {
-            SizeClassedChunk next = chunk.pendingNext;
+        static Chunk rearm(Chunk chunk) {
+            Chunk next = chunk.pendingNext;
             NEXT.set(chunk, null);
             return next == END ? null : next;
         }
@@ -839,7 +839,7 @@ final class AdaptivePoolingAllocator {
         // Visible for testing: how many chunks are queued.
         int size() {
             int count = 0;
-            SizeClassedChunk cur = head;
+            Chunk cur = head;
             while (cur != null && cur != END) {
                 count++;
                 cur = cur.pendingNext;
@@ -1042,11 +1042,11 @@ final class AdaptivePoolingAllocator {
          * a thread-local cache.
          */
         void drainPending() {
-            SizeClassedChunk cur = pending.takeAll();
+            Chunk cur = pending.takeAll();
             while (cur != null) {
                 // Re-arm BEFORE processing (property 3): see PendingChunks#rearm.
-                SizeClassedChunk next = PendingChunks.rearm(cur);
-                refile(cur);
+                Chunk next = PendingChunks.rearm(cur);
+                refile((SizeClassedChunk) cur);
                 cur = next;
             }
         }
@@ -1126,7 +1126,7 @@ final class AdaptivePoolingAllocator {
         private SizeClassedChunk pollChunkInternal() {
             // The magazine gives up its active chunk before it asks for another one.
             assert active == null : "poll with an active chunk";
-            SizeClassedChunk chunk = reusable.head;
+            SizeClassedChunk chunk = (SizeClassedChunk) reusable.head;
             if (chunk != null) {
                 reusable.remove(chunk);
                 return chunk;
@@ -1156,10 +1156,10 @@ final class AdaptivePoolingAllocator {
          * the only kind that holds when nothing matches.
          */
         private SizeClassedChunk probeExhausted() {
-            SizeClassedChunk cur = exhausted.head;
+            SizeClassedChunk cur = (SizeClassedChunk) exhausted.head;
             int visited = 0;
             while (cur != null && visited < MAX_EXHAUSTED_PROBE) {
-                SizeClassedChunk next = cur.nextInQueue;
+                SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 visited++;
                 if (cur.hasRemainingCapacity()) {
                     exhausted.remove(cur);
@@ -1175,9 +1175,9 @@ final class AdaptivePoolingAllocator {
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
             int total = totalCount();
-            SizeClassedChunk cur = reusable.head;
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
             while (cur != null && total > purgeRetentionFloor) {
-                SizeClassedChunk next = cur.nextInQueue;
+                SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
@@ -1249,10 +1249,10 @@ final class AdaptivePoolingAllocator {
         }
 
         private static void freeAll(ChunkQueue queue) {
-            SizeClassedChunk cur;
+            Chunk cur;
             while ((cur = queue.head) != null) {
                 queue.remove(cur);
-                cur.markToDeallocate();
+                ((SizeClassedChunk) cur).markToDeallocate();
             }
         }
 
@@ -1911,6 +1911,21 @@ final class AdaptivePoolingAllocator {
      * owns it, and its accounting in the {@link ChunkRegistry} and the JFR events.
      */
     abstract static class Chunk implements ChunkInfo {
+        /**
+         * The {@link ChunkQueue} of its magazine's cache this chunk is filed on, or {@code null}: the magazine's
+         * active chunk, a chunk just polled, or one that left the cache. The release paths take a cache decision only
+         * when it is on a queue, with one null check.
+         */
+        ChunkQueue queue;
+        // Links of the ChunkQueue this chunk is on, if any.
+        Chunk prevInQueue;
+        Chunk nextInQueue;
+        /**
+         * Link in its cache's {@link PendingChunks}: {@code null} = not queued for attention, non-null = queued (or in
+         * the middle of being queued). This field <em>is</em> the dedup claim: whoever moves it off {@code null} owns
+         * the push, so no separate flag is needed.
+         */
+        volatile Chunk pendingNext;
         protected AbstractByteBuf delegate;
         // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
         final AdaptivePoolingAllocator allocator;
@@ -2099,25 +2114,7 @@ final class AdaptivePoolingAllocator {
          */
         private int allocatedBytes;
 
-        /**
-         * The queue of {@link #owningCache} this chunk is filed on, or {@code null}: the cache's active chunk, a
-         * chunk just polled, or one that left the cache. The release paths take a cache decision only when it is
-         * on a queue, with one null check.
-         */
-        ChunkQueue queue;
-        // Links of the ChunkQueue this chunk is on, if any.
-        SizeClassedChunk prevInQueue;
-        SizeClassedChunk nextInQueue;
         final SizeClassedChunkCache owningCache;
-
-        // --- Link in its cache's PendingChunks ---
-
-        /**
-         * {@code null} = not queued for attention, non-null = queued (or in the middle of being queued).
-         * This field <em>is</em> the dedup claim: whoever moves it off {@code null} owns the push, so no
-         * separate flag is needed.
-         */
-        volatile SizeClassedChunk pendingNext;
 
         /**
          * Constructor only used by {@link PendingChunks}' end marker.
