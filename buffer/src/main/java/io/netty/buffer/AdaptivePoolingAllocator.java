@@ -1598,6 +1598,24 @@ final class AdaptivePoolingAllocator {
             }));
         }
         private void t(int i) { if (sizeClassIndex < 0) { T[i].increment(); } }
+        // TELEMETRY: what the partial serve hands out, relative to the request and to the chunk.
+        static final java.util.concurrent.atomic.LongAdder P_OK = new java.util.concurrent.atomic.LongAdder(), P_FAIL = new java.util.concurrent.atomic.LongAdder(),
+                P_WHOLE_CHUNK = new java.util.concurrent.atomic.LongAdder(), P_WASTE = new java.util.concurrent.atomic.LongAdder(), P_REQ = new java.util.concurrent.atomic.LongAdder();
+        static final java.util.concurrent.atomic.LongAdder[] P_RATIO = new java.util.concurrent.atomic.LongAdder[6]; // block/size <=1.5, <=2, <=4, <=8, <=16, >16
+        static {
+            for (int i = 0; i < P_RATIO.length; i++) { P_RATIO[i] = new java.util.concurrent.atomic.LongAdder(); }
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> System.err.println("TELE partial serve: ok=" + P_OK.sum() + " fail=" + P_FAIL.sum()
+                    + " wholeChunk=" + P_WHOLE_CHUNK.sum() + " requestedBytes=" + P_REQ.sum() + " handedOutMinusRequested=" + P_WASTE.sum()
+                    + " ratio(<=1.5,<=2,<=4,<=8,<=16,>16)=" + P_RATIO[0].sum() + "," + P_RATIO[1].sum() + "," + P_RATIO[2].sum() + ","
+                    + P_RATIO[3].sum() + "," + P_RATIO[4].sum() + "," + P_RATIO[5].sum())));
+        }
+        private static void recordPartial(boolean ok, int size, int block, int chunkCapacity) {
+            if (!ok) { P_FAIL.increment(); return; }
+            P_OK.increment(); P_REQ.add(size); P_WASTE.add(block - size);
+            if (block == chunkCapacity) { P_WHOLE_CHUNK.increment(); }
+            double r = (double) block / size;
+            P_RATIO[r <= 1.5 ? 0 : r <= 2 ? 1 : r <= 4 ? 2 : r <= 8 ? 3 : r <= 16 ? 4 : 5].increment();
+        }
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
             int startingCapacity = chunkController.computeBufferCapacity(size, maxCapacity);
             Chunk curr = current;
@@ -1651,7 +1669,9 @@ final class AdaptivePoolingAllocator {
                         // At this point we know that this will be the last time curr will be used, so directly set it
                         // to null and release it once we are done.
                         t(4);
-                        return curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
+                        boolean ok = curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
+                        if (sizeClassIndex < 0) { recordPartial(ok, size, remainingCapacity, curr.capacity()); }
+                        return ok;
                     }
                 } finally {
                     // Release in a finally block so even if readInitInto(...) would throw we would still correctly
