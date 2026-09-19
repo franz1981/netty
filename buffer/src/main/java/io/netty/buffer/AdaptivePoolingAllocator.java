@@ -2437,10 +2437,7 @@ final class AdaptivePoolingAllocator {
      * is released.
      */
     private static final class BuddyChunk extends Chunk implements IntConsumer {
-        private static final int MIN_BUDDY_SIZE = 32768;
-        private static final byte IS_CLAIMED = (byte) (1 << 7);
-        private static final byte HAS_CLAIMED_CHILDREN = 1 << 6;
-        private static final byte SHIFT_MASK = ~(IS_CLAIMED | HAS_CLAIMED_CHILDREN);
+        private static final int MIN_BUDDY_SIZE = BuddyTree.MIN_BLOCK_SIZE;
         private static final int PACK_OFFSET_MASK = 0xFFFF;
         private static final int PACK_SIZE_SHIFT = Integer.SIZE - Integer.numberOfLeadingZeros(PACK_OFFSET_MASK);
 
@@ -2449,9 +2446,8 @@ final class AdaptivePoolingAllocator {
         final RefCnt refCnt = new RefCnt();
         // null for a one-shot chunk.
         private final MpscIntQueue freeList;
-        // The bits of each buddy: [1: is claimed][1: has claimed children][30: MIN_BUDDY_SIZE shift to get size].
         // null for a one-shot chunk.
-        private final byte[] buddies;
+        private final BuddyTree tree;
         private final int freeListCapacity;
         private BuddyMagazine magazine;
         private int allocatedBytes;
@@ -2461,7 +2457,7 @@ final class AdaptivePoolingAllocator {
          */
         private BuddyChunk() {
             freeList = null;
-            buddies = null;
+            tree = null;
             freeListCapacity = 0;
         }
 
@@ -2476,7 +2472,7 @@ final class AdaptivePoolingAllocator {
         BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
             super(delegate, allocator);
             freeList = null;
-            buddies = null;
+            tree = null;
             freeListCapacity = 0;
         }
 
@@ -2485,23 +2481,8 @@ final class AdaptivePoolingAllocator {
             super(delegate, magazine.allocator, false);
             attachToMagazine(magazine);
             freeListCapacity = delegate.capacity() / MIN_BUDDY_SIZE;
-            int maxShift = Integer.numberOfTrailingZeros(freeListCapacity);
-            assert maxShift <= 30; // The top 2 bits are used for marking.
             freeList = MpscIntQueue.create(freeListCapacity, -1); // At most half of tree (all leaf nodes) can be freed.
-            buddies = new byte[freeListCapacity << 1];
-
-            // Generate the buddies entries.
-            int index = 1;
-            int runLength = 1;
-            int currentRun = 0;
-            while (maxShift > 0) {
-                buddies[index++] = (byte) maxShift;
-                if (++currentRun == runLength) {
-                    currentRun = 0;
-                    runLength <<= 1;
-                    maxShift--;
-                }
-            }
+            tree = new BuddyTree(delegate.capacity());
         }
 
         void attachToMagazine(BuddyMagazine magazine) {
@@ -2522,7 +2503,7 @@ final class AdaptivePoolingAllocator {
             if (!freeList.isEmpty()) {
                 freeList.drain(freeListCapacity, this);
             }
-            int startIndex = chooseFirstFreeBuddy(1, startingCapacity, 0);
+            int startIndex = tree.claim(startingCapacity);
             if (startIndex == -1) {
                 return false;
             }
@@ -2534,7 +2515,7 @@ final class AdaptivePoolingAllocator {
                 chunk = null;
             } finally {
                 if (chunk != null) {
-                    unreserveMatchingBuddy(1, startingCapacity, startIndex, 0);
+                    tree.release(startIndex, startingCapacity);
                     // If chunk is not null we know that buf.init(...) failed and so we need to manually release
                     // the chunk again as we retained it before calling buf.init(...).
                     chunk.release();
@@ -2548,7 +2529,7 @@ final class AdaptivePoolingAllocator {
          * this chunk.
          */
         void readInitOneShot(AdaptiveByteBuf buf, int size, int maxCapacity) {
-            assert buddies == null : "not a one-shot chunk";
+            assert tree == null : "not a one-shot chunk";
             retain();
             boolean initialized = false;
             try {
@@ -2567,7 +2548,7 @@ final class AdaptivePoolingAllocator {
             // Called by allocating thread when draining freeList.
             int size = unpackSize(packed);
             int offset = unpackOffset(packed);
-            unreserveMatchingBuddy(1, size, offset, 0);
+            tree.release(offset, size);
             allocatedBytes -= size;
         }
 
@@ -2621,6 +2602,68 @@ final class AdaptivePoolingAllocator {
             freeList.drain(freeListCapacity, this);
         }
 
+        @Override
+        public String toString() {
+            int capacity = delegate.capacity();
+            if (tree == null) {
+                return "BuddyChunk[one-shot, capacity: " + capacity + ']';
+            }
+            int remaining = capacity - allocatedBytes;
+            return "BuddyChunk[capacity: " + capacity +
+                    ", remaining: " + remaining +
+                    ", free list: " + freeList.size() + ']';
+        }
+    }
+
+    /**
+     * The buddy tree of a {@link BuddyChunk}: hands out power-of-two blocks of at least {@link #MIN_BLOCK_SIZE} from
+     * a capacity that is a power-of-two multiple of it, and merges freed buddies back. Not thread-safe: used by the
+     * chunk's magazine only (frees from other threads reach it through the chunk's free list).
+     */
+    static final class BuddyTree {
+        static final int MIN_BLOCK_SIZE = 32768;
+        private static final byte IS_CLAIMED = (byte) (1 << 7);
+        private static final byte HAS_CLAIMED_CHILDREN = 1 << 6;
+        private static final byte SHIFT_MASK = ~(IS_CLAIMED | HAS_CLAIMED_CHILDREN);
+
+        // The bits of each buddy: [1: is claimed][1: has claimed children][6: MIN_BLOCK_SIZE shift to get size].
+        private final byte[] buddies;
+
+        BuddyTree(int capacity) {
+            int leaves = capacity / MIN_BLOCK_SIZE;
+            assert leaves > 0 && (leaves & leaves - 1) == 0 : "capacity " + capacity;
+            int maxShift = Integer.numberOfTrailingZeros(leaves);
+            buddies = new byte[leaves << 1];
+
+            // Generate the buddies entries.
+            int index = 1;
+            int runLength = 1;
+            int currentRun = 0;
+            while (maxShift > 0) {
+                buddies[index++] = (byte) maxShift;
+                if (++currentRun == runLength) {
+                    currentRun = 0;
+                    runLength <<= 1;
+                    maxShift--;
+                }
+            }
+        }
+
+        /**
+         * Claim the leftmost free block of {@code size}, a power of two of at least {@link #MIN_BLOCK_SIZE}, and
+         * return its offset, or -1 if there is none.
+         */
+        int claim(int size) {
+            return chooseFirstFreeBuddy(1, size, 0);
+        }
+
+        /**
+         * Give back the block of {@code size} at {@code offset}, claimed earlier.
+         */
+        void release(int offset, int size) {
+            unreserveMatchingBuddy(1, size, offset, 0);
+        }
+
         /**
          * Claim a suitable buddy and return its start offset into the delegate chunk, or return -1 if nothing claimed.
          */
@@ -2628,7 +2671,7 @@ final class AdaptivePoolingAllocator {
             byte[] buddies = this.buddies;
             while (index < buddies.length) {
                 byte buddy = buddies[index];
-                int currValue = MIN_BUDDY_SIZE << (buddy & SHIFT_MASK);
+                int currValue = MIN_BLOCK_SIZE << (buddy & SHIFT_MASK);
                 if (currValue < size || (buddy & IS_CLAIMED) == IS_CLAIMED) {
                     return -1;
                 }
@@ -2656,7 +2699,7 @@ final class AdaptivePoolingAllocator {
                 return false;
             }
             byte buddy = buddies[index];
-            int currSize = MIN_BUDDY_SIZE << (buddy & SHIFT_MASK);
+            int currSize = MIN_BLOCK_SIZE << (buddy & SHIFT_MASK);
 
             if (currSize == size) {
                 // We're at the right size level.
@@ -2690,18 +2733,6 @@ final class AdaptivePoolingAllocator {
                 }
             }
             return true;
-        }
-
-        @Override
-        public String toString() {
-            int capacity = delegate.capacity();
-            if (buddies == null) {
-                return "BuddyChunk[one-shot, capacity: " + capacity + ']';
-            }
-            int remaining = capacity - allocatedBytes;
-            return "BuddyChunk[capacity: " + capacity +
-                    ", remaining: " + remaining +
-                    ", free list: " + freeList.size() + ']';
         }
     }
 
