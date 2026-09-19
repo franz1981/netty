@@ -1660,7 +1660,6 @@ final class AdaptivePoolingAllocator {
             drainHeapPending();
             curr = chunkCache.pollChunk(size);
             if (curr != null) {
-                curr.attachToMagazine(this);
                 chunkCache.activate(curr);
                 // The size-class cache only hands out chunks with a free segment, and a segment always fits the size,
                 // so this never happens; if that invariant ever broke, fall back to a fresh chunk rather than fail.
@@ -1712,11 +1711,6 @@ final class AdaptivePoolingAllocator {
             buf.resetRefCnt();
             buf.discardMarks();
             return buf;
-        }
-
-        /** The magazine gave up its active chunk: the cache files it by capacity like any other chunk. */
-        void deactivate(SizeClassedChunk chunk) {
-            chunkCache.deactivate(chunk);
         }
     }
 
@@ -2133,7 +2127,6 @@ final class AdaptivePoolingAllocator {
         MpscIntQueue externalFreeList;
         private IntStack localFreeList;
         private final Thread ownerThread;
-        private SizeClassMagazine magazine;
         /**
          * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free lists.
          * Segments returned since then are not subtracted, so {@code capacity - allocatedBytes} never counts a
@@ -2187,7 +2180,6 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk(AbstractByteBuf delegate, SizeClassMagazine magazine,
                          SizeClassChunkController controller) {
             super(delegate, magazine.allocator, magazine.ownerThread != null);
-            attachToMagazine(magazine);
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
             STATE.lazySet(this, AVAILABLE);
@@ -2211,7 +2203,6 @@ final class AdaptivePoolingAllocator {
                          IntStack recycledLocalFreeList,
                          SizeClassMagazine magazine, SizeClassChunkController controller) {
             super(recycledDelegate, magazine.allocator, magazine.ownerThread != null);
-            attachToMagazine(magazine);
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
             MpscIntQueue externalFreeList = recycledFreeList.capacity() >= segments ?
@@ -2240,25 +2231,23 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        void attachToMagazine(SizeClassMagazine magazine) {
-            assert this.magazine == null;
-            this.magazine = magazine;
+        /**
+         * Called when a magazine is done using this chunk, probably because it was emptied: it stops being the
+         * cache's active chunk and is filed by capacity. {@link #owningCache} is the cache of the one magazine that
+         * ever allocates from this chunk.
+         */
+        void releaseFromMagazine() {
+            owningCache.deactivate(this);
         }
 
         /**
-         * Called when a magazine is done using this chunk, probably because it was emptied: it stops being the
-         * cache's active chunk and is filed by capacity.
+         * Only read from {@link AdaptiveByteBuf#init}, reached from {@link #readInitInto} on the magazine's active
+         * chunk, so this chunk is always attached to its magazine here, and that magazine is a thread-local one exactly
+         * when this chunk has an owner thread.
          */
-        void releaseFromMagazine() {
-            SizeClassMagazine mag = magazine;
-            magazine = null;
-            mag.deactivate(this);
-        }
-
         @Override
         boolean inThreadLocalMagazine() {
-            SizeClassMagazine m = magazine;
-            return m != null && m.ownerThread != null;
+            return ownerThread != null;
         }
 
         boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
