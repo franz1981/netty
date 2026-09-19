@@ -279,10 +279,10 @@ public class SizeClassedChunkCacheTest {
         verify(chunk, never()).markToDeallocate();
     }
 
-    // --- The magazine's active chunk lives at the head of the reusable list ---
+    // --- The magazine's active chunk belongs to the cache but is on neither list ---
 
     @Test
-    void activeChunkIsTheReusableHeadAndChunksFiledLaterGoAfterIt() {
+    void activeChunkIsOnNoListAndChunksFiledLaterGoToTheReusableFront() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
         SizeClassedChunk older = chunkWithCapacity();
         cache.offerChunk(older);
@@ -290,24 +290,25 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk active = chunkWithCapacity();
         cache.activate(active);
         assertSame(active, cache.active);
-        assertSame(active, cache.reusableHead);
+        assertSame(older, cache.reusableHead);
         assertEquals(SizeClassedChunk.CACHE_ACTIVE, active.cacheListState);
-        assertSame(older, active.nextInCache);
+        assertNull(active.nextInCache);
+        assertNull(active.prevInCache);
 
-        // Filed while a chunk is active: linked right after it, so the active chunk stays the head.
+        // Filed while a chunk is active: at the front of the reusable list, newest first.
         SizeClassedChunk offered = chunkWithCapacity();
         cache.offerChunk(offered);
         SizeClassedChunk unfull = chunkWithoutCapacity();
         cache.offerChunk(unfull);
         cache.moveToReusable(unfull);
 
-        assertSame(active, cache.reusableHead);
-        assertSame(unfull, active.nextInCache);
+        assertSame(unfull, cache.reusableHead);
+        assertNull(unfull.prevInCache);
         assertSame(offered, unfull.nextInCache);
         assertSame(older, offered.nextInCache);
         assertNull(older.nextInCache);
-        assertSame(active, unfull.prevInCache);
-        assertEquals(4, cache.reusableCount);
+        assertNull(active.nextInCache);
+        assertEquals(3, cache.reusableCount);
     }
 
     @Test
@@ -324,11 +325,11 @@ public class SizeClassedChunkCacheTest {
         cache.notifyHasCapacity(active);
         cache.drainPending();
         assertEquals(0, cache.pendingCount());
-        assertSame(active, cache.reusableHead);
+        assertSame(active, cache.active);
         assertEquals(SizeClassedChunk.CACHE_ACTIVE, active.cacheListState);
 
         cache.tickPurge();
-        assertSame(active, cache.reusableHead);
+        assertSame(active, cache.active);
         assertEquals(SizeClassedChunk.CACHE_ACTIVE, active.cacheListState);
         verify(active, never()).recycleOrDeallocate(null, 0);
         verify(active, never()).markToDeallocate();

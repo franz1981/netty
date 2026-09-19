@@ -735,24 +735,21 @@ final class AdaptivePoolingAllocator {
      * <ul>
      *   <li><b>Reusable</b> — chunks known to have free segments. {@link #pollChunk} takes the
      *       head, O(1). Fully-free chunks at or below the retention floor stay here rather than
-     *       being evicted, so a burst does not have to re-allocate immediately after draining.
-     *       While the magazine has a chunk to allocate from, that chunk is here too, as the head:
-     *       the <em>active</em> chunk ({@code CACHE_ACTIVE}), see below.</li>
+     *       being evicted, so a burst does not have to re-allocate immediately after draining.</li>
      *   <li><b>Exhausted</b> — chunks with no free segments when they were filed. Primarily an
      *       ownership registry: it keeps chunks reachable for {@link #free()} and gives the
      *       notification drain somewhere to move a chunk out of. It is <em>not</em> the discovery
      *       mechanism, and is never walked.</li>
      * </ul>
      *
-     * <p><b>The active chunk.</b> The chunk the magazine allocates from is linked at the head of the
-     * reusable list with state {@code CACHE_ACTIVE}; the magazine's {@code current} field is only the
-     * fast path's alias of it. {@link #activate} makes a polled or freshly allocated chunk active, and
-     * {@link #deactivate} unlinks it and files it by capacity, like {@link #offerChunk}, when the
-     * magazine runs it out of segments or is freed. Every chunk linked into the reusable list while
-     * one is active goes after it. The active chunk is the magazine's, not a retention candidate: no
-     * cache decision touches it (the release paths and the drain act only on states above
-     * {@code CACHE_ACTIVE}, and {@link #tickPurge} skips it), and it is left out of the count that is
-     * compared with {@link #purgeRetentionFloor}.
+     * <p><b>The active chunk.</b> The chunk the magazine allocates from is the cache's {@link #active}
+     * chunk, with state {@code CACHE_ACTIVE} and on neither list; the magazine's {@code current} field is
+     * only the fast path's alias of it. {@link #activate} makes a polled or freshly allocated chunk active,
+     * and {@link #deactivate} files it by capacity, like {@link #offerChunk}, when the magazine runs it out
+     * of segments or is freed. The active chunk is the magazine's, not a retention candidate: no cache
+     * decision touches it (the release paths and the drain act only on states above {@code CACHE_ACTIVE},
+     * and {@link #tickPurge} walks the lists only), and it is not counted against
+     * {@link #purgeRetentionFloor}.
      *
      * <p><b>Why the reusable list is trustworthy.</b> A cached chunk other than the active one can
      * only <em>gain</em> capacity: segments are handed out only by {@code readInitInto} on the active
@@ -815,14 +812,14 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk exhaustedHead;
         SizeClassedChunk reusableHead;
         /**
-         * The chunk the magazine allocates from ({@link SizeClassedChunk#CACHE_ACTIVE}), or {@code null}.
-         * When set it is {@link #reusableHead} and stays there: {@link #addToReusable} links new chunks after it.
+         * The chunk the magazine allocates from ({@link SizeClassedChunk#CACHE_ACTIVE}), or {@code null}. It is on
+         * neither list: the cache owns it, so the purge and the drain can see it, but only the magazine allocates
+         * from it, until {@link #deactivate} files it by capacity like any other chunk.
          */
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
         private volatile SizeClassedChunk pendingHead;
         int exhaustedCount;
-        /** Chunks linked in the reusable list, the active one included. */
         int reusableCount;
 
         final SizeClassChunkRecycler chunkRecycler;
@@ -851,11 +848,11 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * The chunks that count against {@link #purgeRetentionFloor}: every linked chunk except the active one,
-         * which is the magazine's to use and is not a retention candidate.
+         * The chunks that count against {@link #purgeRetentionFloor}: every linked chunk. The active one is not
+         * linked: it is the magazine's to use and is not a retention candidate.
          */
         private int totalCount() {
-            return exhaustedCount + reusableCount - (active != null ? 1 : 0);
+            return exhaustedCount + reusableCount;
         }
 
         // --- Intrusive doubly-linked list operations ---
@@ -871,24 +868,14 @@ final class AdaptivePoolingAllocator {
             exhaustedCount++;
         }
 
-        /**
-         * Link {@code chunk} at the front of the reusable list: right after the active chunk if there is one, so
-         * the active chunk stays the head, otherwise as the head.
-         */
         private void addToReusable(SizeClassedChunk chunk) {
             chunk.cacheListState = SizeClassedChunk.CACHE_REUSABLE;
-            SizeClassedChunk prev = active;
-            SizeClassedChunk next = prev == null ? reusableHead : prev.nextInCache;
-            chunk.prevInCache = prev;
-            chunk.nextInCache = next;
-            if (next != null) {
-                next.prevInCache = chunk;
+            chunk.prevInCache = null;
+            chunk.nextInCache = reusableHead;
+            if (reusableHead != null) {
+                reusableHead.prevInCache = chunk;
             }
-            if (prev == null) {
-                reusableHead = chunk;
-            } else {
-                prev.nextInCache = chunk;
-            }
+            reusableHead = chunk;
             reusableCount++;
         }
 
@@ -1164,14 +1151,12 @@ final class AdaptivePoolingAllocator {
         void tickPurge() {
             drainPending();
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
-            // fully-free reusable chunks above the retention floor. The active chunk is linked here
-            // too, but it is the magazine's and not a candidate: it is skipped, and not counted.
+            // fully-free reusable chunks above the retention floor.
             int total = totalCount();
-            final SizeClassedChunk active = this.active;
             SizeClassedChunk cur = reusableHead;
             while (cur != null && total > purgeRetentionFloor) {
                 SizeClassedChunk next = cur.nextInCache;
-                if (cur != active && cur.hasFullCapacity()) {
+                if (cur.hasFullCapacity()) {
                     removeFromReusable(cur);
                     detachFromCache(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
@@ -1191,14 +1176,13 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Make {@code chunk}, which is not in this cache, the active chunk: the head of the reusable list, which
-         * the magazine allocates from until {@link #deactivate} files it by capacity like any other chunk.
-         * Caller holds the stripe lock or is the owner thread, like every list operation.
+         * Make {@code chunk}, which is not in this cache, the active chunk: the one the magazine allocates from
+         * until {@link #deactivate} files it by capacity like any other chunk. Caller holds the stripe lock or is
+         * the owner thread, like every list operation.
          */
         void activate(SizeClassedChunk chunk) {
             assert active == null : "the magazine already has an active chunk";
             assert chunk.cacheListState == SizeClassedChunk.CACHE_NONE;
-            addToReusable(chunk);
             chunk.cacheListState = SizeClassedChunk.CACHE_ACTIVE;
             active = chunk;
         }
@@ -1229,8 +1213,7 @@ final class AdaptivePoolingAllocator {
          * A return that took the lock or came from the owner thread cannot interleave with this call at all.
          */
         void deactivate(SizeClassedChunk chunk) {
-            assert chunk == active && chunk == reusableHead : "not the active chunk";
-            removeFromReusable(chunk);
+            assert chunk == active : "not the active chunk";
             active = null;
             detachFromCache(chunk);
             offerChunk(chunk);
@@ -1262,7 +1245,7 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        // Visible for testing: no chunk linked on either list, the active one included.
+        // Visible for testing: no chunk linked on either list.
         boolean isEmpty() {
             return exhaustedCount + reusableCount == 0;
         }
@@ -1684,7 +1667,7 @@ final class AdaptivePoolingAllocator {
                 chunkCache.activate(curr);
             }
 
-            // The active chunk stays in the cache, at the head of its reusable list; current is only the fast
+            // The active chunk stays the cache's (see SizeClassedChunkCache#active); current is only the fast
             // path's alias of it.
             current = curr;
             // Checked only now, with the fallback chunk active and aliased, so that with assertions enabled the
@@ -2108,7 +2091,7 @@ final class AdaptivePoolingAllocator {
         // Intrusive doubly-linked list pointers for cache membership
         static final int CACHE_NONE = 0;
         /**
-         * Linked at the head of the reusable list and serving its magazine's allocations: the magazine's
+         * On no list, serving its magazine's allocations: the cache's {@code active} chunk, the magazine's
          * {@code current}. Ordered right after {@link #CACHE_NONE} so the release paths can tell "a cache
          * decision may be due" ({@code cacheListState > CACHE_ACTIVE}) with the one compare they paid when
          * the magazine's chunk was {@code CACHE_NONE}.
