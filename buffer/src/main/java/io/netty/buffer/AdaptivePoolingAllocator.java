@@ -293,7 +293,8 @@ final class AdaptivePoolingAllocator {
     private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
         AdaptiveByteBuf allocated = null;
         if (size <= MAX_POOLED_BUF_SIZE) {
-            final int index = sizeClassIndexOf(size);
+            // EXPERIMENT (throwaway): pool only the striped heap PR's 16 size classes, the rest goes to buddy.
+            final int index = size > 16896 ? SIZE_CLASSES_COUNT : sizeClassIndexOf(size);
             if (index < POOLED_SIZE_CLASSES_COUNT) {
                 ThreadLocalSizeClassHeap heap = null;
                 if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
@@ -305,7 +306,14 @@ final class AdaptivePoolingAllocator {
                     allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
                 }
             } else if (!IS_LOW_MEM) {
-                allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
+                // EXPERIMENT (throwaway): -Dexpt.tlBuddy=true gives a thread-local heap its own buddy magazine, so
+                // sizes above the size classes take no stripe lock on threads that own a heap.
+                ThreadLocalSizeClassHeap heap = null;
+                if (EXPT_TL_BUDDY && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+                    heap = threadLocalSizeClassHeap.get();
+                }
+                allocated = heap != null ? heap.allocateBuddy(size, maxCapacity, buf)
+                        : allocateShared(index, size, maxCapacity, currentThread, buf);
             }
         }
         if (allocated == null) {
@@ -689,7 +697,25 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    static final boolean EXPT_TL_BUDDY = Boolean.getBoolean("expt.tlBuddy");
+
     private static final class ThreadLocalSizeClassHeap {
+        private static final AdaptiveRecycler BUDDY_BUFFER_POOL = AdaptiveRecycler.threadLocal();
+        private BuddyMagazine buddyMagazine;
+
+        AdaptiveByteBuf allocateBuddy(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            BuddyMagazine mag = buddyMagazine;
+            if (mag == null) {
+                mag = buddyMagazine = new BuddyMagazine(allocator, allocator.buddyStrategy, BUDDY_BUFFER_POOL);
+            }
+            if (buf == null) {
+                buf = mag.newBuffer();
+            }
+            boolean success = mag.allocate(size, maxCapacity, buf);
+            assert success : "Thread-local buddy allocation must always succeed";
+            return buf;
+        }
+
         private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
         private final SizeClassChunkRecycler chunkRecycler = new SizeClassChunkRecycler();
         private final AdaptivePoolingAllocator allocator;
@@ -733,6 +759,10 @@ final class AdaptivePoolingAllocator {
                     mag.free();
                     magazines[i] = null;
                 }
+            }
+            if (buddyMagazine != null) {
+                buddyMagazine.free();
+                buddyMagazine = null;
             }
             chunkRecycler.freeAll();
         }
