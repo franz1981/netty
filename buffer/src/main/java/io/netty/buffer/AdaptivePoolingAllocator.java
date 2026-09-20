@@ -359,7 +359,27 @@ final class AdaptivePoolingAllocator {
      * The size of the chunks of a size class: {@link #MIN_CHUNK_SIZE}, or {@link #MIN_SEGMENTS_PER_CHUNK} segments
      * when that is larger. Chunks are 128 KiB up to 4 KiB segments and hold exactly 32 segments above that.
      */
+    // EXPERIMENT (throwaway): -Dexpt.shareChunks=true makes size classes share chunk sizes. A power-of-two class
+    // uses the chunk of its "+header" sibling (32 x (2^n + h) = 33 or 34 x 2^n, no tail), and every class from
+    // 32768 up uses the chunk of the largest class (4,325,376 B = 32 x 135168 = 33 x 131072 = 64 x 67584 = ...).
+    static final boolean EXPT_SHARE_CHUNKS = Boolean.getBoolean("expt.shareChunks");
+    static final int EXPT_POOL_BYTES = Integer.getInteger("expt.poolBytes", 4 * 1024 * 1024);
+
     static int chunkSizeOf(int segmentSize) {
+        if (EXPT_SHARE_CHUNKS) {
+            if (segmentSize >= 32768) {
+                return 135168 * MIN_SEGMENTS_PER_CHUNK;
+            }
+            if (segmentSize == 16384) {
+                return 16896 * MIN_SEGMENTS_PER_CHUNK;
+            }
+            if (segmentSize == 8192) {
+                return 8704 * MIN_SEGMENTS_PER_CHUNK;
+            }
+            if (segmentSize == 4096) {
+                return 4352 * MIN_SEGMENTS_PER_CHUNK;
+            }
+        }
         return Math.max(MIN_CHUNK_SIZE, segmentSize * MIN_SEGMENTS_PER_CHUNK);
     }
 
@@ -446,7 +466,35 @@ final class AdaptivePoolingAllocator {
      * Accessed only under the owning stripe lock, or by the owner thread of a thread-local heap.
      */
     static final class SizeClassChunkRecycler {
-        private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
+        private static final int TARGET_RECYCLED_BYTES = EXPT_POOL_BYTES;
+        static final java.util.concurrent.atomic.LongAdder[] EVICTED = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] OFFER_FULL = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] POLL_HIT = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] FRESH = newCounters();
+        private static java.util.concurrent.atomic.LongAdder[] newCounters() {
+            java.util.concurrent.atomic.LongAdder[] a = new java.util.concurrent.atomic.LongAdder[CHUNK_POOL_COUNT];
+            for (int i = 0; i < a.length; i++) {
+                a[i] = new java.util.concurrent.atomic.LongAdder();
+            }
+            return a;
+        }
+        static {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder sb = new StringBuilder("TELE pools share=" + EXPT_SHARE_CHUNKS + " poolBytes=" + EXPT_POOL_BYTES
+                        + " (chunkKiB cap: evicted offerFull pollHit fresh)\n");
+                long freshBytes = 0;
+                for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
+                    long ev = EVICTED[i].sum(), full = OFFER_FULL[i].sum(), hit = POLL_HIT[i].sum(), fr = FRESH[i].sum();
+                    freshBytes += fr * CHUNK_SIZES[i];
+                    if ((ev | full | hit | fr) != 0) {
+                        sb.append("  ").append(CHUNK_SIZES[i] / 1024).append("K cap=").append(capacityOf(i)).append(": ")
+                          .append(ev).append(' ').append(full).append(' ').append(hit).append(' ').append(fr).append('\n');
+                    }
+                }
+                sb.append("  fresh chunk bytes total: ").append(freshBytes / (1024 * 1024)).append(" MiB\n");
+                System.out.print(sb);
+            }));
+        }
 
         private final AbstractByteBuf[][] buffers = new AbstractByteBuf[CHUNK_POOL_COUNT][];
         private final MpscIntQueue[][] freeLists = new MpscIntQueue[CHUNK_POOL_COUNT][];
@@ -489,6 +537,7 @@ final class AdaptivePoolingAllocator {
             if (size == 0) {
                 return false;
             }
+            POLL_HIT[pool].increment();
             int idx = --size;
             sizes[pool] = size;
             polledBuffer = buffers[pool][idx];
@@ -527,6 +576,7 @@ final class AdaptivePoolingAllocator {
             int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             int size = sizes[pool];
             if (size >= buffers[pool].length) {
+                OFFER_FULL[pool].increment();
                 return false;
             }
             buffers[pool][size] = delegate;
@@ -984,6 +1034,7 @@ final class AdaptivePoolingAllocator {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
+                SizeClassChunkRecycler.EVICTED[SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex]].increment();
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1352,6 +1403,7 @@ final class AdaptivePoolingAllocator {
                 chunkRegistry.add(chunk);
                 return chunk;
             }
+            SizeClassChunkRecycler.FRESH[SIZE_CLASS_TO_CHUNK_POOL[magazine.sizeClassIndex]].increment();
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
             SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this);
