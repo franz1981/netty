@@ -196,22 +196,23 @@ class AdaptivePoolingAllocatorTest {
     }
 
     /**
-     * What a heap pays to hold one buffer of each size class from 32 KiB up: a chunk of each, and those chunks hold 8
-     * segments, not 32. At 32 segments a heap that touched each of the six classes once held 14.2 MiB for them.
+     * What a heap pays to hold one buffer of each size class from 16 KiB up: a 512 KiB chunk for each 2^n class and
+     * a 528 KiB one for each class that adds a header, whatever the segment size, as mimalloc's 512 KiB medium page
+     * serves every block size to 128 KiB. At 32 segments per chunk the six classes from 32 KiB up alone cost 14.2 MiB.
      */
     @Test
-    void largeSizeClassesAllocateChunksOfEightSegments() throws Exception {
+    void sizeClassesFromSixteenKibShareTheChunkSizeOfTheirFamily() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode pools fewer size classes");
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new CountingChunkAllocator(), true);
         List<ByteBuf> live = new ArrayList<ByteBuf>();
         long expected = 0;
         for (int size : AdaptivePoolingAllocator.getSizeClasses()) {
-            if (size >= 32768) {
+            if (size >= 16384) {
                 live.add(allocator.allocate(size, size));
-                expected += 8L * size;
+                expected += Integer.bitCount(size) == 1 ? 512 * 1024 : 528 * 1024;
             }
         }
-        assertEquals(6, live.size(), "size classes from 32 KiB up");
+        assertEquals(8, live.size(), "size classes from 16 KiB up");
         assertEquals(expected, allocator.usedMemory());
         for (ByteBuf buf : live) {
             buf.release();

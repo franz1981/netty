@@ -106,16 +106,12 @@ final class AdaptivePoolingAllocator {
      */
     private static final int MIN_SEGMENTS_PER_CHUNK = 32;
     /**
-     * The size classes from here up get chunks of {@link #LARGE_SEGMENTS_PER_CHUNK} segments.
+     * From this segment size up, every size class uses the chunk size of the first one of its family: 512 KiB for
+     * 16, 32, 64 and 128 KiB, and 528 KiB for the four that add a header. This is mimalloc's medium page, which holds
+     * 32 blocks of 16 KiB down to 4 of 128 KiB: a heap pays the same for its first buffer of any of these classes,
+     * and a chunk given up by one of them is reused by the other three.
      */
-    private static final int LARGE_SEGMENT_SIZE = 32 * 1024;
-    /**
-     * Segments per chunk from {@link #LARGE_SEGMENT_SIZE} up. At 32 segments these chunks are 1 to 4.2 MiB, which a
-     * heap pays in full for a single buffer of the class: 14.2 MiB for one buffer of each of the six classes, against
-     * 4 MiB for everything in mimalloc, whose 128 KiB blocks come four to a page. At 8 segments they are 256 KiB to
-     * 1 MiB, and three of them are chunk sizes the smaller classes already use, so their buffers share those pools.
-     */
-    private static final int LARGE_SEGMENTS_PER_CHUNK = 8;
+    private static final int MEDIUM_SEGMENT_SIZE = 16 * 1024;
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
@@ -232,7 +228,7 @@ final class AdaptivePoolingAllocator {
 
         // Precompute per-chunkSize pool mapping for O(1) recycled chunk routing.
         // Each size class maps to chunkSizeOf(segmentSize), and all the size classes with the same chunk size share
-        // one pool, adjacent or not: the small ones (MIN_CHUNK_SIZE), and 16896 with 67584.
+        // one pool, adjacent or not: the small ones (MIN_CHUNK_SIZE), and each family from MEDIUM_SEGMENT_SIZE up.
         int[] chunkSizesTemp = new int[SIZE_CLASSES_COUNT];
         byte[] mappingTemp = new byte[SIZE_CLASSES_COUNT];
         int poolCount = 0;
@@ -254,7 +250,7 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Largest size served by a size class in low-memory mode. Low-memory mode never pooled sizes above it (the buddy
-     * path is disabled there too), and the size classes above it use chunks of 1 MiB and more, so they stay unpooled.
+     * path is disabled there too), so the size classes above it stay unpooled.
      */
     private static final int LOW_MEM_MAX_SIZE_CLASS = 16896;
 
@@ -375,13 +371,13 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * The size of the chunks of a size class: {@link #MIN_CHUNK_SIZE}, or {@link #MIN_SEGMENTS_PER_CHUNK} segments
-     * when that is larger, and {@link #LARGE_SEGMENTS_PER_CHUNK} segments from {@link #LARGE_SEGMENT_SIZE} up.
-     * Chunks are 128 KiB up to 4 KiB segments, hold 32 segments up to 16.9 KiB, and 8 from 32 KiB.
+     * The size of the chunks of a size class: {@link #MIN_CHUNK_SIZE} up to 4 KiB segments,
+     * {@link #MIN_SEGMENTS_PER_CHUNK} segments up to 16.9 KiB, and that same chunk size for the rest of the family
+     * from {@link #MEDIUM_SEGMENT_SIZE} up, whose chunks hold 16, 8 and 4 segments.
      */
     static int chunkSizeOf(int segmentSize) {
-        if (segmentSize >= LARGE_SEGMENT_SIZE) {
-            return segmentSize * LARGE_SEGMENTS_PER_CHUNK;
+        while (segmentSize >= MEDIUM_SEGMENT_SIZE << 1) {
+            segmentSize >>= 1;
         }
         return Math.max(MIN_CHUNK_SIZE, segmentSize * MIN_SEGMENTS_PER_CHUNK);
     }
