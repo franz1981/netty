@@ -707,6 +707,9 @@ final class AdaptivePoolingAllocator {
             BuddyMagazine mag = buddyMagazine;
             if (mag == null) {
                 mag = buddyMagazine = new BuddyMagazine(allocator, allocator.buddyStrategy, BUDDY_BUFFER_POOL);
+                if (Boolean.getBoolean("expt.tlBuddyLocalRelease")) {
+                    mag.ownerThread = Thread.currentThread();
+                }
             }
             if (buf == null) {
                 buf = mag.newBuffer();
@@ -1715,6 +1718,22 @@ final class AdaptivePoolingAllocator {
         private final ChunkQueue whollyFree = new ChunkQueue();
         /** The chunk the magazine allocates from, on no queue; {@code null} before the first allocation. */
         private BuddyChunk active;
+        // EXPERIMENT (throwaway): the thread that owns this magazine, when it belongs to a thread-local heap.
+        Thread ownerThread;
+
+        /** Owner thread only: put the block straight back in the tree and refile the chunk if its queue changed. */
+        void releaseLocal(BuddyChunk chunk, int offset, int size) {
+            chunk.releaseToTree(offset, size);
+            ChunkQueue queue = chunk.queue;
+            if (queue != null) {
+                ChunkQueue target = chunk.isWhollyFree() ? whollyFree
+                        : chunk.largestFreeOrder() < 0 ? full : byLargestFreeOrder[chunk.largestFreeOrder()];
+                if (target != queue) {
+                    unfile(chunk);
+                    file(chunk);
+                }
+            }
+        }
 
         BuddyMagazine(AdaptivePoolingAllocator allocator,
                       BuddyChunkManagementStrategy strategy, AdaptiveRecycler bufRecycler) {
@@ -2506,6 +2525,11 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int startingIndex, int size) {
             MpscIntQueue freeList = this.freeList;
+            if (freeList != null && owner.ownerThread != null && Thread.currentThread() == owner.ownerThread) {
+                owner.releaseLocal(this, startingIndex, size);
+                release();
+                return;
+            }
             if (freeList != null) {
                 int packedOffset = startingIndex / MIN_BUDDY_SIZE;
                 int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
@@ -2527,6 +2551,10 @@ final class AdaptivePoolingAllocator {
             if (RefCnt.release(refCnt)) {
                 deallocate();
             }
+        }
+
+        void releaseToTree(int offset, int size) {
+            tree.release(offset, size);
         }
 
         boolean hasUnprocessedFreelistEntries() {
