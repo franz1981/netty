@@ -293,26 +293,33 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @Test
     void idleBuddyChunksAboveTheReuseLimitAreFreed() {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        int size = 256 * 1024; // 2 MiB chunks: 8 buffers each
-        int chunkSize = 2 * 1024 * 1024;
+        int size = 256 * 1024; // above the largest size class, so buddy chunks
+        // The first buffer creates the first chunk: its size and how many buffers it holds come from the allocator,
+        // not from the sizing formula copied here.
+        ByteBuf first = allocator.heapBuffer(size, size);
+        long chunkSize = allocator.usedHeapMemory();
+        int buffersPerChunk = (int) (chunkSize / size);
+        assertTrue(buffersPerChunk >= 2, "buffers per chunk " + buffersPerChunk);
         int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 8;
-        ByteBuf[] bufs = new ByteBuf[chunks * 8];
-        for (int i = 0; i < bufs.length; i++) {
-            bufs[i] = allocator.heapBuffer(size, size);
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        bufs.add(first);
+        while (bufs.size() < chunks * buffersPerChunk) {
+            bufs.add(allocator.heapBuffer(size, size));
         }
         long peak = allocator.usedHeapMemory();
-        assertTrue(peak >= (long) chunks * chunkSize, "peak " + peak);
+        assertEquals((long) chunks * chunkSize, peak, "one chunk per " + buffersPerChunk + " buffers");
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        // One chunk's worth and one more: the last one needs the slow path, which applies the releases.
+        // Everything is idle now: allocating a chunk's worth again plus one takes the slow path, which applies the
+        // releases and frees what is kept beyond the limit.
         List<ByteBuf> again = new ArrayList<ByteBuf>();
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i <= buffersPerChunk; i++) {
             again.add(allocator.heapBuffer(size, size));
         }
         long settled = allocator.usedHeapMemory();
-        assertTrue(settled <= (long) (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 2) * chunkSize,
-                "peak " + peak + ", settled " + settled);
+        assertTrue(settled <= (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 2) * chunkSize,
+                "peak " + peak + ", settled " + settled + ", chunk " + chunkSize);
         for (ByteBuf buf : again) {
             buf.release();
         }

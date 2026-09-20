@@ -197,19 +197,25 @@ class AdaptivePoolingAllocatorTest {
         assumeFalse(isLowMemory(), "low-memory mode has no buddy magazines");
         CountingChunkAllocator counter = new CountingChunkAllocator();
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(counter, true);
-        int size = 256 * 1024; // above the largest size class: 2 MiB buddy chunks, 8 buffers each
-        int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 4;
+        int size = 256 * 1024; // above the largest size class, so buddy chunks
         List<ByteBuf> live = new ArrayList<ByteBuf>();
-        for (int i = 0; i < chunks * 8; i++) {
+        live.add(allocator.allocate(size, size));
+        // How many buffers a chunk holds comes from the allocator: one chunk was allocated for the first buffer.
+        assertEquals(1, counter.count);
+        int buffersPerChunk = (int) (allocator.usedMemory() / size);
+        assertTrue(buffersPerChunk >= 2, "buffers per chunk " + buffersPerChunk);
+        int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 4;
+        while (live.size() < chunks * buffersPerChunk) {
             live.add(allocator.allocate(size, size));
         }
         long allocated = counter.count;
-        // Empty the first chunk, which served the first 8 buffers; every other chunk stays full.
-        for (int i = 0; i < 8; i++) {
+        assertEquals(chunks, allocated, "one chunk per " + buffersPerChunk + " buffers");
+        // Empty the first chunk, which served the first buffers; every other chunk stays full.
+        for (int i = 0; i < buffersPerChunk; i++) {
             live.remove(0).release();
         }
-        // The next allocation takes the slow path, which applies the releases and finds the emptied chunk.
-        for (int i = 0; i < 8; i++) {
+        // The next allocations take the slow path, which applies the releases and finds the emptied chunk.
+        for (int i = 0; i < buffersPerChunk; i++) {
             live.add(allocator.allocate(size, size));
         }
         assertEquals(allocated, counter.count, "chunks allocated");

@@ -51,29 +51,32 @@ import java.util.concurrent.locks.StampedLock;
 import java.util.function.IntConsumer;
 
 /**
- * An auto-tuning pooling allocator, that follows an anti-generational hypothesis.
+ * A pooling allocator that follows an anti-generational hypothesis: buffers are expected to die young, so the memory
+ * behind them is kept close to the thread that allocated it and handed out again as soon as it comes back.
  * <p>
- * The allocator is organized into a list of Magazines, and each magazine has a chunk-buffer that they allocate buffers
- * from.
+ * Memory is held in chunks, and a buffer is a range of one chunk. Which chunk serves a request depends on its size:
+ * <ul>
+ *   <li><b>Up to the largest size class</b> ({@link #SIZE_CLASSES}): a {@link SizeClassedChunk}, cut into equal
+ *       segments of one size class. Its {@link SizeClassMagazine} allocates from one chunk at a time and keeps the
+ *       others in a {@link SizeClassedChunkCache}, which files them by whether they have a free segment.</li>
+ *   <li><b>Above it, up to {@link #MAX_POOLED_BUF_SIZE}</b>: a power-of-two block of a {@link BuddyChunk}, carved by a
+ *       {@link BuddyTree}. Its {@link BuddyMagazine} files the chunks it is not allocating from by the size of their
+ *       largest free block, so a request takes the smallest block that fits.</li>
+ *   <li><b>Larger still</b>: a one-shot {@link BuddyChunk} with no tree, holding that buffer alone and freed with
+ *       it.</li>
+ * </ul>
  * <p>
- * The magazines hold the mutexes that ensure the thread-safety of the allocator, and each thread picks a magazine
- * based on the id of the thread. This spreads the contention of multi-threaded access across the magazines.
- * If contention is detected above a certain threshold, the number of magazines are increased in response to the
- * contention.
+ * The magazines are grouped into {@link StripedHeap}s, each guarded by one lock, and a thread picks a stripe by its
+ * id; more stripes are used when threads collide on the lock. A {@link FastThreadLocalThread} instead gets a
+ * {@link ThreadLocalSizeClassHeap} of its own for the size classes, which needs no lock at all; buffers above the
+ * size classes always come from a stripe.
  * <p>
- * The magazines maintain histograms of the sizes of the allocations they do. The histograms are used to compute the
- * preferred chunk size. The preferred chunk size is one that is big enough to service 10 allocations of the
- * 99-percentile size. This way, the chunk size is adapted to the allocation patterns.
+ * A buffer released by the thread that owns its chunk is returned to it directly. A buffer released by any other
+ * thread puts its segment or block on the chunk's lock-free free list and leaves a note for the owner, which applies
+ * it on its next slow path: the chunk's own structures are only ever touched by one thread at a time.
  * <p>
- * Computing the preferred chunk size is a somewhat expensive operation. Therefore, the frequency with which this is
- * done, is also adapted to the allocation pattern. If a newly computed preferred chunk is the same as the previous
- * preferred chunk size, then the frequency is reduced. Otherwise, the frequency is increased.
- * <p>
- * This allows the allocator to quickly respond to changes in the application workload,
- * without suffering undue overhead from maintaining its statistics.
- * <p>
- * Since magazines are "relatively thread-local", the allocator has a chunk cache that allows excess chunks from any
- * magazine to be shared with other magazines.
+ * Chunks that are given up are kept for reuse, bounded per magazine, and freed beyond that. Their buffers go to a
+ * {@link SizeClassChunkRecycler} so a chunk of another size class can be built from the same memory.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -722,8 +725,9 @@ final class AdaptivePoolingAllocator {
     /**
      * An intrusive doubly linked list of chunks, newest first, like mimalloc's page queue. The links live on the
      * chunk, so removing any chunk is O(1), and so does the chunk's membership: {@code chunk.queue} is the queue it
-     * is on, or {@code null}. Not concurrent: the cache that owns it guards it with its magazine's lock, or uses it
-     * from its owner thread only.
+     * is on, or {@code null}. Not concurrent: the magazine that owns it holds the stripe lock, or is the only thread
+     * that touches it. Used by both magazines: by capacity on the size-class path, by largest free block on the
+     * buddy path.
      */
     static final class ChunkQueue {
         Chunk head;
@@ -760,10 +764,10 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * Chunks that a releasing thread asked their cache to look at: the chunk gained capacity while the thread could
-     * not take the cache's lock (see Invariant N in {@link SizeClassedChunkCache}). A lock-free (Treiber) stack
-     * that any thread pushes to and the cache's owner takes whole. A chunk's {@code pendingNext} is both its link
-     * and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
+     * Chunks that a releasing thread asked their owner to look at, because it freed memory in a chunk whose queues
+     * it may not touch (see Invariant N in {@link SizeClassedChunkCache}, which both magazines follow). A lock-free
+     * (Treiber) stack that any thread pushes to and the owner takes whole. A chunk's {@code pendingNext} is both its
+     * link and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
      * volatile read.
      */
     static final class PendingChunks {
