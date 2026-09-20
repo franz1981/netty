@@ -45,6 +45,7 @@ import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
@@ -2442,6 +2443,146 @@ final class AdaptivePoolingAllocator {
             int localSize = localFreeList != null ? localFreeList.size() : 0;
             STATE.set(this, localSize);
             deallocateIfNeeded(localSize);
+        }
+    }
+
+    /**
+     * The free segments of a size-classed chunk, one bit each, in place of two lists of offsets: a chunk of 4096
+     * segments needs 1 KiB instead of 32 KiB, and nothing has to be sized, filled or handed over when its buffer
+     * moves to another size class.
+     * <p>
+     * The owner's side is a plain two-level set: bit {@code w} of {@link #summary} is set while word {@code w} has a
+     * free segment, so the lowest free segment is two {@code numberOfTrailingZeros} away for up to 64 * 64 segments,
+     * the most a chunk has. {@link #acquire} and {@link #release} are for the chunk's owner thread, or a thread
+     * holding the stripe lock. Any other thread uses {@link #releaseExternal}, which sets the bit in a second,
+     * atomic set; the owner takes those bits, a word at a time, when its own run out.
+     */
+    static final class SegmentBitSet {
+        private static final int MAX_SEGMENTS = Long.SIZE * Long.SIZE;
+
+        private final int segments;
+        private final long[] words;
+        private final AtomicLongArray external;
+        private long summary;
+
+        SegmentBitSet(int segments) {
+            if (segments < 1 || segments > MAX_SEGMENTS) {
+                throw new IllegalArgumentException("segments: " + segments + " (expected: 1-" + MAX_SEGMENTS + ')');
+            }
+            this.segments = segments;
+            int wordCount = segments + Long.SIZE - 1 >>> 6;
+            words = new long[wordCount];
+            external = new AtomicLongArray(wordCount);
+            fill();
+        }
+
+        /**
+         * Make every segment free again, for a chunk built on a recycled buffer.
+         */
+        void fill() {
+            for (int w = 0; w < words.length; w++) {
+                words[w] = fullWord(w);
+                external.set(w, 0);
+            }
+            summary = words.length == Long.SIZE ? -1L : (1L << words.length) - 1;
+        }
+
+        private long fullWord(int w) {
+            int bits = segments - (w << 6);
+            return bits >= Long.SIZE ? -1L : (1L << bits) - 1;
+        }
+
+        /**
+         * The index of the lowest free segment, which is no longer free, or {@code -1}.
+         */
+        int acquire() {
+            long summary = this.summary;
+            if (summary == 0) {
+                summary = takeExternal();
+                if (summary == 0) {
+                    return -1;
+                }
+            }
+            int w = Long.numberOfTrailingZeros(summary);
+            long word = words[w];
+            int bit = Long.numberOfTrailingZeros(word);
+            word &= word - 1;
+            words[w] = word;
+            if (word == 0) {
+                this.summary = summary & summary - 1;
+            }
+            return (w << 6) + bit;
+        }
+
+        void release(int index) {
+            int w = index >>> 6;
+            long bit = 1L << index;
+            assert (words[w] & bit) == 0 && (external.get(w) & bit) == 0 : "segment " + index + " released twice";
+            words[w] |= bit;
+            summary |= 1L << w;
+        }
+
+        /**
+         * Release from a thread that is neither the owner nor holds the stripe lock.
+         */
+        void releaseExternal(int index) {
+            int w = index >>> 6;
+            long bit = 1L << index;
+            long word;
+            do {
+                word = external.get(w);
+                assert (word & bit) == 0 : "segment " + index + " released twice";
+            } while (!external.compareAndSet(w, word, word | bit));
+        }
+
+        private long takeExternal() {
+            long summary = 0;
+            for (int w = 0; w < words.length; w++) {
+                if (external.get(w) != 0) {
+                    words[w] = external.getAndSet(w, 0);
+                    summary |= 1L << w;
+                }
+            }
+            this.summary = summary;
+            return summary;
+        }
+
+        /**
+         * Whether a segment is free, released by whichever thread.
+         */
+        boolean hasFree() {
+            if (summary != 0) {
+                return true;
+            }
+            for (int w = 0; w < words.length; w++) {
+                if (external.get(w) != 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Whether every segment is free: each word compared with its mask, stopping at the first that is not.
+         */
+        boolean isWhollyFree() {
+            for (int w = 0; w < words.length; w++) {
+                if ((words[w] | external.get(w)) != fullWord(w)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * The number of free segments. Counts bits: for metrics and tests, not for the allocation paths.
+         */
+        int freeCount() {
+            int count = 0;
+            for (int w = 0; w < words.length; w++) {
+                count += Long.bitCount(words[w] | external.get(w));
+            }
+            return count;
         }
     }
 
