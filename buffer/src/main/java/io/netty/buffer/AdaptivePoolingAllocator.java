@@ -447,6 +447,36 @@ final class AdaptivePoolingAllocator {
      */
     static final class SizeClassChunkRecycler {
         private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
+        // TELEMETRY (throwaway): where the chunk buffers of each chunk size come from and go to.
+        static final java.util.concurrent.atomic.LongAdder[] EVICTED = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] OFFER_OK = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] OFFER_FULL = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] POLL_HIT = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] POLL_MISS = newCounters();
+        static final java.util.concurrent.atomic.LongAdder[] FRESH = newCounters();
+        private static java.util.concurrent.atomic.LongAdder[] newCounters() {
+            java.util.concurrent.atomic.LongAdder[] a = new java.util.concurrent.atomic.LongAdder[CHUNK_POOL_COUNT];
+            for (int i = 0; i < a.length; i++) {
+                a[i] = new java.util.concurrent.atomic.LongAdder();
+            }
+            return a;
+        }
+        static {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder sb = new StringBuilder("TELE chunk pools (chunkSize: evicted offerOk offerFull pollHit pollMiss fresh)\n");
+                for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
+                    long ev = EVICTED[i].sum(), ok = OFFER_OK[i].sum(), full = OFFER_FULL[i].sum();
+                    long hit = POLL_HIT[i].sum(), miss = POLL_MISS[i].sum(), fresh = FRESH[i].sum();
+                    if ((ev | ok | full | hit | miss | fresh) == 0) {
+                        continue;
+                    }
+                    sb.append("  ").append(CHUNK_SIZES[i] / 1024).append("K cap=").append(capacityOf(i))
+                      .append(": ").append(ev).append(' ').append(ok).append(' ').append(full).append(' ')
+                      .append(hit).append(' ').append(miss).append(' ').append(fresh).append('\n');
+                }
+                System.out.print(sb);
+            }));
+        }
 
         private final AbstractByteBuf[][] buffers = new AbstractByteBuf[CHUNK_POOL_COUNT][];
         private final MpscIntQueue[][] freeLists = new MpscIntQueue[CHUNK_POOL_COUNT][];
@@ -487,8 +517,10 @@ final class AdaptivePoolingAllocator {
             int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             int size = sizes[pool];
             if (size == 0) {
+                POLL_MISS[pool].increment();
                 return false;
             }
+            POLL_HIT[pool].increment();
             int idx = --size;
             sizes[pool] = size;
             polledBuffer = buffers[pool][idx];
@@ -527,8 +559,10 @@ final class AdaptivePoolingAllocator {
             int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             int size = sizes[pool];
             if (size >= buffers[pool].length) {
+                OFFER_FULL[pool].increment();
                 return false;
             }
+            OFFER_OK[pool].increment();
             buffers[pool][size] = delegate;
             freeLists[pool][size] = freeList;
             localFreeLists[pool][size] = localFreeList;
@@ -984,6 +1018,7 @@ final class AdaptivePoolingAllocator {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
+                SizeClassChunkRecycler.EVICTED[SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex]].increment();
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1352,6 +1387,7 @@ final class AdaptivePoolingAllocator {
                 chunkRegistry.add(chunk);
                 return chunk;
             }
+            SizeClassChunkRecycler.FRESH[SIZE_CLASS_TO_CHUNK_POOL[magazine.sizeClassIndex]].increment();
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
             SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this);
