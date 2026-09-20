@@ -231,19 +231,21 @@ final class AdaptivePoolingAllocator {
         }
 
         // Precompute per-chunkSize pool mapping for O(1) recycled chunk routing.
-        // Each size class maps to chunkSizeOf(segmentSize).
-        // Multiple small size classes share the same chunkSize (MIN_CHUNK_SIZE),
-        // while larger ones get their own pool.
+        // Each size class maps to chunkSizeOf(segmentSize), and all the size classes with the same chunk size share
+        // one pool, adjacent or not: the small ones (MIN_CHUNK_SIZE), and 16896 with 67584.
         int[] chunkSizesTemp = new int[SIZE_CLASSES_COUNT];
         byte[] mappingTemp = new byte[SIZE_CLASSES_COUNT];
         int poolCount = 0;
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
             int chunkSize = chunkSizeOf(SIZE_CLASSES[i]);
-            if (poolCount == 0 || chunkSizesTemp[poolCount - 1] != chunkSize) {
-                chunkSizesTemp[poolCount] = chunkSize;
-                poolCount++;
+            int pool = 0;
+            while (pool < poolCount && chunkSizesTemp[pool] != chunkSize) {
+                pool++;
             }
-            mappingTemp[i] = (byte) (poolCount - 1);
+            if (pool == poolCount) {
+                chunkSizesTemp[poolCount++] = chunkSize;
+            }
+            mappingTemp[i] = (byte) pool;
         }
         CHUNK_POOL_COUNT = poolCount;
         CHUNK_SIZES = Arrays.copyOf(chunkSizesTemp, poolCount);
