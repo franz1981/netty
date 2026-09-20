@@ -362,11 +362,11 @@ final class AdaptivePoolingAllocator {
     // EXPERIMENT (throwaway): -Dexpt.shareChunks=true makes size classes share chunk sizes. A power-of-two class
     // uses the chunk of its "+header" sibling (32 x (2^n + h) = 33 or 34 x 2^n, no tail), and every class from
     // 32768 up uses the chunk of the largest class (4,325,376 B = 32 x 135168 = 33 x 131072 = 64 x 67584 = ...).
-    static final boolean EXPT_SHARE_CHUNKS = Boolean.getBoolean("expt.shareChunks");
     static final int EXPT_POOL_BYTES = Integer.getInteger("expt.poolBytes", 4 * 1024 * 1024);
 
     static int chunkSizeOf(int segmentSize) {
-        if (EXPT_SHARE_CHUNKS) {
+        // Read here, not from a static field: the pool table is built by a static block above this declaration.
+        if (Boolean.getBoolean("expt.shareChunks")) {
             if (segmentSize >= 32768) {
                 return 135168 * MIN_SEGMENTS_PER_CHUNK;
             }
@@ -480,7 +480,7 @@ final class AdaptivePoolingAllocator {
         }
         static {
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                StringBuilder sb = new StringBuilder("TELE pools share=" + EXPT_SHARE_CHUNKS + " poolBytes=" + EXPT_POOL_BYTES
+                StringBuilder sb = new StringBuilder("TELE pools share=" + Boolean.getBoolean("expt.shareChunks") + " poolBytes=" + EXPT_POOL_BYTES
                         + " (chunkKiB cap: evicted offerFull pollHit fresh)\n");
                 long freshBytes = 0;
                 for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
