@@ -626,7 +626,7 @@ final class AdaptivePoolingAllocator {
             if (recycler == null) {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
-            BuddyMagazine mag = new BuddyMagazine(allocator, allocator.buddyStrategy, recycler);
+            BuddyMagazine mag = new BuddyMagazine(allocator, allocator.buddyStrategy, recycler, lock);
             buddyMagazine = mag;
             return mag;
         }
@@ -1691,13 +1691,16 @@ final class AdaptivePoolingAllocator {
         private final ChunkQueue whollyFree = new ChunkQueue();
         /** Bytes of the chunks on {@link #whollyFree}; never above {@link #BUDDY_IDLE_BYTES}. */
         private long idleBytes;
+        /** The lock of the stripe this magazine lives on, which guards everything here but {@link #pending}. */
+        private final StampedLock stripeLock;
         /** The chunk the magazine allocates from, on no queue; {@code null} before the first allocation. */
         private BuddyChunk active;
 
         BuddyMagazine(AdaptivePoolingAllocator allocator,
-                      BuddyChunkManagementStrategy strategy, AdaptiveRecycler bufRecycler) {
+                      BuddyChunkManagementStrategy strategy, AdaptiveRecycler bufRecycler, StampedLock stripeLock) {
             this.allocator = allocator;
             this.bufRecycler = bufRecycler;
+            this.stripeLock = stripeLock;
             this.chunkController = strategy.createController(allocator);
             for (int order = 0; order < ORDERS; order++) {
                 byLargestFreeOrder[order] = new ChunkQueue();
@@ -1814,6 +1817,33 @@ final class AdaptivePoolingAllocator {
                     byLargestFreeOrder[order].pushFront(chunk);
                     ordersInUse |= 1 << order;
                 }
+            }
+        }
+
+        /**
+         * Try to take the stripe lock so a releasing thread can put its block back and refile the chunk itself.
+         * Returns 0 when the lock is busy: it is never waited on, and the release leaves a note instead.
+         */
+        long tryLockForRelease() {
+            return stripeLock.tryWriteLock();
+        }
+
+        void unlockAfterRelease(long stamp) {
+            stripeLock.unlockWrite(stamp);
+        }
+
+        /**
+         * Put a block back in its chunk and move the chunk to the queue its tree now calls for; a chunk that became
+         * wholly free is kept or given up here, by {@link #file}. Caller holds the stripe lock. This is what makes
+         * the idle bound hold for a magazine that stops allocating: a release that only left a note would wait for
+         * the magazine's next slow path.
+         */
+        void releaseInPlace(BuddyChunk chunk, int offset, int size) {
+            chunk.releaseToTree(offset, size);
+            if (chunk.queue != null) {
+                // Not the active chunk, which is filed when the magazine gives it up, nor one that left the magazine.
+                unfile(chunk);
+                file(chunk);
             }
         }
 
@@ -2484,18 +2514,29 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Any thread: put the block on the free list, then leave a note for the owner, then drop the buffer's
-         * reference. Offer before note, so a drain that pops the note sees the block; note before the reference is
-         * dropped, so the chunk is still alive when the note is pushed. A one-shot chunk only drops the reference.
+         * Any thread. If the stripe lock is free, take it and put the block straight back in the tree, refiling the
+         * chunk. Otherwise put the block on the free list, then leave a note for the owner: offer before note, so a
+         * drain that pops the note sees the block. Either way the buffer's reference is dropped last, so the chunk
+         * is alive throughout. A one-shot chunk only drops the reference.
          */
         @Override
         void releaseSegment(int startingIndex, int size) {
             MpscIntQueue freeList = this.freeList;
             if (freeList != null) {
-                int packedOffset = startingIndex / MIN_BUDDY_SIZE;
-                int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
-                freeList.offer(packedOffset | packedSize);
-                owner.pending.push(this);
+                final BuddyMagazine owner = this.owner;
+                final long stamp = owner.tryLockForRelease();
+                if (stamp != 0) {
+                    try {
+                        owner.releaseInPlace(this, startingIndex, size);
+                    } finally {
+                        owner.unlockAfterRelease(stamp);
+                    }
+                } else {
+                    int packedOffset = startingIndex / MIN_BUDDY_SIZE;
+                    int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
+                    freeList.offer(packedOffset | packedSize);
+                    owner.pending.push(this);
+                }
             }
             release();
         }
@@ -2512,6 +2553,11 @@ final class AdaptivePoolingAllocator {
             if (RefCnt.release(refCnt)) {
                 deallocate();
             }
+        }
+
+        /** Owner or stripe lock holder only. */
+        void releaseToTree(int offset, int size) {
+            tree.release(offset, size);
         }
 
         boolean hasUnprocessedFreelistEntries() {

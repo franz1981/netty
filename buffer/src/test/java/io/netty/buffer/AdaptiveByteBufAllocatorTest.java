@@ -289,8 +289,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Idle memory above the size classes is bounded in bytes, whatever the size of the chunks: after a burst of large
-     * buffers is released, the next allocations leave no more than the idle bound plus the chunks in use.
+     * Idle memory above the size classes is bounded in bytes, whatever the size of the chunks, and the bound is
+     * applied by the releases: after a burst of large buffers is released, no more than the idle bound plus the
+     * chunk the magazine allocates from is held, without any further allocation.
      */
     @Test
     void idleBuddyMemoryIsBoundedInBytes() {
@@ -309,17 +310,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        // The releases are applied by the next slow path of the magazine: allocate until one chunk is used up.
-        List<ByteBuf> again = new ArrayList<ByteBuf>();
-        for (long i = 0; i <= chunkSize / size; i++) {
-            again.add(allocator.heapBuffer(size, size));
-        }
+        // No allocation follows: a heap that goes quiet must not keep the burst. The releases themselves apply the
+        // bound (nothing else holds the stripe lock here, so every release acts in place).
         long settled = allocator.usedHeapMemory();
-        assertTrue(settled <= AdaptivePoolingAllocator.BUDDY_IDLE_BYTES + 2 * chunkSize,
+        assertTrue(settled <= AdaptivePoolingAllocator.BUDDY_IDLE_BYTES + chunkSize,
                 "peak " + peak + ", settled " + settled + ", bound " + AdaptivePoolingAllocator.BUDDY_IDLE_BYTES);
-        for (ByteBuf buf : again) {
-            buf.release();
-        }
     }
 
     /**
