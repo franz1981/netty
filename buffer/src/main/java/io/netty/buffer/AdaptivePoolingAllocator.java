@@ -940,6 +940,8 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
         final PendingChunks pending = new PendingChunks();
+        /** Chunks on the queues with every segment free: what {@link #purgeRetentionFloor} bounds. */
+        int idleCount;
 
         final SizeClassChunkRecycler chunkRecycler;
         final int sizeClassIndex;
@@ -967,11 +969,23 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * The chunks that count against {@link #purgeRetentionFloor}: every linked chunk. The active one is not
-         * linked: it is the magazine's to use and is not a retention candidate.
+         * Mark {@code chunk}, on a queue, as holding no live segment, and count it against the retention floor.
          */
-        private int totalCount() {
-            return exhausted.size + reusable.size;
+        private void markIdle(SizeClassedChunk chunk) {
+            if (!chunk.idleInCache) {
+                chunk.idleInCache = true;
+                idleCount++;
+            }
+        }
+
+        /**
+         * Stop counting {@code chunk} as idle: it is being handed out, or it is leaving this cache.
+         */
+        private void clearIdle(SizeClassedChunk chunk) {
+            if (chunk.idleInCache) {
+                chunk.idleInCache = false;
+                idleCount--;
+            }
         }
 
         // Signal A (see refile): exhausted → reusable
@@ -980,10 +994,24 @@ final class AdaptivePoolingAllocator {
             reusable.pushFront(chunk);
         }
 
+        /**
+         * A chunk on the reusable queue with no live segment is kept for the next burst, up to
+         * {@link #purgeRetentionFloor} of them; beyond that it is given up here.
+         * <p>
+         * The floor bounds the <em>idle</em> chunks, not every chunk this cache holds: a size class with more chunks
+         * in use than the floor would otherwise give up every chunk the moment it empties and allocate another one as
+         * the burst goes on (measured on E_COMMERCE heap 16384: 50,335 chunks of 2 MiB given up in 20 s, 4,695 of
+         * them past what the recycler could hold).
+         */
         void evictIfAboveFloor(SizeClassedChunk chunk) {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
-            if (chunk.hasFullCapacity() && totalCount() > purgeRetentionFloor) {
+            if (!chunk.hasFullCapacity()) {
+                return;
+            }
+            markIdle(chunk);
+            if (idleCount > purgeRetentionFloor) {
+                clearIdle(chunk);
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1128,6 +1156,7 @@ final class AdaptivePoolingAllocator {
             assert active == null : "poll with an active chunk";
             SizeClassedChunk chunk = (SizeClassedChunk) reusable.head;
             if (chunk != null) {
+                clearIdle(chunk);
                 reusable.remove(chunk);
                 return chunk;
             }
@@ -1162,6 +1191,7 @@ final class AdaptivePoolingAllocator {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 visited++;
                 if (cur.hasRemainingCapacity()) {
+                    clearIdle(cur);
                     exhausted.remove(cur);
                     return cur;
                 }
@@ -1170,18 +1200,28 @@ final class AdaptivePoolingAllocator {
             return null;
         }
 
+        /**
+         * Give up the idle chunks above the retention floor, newest first: the reusable queue is newest first, and
+         * the chunk that emptied last is the one a continuing burst is least likely to want back.
+         */
         void tickPurge() {
             drainPending();
-            // Exhausted→reusable is applied by the drain above. All that is left is evicting
-            // fully-free reusable chunks above the retention floor.
-            int total = totalCount();
+            // Count the idle chunks first: a release since the last purge may have emptied any of them.
+            for (Chunk cur = reusable.head; cur != null; cur = cur.nextInQueue) {
+                SizeClassedChunk chunk = (SizeClassedChunk) cur;
+                if (chunk.hasFullCapacity()) {
+                    markIdle(chunk);
+                }
+            }
+            // Then give up the ones above the floor, newest first: the queue is newest first, and the oldest chunks
+            // are the ones an allocator underneath can most easily return to the operating system.
             SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
-            while (cur != null && total > purgeRetentionFloor) {
+            while (cur != null && idleCount > purgeRetentionFloor) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
-                if (cur.hasFullCapacity()) {
+                if (cur.idleInCache) {
+                    clearIdle(cur);
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
-                    total--;
                 }
                 cur = next;
             }
@@ -1203,6 +1243,7 @@ final class AdaptivePoolingAllocator {
          */
         void activate(SizeClassedChunk chunk) {
             assert active == null : "the magazine already has an active chunk";
+            clearIdle(chunk);
             assert chunk.queue == null : "the chunk is filed on a queue";
             active = chunk;
         }
@@ -1248,9 +1289,10 @@ final class AdaptivePoolingAllocator {
             freeAll(reusable);
         }
 
-        private static void freeAll(ChunkQueue queue) {
+        private void freeAll(ChunkQueue queue) {
             Chunk cur;
             while ((cur = queue.head) != null) {
+                clearIdle((SizeClassedChunk) cur);
                 queue.remove(cur);
                 ((SizeClassedChunk) cur).markToDeallocate();
             }
@@ -1879,6 +1921,8 @@ final class AdaptivePoolingAllocator {
          * the push, so no separate flag is needed.
          */
         volatile Chunk pendingNext;
+        /** Whether this chunk is counted among its cache's idle chunks; guarded like the queues. */
+        boolean idleInCache;
         protected AbstractByteBuf delegate;
         // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
         final AdaptivePoolingAllocator allocator;

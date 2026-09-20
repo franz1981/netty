@@ -197,9 +197,9 @@ public class SizeClassedChunkCacheTest {
 
         int floor = cache.purgeRetentionFloor;
 
-        // Fill to floor with working-set chunks
+        // Fill the floor with idle chunks, which is what it bounds
         for (int i = 0; i < floor; i++) {
-            cache.offerChunk(chunkWithCapacity());
+            cache.offerChunk(fullChunk());
         }
 
         // Add excess fully-free chunk
@@ -230,11 +230,11 @@ public class SizeClassedChunkCacheTest {
         int floor = cache.purgeRetentionFloor;
         int excess = 10;
 
-        // Working set at floor
+        // Idle chunks at the floor, plus one chunk of the working set that must be kept
         SizeClassedChunk workingSet = chunkWithCapacity();
         cache.offerChunk(workingSet);
-        for (int i = 0; i < floor - 1; i++) {
-            cache.offerChunk(chunkWithoutCapacity());
+        for (int i = 0; i < floor; i++) {
+            cache.offerChunk(fullChunk());
         }
 
         // Excess fully-free chunks
@@ -340,24 +340,26 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
         int floor = cache.purgeRetentionFloor;
         for (int i = 0; i < floor - 1; i++) {
-            cache.offerChunk(chunkWithCapacity());
+            cache.offerChunk(fullChunk());
         }
         SizeClassedChunk idle = fullChunk();
         cache.offerChunk(idle);
-        SizeClassedChunk active = chunkWithCapacity();
+        SizeClassedChunk active = fullChunk();
         cache.activate(active);
 
-        // floor chunks besides the active one: at the floor, nothing is evicted.
+        // The active chunk is fully free too, but it does not count: at the floor, nothing is evicted.
         cache.tickPurge();
         verify(idle, never()).recycleOrDeallocate(null, 0);
+        verify(active, never()).recycleOrDeallocate(null, 0);
 
-        // Once the magazine gives it up, the same chunk counts, and the cache is above the floor.
+        // Once the magazine gives it up, it counts, and the cache is one above the floor: the newest idle chunk,
+        // which is the one just given up, is the one evicted.
         cache.deactivate(active);
         assertNull(cache.active);
         assertSame(cache.reusable, active.queue);
         cache.tickPurge();
-        verify(idle).recycleOrDeallocate(null, 0);
-        verify(active, never()).recycleOrDeallocate(null, 0);
+        verify(active).recycleOrDeallocate(null, 0);
+        verify(idle, never()).recycleOrDeallocate(null, 0);
     }
 
     @Test
@@ -464,9 +466,11 @@ public class SizeClassedChunkCacheTest {
     void signalBEvictsAboveFloor() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
 
-        // Fill above retention floor
+        // The floor counts the idle (fully free) chunks, so fill it with those.
         for (int i = 0; i < cache.purgeRetentionFloor; i++) {
-            cache.offerChunk(chunkWithCapacity());
+            SizeClassedChunk idle = fullChunk();
+            cache.offerChunk(idle);
+            cache.evictIfAboveFloor(idle);
         }
 
         SizeClassedChunk chunk = fullChunk();
@@ -648,9 +652,11 @@ public class SizeClassedChunkCacheTest {
     void drainEvictsNotifiedReusableChunkThatBecameFullyFree() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache(128 * 1024, null, 0);
 
-        // Pad above the retention floor so eviction is allowed.
+        // Fill the floor with idle chunks, so one more idle chunk is above it.
         for (int i = 0; i < cache.purgeRetentionFloor; i++) {
-            cache.offerChunk(chunkWithCapacity());
+            SizeClassedChunk padding = fullChunk();
+            cache.offerChunk(padding);
+            cache.evictIfAboveFloor(padding);
         }
         SizeClassedChunk chunk = chunkWithCapacity();
         cache.offerChunk(chunk);

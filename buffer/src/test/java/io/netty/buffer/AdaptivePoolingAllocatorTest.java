@@ -33,6 +33,7 @@ import java.util.concurrent.locks.StampedLock;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 class AdaptivePoolingAllocatorTest {
     @Test
@@ -57,26 +58,27 @@ class AdaptivePoolingAllocatorTest {
 
     /**
      * Fresh chunk allocations and used memory at fixed checkpoints of a seeded, single-stripe allocation trace.
-     * One row per checkpoint: {@code {fresh chunks allocated so far, usedMemory}}. The values were recorded on
-     * 004e4cc8a3, before the magazine's current chunk became the cache's active chunk, and must not change. They
-     * move when the retention floor counts the active chunk, or when a poll takes the oldest reusable chunk
-     * instead of the newest.
+     * One row per checkpoint: {@code {fresh chunks allocated so far, usedMemory}}. The chunk counts were recorded on
+     * 004e4cc8a3 and have not changed since. The used-memory values were re-recorded when the retention floor started
+     * bounding the idle chunks instead of every chunk a cache holds: the same chunks are allocated, and more of them
+     * are kept at the troughs instead of being given up and allocated again. They move when the floor counts the
+     * active chunk, or when a poll takes the oldest reusable chunk instead of the newest.
      */
     private static final long[][] EXPECTED_SHARED = {
             {0, 0}, {23, 19136512}, {38, 32505856}, {38, 32505856},
-            {38, 16777216}, {38, 20971520}, {46, 37224448}, {46, 37224448},
-            {46, 20971520}, {47, 27262976}, {47, 27262976}, {47, 23068672},
-            {47, 20971520}, {48, 27262976}, {54, 38928384}, {54, 38928384},
-            {54, 21102592}, {55, 27394048}, {59, 36831232}, {59, 36831232},
-            {59, 21626880}, {59, 21626880}, {59, 21626880},
+            {38, 19398656}, {38, 21495808}, {46, 37224448}, {46, 37224448},
+            {46, 22544384}, {47, 27787264}, {47, 27787264}, {47, 27787264},
+            {47, 21495808}, {48, 27787264}, {54, 38928384}, {54, 38928384},
+            {54, 25821184}, {55, 27918336}, {59, 36831232}, {59, 36831232},
+            {59, 22151168}, {59, 22151168}, {59, 21626880},
     };
     private static final long[][] EXPECTED_THREAD_LOCAL = {
             {0, 0}, {23, 19136512}, {38, 32505856}, {38, 32505856},
-            {38, 17301504}, {38, 20971520}, {46, 37224448}, {46, 37224448},
-            {46, 21495808}, {47, 27262976}, {47, 27262976}, {47, 23068672},
-            {47, 20971520}, {48, 27262976}, {54, 38928384}, {54, 38928384},
-            {54, 23724032}, {55, 27918336}, {59, 36831232}, {59, 36831232},
-            {59, 21626880}, {59, 21626880}, {59, 21626880},
+            {38, 17301504}, {38, 21495808}, {46, 37224448}, {46, 37224448},
+            {46, 24641536}, {47, 27787264}, {47, 27787264}, {47, 27787264},
+            {47, 21495808}, {48, 27787264}, {54, 38928384}, {54, 38928384},
+            {54, 27918336}, {55, 27918336}, {59, 36831232}, {59, 36831232},
+            {59, 22151168}, {59, 22151168}, {59, 21626880},
     };
 
     private static final int[] TRACE_SIZES = {64, 1024, 4096, 16384, 65536};
@@ -184,6 +186,46 @@ class AdaptivePoolingAllocatorTest {
             return checkpoints.toArray(new long[0][]);
         } finally {
             helper.shutdown();
+        }
+    }
+
+    /**
+     * A size-classed chunk that empties while its magazine holds many chunks still in use is kept and reused: the
+     * retention floor bounds the idle chunks, not every chunk the cache holds. Emptying one chunk's worth of buffers
+     * and allocating them again must not allocate a chunk.
+     */
+    @Test
+    void emptiedSizeClassedChunkIsReusedWhileManyChunksAreInUse() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode pools fewer size classes");
+        CountingChunkAllocator counter = new CountingChunkAllocator();
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(counter, true);
+        int size = 65536; // a size class whose chunks hold few segments
+        List<ByteBuf> live = new ArrayList<ByteBuf>();
+        live.add(allocator.allocate(size, size));
+        assertEquals(1, counter.count);
+        int perChunk = (int) (allocator.usedMemory() / size);
+        assumeTrue(perChunk >= 4, "chunk holds " + perChunk + " segments");
+        // Above the retention floor of this size class, which is where eviction starts.
+        int chunkSize = perChunk * size;
+        int chunks = Math.max(1, AdaptivePoolingAllocator.THREAD_LOCAL_CACHE_MIN_BYTES / chunkSize) + 4;
+        while (live.size() < chunks * perChunk) {
+            live.add(allocator.allocate(size, size));
+        }
+        long allocated = counter.count;
+        assertEquals(chunks, allocated, "one chunk per " + perChunk + " buffers");
+        // Empty more chunks than the recycler can hold, so an evicted chunk's buffer is freed rather than pooled.
+        int emptied = AdaptivePoolingAllocator.SizeClassChunkRecycler.poolCapacity(
+                AdaptivePoolingAllocator.sizeClassIndexOf(size)) + 2;
+        assumeTrue(emptied < chunks, "emptying " + emptied + " of " + chunks + " chunks");
+        for (int i = 0; i < emptied * perChunk; i++) {
+            live.remove(0).release();
+        }
+        for (int i = 0; i < emptied * perChunk; i++) {
+            live.add(allocator.allocate(size, size));
+        }
+        assertEquals(allocated, counter.count, "chunks allocated");
+        for (ByteBuf buf : live) {
+            buf.release();
         }
     }
 
