@@ -443,15 +443,27 @@ final class AdaptivePoolingAllocator {
      * larger than needed, so within a shared pool the lists drift towards the largest need (up to 4096 entries,
      * for the 32-byte class).
      * <p>
+     * <p>
+     * The pool is bounded by one number of bytes per heap, {@link #RECYCLED_BYTES_BUDGET}, across every chunk size:
+     * whichever chunk sizes are churning get the room. A bound per chunk size left one or two buffers to the large
+     * size classes, whose chunks are given up at the rate of the small ones (measured on E_COMMERCE heap 16384:
+     * 12 GiB of chunk buffers allocated in 20 s, and four times the garbage collections, for the same used memory).
+     * <p>
      * Accessed only under the owning stripe lock, or by the owner thread of a thread-local heap.
      */
     static final class SizeClassChunkRecycler {
-        private static final int TARGET_RECYCLED_BYTES = 4 * 1024 * 1024;
+        /**
+         * The bytes of chunk buffers a heap keeps for reuse.
+         */
+        static final int RECYCLED_BYTES_BUDGET = Math.max(MIN_CHUNK_SIZE, SystemPropertyUtil.getInt(
+                "io.netty.allocator.recycledChunkBytes", IS_LOW_MEM ? 4 * 1024 * 1024 : 32 * 1024 * 1024));
 
         private final AbstractByteBuf[][] buffers = new AbstractByteBuf[CHUNK_POOL_COUNT][];
         private final MpscIntQueue[][] freeLists = new MpscIntQueue[CHUNK_POOL_COUNT][];
         private final IntStack[][] localFreeLists = new IntStack[CHUNK_POOL_COUNT][];
         private final int[] sizes = new int[CHUNK_POOL_COUNT];
+        /** Bytes of the buffers held by all the pools; never above {@link #RECYCLED_BYTES_BUDGET}. */
+        private int retainedBytes;
 
         // What the last successful poll() returned, read once by the caller.
         private AbstractByteBuf polledBuffer;
@@ -468,7 +480,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private static int capacityOf(int pool) {
-            return Math.max(1, TARGET_RECYCLED_BYTES / CHUNK_SIZES[pool]);
+            return Math.max(1, RECYCLED_BYTES_BUDGET / CHUNK_SIZES[pool]);
         }
 
         // Visible for testing.
@@ -491,6 +503,7 @@ final class AdaptivePoolingAllocator {
             }
             int idx = --size;
             sizes[pool] = size;
+            retainedBytes -= CHUNK_SIZES[pool];
             polledBuffer = buffers[pool][idx];
             polledFreeList = freeLists[pool][idx];
             polledLocalFreeList = localFreeLists[pool][idx];
@@ -519,16 +532,18 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Keep {@code delegate} and its free lists for the next chunk of this chunk size, or refuse when the
-         * pool for that chunk size is full.
+         * Keep {@code delegate} and its free lists for the next chunk of this chunk size, or refuse when that would
+         * take the heap's pools above {@link #RECYCLED_BYTES_BUDGET}.
          */
         boolean offer(AbstractByteBuf delegate, MpscIntQueue freeList, IntStack localFreeList, int sizeClassIndex) {
             assert delegate != null && freeList != null && localFreeList != null;
             int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
             int size = sizes[pool];
-            if (size >= buffers[pool].length) {
+            int chunkSize = CHUNK_SIZES[pool];
+            if (size >= buffers[pool].length || retainedBytes + chunkSize > RECYCLED_BYTES_BUDGET) {
                 return false;
             }
+            retainedBytes += chunkSize;
             buffers[pool][size] = delegate;
             freeLists[pool][size] = freeList;
             localFreeLists[pool][size] = localFreeList;
@@ -551,6 +566,7 @@ final class AdaptivePoolingAllocator {
                 }
                 sizes[pool] = 0;
             }
+            retainedBytes = 0;
         }
     }
 
