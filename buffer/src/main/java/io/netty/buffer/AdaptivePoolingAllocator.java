@@ -61,7 +61,7 @@ import java.util.function.IntConsumer;
  *       others in a {@link SizeClassedChunkCache}, which files them by whether they have a free segment.</li>
  *   <li><b>Above it, up to {@link #MAX_POOLED_BUF_SIZE}</b>: a power-of-two block of a {@link BuddyChunk}, carved by a
  *       {@link BuddyTree}. Its {@link BuddyMagazine} files the chunks it is not allocating from by the size of their
- *       largest free block, so a request takes the smallest block that fits.</li>
+ *       largest free block, so a request takes a block from the chunk with the most room.</li>
  *   <li><b>Larger still</b>: a one-shot {@link BuddyChunk} with no tree, holding that buffer alone and freed with
  *       it.</li>
  * </ul>
@@ -1638,7 +1638,7 @@ final class AdaptivePoolingAllocator {
      * The magazine for buffers above the largest size class, one per stripe, guarded by the stripe lock. It carves
      * power-of-two blocks out of {@link BuddyChunk}s: it allocates from its {@link #active} chunk and files every other
      * chunk it owns by the order of its largest free block, so the next chunk to allocate from is the one with the
-     * smallest free block that fits, found in O(1).
+     * largest free block, found in O(1).
      * <p>
      * Only the stripe lock holder touches the queues and the chunks' trees. A buffer released by any thread puts
      * its block on the chunk's MPSC free list and leaves a note in {@link #pending} (see
@@ -1712,21 +1712,27 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * The chunk with the smallest free block of at least {@code blockSize}, taken off its queue; else a wholly free
-         * chunk that large; else a full chunk that regained such a block from releases not yet noted; else null.
+         * The chunk with the largest free block, taken off its queue, when that block is at least {@code blockSize};
+         * else a wholly free chunk that large; else a full chunk that regained such a block from releases not yet
+         * noted; else null.
+         * <p>
+         * The largest rather than the smallest that fits: the chunk polled here becomes the one the magazine allocates
+         * from, and one with a big free block serves many more requests before it runs out. Taking the smallest fit
+         * picks the chunk that is nearly full, which serves about one request and sends the next allocation down here
+         * again (measured on E_COMMERCE heap 65536: 47% of buddy allocations took this path, against 9%).
          */
         private BuddyChunk poll(int blockSize) {
             int order = Integer.numberOfTrailingZeros(blockSize / BuddyTree.MIN_BLOCK_SIZE);
             int candidates = ordersInUse & -(1 << order);
             while (candidates != 0) {
-                int candidate = Integer.numberOfTrailingZeros(candidates);
+                int candidate = 31 - Integer.numberOfLeadingZeros(candidates);
                 Chunk head = byLargestFreeOrder[candidate].head;
                 if (head != null) {
                     unfile(head);
                     return (BuddyChunk) head;
                 }
                 ordersInUse &= ~(1 << candidate);
-                candidates &= candidates - 1;
+                candidates &= ~(1 << candidate);
             }
             for (Chunk cur = whollyFree.head; cur != null; cur = cur.nextInQueue) {
                 if (cur.capacity >= blockSize) {

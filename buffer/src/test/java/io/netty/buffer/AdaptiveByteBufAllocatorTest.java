@@ -48,10 +48,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<AdaptiveByteBufAllocator> {
     @Override
@@ -386,6 +388,48 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
+     * A magazine picks the chunk with the largest free block, not the smallest one that fits: the chunk it then
+     * allocates from serves many requests before it runs out, instead of one.
+     */
+    @Test
+    void buddyAllocationPrefersTheChunkWithTheLargestFreeBlock() {
+        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        int size = 256 * 1024; // above the largest size class, so buddy chunks
+        ByteBuf first = allocator.heapBuffer(size, size);
+        long chunkSize = allocator.usedHeapMemory();
+        int perChunk = (int) (chunkSize / size);
+        assumeTrue(perChunk >= 8 && perChunk % 4 == 0, "chunk holds " + perChunk + " buffers");
+
+        // Three chunks, each filled completely: A, B, then C, which stays the magazine's active chunk.
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        bufs.add(first);
+        while (bufs.size() < 3 * perChunk) {
+            bufs.add(allocator.heapBuffer(size, size));
+        }
+        Object chunkA = anyChunkOf(bufs.get(0));
+        Object chunkB = anyChunkOf(bufs.get(perChunk));
+        Object chunkC = anyChunkOf(bufs.get(2 * perChunk));
+        assumeTrue(chunkA != chunkB && chunkB != chunkC, "one chunk per " + perChunk + " buffers");
+
+        // A is left with one free block; B with four neighbours, which merge into a block four times as large.
+        bufs.get(0).release();
+        for (int i = 0; i < 4; i++) {
+            bufs.get(perChunk + i).release();
+        }
+
+        // C is full, so this takes the slow path: it applies the releases and picks between A and B.
+        ByteBuf next = allocator.heapBuffer(size, size);
+        assertSame(chunkB, anyChunkOf(next), "expected the chunk with the larger free block");
+
+        next.release();
+        for (int i = 0; i < bufs.size(); i++) {
+            if (i != 0 && (i < perChunk || i >= perChunk + 4)) {
+                bufs.get(i).release();
+            }
+        }
+    }
+
+    /**
      * Buddy chunks given up by a magazine are reused by it: allocating and releasing the same set of large buffers
      * over and over from one thread does not grow the memory held after the first round.
      */
@@ -628,6 +672,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 locks.get(i).unlockWrite(stamps.get(i));
             }
         }
+    }
+
+    /** The chunk a buffer was carved from, whatever its kind. */
+    private static Object anyChunkOf(ByteBuf buf) {
+        while (!(buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf)) {
+            buf = buf.unwrap();
+        }
+        return ((AdaptivePoolingAllocator.AdaptiveByteBuf) buf).chunk;
     }
 
     private static SizeClassedChunk chunkOf(ByteBuf buf) {
