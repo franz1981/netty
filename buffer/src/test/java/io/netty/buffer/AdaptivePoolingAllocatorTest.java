@@ -62,24 +62,26 @@ class AdaptivePoolingAllocatorTest {
      * recorded on 004e4cc8a3, before the magazine's current chunk became the cache's active chunk, and must not
      * change. They move when the retention floor counts the active chunk, or when a poll takes the oldest reusable
      * chunk instead of the newest. The chunk counts were re-recorded when the recycler got one byte budget per heap
-     * instead of a bound per chunk size: the same memory is used at every checkpoint, with 43 chunk buffers
-     * allocated over the trace instead of 59.
+     * instead of a bound per chunk size (43 chunk buffers over the trace instead of 59, same used memory), and both
+     * columns when the size classes from 32 KiB up went from 32 to 8 segments per chunk: the trace's 64 KiB buffers
+     * come from chunks a quarter of the size, so less memory is used at every checkpoint and more chunk buffers are
+     * allocated (73).
      */
     private static final long[][] EXPECTED_SHARED = {
-            {0, 0}, {23, 19136512}, {38, 32505856}, {38, 32505856},
-            {38, 16777216}, {38, 20971520}, {41, 37224448}, {41, 37224448},
-            {41, 20971520}, {41, 27262976}, {41, 27262976}, {41, 23068672},
-            {41, 20971520}, {41, 27262976}, {43, 38928384}, {43, 38928384},
-            {43, 21102592}, {43, 27394048}, {43, 36831232}, {43, 36831232},
-            {43, 21626880}, {43, 21626880}, {43, 21626880},
+            {0, 0}, {38, 17563648}, {67, 31981568}, {67, 29360128},
+            {67, 15204352}, {67, 21495808}, {70, 36175872}, {70, 36175872},
+            {70, 19398656}, {70, 27262976}, {70, 27262976}, {70, 19398656},
+            {70, 18874368}, {70, 25690112}, {73, 37355520}, {73, 35782656},
+            {73, 19529728}, {73, 25821184}, {73, 36306944}, {73, 34734080},
+            {73, 19529728}, {73, 19529728}, {73, 19529728},
     };
     private static final long[][] EXPECTED_THREAD_LOCAL = {
-            {0, 0}, {23, 19136512}, {38, 32505856}, {38, 32505856},
-            {38, 17301504}, {38, 20971520}, {41, 37224448}, {41, 37224448},
-            {41, 21495808}, {41, 27262976}, {41, 27262976}, {41, 23068672},
-            {41, 20971520}, {41, 27262976}, {43, 38928384}, {43, 38928384},
-            {43, 23724032}, {43, 27918336}, {43, 36831232}, {43, 36831232},
-            {43, 21626880}, {43, 21626880}, {43, 21626880},
+            {0, 0}, {38, 17563648}, {67, 31981568}, {67, 30932992},
+            {67, 15728640}, {67, 21495808}, {70, 36175872}, {70, 36175872},
+            {70, 18874368}, {70, 27262976}, {70, 27262976}, {70, 19398656},
+            {70, 18874368}, {70, 25690112}, {73, 37355520}, {73, 35782656},
+            {73, 19529728}, {73, 25821184}, {73, 36306944}, {73, 34734080},
+            {73, 19529728}, {73, 19529728}, {73, 19529728},
     };
 
     private static final int[] TRACE_SIZES = {64, 1024, 4096, 16384, 65536};
@@ -187,6 +189,29 @@ class AdaptivePoolingAllocatorTest {
             return checkpoints.toArray(new long[0][]);
         } finally {
             helper.shutdown();
+        }
+    }
+
+    /**
+     * What a heap pays to hold one buffer of each size class from 32 KiB up: a chunk of each, and those chunks hold 8
+     * segments, not 32. At 32 segments a heap that touched each of the six classes once held 14.2 MiB for them.
+     */
+    @Test
+    void largeSizeClassesAllocateChunksOfEightSegments() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode pools fewer size classes");
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new CountingChunkAllocator(), true);
+        List<ByteBuf> live = new ArrayList<ByteBuf>();
+        long expected = 0;
+        for (int size : AdaptivePoolingAllocator.getSizeClasses()) {
+            if (size >= 32768) {
+                live.add(allocator.allocate(size, size));
+                expected += 8L * size;
+            }
+        }
+        assertEquals(6, live.size(), "size classes from 32 KiB up");
+        assertEquals(expected, allocator.usedMemory());
+        for (ByteBuf buf : live) {
+            buf.release();
         }
     }
 

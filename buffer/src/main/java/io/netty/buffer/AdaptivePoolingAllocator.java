@@ -105,6 +105,17 @@ final class AdaptivePoolingAllocator {
      * We choose 32 because it seems neither too small nor too big.
      */
     private static final int MIN_SEGMENTS_PER_CHUNK = 32;
+    /**
+     * The size classes from here up get chunks of {@link #LARGE_SEGMENTS_PER_CHUNK} segments.
+     */
+    private static final int LARGE_SEGMENT_SIZE = 32 * 1024;
+    /**
+     * Segments per chunk from {@link #LARGE_SEGMENT_SIZE} up. At 32 segments these chunks are 1 to 4.2 MiB, which a
+     * heap pays in full for a single buffer of the class: 14.2 MiB for one buffer of each of the six classes, against
+     * 4 MiB for everything in mimalloc, whose 128 KiB blocks come four to a page. At 8 segments they are 256 KiB to
+     * 1 MiB, and three of them are chunk sizes the smaller classes already use, so their buffers share those pools.
+     */
+    private static final int LARGE_SEGMENTS_PER_CHUNK = 8;
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
@@ -363,9 +374,13 @@ final class AdaptivePoolingAllocator {
 
     /**
      * The size of the chunks of a size class: {@link #MIN_CHUNK_SIZE}, or {@link #MIN_SEGMENTS_PER_CHUNK} segments
-     * when that is larger. Chunks are 128 KiB up to 4 KiB segments and hold exactly 32 segments above that.
+     * when that is larger, and {@link #LARGE_SEGMENTS_PER_CHUNK} segments from {@link #LARGE_SEGMENT_SIZE} up.
+     * Chunks are 128 KiB up to 4 KiB segments, hold 32 segments up to 16.9 KiB, and 8 from 32 KiB.
      */
     static int chunkSizeOf(int segmentSize) {
+        if (segmentSize >= LARGE_SEGMENT_SIZE) {
+            return segmentSize * LARGE_SEGMENTS_PER_CHUNK;
+        }
         return Math.max(MIN_CHUNK_SIZE, segmentSize * MIN_SEGMENTS_PER_CHUNK);
     }
 
