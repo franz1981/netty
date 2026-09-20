@@ -2501,7 +2501,18 @@ final class AdaptivePoolingAllocator {
             BuddyChunk chunk = this;
             chunk.retain();
             try {
-                buf.init(delegate, this, 0, 0, startIndex, size, blockSize, maxCapacity);
+                // EXPERIMENT (throwaway): -Dexpt.buddyColor=true starts the buffer a varying multiple of 64 bytes into
+                // its block when the request leaves room, so the first cache lines of the buffers do not all share
+                // the same low address bits (every block starts at a multiple of 32 KiB).
+                int color = 0;
+                if (COLOR) {
+                    int room = Math.min(blockSize - size, MIN_BUDDY_SIZE - 64) & ~63;
+                    if (room > 0) {
+                        int h = (startIndex >>> 15) * 0x9E3779B1;
+                        color = ((h >>> 8) % (room + 64)) & ~63;
+                    }
+                }
+                buf.init(delegate, this, 0, 0, startIndex + color, size, blockSize - color, maxCapacity);
                 chunk = null;
             } finally {
                 if (chunk != null) {
@@ -2554,8 +2565,16 @@ final class AdaptivePoolingAllocator {
          * reference. Offer before note, so a drain that pops the note sees the block; note before the reference is
          * dropped, so the chunk is still alive when the note is pushed. A one-shot chunk only drops the reference.
          */
+        static final boolean COLOR = Boolean.getBoolean("expt.buddyColor");
+
         @Override
         void releaseSegment(int startingIndex, int size) {
+            if (COLOR && freeList != null) {
+                // Undo the colouring: blocks start at multiples of MIN_BUDDY_SIZE and colours are smaller than that.
+                int color = startingIndex & (MIN_BUDDY_SIZE - 1);
+                startingIndex -= color;
+                size += color;
+            }
             MpscIntQueue freeList = this.freeList;
             if (freeList != null && owner.ownerThread != null && Thread.currentThread() == owner.ownerThread) {
                 if (BuddyMagazine.HOT > 0 && owner.stashHot(this, startingIndex, size)) {
