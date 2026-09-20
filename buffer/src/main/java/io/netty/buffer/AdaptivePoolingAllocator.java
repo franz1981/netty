@@ -1720,6 +1720,26 @@ final class AdaptivePoolingAllocator {
         private BuddyChunk active;
         // EXPERIMENT (throwaway): the thread that owns this magazine, when it belongs to a thread-local heap.
         Thread ownerThread;
+        // EXPERIMENT (throwaway): -Dexpt.tlBuddyHot=N keeps the last N blocks of each order released by the owner
+        // thread, still claimed in their tree and still holding their chunk reference, and hands them out first:
+        // the most recently used memory is reused first, as a size-classed chunk's local free list does.
+        static final int HOT = Integer.getInteger("expt.tlBuddyHot", 0);
+        private final BuddyChunk[] hotChunks = new BuddyChunk[ORDERS * Math.max(1, HOT)];
+        private final int[] hotOffsets = new int[ORDERS * Math.max(1, HOT)];
+        private final int[] hotCount = new int[ORDERS];
+
+        /** Owner thread only. Returns false when the stack of this order is full. */
+        boolean stashHot(BuddyChunk chunk, int offset, int size) {
+            int order = Integer.numberOfTrailingZeros(size / BuddyTree.MIN_BLOCK_SIZE);
+            int n = hotCount[order];
+            if (n == HOT) {
+                return false;
+            }
+            hotChunks[order * HOT + n] = chunk;
+            hotOffsets[order * HOT + n] = offset;
+            hotCount[order] = n + 1;
+            return true;
+        }
 
         /** Owner thread only: put the block straight back in the tree and refile the chunk if its queue changed. */
         void releaseLocal(BuddyChunk chunk, int offset, int size) {
@@ -1747,6 +1767,18 @@ final class AdaptivePoolingAllocator {
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
             int blockSize = chunkController.computeBufferCapacity(size, maxCapacity);
+            if (HOT > 0) {
+                int hotOrder = Integer.numberOfTrailingZeros(blockSize / BuddyTree.MIN_BLOCK_SIZE);
+                int n = hotCount[hotOrder];
+                if (n > 0) {
+                    int slot = hotOrder * HOT + --n;
+                    hotCount[hotOrder] = n;
+                    BuddyChunk hot = hotChunks[slot];
+                    hotChunks[slot] = null;
+                    hot.initOverClaimedBlock(buf, hotOffsets[slot], size, blockSize, maxCapacity);
+                    return true;
+                }
+            }
             BuddyChunk chunk = active;
             if (chunk != null && chunk.readInitInto(buf, size, blockSize, maxCapacity)) {
                 return true;
@@ -2526,6 +2558,9 @@ final class AdaptivePoolingAllocator {
         void releaseSegment(int startingIndex, int size) {
             MpscIntQueue freeList = this.freeList;
             if (freeList != null && owner.ownerThread != null && Thread.currentThread() == owner.ownerThread) {
+                if (BuddyMagazine.HOT > 0 && owner.stashHot(this, startingIndex, size)) {
+                    return; // the block stays claimed and keeps its chunk reference
+                }
                 owner.releaseLocal(this, startingIndex, size);
                 release();
                 return;
@@ -2551,6 +2586,11 @@ final class AdaptivePoolingAllocator {
             if (RefCnt.release(refCnt)) {
                 deallocate();
             }
+        }
+
+        /** The block is already claimed in the tree and already holds a chunk reference: only wire up the buffer. */
+        void initOverClaimedBlock(AdaptiveByteBuf buf, int offset, int size, int blockSize, int maxCapacity) {
+            buf.init(delegate, this, 0, 0, offset, size, blockSize, maxCapacity);
         }
 
         void releaseToTree(int offset, int size) {
