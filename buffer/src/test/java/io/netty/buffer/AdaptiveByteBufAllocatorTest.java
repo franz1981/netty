@@ -289,6 +289,40 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
+     * Idle memory above the size classes is bounded in bytes, whatever the size of the chunks: after a burst of large
+     * buffers is released, the next allocations leave no more than the idle bound plus the chunks in use.
+     */
+    @Test
+    void idleBuddyMemoryIsBoundedInBytes() {
+        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        int size = 1024 * 1024; // the largest pooled size: the largest chunks
+        ByteBuf first = allocator.heapBuffer(size, size);
+        long chunkSize = allocator.usedHeapMemory();
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        bufs.add(first);
+        // Four times the idle bound, in whole chunks.
+        long burst = 4L * AdaptivePoolingAllocator.BUDDY_IDLE_BYTES;
+        while (allocator.usedHeapMemory() < burst) {
+            bufs.add(allocator.heapBuffer(size, size));
+        }
+        long peak = allocator.usedHeapMemory();
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        // The releases are applied by the next slow path of the magazine: allocate until one chunk is used up.
+        List<ByteBuf> again = new ArrayList<ByteBuf>();
+        for (long i = 0; i <= chunkSize / size; i++) {
+            again.add(allocator.heapBuffer(size, size));
+        }
+        long settled = allocator.usedHeapMemory();
+        assertTrue(settled <= AdaptivePoolingAllocator.BUDDY_IDLE_BYTES + 2 * chunkSize,
+                "peak " + peak + ", settled " + settled + ", bound " + AdaptivePoolingAllocator.BUDDY_IDLE_BYTES);
+        for (ByteBuf buf : again) {
+            buf.release();
+        }
+    }
+
+    /**
      * Wholly free buddy chunks are not kept beyond the reuse limit: after a burst is released, the next allocations
      * leave at most {@link AdaptivePoolingAllocator#CHUNK_REUSE_QUEUE} idle chunks plus the ones in use.
      */

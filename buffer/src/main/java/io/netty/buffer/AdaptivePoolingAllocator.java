@@ -129,6 +129,12 @@ final class AdaptivePoolingAllocator {
     static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
 
+    /**
+     * The bytes of wholly free chunks a buddy magazine keeps for reuse.
+     */
+    static final int BUDDY_IDLE_BYTES = Math.max(MAX_CHUNK_SIZE, SystemPropertyUtil.getInt(
+            "io.netty.allocator.buddyIdleBytes", IS_LOW_MEM ? 4 * 1024 * 1024 : 32 * 1024 * 1024));
+
     static final long CHUNK_PURGE_POLLS_THREAD_LOCAL = Math.max(1, SystemPropertyUtil.getLong(
             "io.netty.allocator.chunkPurgePollsThreadLocal", 4L));
 
@@ -1683,6 +1689,8 @@ final class AdaptivePoolingAllocator {
         private final ChunkQueue full = new ChunkQueue();
         /** Chunks with no block claimed; the only ones the magazine can free while it holds more than it may keep. */
         private final ChunkQueue whollyFree = new ChunkQueue();
+        /** Bytes of the chunks on {@link #whollyFree}; never above {@link #BUDDY_IDLE_BYTES}. */
+        private long idleBytes;
         /** The chunk the magazine allocates from, on no queue; {@code null} before the first allocation. */
         private BuddyChunk active;
 
@@ -1784,16 +1792,19 @@ final class AdaptivePoolingAllocator {
 
         /**
          * File {@code chunk}, on no queue, by its tree once its free list is applied. A wholly free chunk is freed
-         * instead when the magazine already keeps {@link #CHUNK_REUSE_QUEUE} wholly free chunks: the limit is on idle
-         * chunks, whatever the number of chunks in use.
+         * instead when keeping it would take the idle chunks above {@link #BUDDY_IDLE_BYTES}, or above
+         * {@link #CHUNK_REUSE_QUEUE} chunks: the limits are on idle memory, whatever the number of chunks in use.
+         * A count alone is no bound: chunks are 2 to 8 MiB, and a burst of large buffers was kept whole (measured on
+         * one heap: 192 MiB of 192 held after every buffer was released).
          */
         private void file(BuddyChunk chunk) {
             chunk.processFreelistEntries();
             if (chunk.isWhollyFree()) {
-                if (whollyFree.size >= CHUNK_REUSE_QUEUE) {
+                if (whollyFree.size >= CHUNK_REUSE_QUEUE || idleBytes + chunk.capacity > BUDDY_IDLE_BYTES) {
                     chunk.markToDeallocate();
                     return;
                 }
+                idleBytes += chunk.capacity;
                 whollyFree.pushFront(chunk);
             } else {
                 int order = chunk.largestFreeOrder();
@@ -1807,7 +1818,11 @@ final class AdaptivePoolingAllocator {
         }
 
         private void unfile(Chunk chunk) {
-            chunk.queue.remove(chunk);
+            ChunkQueue queue = chunk.queue;
+            if (queue == whollyFree) {
+                idleBytes -= chunk.capacity;
+            }
+            queue.remove(chunk);
         }
 
         /**
