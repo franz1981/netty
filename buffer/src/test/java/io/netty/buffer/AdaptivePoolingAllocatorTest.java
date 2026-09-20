@@ -196,6 +196,24 @@ class AdaptivePoolingAllocatorTest {
     }
 
     /**
+     * Every size class is a power of two, or one plus a smaller power of two for a header, so the offset of a segment
+     * is two shifts of its index and an add: no multiplication to acquire a segment, and with the index kept in the
+     * buffer, no division to release it. Checked for every segment of every size class.
+     */
+    @Test
+    void segmentOffsetIsTwoShiftsOfItsIndex() {
+        for (int size : AdaptivePoolingAllocator.getSizeClasses()) {
+            int high = AdaptivePoolingAllocator.segmentShiftHigh(size);
+            int low = AdaptivePoolingAllocator.segmentShiftLow(size);
+            assertEquals(size, (1 << high) + (1 << low), "size class " + size);
+            int segments = AdaptivePoolingAllocator.chunkSizeOf(size) / size;
+            for (int index = 0; index < segments; index++) {
+                assertEquals(index * size, (index << high) + (index << low), "segment " + index + " of " + size);
+            }
+        }
+    }
+
+    /**
      * What a heap pays to hold one buffer of each size class from 16 KiB up: a 512 KiB chunk for each 2^n class and
      * a 528 KiB one for each class that adds a header, whatever the segment size, as mimalloc's 512 KiB medium page
      * serves every block size to 128 KiB. At 32 segments per chunk the six classes from 32 KiB up alone cost 14.2 MiB.

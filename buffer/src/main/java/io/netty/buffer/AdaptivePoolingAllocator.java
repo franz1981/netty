@@ -382,6 +382,28 @@ final class AdaptivePoolingAllocator {
         return Math.max(MIN_CHUNK_SIZE, segmentSize * MIN_SEGMENTS_PER_CHUNK);
     }
 
+    /**
+     * A segment size is {@code (1 << segmentShiftHigh) + (1 << segmentShiftLow)}: every size class is a power of two,
+     * written as two halves, or a power of two plus a smaller one for a header. The offset of segment {@code index}
+     * is therefore {@code (index << high) + (index << low)}, without a multiplication.
+     */
+    static int segmentShiftHigh(int segmentSize) {
+        int high = 31 - Integer.numberOfLeadingZeros(segmentSize);
+        return segmentSize == 1 << high ? high - 1 : high;
+    }
+
+    static int segmentShiftLow(int segmentSize) {
+        int high = 31 - Integer.numberOfLeadingZeros(segmentSize);
+        int rest = segmentSize - (1 << high);
+        if (rest == 0) {
+            return high - 1;
+        }
+        if (Integer.bitCount(rest) != 1) {
+            throw new IllegalArgumentException("size class " + segmentSize + " is not the sum of two powers of two");
+        }
+        return Integer.numberOfTrailingZeros(rest);
+    }
+
     static int sizeClassIndexOf(int size) {
         int sizeIndex = sizeIndexOf(size);
         if (sizeIndex < SIZE_INDEXES.length) {
