@@ -642,15 +642,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assertSame(activeArray, next.array(), "the next allocation must land in the same chunk");
             assertEquals(used, allocator.usedHeapMemory());
 
-            // Control: in the same state, emptying more chunks than the floor keeps idle does evict one, so the
-            // assertions above are about the active chunk and not about a cache that would evict nothing.
-            for (ByteBuf buf : held) {
-                release(buf, foreignRelease);
+            // Control: in the same state, a fully free chunk that is not active is evicted, so the assertions
+            // above are about the active chunk and not about a cache that would evict nothing.
+            for (int i = 0; i < BURST_SEGMENTS_PER_CHUNK; i++) {
+                release(held.get(i), foreignRelease);
             }
-            held.clear();
+            held.subList(0, BURST_SEGMENTS_PER_CHUNK).clear();
             underStripeLocks(allocator, sharedStripe, cache::drainPending);
-            assertEquals(used - BURST_CHUNK_SIZE, allocator.usedHeapMemory(),
-                    "floor + 1 chunks emptied: the floor is kept, one is given up");
+            assertEquals(used - BURST_CHUNK_SIZE, allocator.usedHeapMemory());
         } finally {
             for (ByteBuf buf : held) {
                 buf.release();
