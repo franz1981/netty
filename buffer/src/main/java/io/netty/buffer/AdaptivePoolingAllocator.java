@@ -2151,6 +2151,11 @@ final class AdaptivePoolingAllocator {
         private IntStack localFreeList;
         private int[] localStack;
         private int localTop;
+        // How many segments are in externalFreeList, kept here so that the owner's capacity checks (made on almost
+        // every release, through refile) read a field of the chunk instead of loading the queue object.
+        private static final AtomicIntegerFieldUpdater<SizeClassedChunk> EXTERNAL_COUNT =
+                AtomicIntegerFieldUpdater.newUpdater(SizeClassedChunk.class, "externalCount");
+        private volatile int externalCount;
         private final Thread ownerThread;
         /**
          * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free lists.
@@ -2188,6 +2193,7 @@ final class AdaptivePoolingAllocator {
             }
             localStack = localFreeList.array();
             localTop = localFreeList.top();
+            EXTERNAL_COUNT.lazySet(this, ownerThread == null ? segments : 0);
         }
 
         /**
@@ -2227,6 +2233,7 @@ final class AdaptivePoolingAllocator {
             }
             localStack = localFreeList.array();
             localTop = localFreeList.top();
+            EXTERNAL_COUNT.lazySet(this, ownerThread == null ? segments : 0);
         }
 
         /**
@@ -2271,7 +2278,11 @@ final class AdaptivePoolingAllocator {
                 localTop = top - 1;
                 return localStack[top];
             }
-            return externalFreeList.poll();
+            int offset = externalFreeList.poll();
+            if (offset != FREE_LIST_EMPTY) {
+                EXTERNAL_COUNT.decrementAndGet(this);
+            }
+            return offset;
         }
 
         /**
@@ -2283,12 +2294,12 @@ final class AdaptivePoolingAllocator {
             if (remaining > 0) {
                 return true;
             }
-            return localTop >= 0 || !externalFreeList.isEmpty();
+            return localTop >= 0 || externalCount != 0;
         }
 
         boolean hasFullCapacity() {
             int localSize = localTop + 1;
-            return localSize == segments || localSize + externalFreeList.size() == segments;
+            return localSize == segments || localSize + externalCount == segments;
         }
 
         /**
@@ -2303,7 +2314,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private int updateRemainingCapacity(int snapshotted) {
-            int freeSegments = externalFreeList.size() + localTop + 1;
+            int freeSegments = externalCount + localTop + 1;
             int updated = freeSegments * segmentSize;
             if (updated != snapshotted) {
                 allocatedBytes = capacity() - updated;
@@ -2317,6 +2328,7 @@ final class AdaptivePoolingAllocator {
             } else {
                 boolean segmentReturned = externalFreeList.offer(startIndex);
                 assert segmentReturned : "Unable to return segment " + startIndex + " to free list";
+                EXTERNAL_COUNT.incrementAndGet(this);
             }
         }
 
@@ -2338,6 +2350,7 @@ final class AdaptivePoolingAllocator {
                 } else {
                     boolean segmentReturned = externalFreeList.offer(startIndex);
                     assert segmentReturned;
+                    EXTERNAL_COUNT.incrementAndGet(this);
                     // implicit StoreLoad barrier from MPSC offer()
                     int state = this.state;
                     if (state != AVAILABLE) {
