@@ -2031,6 +2031,8 @@ final class AdaptivePoolingAllocator {
         /** Offset of the first segment never handed out; they are taken in order up to {@link #bumpLimit}. */
         private int bump;
         private final int bumpLimit;
+        /** Offset of the last segment: the largest link a free segment can hold. */
+        private final int lastSegmentOffset;
         /** The segments reachable from {@link #head} plus those never handed out. */
         private int localFree;
         /** Segments released by other threads: their count in the high half, the first one's offset in the low. */
@@ -2052,6 +2054,7 @@ final class AdaptivePoolingAllocator {
             segmentSize = 0;
             segments = 0;
             bumpLimit = 0;
+            lastSegmentOffset = 0;
             ownerThread = null;
             owningCache = null;
         }
@@ -2066,6 +2069,7 @@ final class AdaptivePoolingAllocator {
             segmentSize = controller.segmentSize;
             segments = controller.chunkSize / segmentSize;
             bumpLimit = segments * segmentSize;
+            lastSegmentOffset = bumpLimit - segmentSize;
             localFree = segments;
             EXTERNAL_FREE.lazySet(this, EXTERNAL_EMPTY);
             STATE.lazySet(this, AVAILABLE);
@@ -2159,7 +2163,7 @@ final class AdaptivePoolingAllocator {
          */
         private int nextFreeAfter(int offset) {
             int next = delegate._getIntLE(offset);
-            if (next < FREE_LIST_EMPTY || next > bumpLimit - segmentSize) {
+            if (next < FREE_LIST_EMPTY || next > lastSegmentOffset) {
                 throw corruptedFreeList(offset, next);
             }
             return next;
