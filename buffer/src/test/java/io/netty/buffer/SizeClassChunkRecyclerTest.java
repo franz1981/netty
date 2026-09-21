@@ -15,10 +15,8 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.IntStack;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassChunkRecycler;
 import io.netty.util.concurrent.FastThreadLocalThread;
-import io.netty.util.concurrent.MpscIntQueue;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -51,14 +49,6 @@ public class SizeClassChunkRecyclerTest {
         return (AbstractByteBuf) Unpooled.buffer(chunkSize(sizeClassIndex));
     }
 
-    private static MpscIntQueue freeList(int capacity) {
-        return MpscIntQueue.create(capacity, -1);
-    }
-
-    private static IntStack localFreeList(int capacity) {
-        return new IntStack(new int[capacity]);
-    }
-
     @Test
     public void poolSharingFollowsChunkSize() {
         assertEquals(chunkSize(SMALL), chunkSize(SMALL2));
@@ -66,21 +56,16 @@ public class SizeClassChunkRecyclerTest {
     }
 
     @Test
-    public void bufferComesBackWithItsFreeLists() {
+    public void bufferComesBack() {
         SizeClassChunkRecycler recycler = new SizeClassChunkRecycler();
         AbstractByteBuf buf = buffer(SMALL);
-        MpscIntQueue fl = freeList(64);
-        IntStack local = localFreeList(64);
 
-        assertTrue(recycler.offer(buf, fl, local, SMALL));
+        assertTrue(recycler.offer(buf, SMALL));
         assertEquals(1, recycler.size(SMALL));
 
-        assertTrue(recycler.poll(SMALL));
-        assertSame(buf, recycler.takeBuffer());
-        assertSame(fl, recycler.takeFreeList());
-        assertSame(local, recycler.takeLocalFreeList());
+        assertSame(buf, recycler.poll(SMALL));
         assertEquals(0, recycler.size(SMALL));
-        assertFalse(recycler.poll(SMALL));
+        assertNull(recycler.poll(SMALL));
         buf.release();
     }
 
@@ -88,16 +73,12 @@ public class SizeClassChunkRecyclerTest {
     public void sizeClassesWithTheSameChunkSizeShareOnePool() {
         SizeClassChunkRecycler recycler = new SizeClassChunkRecycler();
         AbstractByteBuf buf = buffer(SMALL);
-        MpscIntQueue fl = freeList(64);
 
-        assertTrue(recycler.offer(buf, fl, localFreeList(64), SMALL));
+        assertTrue(recycler.offer(buf, SMALL));
         assertEquals(1, recycler.size(SMALL2));
         assertEquals(0, recycler.size(LARGE));
 
-        assertTrue(recycler.poll(SMALL2));
-        assertSame(buf, recycler.takeBuffer());
-        assertSame(fl, recycler.takeFreeList());
-        recycler.takeLocalFreeList();
+        assertSame(buf, recycler.poll(SMALL2));
         buf.release();
     }
 
@@ -110,21 +91,18 @@ public class SizeClassChunkRecyclerTest {
         for (int i = 0; i < capacity; i++) {
             AbstractByteBuf buf = buffer(SMALL);
             offered.add(buf);
-            assertTrue(recycler.offer(buf, freeList(64), localFreeList(64), SMALL));
+            assertTrue(recycler.offer(buf, SMALL));
         }
         AbstractByteBuf refused = buffer(SMALL);
-        assertFalse(recycler.offer(refused, freeList(64), localFreeList(64), SMALL));
+        assertFalse(recycler.offer(refused, SMALL));
         assertEquals(capacity, recycler.size(SMALL));
         refused.release();
 
         // LIFO: the most recently freed buffer, still warm, is the first to be reused.
         for (int i = capacity - 1; i >= 0; i--) {
-            assertTrue(recycler.poll(SMALL));
-            assertSame(offered.get(i), recycler.takeBuffer());
-            recycler.takeFreeList();
-            recycler.takeLocalFreeList();
+            assertSame(offered.get(i), recycler.poll(SMALL));
         }
-        assertFalse(recycler.poll(SMALL));
+        assertNull(recycler.poll(SMALL));
         for (AbstractByteBuf buf : offered) {
             buf.release();
         }
@@ -139,27 +117,24 @@ public class SizeClassChunkRecyclerTest {
         for (int i = 0; i < capacity; i++) {
             AbstractByteBuf buf = buffer(LARGE);
             offered.add(buf);
-            assertTrue(recycler.offer(buf, freeList(64), localFreeList(64), LARGE));
+            assertTrue(recycler.offer(buf, LARGE));
         }
         // The budget is per recycler, not per chunk size: a buffer of another chunk size is refused too.
         AbstractByteBuf other = buffer(SMALL);
-        assertFalse(recycler.offer(other, freeList(64), localFreeList(64), SMALL));
+        assertFalse(recycler.offer(other, SMALL));
         // Taking one out makes room again.
-        assertTrue(recycler.poll(LARGE));
-        recycler.takeBuffer().release();
-        recycler.takeFreeList();
-        recycler.takeLocalFreeList();
-        assertTrue(recycler.offer(other, freeList(64), localFreeList(64), SMALL));
+        recycler.poll(LARGE).release();
+        assertTrue(recycler.offer(other, SMALL));
         recycler.freeAll();
     }
 
     @Test
-    public void freeAllReleasesPooledBuffersAndDropsLists() {
+    public void freeAllReleasesPooledBuffers() {
         SizeClassChunkRecycler recycler = new SizeClassChunkRecycler();
         AbstractByteBuf a = buffer(SMALL);
         AbstractByteBuf b = buffer(LARGE);
-        assertTrue(recycler.offer(a, freeList(64), localFreeList(64), SMALL));
-        assertTrue(recycler.offer(b, freeList(32), localFreeList(32), LARGE));
+        assertTrue(recycler.offer(a, SMALL));
+        assertTrue(recycler.offer(b, LARGE));
 
         recycler.freeAll();
 
@@ -167,15 +142,14 @@ public class SizeClassChunkRecyclerTest {
         assertEquals(0, b.refCnt());
         assertEquals(0, recycler.size(SMALL));
         assertEquals(0, recycler.size(LARGE));
-        assertFalse(recycler.poll(SMALL));
-        assertNull(recycler.takeBuffer());
+        assertNull(recycler.poll(SMALL));
     }
 
     /**
      * End to end through the allocator: chunks of one size class are freed past the cache floor, so their buffers go
-     * to the recycler, and a different size class with the same chunk size must reuse them with the free lists that
-     * came along - smaller than it needs (4096 then 32), larger (32 then 4096), or one of each (1152: 113 segments,
-     * an external list rounded up to 128 entries and a local one of exactly 113; then 1024: 128 segments).
+     * to the recycler, and a different size class with the same chunk size must reuse them, whatever the first one
+     * left in them: fewer and larger segments (4096 then 32), more and smaller (32 then 4096), or a segment size that
+     * does not divide the chunk (1152: 113 segments and a tail; then 1024: 128 segments).
      * Size classes that are not adjacent share chunks too: 16896 then 67584. From 16 KiB up a whole family (2^n, and
      * 2^n plus header) shares one chunk size, as the blocks of a mimalloc medium page do: 131072 then 16384.
      */
@@ -184,7 +158,7 @@ public class SizeClassChunkRecyclerTest {
             "4096, 32, false", "32, 4096, false", "1152, 1024, false", "16896, 67584, false", "131072, 16384, false",
             "4096, 32, true", "32, 4096, true", "1152, 1024, true", "16896, 67584, true", "131072, 16384, true",
     })
-    public void chunksAreReusedAcrossSizeClassesWithTheirFreeLists(int freedSize, int reusingSize, boolean threadLocal)
+    public void chunksAreReusedAcrossSizeClasses(int freedSize, int reusingSize, boolean threadLocal)
             throws Exception {
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
         Runnable test = () -> assertReusedAcrossSizeClasses(allocator, freedSize, reusingSize);
