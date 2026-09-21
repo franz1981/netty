@@ -2093,6 +2093,18 @@ final class AdaptivePoolingAllocator {
             return stack.length;
         }
 
+        int[] array() {
+            return stack;
+        }
+
+        int top() {
+            return top;
+        }
+
+        void top(int top) {
+            this.top = top;
+        }
+
         void refill(int count, int segmentSize) {
             int offset = count * segmentSize;
             for (int i = 0; i < count; i++) {
@@ -2134,7 +2146,11 @@ final class AdaptivePoolingAllocator {
         private final int segments;
         private final int segmentSize;
         MpscIntQueue externalFreeList;
+        // Only carried to and from the recycler; the chunk works on its array and top directly (localStack, localTop),
+        // so that a release does not load a second object to reach the array.
         private IntStack localFreeList;
+        private int[] localStack;
+        private int localTop;
         private final Thread ownerThread;
         /**
          * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free lists.
@@ -2170,6 +2186,8 @@ final class AdaptivePoolingAllocator {
                 externalFreeList = controller.createEmptyFreeList();
                 localFreeList = controller.createLocalFreeList();
             }
+            localStack = localFreeList.array();
+            localTop = localFreeList.top();
         }
 
         /**
@@ -2207,6 +2225,8 @@ final class AdaptivePoolingAllocator {
                 }
                 externalFreeList.resetAndFill(segments, segmentSize);
             }
+            localStack = localFreeList.array();
+            localTop = localFreeList.top();
         }
 
         /**
@@ -2246,9 +2266,10 @@ final class AdaptivePoolingAllocator {
         }
 
         private int nextAvailableSegmentOffset() {
-            IntStack localFreeList = this.localFreeList;
-            if (!localFreeList.isEmpty()) {
-                return localFreeList.pop();
+            int top = localTop;
+            if (top >= 0) {
+                localTop = top - 1;
+                return localStack[top];
             }
             return externalFreeList.poll();
         }
@@ -2262,11 +2283,11 @@ final class AdaptivePoolingAllocator {
             if (remaining > 0) {
                 return true;
             }
-            return !localFreeList.isEmpty() || !externalFreeList.isEmpty();
+            return localTop >= 0 || !externalFreeList.isEmpty();
         }
 
         boolean hasFullCapacity() {
-            int localSize = localFreeList.size();
+            int localSize = localTop + 1;
             return localSize == segments || localSize + externalFreeList.size() == segments;
         }
 
@@ -2282,7 +2303,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private int updateRemainingCapacity(int snapshotted) {
-            int freeSegments = externalFreeList.size() + localFreeList.size();
+            int freeSegments = externalFreeList.size() + localTop + 1;
             int updated = freeSegments * segmentSize;
             if (updated != snapshotted) {
                 allocatedBytes = capacity() - updated;
@@ -2292,7 +2313,7 @@ final class AdaptivePoolingAllocator {
 
         private void releaseSegmentOffsetIntoFreeList(int startIndex) {
             if (ownerThread != null && Thread.currentThread() == ownerThread) {
-                localFreeList.push(startIndex);
+                localStack[++localTop] = startIndex;
             } else {
                 boolean segmentReturned = externalFreeList.offer(startIndex);
                 assert segmentReturned : "Unable to return segment " + startIndex + " to free list";
@@ -2302,14 +2323,14 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int startIndex, int size) {
             if (ownerThread != null && Thread.currentThread() == ownerThread) {
-                localFreeList.push(startIndex);
+                localStack[++localTop] = startIndex;
                 afterLocalRelease();
             } else {
                 final SizeClassedChunkCache cache = owningCache;
                 final long stamp = cache.tryLockForRelease();
                 if (stamp != 0) {
                     try {
-                        localFreeList.push(startIndex);
+                        localStack[++localTop] = startIndex;
                         afterLockedRelease(cache);
                     } finally {
                         cache.unlockAfterRelease(stamp);
@@ -2372,7 +2393,7 @@ final class AdaptivePoolingAllocator {
             int st = observedState;
             while (st != DEALLOCATED) {
                 // Safe under the stripe lock: only lock holders mutate localFreeList.
-                int newLocalSize = localFreeList.size();
+                int newLocalSize = localTop + 1;
                 if (STATE.compareAndSet(this, st, newLocalSize)) {
                     deallocateIfNeeded(newLocalSize);
                     return;
@@ -2382,7 +2403,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private void updateStateOnLocalReleaseSegment(int previousLocalSize) {
-            int newLocalSize = localFreeList.size();
+            int newLocalSize = localTop + 1;
             boolean alwaysTrue = STATE.compareAndSet(this, previousLocalSize, newLocalSize);
             assert alwaysTrue : "this shouldn't happen unless double release in the local free list";
             deallocateIfNeeded(newLocalSize);
@@ -2399,11 +2420,13 @@ final class AdaptivePoolingAllocator {
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
+            localFreeList.top(localTop);
             if (recycler != null && recycler.offer(delegate, externalFreeList, localFreeList, sizeClassIndex)) {
                 delegate = null;
             }
             externalFreeList = null;
             localFreeList = null;
+            localStack = null;
             markToDeallocate();
         }
 
@@ -2416,8 +2439,7 @@ final class AdaptivePoolingAllocator {
                 deallocate();
                 return;
             }
-            IntStack localFreeList = this.localFreeList;
-            int localSize = localFreeList != null ? localFreeList.size() : 0;
+            int localSize = localStack != null ? localTop + 1 : 0;
             STATE.set(this, localSize);
             deallocateIfNeeded(localSize);
         }
