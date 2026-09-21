@@ -916,6 +916,175 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
+     * The corruption is found on a chunk that ran out of segments, got some back and refreshed its capacity
+     * snapshot: the chain that is forgotten must leave the chunk's capacity consistent, so the size class keeps
+     * allocating, and its segments must still count as free, so the chunk is freed like any other.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void writeAfterReleaseOnAnExhaustedChunkNeitherBreaksTheSizeClassNorLeaksTheChunk(boolean threadLocal)
+            throws Exception {
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        Runnable body = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    corruptAnExhaustedChunkAndKeepAllocating(allocator);
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }
+        };
+        if (threadLocal) {
+            // The thread's heap is freed when it exits.
+            Thread thread = new FastThreadLocalThread(body);
+            thread.start();
+            thread.join();
+        } else {
+            body.run();
+        }
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        freeHeap(allocator);
+        assertEquals(0, allocator.usedHeapMemory(), "the chunk with the forgotten chain was never freed");
+    }
+
+    private static void corruptAnExhaustedChunkAndKeepAllocating(final AdaptiveByteBufAllocator allocator) {
+        List<ByteBuf> held = new ArrayList<ByteBuf>();
+        // Chunk A: every segment handed out. Chunk B: the active chunk, one segment handed out.
+        for (int i = 0; i <= BURST_SEGMENTS_PER_CHUNK; i++) {
+            held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+        }
+        byte[] arrayA = held.get(0).array();
+        int corrupted = held.get(2).arrayOffset();
+        // Three segments of A come back; the last one released is the first read.
+        held.get(0).release();
+        held.get(1).release();
+        held.get(2).release();
+        for (int i = 0; i < 4; i++) {
+            arrayA[corrupted + i] = 0x7f;
+        }
+        List<ByteBuf> later = new ArrayList<ByteBuf>();
+        // Run B out of segments; the next allocation polls A and reads the destroyed link.
+        for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
+            later.add(allocator.heapBuffer(BURST_BUF_SIZE));
+        }
+        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(BURST_BUF_SIZE));
+        // The size class keeps working, and never from the chunk whose chain was forgotten.
+        for (int i = 0; i < 2 * BURST_SEGMENTS_PER_CHUNK; i++) {
+            ByteBuf buf = allocator.heapBuffer(BURST_BUF_SIZE);
+            assertNotSame(arrayA, buf.array());
+            later.add(buf);
+        }
+        for (ByteBuf buf : held.subList(3, held.size())) {
+            buf.release();
+        }
+        for (ByteBuf buf : later) {
+            buf.release();
+        }
+    }
+
+    /**
+     * A segment released twice would link to itself and be handed out for ever; it is a corrupted link like any
+     * other value that is not the next free segment.
+     */
+    @Test
+    void aFreeSegmentLinkingToItselfIsDetected() {
+        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
+        ByteBuf first = allocator.heapBuffer(256, 256);
+        ByteBuf second = allocator.heapBuffer(256, 256);
+        byte[] chunk = second.array();
+        int offset = second.arrayOffset();
+        first.release();
+        second.release();
+        chunk[offset] = (byte) offset;
+        chunk[offset + 1] = (byte) (offset >>> 8);
+        chunk[offset + 2] = (byte) (offset >>> 16);
+        chunk[offset + 3] = (byte) (offset >>> 24);
+        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(256, 256));
+        allocator.heapBuffer(256, 256).release();
+    }
+
+    /**
+     * The owner thread keeps allocating while other threads release what it allocated: their segments reach it
+     * through the list it takes over whole, racing their pushes. A segment must never be handed out while the
+     * buffer that holds it is still in use, whatever the interleaving.
+     */
+    @Test
+    void segmentsReleasedByOtherThreadsAreNeverHandedOutTwice() throws Exception {
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        final int releasers = 3;
+        final int allocations = 300000;
+        final BlockingQueue<ByteBuf> toRelease = new ArrayBlockingQueue<ByteBuf>(256);
+        final java.util.concurrent.ConcurrentHashMap<Long, Boolean> inUse =
+                new java.util.concurrent.ConcurrentHashMap<Long, Boolean>();
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        final ByteBuf poison = Unpooled.buffer(1);
+        Thread[] threads = new Thread[releasers];
+        for (int i = 0; i < releasers; i++) {
+            threads[i] = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        for (;;) {
+                            ByteBuf buf = toRelease.take();
+                            if (buf == poison) {
+                                return;
+                            }
+                            // Forget the segment before releasing it: it can only be handed out again afterwards.
+                            inUse.remove(buf.memoryAddress());
+                            buf.release();
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                }
+            });
+            threads[i].start();
+        }
+        Thread owner = new FastThreadLocalThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    for (int i = 0; i < allocations && failure.get() == null; i++) {
+                        ByteBuf buf = allocator.directBuffer(64, 64);
+                        if (inUse.putIfAbsent(buf.memoryAddress(), Boolean.TRUE) != null) {
+                            throw new AssertionError("segment at " + buf.memoryAddress() + " handed out twice");
+                        }
+                        toRelease.put(buf);
+                    }
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+            }
+        });
+        owner.start();
+        owner.join();
+        for (int i = 0; i < releasers; i++) {
+            toRelease.put(poison);
+        }
+        for (Thread thread : threads) {
+            thread.join();
+        }
+        poison.release();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        assertTrue(inUse.isEmpty());
+    }
+
+    private static void freeHeap(AdaptiveByteBufAllocator allocator) throws Exception {
+        java.lang.reflect.Field f = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
+        f.setAccessible(true);
+        Object inner = f.get(allocator);
+        java.lang.reflect.Method free = inner.getClass().getDeclaredMethod("free");
+        free.setAccessible(true);
+        free.invoke(inner);
+    }
+
+    /**
      * The fallback in the allocation slow path: a polled chunk without a free segment is given up and a fresh
      * chunk serves the allocation. The cache never hands out such a chunk, so the test makes one by taking every
      * free segment out of a cached chunk behind the cache's back. With assertions enabled the allocation fails

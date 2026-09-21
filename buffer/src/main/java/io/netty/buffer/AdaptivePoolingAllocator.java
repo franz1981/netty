@@ -453,16 +453,13 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Per-heap pool of chunk buffers that were fully free when their chunk was evicted, kept for the next
-     * chunk of the same chunk size on this heap. A buffer travels with the two free lists of the chunk
-     * that owned it, so re-creating a chunk from the pool only allocates the chunk object: the lists have
-     * the lifetime and count of the buffers, and the pool is sized by a single number.
+     * chunk of the same chunk size on this heap. A buffer carries nothing of the chunk that owned it: a
+     * {@link SizeClassedChunk} links its free segments through the buffer's own memory and starts from the segments
+     * never handed out, so whatever the last owner left in the buffer is ignored and re-creating a chunk from the
+     * pool only allocates the chunk object.
      * <p>
-     * Pools are keyed by chunk size, not size class: the size classes up to 4 KiB share one chunk size, and a
-     * buffer freed by one of them serves the next. The free lists are sized for the class that freed them; the
-     * recycling {@link SizeClassedChunk} constructor replaces a list that is too small and keeps one that is
-     * larger than needed, so within a shared pool the lists drift towards the largest need (up to 4096 entries,
-     * for the 32-byte class).
-     * <p>
+     * Pools are keyed by chunk size, not size class: every size class with the same chunk size, adjacent or not,
+     * takes the buffers the others gave up, as they are.
      * <p>
      * The pool is bounded by one number of bytes per heap, {@link #RECYCLED_BYTES_BUDGET}, across every chunk size:
      * whichever chunk sizes are churning get the room. A bound per chunk size left one or two buffers to the large
@@ -818,8 +815,8 @@ final class AdaptivePoolingAllocator {
          * later, unrelated one.
          * <p>
          * The store is a full volatile store on purpose, not a lazySet: it is the store half of a Dekker pair with
-         * the releaser, which offers the segment (the MPSC offer ends in a CAS on the producer index, a StoreLoad)
-         * and only then reads {@code pendingNext}. The processing reads the free lists right after this store;
+         * the releaser, which pushes the segment (the push ends in a CAS on the chunk's external list, a StoreLoad)
+         * and only then reads {@code pendingNext}. The processing reads the free counts right after this store;
          * without the StoreLoad here both sides could miss each other and the chunk would be stranded.
          */
         static Chunk rearm(Chunk chunk) {
@@ -914,7 +911,7 @@ final class AdaptivePoolingAllocator {
      *
      * <p><b>Eviction only ever operates on the reusable list</b> — {@link #evictIfAboveFloor} calls
      * {@code reusable.remove} unconditionally, and every caller either walks the reusable list
-     * or moves the chunk there first. So an exhausted-list chunk never has its free lists stripped,
+     * or moves the chunk there first. So an exhausted-list chunk never has its buffer taken away,
      * and {@link #probeExhausted()} cannot encounter one that does.
      *
      * <p>Note that route 3 can hand out a chunk that route 2 would have evicted. That is intended:
@@ -996,7 +993,7 @@ final class AdaptivePoolingAllocator {
         // list forever -- never reusable, and never fully free either, so the purge sweep will not
         // evict it. Four properties carry the invariant, and all four must hold:
         //
-        //  1. Offer before notify. releaseSegment puts the segment in the MPSC free list first, so a
+        //  1. Offer before notify. releaseSegment pushes the segment on the external list first, so a
         //     drainer that pops the note is guaranteed to see the segment.
         //  2. Notes are state-independent: "look at this chunk", never "this specific thing changed".
         //     One note therefore covers any number of later returns, and a note left while the chunk
@@ -1071,7 +1068,7 @@ final class AdaptivePoolingAllocator {
                 moveToReusable(chunk);
             } else if (queue != reusable) {
                 // On no queue: either gone (evicted, recycled, or its cache freed), not ours to move - its capacity
-                // is never read, because such a chunk may have had its free lists stripped by recycleOrDeallocate - or
+                // is never read, because such a chunk may have had its buffer taken by recycleOrDeallocate - or
                 // the active chunk, which consumes its own returned segments and is filed by capacity when the
                 // magazine gives it up (see deactivate). A polled chunk is activated before any drain can run.
                 return;
@@ -1222,8 +1219,8 @@ final class AdaptivePoolingAllocator {
          *   <li>never pushed: the releaser found {@code pendingNext} already non-null and walked away. If that
          *       link is a note still outstanding, the previous case covers this segment too. If it is a note a
          *       drain already popped, the releaser read the link before that drain's re-arm store: the releaser
-         *       offered first (a CAS on the MPSC queue) and read {@code pendingNext} second, and the drain's
-         *       full volatile re-arm store precedes every later volatile read of the queue indices on the
+         *       pushed first (a CAS on the external list) and read {@code pendingNext} second, and the drain's
+         *       full volatile re-arm store precedes every later volatile read of the external list on the
          *       draining side, this call's capacity read included. So the segment is visible here (see
          *       {@link PendingChunks#rearm}).</li>
          * </ul>
@@ -2035,11 +2032,17 @@ final class AdaptivePoolingAllocator {
         private final int lastSegmentOffset;
         /** The segments reachable from {@link #head} plus those never handed out. */
         private int localFree;
+        /**
+         * Free segments that can no longer be reached, because the chain they were on held a corrupted link
+         * ({@link #corruptedFreeList}). They are never handed out again, but they are free: they count when the
+         * chunk is asked whether every segment is back, so that it is still given up or deallocated.
+         */
+        private int lostFree;
         /** Segments released by other threads: their count in the high half, the first one's offset in the low. */
         private volatile long externalFree;
         private final Thread ownerThread;
         /**
-         * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free lists.
+         * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free counts.
          * Segments returned since then are not subtracted, so {@code capacity - allocatedBytes} never counts a
          * segment that is not free.
          */
@@ -2055,6 +2058,7 @@ final class AdaptivePoolingAllocator {
             segments = 0;
             bumpLimit = 0;
             lastSegmentOffset = 0;
+            EXTERNAL_FREE.lazySet(this, EXTERNAL_EMPTY);
             ownerThread = null;
             owningCache = null;
         }
@@ -2149,8 +2153,10 @@ final class AdaptivePoolingAllocator {
             }
             long taken = EXTERNAL_FREE.getAndSet(this, EXTERNAL_EMPTY);
             int head = (int) taken;
+            // Counted before the first link is read, so that a corrupted one forgets exactly these segments.
+            localFree += externalCount(taken);
             this.head = nextFreeAfter(head);
-            localFree += externalCount(taken) - 1;
+            localFree--;
             return head;
         }
 
@@ -2163,21 +2169,27 @@ final class AdaptivePoolingAllocator {
          */
         private int nextFreeAfter(int offset) {
             int next = delegate._getIntLE(offset);
-            if (next < FREE_LIST_EMPTY || next > lastSegmentOffset) {
-                throw corruptedFreeList(offset, next);
+            if (next < FREE_LIST_EMPTY || next > lastSegmentOffset || next == offset) {
+                throw corruptedFreeList(offset);
             }
             return next;
         }
 
         /**
-         * A link that is not a segment of this chunk. The chain it belongs to cannot be trusted, so it is forgotten:
-         * its segments are lost to this chunk, which is then never given up, but the chunk keeps serving the segments
-         * never handed out and those released from now on. A link overwritten with the offset of another segment of
-         * this chunk cannot be told from a good one.
+         * A link that is not another segment of this chunk. The chain it belongs to cannot be trusted, so it is
+         * forgotten, and the exception to throw is returned: its segments are never handed out again, but they
+         * stay counted as free ({@link #lostFree}), so the chunk is still given up or deallocated once the segments
+         * in use are back, and it keeps serving the segments never handed out and those released from now on. The
+         * capacity snapshot is dropped with the chain, so that the next query counts again. A link overwritten with
+         * the offset of another segment of this chunk cannot be told from a good one.
          */
-        private IllegalStateException corruptedFreeList(int offset, int next) {
+        private IllegalStateException corruptedFreeList(int offset) {
+            int next = delegate._getIntLE(offset);
+            int reachable = (bumpLimit - bump) / segmentSize;
+            lostFree += localFree - reachable;
+            localFree = reachable;
             head = FREE_LIST_EMPTY;
-            localFree = (bumpLimit - bump) / segmentSize;
+            allocatedBytes = capacity;
             return new IllegalStateException("free segment at " + offset + " links to " + next
                     + ": a buffer was written after it was released");
         }
@@ -2211,15 +2223,16 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean hasFullCapacity() {
-            int localSize = localFree;
+            int localSize = localFree + lostFree;
             return localSize == segments || localSize + externalCount(externalFree) == segments;
         }
 
         /**
          * The free bytes of this chunk as the magazine sees it after each allocation. While the snapshot is above
-         * one segment it is returned as is, without touching the free lists; at or below one segment the free lists
-         * are counted and the snapshot refreshed. Before the first refresh the snapshot also counts the tail of the
-         * chunk that is too small for a segment, when the chunk size is not a multiple of the segment size.
+         * one segment it is returned as is, without reading the free counts; at or below one segment the free
+         * segments are counted and the snapshot refreshed. Before the first refresh the snapshot also counts the
+         * tail of the chunk that is too small for a segment, when the chunk size is not a multiple of the segment
+         * size.
          */
         public int remainingCapacity() {
             int remaining = capacity - allocatedBytes;
@@ -2308,14 +2321,14 @@ final class AdaptivePoolingAllocator {
         /**
          * Deallocation accounting for a segment pushed on {@link #head} while holding
          * the stripe lock. Unlike the owner-thread variant, {@code state} may be concurrently
-         * advanced to {@link #DEALLOCATED} by a releaser on the lock-free MPSC path, so the
+         * advanced to {@link #DEALLOCATED} by a releaser on the lock-free external path, so the
          * update is a CAS loop rather than an unconditional CAS.
          */
         private void updateStateOnLockedReleaseSegment(int observedState) {
             int st = observedState;
             while (st != DEALLOCATED) {
                 // Safe under the stripe lock: only lock holders push on head.
-                int newLocalSize = localFree;
+                int newLocalSize = localFree + lostFree;
                 if (STATE.compareAndSet(this, st, newLocalSize)) {
                     deallocateIfNeeded(newLocalSize);
                     return;
@@ -2325,7 +2338,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private void updateStateOnLocalReleaseSegment(int previousLocalSize) {
-            int newLocalSize = localFree;
+            int newLocalSize = localFree + lostFree;
             boolean alwaysTrue = STATE.compareAndSet(this, previousLocalSize, newLocalSize);
             assert alwaysTrue : "this shouldn't happen unless double release in the local free list";
             deallocateIfNeeded(newLocalSize);
@@ -2353,7 +2366,7 @@ final class AdaptivePoolingAllocator {
         }
 
         void markToDeallocate() {
-            int localSize = localFree;
+            int localSize = localFree + lostFree;
             STATE.set(this, localSize);
             deallocateIfNeeded(localSize);
         }
