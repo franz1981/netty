@@ -19,8 +19,11 @@ import io.netty.util.IllegalReferenceCountException;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -31,6 +34,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The shape-proving subset of section 5.0 of {@code event-loop-arena-design.md}: confinement, the
@@ -542,6 +547,245 @@ class CycleArenaAllocatorTest {
             assertTrue(counters.startsWith("ARENATELE"), counters);
             assertTrue(counters.contains("arenaShare="), counters);
             assertTrue(counters.contains("ARENALOOP thread="), counters);
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    // ------------------------------------------------------------------ the ring (-Darena.ring)
+
+    /** A buffer's place in its block, unique across blocks: block id and offset, never an address. */
+    private static long slot(ByteBuf buf) {
+        CycleArenaAllocator.ArenaBuf ab = assertInstanceOf(CycleArenaAllocator.ArenaBuf.class, buf);
+        return (long) ab.blockIdForTest() * CycleArenaAllocator.BLOCK_SIZE + ab.startForTest();
+    }
+
+    /**
+     * (1) The shape of the ring: a freed slot is NOT the next one handed out - the tail keeps bumping
+     * forward over untouched bytes - and it comes back exactly when the tail reaches the wall and wraps.
+     */
+    @Test
+    void theFreedSlotComesBackOnlyWhenTheTailWraps() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf a = alloc.heapBuffer(1024);
+            CycleArenaAllocator.Space space = space(alloc, false);
+            assertEquals(0, arenaBuf(a).startForTest());
+            long slotA = slot(a);
+            assertTrue(a.release());
+
+            // b is next, and the tail has room: b lands AFTER a's slot, not on it.
+            ByteBuf b = alloc.heapBuffer(1024);
+            assertEquals(1024, arenaBuf(b).startForTest());
+            assertNotEquals(slotA, slot(b));
+            assertEquals(0, space.ringWraps);
+
+            // Run the tail to the top of the block with only b alive. b is the lowest live start and it
+            // leaves 1024 free bytes below it, so the allocation that hits the wall wraps onto a's slot.
+            ByteBuf wrapped = null;
+            while (space.ringWraps == 0) {
+                ByteBuf filler = alloc.heapBuffer(1024);
+                assertEquals(1, space.blockCount());
+                if (space.ringWraps == 1) {
+                    wrapped = filler;
+                } else {
+                    assertNotEquals(slotA, slot(filler), "a's bytes came back before the tail wrapped");
+                    assertTrue(filler.release());
+                }
+            }
+            assertNotNull(wrapped);
+            assertEquals(0, space.blockSwitches);
+            assertEquals(slotA, slot(wrapped), "the wrapped tail hands out what the head gave back");
+            assertTrue(wrapped.release());
+            assertTrue(b.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * (2) A FIFO stream of far more than two blocks' worth, with never more than a quarter of a block
+     * live, must never leave the first block: that is the whole point of the ring.
+     */
+    @Test
+    void aFifoStreamStaysInOneBlock() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            CycleArenaAllocator.Space space = null;
+            ArrayDeque<ByteBuf> window = new ArrayDeque<ByteBuf>();
+            long bytes = 0;
+            while (bytes < 4L * CycleArenaAllocator.BLOCK_SIZE) {
+                ByteBuf buf = alloc.heapBuffer(1024);
+                arenaBuf(buf);
+                if (space == null) {
+                    space = space(alloc, false);
+                }
+                window.addLast(buf);
+                bytes += 1024;
+                if (window.size() > 64) {                  // 64 KiB live, a quarter of the block
+                    assertTrue(window.pollFirst().release());
+                }
+            }
+            while (!window.isEmpty()) {
+                assertTrue(window.pollFirst().release());
+            }
+            assertNotNull(space);
+            assertEquals(1, space.blockCount(), "a FIFO stream must fit in one block");
+            assertEquals(0, space.blockSwitches);
+            assertTrue(space.ringWraps > 0, "the tail never wrapped: ringWraps=" + space.ringWraps);
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * (3) A survivor at the very bottom of a block leaves nothing to wrap into: the ring must never hand
+     * out its bytes, and when the tail reaches the top the space must switch block instead.
+     */
+    @Test
+    void theRingNeverHandsOutASurvivorAtTheBottom() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf survivor = alloc.heapBuffer(1024);
+            CycleArenaAllocator.Space space = space(alloc, false);
+            int survivorBlock = arenaBuf(survivor).blockIdForTest();
+            assertEquals(0, arenaBuf(survivor).startForTest());
+
+            long bytes = 0;
+            while (bytes < 3L * CycleArenaAllocator.BLOCK_SIZE) {
+                ByteBuf buf = alloc.heapBuffer(1024);
+                CycleArenaAllocator.ArenaBuf ab = arenaBuf(buf);
+                if (ab.blockIdForTest() == survivorBlock) {
+                    // [start, end) must be disjoint from the survivor's [0, 1024).
+                    assertTrue(ab.startForTest() >= 1024,
+                            "the ring handed out the survivor's bytes at " + ab.startForTest());
+                }
+                bytes += 1024;
+                assertTrue(buf.release());
+            }
+            assertEquals(0, space.ringWraps, "a survivor at offset 0 leaves no room to wrap into");
+            assertEquals(1, space.blockSwitches, "the pinned block is left exactly once");
+            assertEquals(2, space.blockCount());
+            assertTrue(space.ringResets > 0, "the empty second block must restart in place");
+            assertEquals(1, live(space, survivorBlock));
+            assertTrue(survivor.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /** (4) Growing in place moves the tail, so it must stop at the ring's wall, not at the block's top. */
+    @Test
+    void inPlaceGrowthStopsAtTheRingWall() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf first = alloc.heapBuffer(1024);          // [0, 1024)
+            ByteBuf wall = alloc.heapBuffer(1024);           // [1024, 2048): what the tail will stop at
+            assertTrue(first.release());
+            CycleArenaAllocator.Space space = space(alloc, false);
+
+            ByteBuf topmost = null;
+            while (space.ringWraps == 0) {
+                ByteBuf filler = alloc.heapBuffer(1024);
+                if (space.ringWraps == 1) {
+                    topmost = filler;
+                } else {
+                    assertTrue(filler.release());
+                }
+            }
+            assertNotNull(topmost);
+            assertEquals(0, arenaBuf(topmost).startForTest());
+            assertEquals(1024, space.curLimit);
+            assertEquals(1024, space.curBump);               // topmost fills the whole wrapped region
+            topmost.writeLong(0x0102030405060708L);
+
+            long slotBefore = slot(topmost);
+            long inPlace = space.reallocInPlace;
+            topmost.capacity(2048);                          // would cross the wall: it must move instead
+            assertEquals(inPlace, space.reallocInPlace, "in-place growth must stop at curLimit");
+            assertEquals(1, space.reallocMoved);
+            assertNotEquals(slotBefore, slot(topmost));
+            assertEquals(2048, topmost.capacity());
+            assertEquals(0x0102030405060708L, topmost.getLong(0));
+            assertEquals(1024, arenaBuf(wall).startForTest(), "the wall buffer never moved");
+            assertTrue(topmost.release());
+            assertTrue(wall.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /** (5) {@code -Darena.ring=false}: nothing is handed out again before a hook, block after block. */
+    @Test
+    void withoutTheRingNothingComesBackBeforeTheHook() {
+        assumeFalse(CycleArenaAllocator.RING, "the ring is on");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            CycleArenaAllocator.Space space = null;
+            Set<Long> seen = new HashSet<Long>();
+            long bytes = 0;
+            while (bytes < 2L * CycleArenaAllocator.BLOCK_SIZE) {
+                ByteBuf buf = alloc.heapBuffer(1024);
+                if (space == null) {
+                    space = space(alloc, false);
+                }
+                assertTrue(seen.add(slot(buf)), "a slot came back before any hook ran");
+                bytes += 1024;
+                assertTrue(buf.release());                   // released at once, and still never reused
+            }
+            assertNotNull(space);
+            assertTrue(space.blockCount() > 1, "without the ring the space must switch block");
+            assertEquals(0, space.ringWraps + space.ringResets);
+
+            // The hook is still the only thing that brings a block back.
+            alloc.runHookForTest();
+            ByteBuf afterHook = alloc.heapBuffer(1024);
+            assertFalse(seen.add(slot(afterHook)), "the hook must bring an already-used slot back");
+            assertTrue(afterHook.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * {@code -Darena.ringStats=true}: the stall measurement itself. One block, two survivors with a dead
+     * 1 KiB gap between them, and the tail run up to the top - so the arithmetic is known exactly.
+     */
+    @Test
+    void ringStatsMeasureTheStrandedBytesAndTheHoles() {
+        assumeTrue(CycleArenaAllocator.RING && CycleArenaAllocator.RING_STATS, "ring stats are off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf a = alloc.heapBuffer(1024);              // [0, 1024): kept
+            ByteBuf gap = alloc.heapBuffer(1024);            // [1024, 2048): dies at once
+            ByteBuf b = alloc.heapBuffer(256);               // [2048, 2304): kept
+            CycleArenaAllocator.Space space = space(alloc, false);
+            assertEquals(0, arenaBuf(a).startForTest());
+            assertEquals(2048, arenaBuf(b).startForTest());
+            assertTrue(gap.release());
+
+            while (space.ringStalls == 0) {                  // run the tail to the top of the block
+                assertTrue(alloc.heapBuffer(1024).release());
+            }
+            int blockSize = CycleArenaAllocator.BLOCK_SIZE;
+            assertEquals(1, space.ringStalls);
+            assertEquals(blockSize, space.stallBytes);
+            // The tail stalls at the last 1 KiB slot that still fits, not at the top of the block.
+            int tail = 2304;
+            while (tail + 1024 <= blockSize) {
+                tail += 1024;
+            }
+            // Live: [0,1024) and [2048,2304). Holes: [1024,2048) and [2304, tail).
+            assertEquals(tail - 1280, space.strandedBytes);
+            assertEquals(1, space.holes1k, "the 1 KiB gap between the two survivors");
+            assertEquals(1, space.holesBig, "everything above the last survivor");
+            assertEquals(0, space.holes256 + space.holes4k + space.holes8k);
+            assertTrue(a.release());
+            assertTrue(b.release());
         } finally {
             alloc.removeForTest();
         }
