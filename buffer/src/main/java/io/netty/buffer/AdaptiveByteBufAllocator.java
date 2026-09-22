@@ -87,10 +87,10 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
-    private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
         private final ByteBufAllocator allocator;
 
-        private HeapChunkAllocator(ByteBufAllocator allocator) {
+        HeapChunkAllocator(ByteBufAllocator allocator) {
             this.allocator = allocator;
         }
 
@@ -102,10 +102,10 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
     }
 
-    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
         private final ByteBufAllocator allocator;
 
-        private DirectChunkAllocator(ByteBufAllocator allocator) {
+        DirectChunkAllocator(ByteBufAllocator allocator) {
             this.allocator = allocator;
         }
 
