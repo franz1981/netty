@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.ByteProcessor;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.FastThreadLocal;
@@ -45,12 +46,13 @@ import java.util.List;
  * design - see the metrics).
  * <p>
  * <b>Layout.</b> There is no block object. A block is an id in {@code [0, maxBlocks)} and a column of flat
- * per-space arrays - {@link Space#live}, {@link Space#mem}, {@link Space#base}, {@link Space#nio},
- * {@link Space#roots} - plus two {@code int} bit masks. The current block is plain fields of the space:
- * {@link Space#curId}, {@link Space#curBump}, {@link Space#curMemory}, {@link Space#curAddress}. A buffer
- * stores its block as an {@code int} id; allocation writes ints, one {@code long} address and - for a heap
- * buffer that lands in another block - one guarded {@code byte[]} store, which is the only reference store
- * on any hot path. Switching block is {@code numberOfTrailingZeros(reusableMask)}; the hook scans the live
+ * per-space arrays - {@link Space#allocs}, {@link Space#frees}, {@link Space#roots} - plus two {@code int}
+ * bit masks. The current block is plain fields of the space: {@link Space#curId}, {@link Space#curBump} and
+ * {@link Space#curRoot}, the chunk buffer that backs it. A buffer stores its block as an {@code int} id and
+ * reaches its bytes the way {@link AdaptivePoolingAllocator.AdaptiveByteBuf} does - through that root parent
+ * and an offset; allocation writes ints and - for a buffer that lands in another block - one guarded
+ * reference store, which is the only reference store on any hot path. Switching block is
+ * {@code numberOfTrailingZeros(reusableMask)}; the hook scans the live
  * ints, resets the current block's bump in place and rebuilds the mask. There is no {@code bump[]} column:
  * only the current block is ever bumped, and a block switched away from is never bumped again.
  * <p>
@@ -319,13 +321,8 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          */
         final int[] allocs = new int[MAX_BLOCKS + 1];
         final int[] frees = new int[MAX_BLOCKS + 1];
-        /** Base address per block, 0 when the chunks of this space have none. */
-        final long[] base = new long[MAX_BLOCKS + 1];
-        /** Backing array per block, null for a direct space. */
-        final byte[][] mem = new byte[MAX_BLOCKS + 1][];
-        /** One NIO view of the whole block, the source the per-buffer views are duplicated from. */
-        final ByteBuffer[] nio = new ByteBuffer[MAX_BLOCKS + 1];
-        /** The chunk buffer per block: bulk access, and the memory to give back. */
+        /** The chunk buffer per block: the root parent of every buffer of the block, and the memory to
+         * give back. */
         final AbstractByteBuf[] roots = new AbstractByteBuf[MAX_BLOCKS + 1];
         /** Debug only: the hook generation that last reset each block. */
         final long[] stamp = new long[MAX_BLOCKS + 1];
@@ -338,21 +335,12 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          * else. Set by {@link #switchBlock()}, cleared by the hook and by {@link #trim()}.
          */
         boolean exhausted;
-        boolean hasAddress;
-        /**
-         * -1 when the chunks of this space have a usable memory address, 0 when they do not. It turns the
-         * offset into the block into zero for a heap space, so that a heap buffer's address stays 0 and
-         * {@code hasMemoryAddress()} is false - as {@link UnpooledHeapByteBuf}'s is. Without it a heap
-         * buffer would report {@code start} as an absolute address and every unsafe copy into it would
-         * write to whatever lives there.
-         */
-        int addressMask;
 
         // --- the current block, flat ---
         int curId;
         int curBump;
-        byte[] curMemory;
-        long curAddress;
+        /** {@code roots[curId]}: allocation reads no column at all to give a buffer its root parent. */
+        AbstractByteBuf curRoot;
 
         // --- the buffer objects of this space ---
         ArenaBuf[] objects = new ArenaBuf[INITIAL_OBJECTS];
@@ -568,20 +556,13 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         private void makeCurrent(int id) {
             curId = id;
             curBump = 0;                       // the hook reset it; nothing has been handed out since
-            curMemory = mem[id];
-            curAddress = base[id];
+            curRoot = roots[id];
         }
 
         /** Take a free slot and give it a chunk. Cold: growth only. */
         private void newBlock() {
             int id = Integer.numberOfTrailingZeros(~allocatedMask & FULL_MASK);
-            AbstractByteBuf root = chunkAllocator.allocate(BLOCK_SIZE, BLOCK_SIZE);
-            roots[id] = root;
-            mem[id] = root.hasArray() ? root.array() : null;
-            hasAddress = root.hasMemoryAddress();
-            addressMask = hasAddress ? -1 : 0;
-            base[id] = hasAddress ? root.memoryAddress() : 0L;
-            nio[id] = root.internalNioBuffer(0, BLOCK_SIZE).duplicate();
+            roots[id] = chunkAllocator.allocate(BLOCK_SIZE, BLOCK_SIZE);
             allocs[id] = 0;
             frees[id] = 0;
             stamp[id] = generation - 1;        // fresh memory: never "reused before its hook"
@@ -723,17 +704,13 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             allocatedMask = 0;
             reusableMask = 0;
-            curMemory = null;
-            curAddress = 0;
+            curRoot = null;
             hook = null;
         }
 
         private void dropBlock(int id) {
             AbstractByteBuf root = roots[id];
             roots[id] = null;
-            mem[id] = null;
-            nio[id] = null;
-            base[id] = 0L;
             root.release();
         }
 
@@ -819,8 +796,10 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
     /**
      * A buffer over a region of a block - or, in the DELEGATED state, over a buffer of the delegate
-     * allocator. Element access goes straight to {@link #memory} + {@link #start} (heap) or to
-     * {@link #address} (direct), never through the block columns.
+     * allocator. Element access is {@link AdaptivePoolingAllocator.AdaptiveByteBuf}'s: the block's chunk
+     * buffer is the root parent, {@link #start} is this buffer's index 0 inside it, and every accessor is
+     * one forward to the root's own primitive. Everything {@link AbstractByteBuf} already builds on top of
+     * those primitives - the indexed reads and writes, the char sequences, {@code setZero} - is inherited.
      */
     static final class ArenaBuf extends AbstractByteBuf {
         private final ByteBufAllocator alloc;
@@ -829,22 +808,18 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         final int index;                 // stable slot in the space's object array
         /** The block this buffer's region belongs to, or {@link #DELEGATE_SLOT} when DELEGATED. */
         private int blockId;
-        /** Offset of this buffer's index 0 inside {@link #memory} (heap), and inside its block. */
+        /** This buffer's index 0 inside {@link #rootParent}. */
         private int start;
         private int length;
         private int refCnt;
-        /** The block's array (heap), or the delegate buffer's array; null for direct memory. */
-        private byte[] memory;
-        /** The address of this buffer's index 0 (direct), 0 when there is none. */
-        private long address;
+        /** The block's chunk buffer, or - when DELEGATED - the unwrapped delegate buffer. */
+        private AbstractByteBuf rootParent;
         /** DELEGATED state only: the buffer to release, leak-aware wrapper and all. */
         private ByteBuf delegated;
-        /** DELEGATED state only: the same buffer, unwrapped, for the bulk and view paths. */
-        private AbstractByteBuf delegateRoot;
         // The NIO view must be per buffer: several buffers of one block are asked for their view before any
-        // of them is used (a gathering write), so a view shared per block would be handed out twice.
+        // of them is used (a gathering write), so a view shared per block would be handed out twice. It is
+        // anchored at this buffer's index 0, so it is dropped whenever the region moves.
         private ByteBuffer tmpNioBuf;
-        private int tmpNioBlock = NO_BLOCK;
 
         ArenaBuf(ByteBufAllocator alloc, Space space, int index) {
             super(0);
@@ -860,32 +835,38 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
 
         /**
-         * Ints, one long, and - only when this buffer lands in another block - one guarded {@code byte[]}
-         * store. That store is the single reference store on the allocation path and it is paid once per
-         * block switch, not once per allocation.
+         * Ints, and - only when this buffer lands in another block - one guarded reference store. That
+         * store is the single reference store on the allocation path and it is paid once per block switch,
+         * not once per allocation. The NIO view is cleared the same guarded way: most buffers never take
+         * one, so the common case writes no reference at all.
          */
         void init(int blockId, int start, int length, int maxCapacity) {
             this.blockId = blockId;
             this.start = start;
             this.length = length;
             this.refCnt = 1;
-            byte[] m = space.curMemory;
-            if (memory != m) {
-                memory = m;
+            AbstractByteBuf root = space.curRoot;
+            if (rootParent != root) {
+                rootParent = root;
             }
-            address = space.curAddress + (space.addressMask & start);
+            if (tmpNioBuf != null) {
+                tmpNioBuf = null;
+            }
             resetForReuse(maxCapacity);
         }
 
-        /** The buffer that holds the bytes, for the bulk and view paths only. */
-        private AbstractByteBuf root() {
-            int id = blockId;
-            return id == DELEGATE_SLOT ? delegateRoot : space.roots[id];
+        /** The buffer that holds the bytes: the block's chunk, or the delegate buffer when DELEGATED. */
+        private AbstractByteBuf rootParent() {
+            AbstractByteBuf root = rootParent;
+            if (root != null) {
+                return root;
+            }
+            throw new IllegalReferenceCountException(0);
         }
 
-        /** This buffer's index 0 inside {@link #root()}. */
-        private int rootStart() {
-            return blockId == DELEGATE_SLOT ? 0 : start;
+        /** This buffer's index {@code i} in the root parent's index space. */
+        private int idx(int i) {
+            return i + start;
         }
 
         // --- reference counting: plain int, owner-confined (Invariant A) ---
@@ -981,11 +962,8 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         private void releaseDelegated() {
             ByteBuf buf = delegated;
             delegated = null;
-            delegateRoot = null;
+            rootParent = null;
             tmpNioBuf = null;
-            tmpNioBlock = NO_BLOCK;
-            memory = null;
-            address = 0;
             buf.release();
         }
 
@@ -1033,57 +1011,53 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             if (id == DELEGATE_SLOT) {
                 delegated.capacity(newCapacity);   // DELEGATED: the delegate buffer grows itself
                 length = newCapacity;
-                adoptDelegate(delegated);          // its memory may have moved
+                tmpNioBuf = null;                  // its memory may have moved
                 return this;
             }
             int newEnd = start + ((newCapacity + 7) & ~7);
             if (id == space.curId && space.curBump == start + ((length + 7) & ~7) && newEnd <= BLOCK_SIZE) {
                 space.curBump = newEnd;
                 length = newCapacity;
+                tmpNioBuf = null;                  // the view is capped at the old length
                 space.reallocInPlace++;
                 return this;
             }
-            AbstractByteBuf oldRoot = space.roots[id];
+            AbstractByteBuf oldRoot = rootParent();
             int oldStart = start;
             int oldLength = length;
             int newId = space.reserve(newCapacity);
             if (newId >= 0) {
+                AbstractByteBuf newRoot = space.roots[newId];
                 int newStart = space.reservedStart;
-                space.roots[newId].setBytes(newStart, oldRoot, oldStart, oldLength);
+                newRoot.setBytes(newStart, oldRoot, oldStart, oldLength);
                 space.reallocMoved++;
                 blockId = newId;
                 start = newStart;
                 length = newCapacity;
-                memory = space.mem[newId];
-                address = space.base[newId] + (space.addressMask & newStart);
+                rootParent = newRoot;
                 tmpNioBuf = null;
-                tmpNioBlock = NO_BLOCK;
             } else {
                 ByteBuf buf = space.arena.alloc.delegateForGrow(space, newCapacity, maxCapacity());
                 AbstractByteBuf target = unwrapDelegate(buf);
                 target.setBytes(0, oldRoot, oldStart, oldLength);
                 space.reallocDelegated++;
                 delegated = buf;
-                delegateRoot = target;
                 length = newCapacity;
-                adoptDelegate(buf);            // counts the delegate slot itself
+                adoptDelegate(target);             // counts the delegate slot itself
             }
             space.frees[id]++;
             return this;
         }
 
-        /** Point the data fields at a delegate buffer's memory; the id becomes {@link #DELEGATE_SLOT}. */
-        private void adoptDelegate(ByteBuf buf) {
-            AbstractByteBuf target = delegateRoot;
+        /** Point this buffer at a delegate buffer's memory; the id becomes {@link #DELEGATE_SLOT}. */
+        private void adoptDelegate(AbstractByteBuf target) {
             if (blockId != DELEGATE_SLOT) {
                 space.allocs[DELEGATE_SLOT]++;
             }
             blockId = DELEGATE_SLOT;
-            memory = target.hasArray() ? target.array() : null;
-            start = memory != null ? target.arrayOffset() : 0;
-            address = target.hasMemoryAddress() ? target.memoryAddress() : 0L;
+            rootParent = target;               // the delegate buffer's own index 0 is this buffer's index 0
+            start = 0;
             tmpNioBuf = null;
-            tmpNioBlock = NO_BLOCK;
         }
 
         /** The delegate wraps its buffers when leak detection is on; element access needs the raw one. */
@@ -1124,39 +1098,39 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             return space.direct;
         }
 
+        // --- memory, views and copies: the root parent's, shifted by start ---
+
         @Override
         public boolean hasArray() {
-            return memory != null;
+            return rootParent().hasArray();
         }
 
         @Override
         public byte[] array() {
             ensureAccessible();
-            if (memory == null) {
-                throw new UnsupportedOperationException("direct buffer");
-            }
-            return memory;
+            return rootParent().array();
         }
 
         @Override
         public int arrayOffset() {
-            return start;
+            return idx(rootParent().arrayOffset());
         }
 
         @Override
         public boolean hasMemoryAddress() {
-            return address != 0;
+            return rootParent().hasMemoryAddress();
         }
 
         @Override
         public long memoryAddress() {
             ensureAccessible();
-            return address;
+            return _memoryAddress();
         }
 
         @Override
         long _memoryAddress() {
-            return address;
+            AbstractByteBuf root = rootParent;
+            return root != null ? root._memoryAddress() + start : 0L;
         }
 
         @Override
@@ -1165,72 +1139,226 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
 
         @Override
-        public ByteBuffer nioBuffer(int index, int len) {
-            checkIndex(index, len);
-            return root().nioBuffer(rootStart() + index, len);   // a fresh view per call
+        public ByteBuffer nioBuffer(int i, int len) {
+            checkIndex(i, len);
+            return rootParent().nioBuffer(idx(i), len);          // a fresh view per call
         }
 
         @Override
-        public ByteBuffer internalNioBuffer(int index, int len) {
-            checkIndex(index, len);
-            int id = blockId;
-            if (id == DELEGATE_SLOT) {
-                return delegateRoot.internalNioBuffer(index, len);   // the delegate has its own
-            }
+        public ByteBuffer[] nioBuffers(int i, int len) {
+            checkIndex(i, len);
+            return rootParent().nioBuffers(idx(i), len);
+        }
+
+        @Override
+        public ByteBuffer internalNioBuffer(int i, int len) {
+            checkIndex(i, len);
+            return (ByteBuffer) internalNioBuffer().position(i).limit(i + len);
+        }
+
+        /** This buffer's own view, anchored at its index 0; {@link #init} and {@link #grow} drop it. */
+        private ByteBuffer internalNioBuffer() {
             ByteBuffer buf = tmpNioBuf;
-            if (buf == null || tmpNioBlock != id) {
-                buf = space.nio[id].duplicate();
-                tmpNioBuf = buf;
-                tmpNioBlock = id;
+            if (buf == null) {
+                tmpNioBuf = buf = rootParent().nioBuffer(start, length);
             }
-            buf.clear().position(start + index).limit(start + index + len);
-            return buf;
+            return (ByteBuffer) buf.clear();
         }
 
         @Override
-        public ByteBuffer[] nioBuffers(int index, int len) {
-            return new ByteBuffer[] { nioBuffer(index, len) };
+        public ByteBuf copy(int i, int len) {
+            checkIndex(i, len);
+            return rootParent().copy(idx(i), len);
         }
 
         @Override
-        public ByteBuf copy(int index, int len) {
-            checkIndex(index, len);
-            return root().copy(rootStart() + index, len);
+        public int forEachByte(int i, int len, ByteProcessor processor) {
+            checkIndex(i, len);
+            return forEachResult(rootParent().forEachByte(idx(i), len, processor));
         }
 
-        // --- element access: straight to the array or to the address, no block column is read ---
-        @Override protected byte _getByte(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getByte(m, start + i) : HeapByteBufUtil.getByte(m, start + i)) : UnsafeByteBufUtil.getByte(address + i); }
-        @Override protected short _getShort(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getShort(m, start + i) : HeapByteBufUtil.getShort(m, start + i)) : UnsafeByteBufUtil.getShort(address + i); }
-        @Override protected short _getShortLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getShortLE(m, start + i) : HeapByteBufUtil.getShortLE(m, start + i)) : UnsafeByteBufUtil.getShortLE(address + i); }
-        @Override protected int _getUnsignedMedium(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getUnsignedMedium(m, start + i) : HeapByteBufUtil.getUnsignedMedium(m, start + i)) : UnsafeByteBufUtil.getUnsignedMedium(address + i); }
-        @Override protected int _getUnsignedMediumLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getUnsignedMediumLE(m, start + i) : HeapByteBufUtil.getUnsignedMediumLE(m, start + i)) : UnsafeByteBufUtil.getUnsignedMediumLE(address + i); }
-        @Override protected int _getInt(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getInt(m, start + i) : HeapByteBufUtil.getInt(m, start + i)) : UnsafeByteBufUtil.getInt(address + i); }
-        @Override protected int _getIntLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getIntLE(m, start + i) : HeapByteBufUtil.getIntLE(m, start + i)) : UnsafeByteBufUtil.getIntLE(address + i); }
-        @Override protected long _getLong(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getLong(m, start + i) : HeapByteBufUtil.getLong(m, start + i)) : UnsafeByteBufUtil.getLong(address + i); }
-        @Override protected long _getLongLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getLongLE(m, start + i) : HeapByteBufUtil.getLongLE(m, start + i)) : UnsafeByteBufUtil.getLongLE(address + i); }
-        @Override protected void _setByte(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setByte(m, start + i, v); } else { HeapByteBufUtil.setByte(m, start + i, v); } } else { UnsafeByteBufUtil.setByte(address + i, v); } }
-        @Override protected void _setShort(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setShort(m, start + i, v); } else { HeapByteBufUtil.setShort(m, start + i, v); } } else { UnsafeByteBufUtil.setShort(address + i, v); } }
-        @Override protected void _setShortLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setShortLE(m, start + i, v); } else { HeapByteBufUtil.setShortLE(m, start + i, v); } } else { UnsafeByteBufUtil.setShortLE(address + i, v); } }
-        @Override protected void _setMedium(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setMedium(m, start + i, v); } else { HeapByteBufUtil.setMedium(m, start + i, v); } } else { UnsafeByteBufUtil.setMedium(address + i, v); } }
-        @Override protected void _setMediumLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setMediumLE(m, start + i, v); } else { HeapByteBufUtil.setMediumLE(m, start + i, v); } } else { UnsafeByteBufUtil.setMediumLE(address + i, v); } }
-        @Override protected void _setInt(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setInt(m, start + i, v); } else { HeapByteBufUtil.setInt(m, start + i, v); } } else { UnsafeByteBufUtil.setInt(address + i, v); } }
-        @Override protected void _setIntLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setIntLE(m, start + i, v); } else { HeapByteBufUtil.setIntLE(m, start + i, v); } } else { UnsafeByteBufUtil.setIntLE(address + i, v); } }
-        @Override protected void _setLong(int i, long v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setLong(m, start + i, v); } else { HeapByteBufUtil.setLong(m, start + i, v); } } else { UnsafeByteBufUtil.setLong(address + i, v); } }
-        @Override protected void _setLongLE(int i, long v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setLongLE(m, start + i, v); } else { HeapByteBufUtil.setLongLE(m, start + i, v); } } else { UnsafeByteBufUtil.setLongLE(address + i, v); } }
+        @Override
+        public int forEachByteDesc(int i, int len, ByteProcessor processor) {
+            checkIndex(i, len);
+            return forEachResult(rootParent().forEachByteDesc(idx(i), len, processor));
+        }
 
-        // --- bulk access, through the block's chunk (or the delegate buffer) ---
-        @Override public ByteBuf getBytes(int i, ByteBuf dst, int di, int len) { checkIndex(i, len); root().getBytes(rootStart() + i, dst, di, len); return this; }
-        @Override public ByteBuf getBytes(int i, byte[] dst, int di, int len) { checkIndex(i, len); root().getBytes(rootStart() + i, dst, di, len); return this; }
-        @Override public ByteBuf getBytes(int i, ByteBuffer dst) { checkIndex(i, dst.remaining()); root().getBytes(rootStart() + i, dst); return this; }
-        @Override public ByteBuf getBytes(int i, OutputStream out, int len) throws IOException { checkIndex(i, len); root().getBytes(rootStart() + i, out, len); return this; }
-        @Override public int getBytes(int i, GatheringByteChannel out, int len) throws IOException { checkIndex(i, len); return root().getBytes(rootStart() + i, out, len); }
-        @Override public int getBytes(int i, FileChannel out, long pos, int len) throws IOException { checkIndex(i, len); return root().getBytes(rootStart() + i, out, pos, len); }
-        @Override public ByteBuf setBytes(int i, ByteBuf src, int si, int len) { checkIndex(i, len); root().setBytes(rootStart() + i, src, si, len); return this; }
-        @Override public ByteBuf setBytes(int i, byte[] src, int si, int len) { checkIndex(i, len); root().setBytes(rootStart() + i, src, si, len); return this; }
-        @Override public ByteBuf setBytes(int i, ByteBuffer src) { checkIndex(i, src.remaining()); root().setBytes(rootStart() + i, src); return this; }
-        @Override public int setBytes(int i, InputStream in, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, len); }
-        @Override public int setBytes(int i, ScatteringByteChannel in, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, len); }
-        @Override public int setBytes(int i, FileChannel in, long pos, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, pos, len); }
+        private int forEachResult(int ret) {
+            return ret < start ? -1 : ret - start;
+        }
+
+        // --- element access: one forward to the root parent's primitive ---
+
+        @Override
+        protected byte _getByte(int i) {
+            return rootParent()._getByte(idx(i));
+        }
+
+        @Override
+        protected short _getShort(int i) {
+            return rootParent()._getShort(idx(i));
+        }
+
+        @Override
+        protected short _getShortLE(int i) {
+            return rootParent()._getShortLE(idx(i));
+        }
+
+        @Override
+        protected int _getUnsignedMedium(int i) {
+            return rootParent()._getUnsignedMedium(idx(i));
+        }
+
+        @Override
+        protected int _getUnsignedMediumLE(int i) {
+            return rootParent()._getUnsignedMediumLE(idx(i));
+        }
+
+        @Override
+        protected int _getInt(int i) {
+            return rootParent()._getInt(idx(i));
+        }
+
+        @Override
+        protected int _getIntLE(int i) {
+            return rootParent()._getIntLE(idx(i));
+        }
+
+        @Override
+        protected long _getLong(int i) {
+            return rootParent()._getLong(idx(i));
+        }
+
+        @Override
+        protected long _getLongLE(int i) {
+            return rootParent()._getLongLE(idx(i));
+        }
+
+        @Override
+        protected void _setByte(int i, int v) {
+            rootParent()._setByte(idx(i), v);
+        }
+
+        @Override
+        protected void _setShort(int i, int v) {
+            rootParent()._setShort(idx(i), v);
+        }
+
+        @Override
+        protected void _setShortLE(int i, int v) {
+            rootParent()._setShortLE(idx(i), v);
+        }
+
+        @Override
+        protected void _setMedium(int i, int v) {
+            rootParent()._setMedium(idx(i), v);
+        }
+
+        @Override
+        protected void _setMediumLE(int i, int v) {
+            rootParent()._setMediumLE(idx(i), v);
+        }
+
+        @Override
+        protected void _setInt(int i, int v) {
+            rootParent()._setInt(idx(i), v);
+        }
+
+        @Override
+        protected void _setIntLE(int i, int v) {
+            rootParent()._setIntLE(idx(i), v);
+        }
+
+        @Override
+        protected void _setLong(int i, long v) {
+            rootParent()._setLong(idx(i), v);
+        }
+
+        @Override
+        protected void _setLongLE(int i, long v) {
+            rootParent()._setLongLE(idx(i), v);
+        }
+
+        // --- bulk access: the same forward, with the index check this class owns ---
+
+        @Override
+        public ByteBuf getBytes(int i, ByteBuf dst, int di, int len) {
+            checkIndex(i, len);
+            rootParent().getBytes(idx(i), dst, di, len);
+            return this;
+        }
+
+        @Override
+        public ByteBuf getBytes(int i, byte[] dst, int di, int len) {
+            checkIndex(i, len);
+            rootParent().getBytes(idx(i), dst, di, len);
+            return this;
+        }
+
+        @Override
+        public ByteBuf getBytes(int i, ByteBuffer dst) {
+            checkIndex(i, dst.remaining());
+            rootParent().getBytes(idx(i), dst);
+            return this;
+        }
+
+        @Override
+        public ByteBuf getBytes(int i, OutputStream out, int len) throws IOException {
+            checkIndex(i, len);
+            rootParent().getBytes(idx(i), out, len);
+            return this;
+        }
+
+        @Override
+        public int getBytes(int i, GatheringByteChannel out, int len) throws IOException {
+            checkIndex(i, len);
+            return rootParent().getBytes(idx(i), out, len);
+        }
+
+        @Override
+        public int getBytes(int i, FileChannel out, long pos, int len) throws IOException {
+            checkIndex(i, len);
+            return rootParent().getBytes(idx(i), out, pos, len);
+        }
+
+        @Override
+        public ByteBuf setBytes(int i, ByteBuf src, int si, int len) {
+            checkIndex(i, len);
+            rootParent().setBytes(idx(i), src, si, len);
+            return this;
+        }
+
+        @Override
+        public ByteBuf setBytes(int i, byte[] src, int si, int len) {
+            checkIndex(i, len);
+            rootParent().setBytes(idx(i), src, si, len);
+            return this;
+        }
+
+        @Override
+        public ByteBuf setBytes(int i, ByteBuffer src) {
+            checkIndex(i, src.remaining());
+            rootParent().setBytes(idx(i), src);
+            return this;
+        }
+
+        @Override
+        public int setBytes(int i, InputStream in, int len) throws IOException {
+            checkIndex(i, len);
+            return rootParent().setBytes(idx(i), in, len);
+        }
+
+        @Override
+        public int setBytes(int i, ScatteringByteChannel in, int len) throws IOException {
+            checkIndex(i, len);
+            return rootParent().setBytes(idx(i), in, len);
+        }
+
+        @Override
+        public int setBytes(int i, FileChannel in, long pos, int len) throws IOException {
+            checkIndex(i, len);
+            return rootParent().setBytes(idx(i), in, pos, len);
+        }
     }
 
     /** A snapshot of every counter of section 6, summed over arenas. */

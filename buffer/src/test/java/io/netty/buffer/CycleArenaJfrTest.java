@@ -77,7 +77,6 @@ public class CycleArenaJfrTest {
                 RecordedEvent iteration = iterationEvent.get();
                 assertEquals("HEAP", iteration.getString("space"));
 
-
                 RecordedEvent outside = outsideEvent.get();
                 assertEquals(CycleArenaAllocator.REASON_CAP, outside.getString("reason"));
             } finally {

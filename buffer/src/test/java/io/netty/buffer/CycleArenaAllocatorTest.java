@@ -471,7 +471,7 @@ class CycleArenaAllocatorTest {
         try {
             ByteBuf first = alloc.heapBuffer(64);
             CycleArenaAllocator.Space space = space(alloc, false);
-            byte[] block = space.mem[space.curId];
+            byte[] block = space.roots[space.curId].array();
             java.util.Arrays.fill(block, (byte) 0x5A);     // paint the whole block, payload included
 
             // Allocate, release, grow in place, switch nothing, run the hook, allocate again: the arena
