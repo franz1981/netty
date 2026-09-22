@@ -87,6 +87,16 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final int MAX_OBJECTS = Integer.getInteger("arena.maxObjects", 16 * 1024);
     /** {@code -Darena.debug=true}: check that no block is reused before a hook. Folded away when false. */
     static final boolean DEBUG = Boolean.getBoolean("arena.debug");
+    /** One {@code ArenaIteration} event every this many hooks, and one {@code ArenaAllocationSample}. */
+    static final int JFR_PERIOD = Integer.getInteger("arena.jfr.period", 1000);
+
+    static final String REASON_CAP = "CAP";
+    static final String REASON_BOUND = "BOUND";
+    static final String REASON_OBJECTS = "OBJECTS";
+    static final String REASON_OFF_LOOP = "OFF_LOOP";
+    private static final String NEXT_REUSE = "REUSE";
+    private static final String NEXT_GROWTH = "GROWTH";
+    private static final String NEXT_DELEGATE = "DELEGATE";
 
     /** Every slot of a full space: the block masks are {@code int}s, so {@code maxBlocks <= 32}. */
     private static final int FULL_MASK = MAX_BLOCKS == 32 ? -1 : (1 << MAX_BLOCKS) - 1;
@@ -164,7 +174,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         if (buf != null) {
             return buf;
         }
-        space.delegateAllocations++;
+        space.delegated(initialCapacity);
         return delegate.heapBuffer(initialCapacity, maxCapacity);
     }
 
@@ -175,13 +185,13 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         if (buf != null) {
             return buf;
         }
-        space.delegateAllocations++;
+        space.delegated(initialCapacity);
         return delegate.directBuffer(initialCapacity, maxCapacity);
     }
 
     /** The reallocation path's delegate call; the allocation path calls the delegate in place. */
     private ByteBuf delegateForGrow(Space space, int capacity, int maxCapacity) {
-        space.delegateAllocations++;
+        space.delegated(capacity);
         return space.direct ? delegate.directBuffer(capacity, maxCapacity)
                 : delegate.heapBuffer(capacity, maxCapacity);
     }
@@ -302,8 +312,13 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         final int cap;
 
         // --- block columns, indexed by block id ---
-        /** Live buffers per block. The only column a release touches. */
-        final int[] live = new int[MAX_BLOCKS + 1];
+        /**
+         * Allocations and releases per block. A block is empty iff {@code allocs[id] == frees[id]}; both
+         * are zeroed when the block is reset, and their values are added to the arena's totals then - the
+         * way a TLAB's statistics are accumulated when it is retired, never per object.
+         */
+        final int[] allocs = new int[MAX_BLOCKS + 1];
+        final int[] frees = new int[MAX_BLOCKS + 1];
         /** Base address per block, 0 when the chunks of this space have none. */
         final long[] base = new long[MAX_BLOCKS + 1];
         /** Backing array per block, null for a direct space. */
@@ -349,8 +364,19 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long generation;
         IterationHook hook;        // null when this thread is not an event loop thread
 
-        // Metrics (plain longs, owner-written).
-        long arenaAllocations;
+        // Metrics (plain longs, owner-written). Nothing here is touched by the bump or release path:
+        // allocations are counted in the block columns and accumulated when a block is reset, and bytes
+        // are added from the cursor when a block is retired - as the JDK does with a TLAB.
+        long retiredAllocations;
+        long bytesBumped;
+        // JFR bookkeeping, touched only where an event may be emitted.
+        int jfrTick;
+        long sampledBytes;
+        long sampledAllocations;
+        long reportedBytes;
+        long reportedAllocations;
+        long reportedDelegated;
+        long reportedHooks;
         long delegateAllocations;
         long blockReuses;
         long blockGrowths;
@@ -402,8 +428,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             freeTop = top;
             curBump = end;
-            live[curId]++;
-            arenaAllocations++;
+            allocs[curId]++;
             ArenaBuf buf = objects[free[top]];
             buf.init(curId, start, size, maxCapacity);
             return buf;
@@ -421,8 +446,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             freeTop = top;
             curBump = end;
-            live[curId]++;
-            arenaAllocations++;
+            allocs[curId]++;
             ArenaBuf buf = objects[free[top]];
             buf.init(curId, 0, size, maxCapacity);
             return buf;
@@ -435,8 +459,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 return null;                   // maxObjects reached: the delegate owns it
             }
             curBump = end;
-            live[curId]++;
-            arenaAllocations++;
+            allocs[curId]++;
             buf.init(curId, start, size, maxCapacity);
             return buf;
         }
@@ -446,7 +469,18 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          * mask means "nothing was empty at the last hook", which is also the latch that stops the rescan.
          */
         private boolean switchBlock() {
+            boolean record = PlatformDependent.isJfrEnabled() && ArenaEvents.BlockSwitch.isEventEnabled();
             int mask = reusableMask;
+            if (record) {
+                switchEvent(mask != 0 ? NEXT_REUSE
+                        : Integer.bitCount(allocatedMask) < MAX_BLOCKS ? NEXT_GROWTH : NEXT_DELEGATE);
+            }
+            bytesBumped += curBump;            // the retired block's used bytes, counted once
+            if (++jfrTick >= JFR_PERIOD && PlatformDependent.isJfrEnabled()
+                    && ArenaEvents.AllocationSample.isEventEnabled()) {
+                jfrTick = 0;
+                sampleEvent();
+            }
             if (mask != 0) {
                 int id = Integer.numberOfTrailingZeros(mask);
                 if (DEBUG) {
@@ -466,6 +500,71 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             return false;
         }
 
+        /** One delegated allocation: a counter, and - when recording - one ArenaAllocationOutside event. */
+        void delegated(int size) {
+            delegateAllocations++;
+            if (PlatformDependent.isJfrEnabled() && ArenaEvents.AllocationOutside.isEventEnabled()) {
+                outsideEvent(size);
+            }
+        }
+
+        private void outsideEvent(int size) {
+            ArenaEvents.AllocationOutside event = new ArenaEvents.AllocationOutside();
+            event.allocatorType = CycleArenaAllocator.class;
+            event.size = size;
+            event.space = direct ? "DIRECT" : "HEAP";
+            event.reason = size > cap ? REASON_CAP
+                    : hook == null ? REASON_OFF_LOOP
+                    : exhausted ? REASON_BOUND : REASON_OBJECTS;
+            event.commit();
+        }
+
+        /** One retired block: the analogue of jdk.ObjectAllocationInNewTLAB. */
+        private void switchEvent(String next) {
+            ArenaEvents.BlockSwitch event = new ArenaEvents.BlockSwitch();
+            event.allocatorType = CycleArenaAllocator.class;
+            event.bytesBumped = curBump;
+            event.allocations = allocs[curId];
+            event.liveAtRetire = allocs[curId] - frees[curId];
+            event.blockId = curId;
+            event.next = next;
+            event.space = direct ? "DIRECT" : "HEAP";
+            event.commit();
+        }
+
+        /** Sampled bump weight, taken only at a block switch or at a hook. */
+        private void sampleEvent() {
+            long bytes = bytesBumpedTotal();
+            long all = arenaAllocations();
+            ArenaEvents.AllocationSample event = new ArenaEvents.AllocationSample();
+            event.allocatorType = CycleArenaAllocator.class;
+            event.weight = bytes - sampledBytes;
+            event.allocations = all - sampledAllocations;
+            event.space = direct ? "DIRECT" : "HEAP";
+            event.commit();
+            sampledBytes = bytes;
+            sampledAllocations = all;
+        }
+
+        private void iterationEvent(int blocksReset, int pinned) {
+            long bytes = bytesBumpedTotal();
+            long all = arenaAllocations();
+            ArenaEvents.Iteration event = new ArenaEvents.Iteration();
+            event.allocatorType = CycleArenaAllocator.class;
+            event.blocksReset = blocksReset;
+            event.pinned = pinned;
+            event.bytesBumped = bytes - reportedBytes;
+            event.allocations = all - reportedAllocations;
+            event.delegated = delegateAllocations - reportedDelegated;
+            event.hooks = arena.hooks - reportedHooks;
+            event.space = direct ? "DIRECT" : "HEAP";
+            event.commit();
+            reportedBytes = bytes;
+            reportedAllocations = all;
+            reportedDelegated = delegateAllocations;
+            reportedHooks = arena.hooks;
+        }
+
         private void makeCurrent(int id) {
             curId = id;
             curBump = 0;                       // the hook reset it; nothing has been handed out since
@@ -483,7 +582,8 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             addressMask = hasAddress ? -1 : 0;
             base[id] = hasAddress ? root.memoryAddress() : 0L;
             nio[id] = root.internalNioBuffer(0, BLOCK_SIZE).duplicate();
-            live[id] = 0;
+            allocs[id] = 0;
+            frees[id] = 0;
             stamp[id] = generation - 1;        // fresh memory: never "reused before its hook"
             allocatedMask |= 1 << id;
             makeCurrent(id);
@@ -539,7 +639,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 end = (size + 7) & ~7;
             }
             curBump = end;
-            live[curId]++;
+            allocs[curId]++;
             reservedStart = start;
             return curId;
         }
@@ -554,11 +654,16 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 if ((allocatedMask & (1 << id)) == 0) {
                     continue;
                 }
-                if (live[id] == 0) {
+                int a = allocs[id];
+                if (a == frees[id]) {
+                    retiredAllocations += a;   // statistics accumulate when a block is reset, not per op
+                    allocs[id] = 0;
+                    frees[id] = 0;
                     if (DEBUG) {
                         stamp[id] = gen;
                     }
                     if (id == cur) {
+                        bytesBumped += curBump;
                         curBump = 0;           // the current block restarts in place, and stays current
                     } else {
                         mask |= 1 << id;
@@ -573,6 +678,15 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             pinnedBlocks = pinned;
             if (pinned > maxPinned) {
                 maxPinned = pinned;
+            }
+            if (++jfrTick >= JFR_PERIOD && PlatformDependent.isJfrEnabled()) {
+                jfrTick = 0;
+                if (ArenaEvents.Iteration.isEventEnabled()) {
+                    iterationEvent(Integer.bitCount(mask), pinned);
+                }
+                if (ArenaEvents.AllocationSample.isEventEnabled()) {
+                    sampleEvent();
+                }
             }
         }
 
@@ -601,7 +715,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             while (mask != 0) {
                 int id = Integer.numberOfTrailingZeros(mask);
                 mask &= mask - 1;
-                if (live[id] == 0) {
+                if (allocs[id] == frees[id]) {
                     dropBlock(id);
                 } else {
                     leakedBlocks++;
@@ -621,6 +735,34 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             nio[id] = null;
             base[id] = 0L;
             root.release();
+        }
+
+        /** Allocations served by this space: what the reset blocks accumulated plus what the live ones hold. */
+        long arenaAllocations() {
+            long total = retiredAllocations + allocs[DELEGATE_SLOT];
+            int mask = allocatedMask;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                total += allocs[id];
+            }
+            return total;
+        }
+
+        /** Bytes bump-allocated: what the retired blocks used plus the current cursor. */
+        long bytesBumpedTotal() {
+            return bytesBumped + curBump;
+        }
+
+        int liveBuffers() {
+            int live = allocs[DELEGATE_SLOT] - frees[DELEGATE_SLOT];
+            int mask = allocatedMask;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                live += allocs[id] - frees[id];
+            }
+            return live;
         }
 
         int blockCount() {
@@ -766,7 +908,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public ByteBuf retain() {
             if (Thread.currentThread() != owner) {
-                throw violation();
+                throw violation("RETAIN");
             }
             int cnt = refCnt;
             if (cnt <= 0) {
@@ -779,7 +921,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public ByteBuf retain(int increment) {
             if (Thread.currentThread() != owner) {
-                throw violation();
+                throw violation("RETAIN");
             }
             int cnt = refCnt;
             if (cnt <= 0 || increment <= 0) {
@@ -792,7 +934,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public boolean release() {
             if (Thread.currentThread() != owner) {
-                throw violation();
+                throw violation("RELEASE");
             }
             int cnt = refCnt;
             if (cnt <= 0) {
@@ -804,7 +946,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             Space s = space;
             int id = blockId;
-            s.live[id]--;
+            s.frees[id]++;
             s.free[s.freeTop++] = index;
             if (id == DELEGATE_SLOT) {
                 releaseDelegated();
@@ -815,7 +957,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public boolean release(int decrement) {
             if (Thread.currentThread() != owner) {
-                throw violation();
+                throw violation("RELEASE");
             }
             int cnt = refCnt;
             if (decrement <= 0 || cnt < decrement) {
@@ -827,7 +969,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             Space s = space;
             int id = blockId;
-            s.live[id]--;
+            s.frees[id]++;
             s.free[s.freeTop++] = index;
             if (id == DELEGATE_SLOT) {
                 releaseDelegated();
@@ -847,8 +989,16 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             buf.release();
         }
 
-        private IllegalStateException violation() {
+        private IllegalStateException violation(String operation) {
             space.arena.violations++;
+            if (PlatformDependent.isJfrEnabled() && ArenaEvents.ConfinementViolation.isEventEnabled()) {
+                ArenaEvents.ConfinementViolation event = new ArenaEvents.ConfinementViolation();
+                event.allocatorType = CycleArenaAllocator.class;
+                event.owner = owner.getName();
+                event.offender = Thread.currentThread().getName();
+                event.operation = operation;
+                event.commit();
+            }
             return new IllegalStateException("arena buffer of " + owner + " touched from "
                     + Thread.currentThread() + " (event-loop arena buffers are thread confined)");
         }
@@ -916,16 +1066,18 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 delegated = buf;
                 delegateRoot = target;
                 length = newCapacity;
-                space.live[DELEGATE_SLOT]++;
-                adoptDelegate(buf);
+                adoptDelegate(buf);            // counts the delegate slot itself
             }
-            space.live[id]--;
+            space.frees[id]++;
             return this;
         }
 
         /** Point the data fields at a delegate buffer's memory; the id becomes {@link #DELEGATE_SLOT}. */
         private void adoptDelegate(ByteBuf buf) {
             AbstractByteBuf target = delegateRoot;
+            if (blockId != DELEGATE_SLOT) {
+                space.allocs[DELEGATE_SLOT]++;
+            }
             blockId = DELEGATE_SLOT;
             memory = target.hasArray() ? target.array() : null;
             start = memory != null ? target.arrayOffset() : 0;
@@ -1106,6 +1258,10 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long blockReuses;
         long blockGrowths;
         long objects;
+        long bytesHeap;
+        long bytesDirect;
+        long liveHeap;
+        long liveDirect;
 
         void add(Counters other) {
             arenaHeap += other.arenaHeap;
@@ -1131,11 +1287,19 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             blockReuses += other.blockReuses;
             blockGrowths += other.blockGrowths;
             objects += other.objects;
+            bytesHeap += other.bytesHeap;
+            bytesDirect += other.bytesDirect;
+            liveHeap += other.liveHeap;
+            liveDirect += other.liveDirect;
         }
 
         void add(Arena arena) {
-            arenaHeap += arena.heap.arenaAllocations;
-            arenaDirect += arena.direct.arenaAllocations;
+            arenaHeap += arena.heap.arenaAllocations();
+            arenaDirect += arena.direct.arenaAllocations();
+            bytesHeap += arena.heap.bytesBumpedTotal();
+            bytesDirect += arena.direct.bytesBumpedTotal();
+            liveHeap += arena.heap.liveBuffers();
+            liveDirect += arena.direct.liveBuffers();
             delegateHeap += arena.heap.delegateAllocations;
             delegateDirect += arena.direct.delegateAllocations;
             blocksHeap += arena.heap.blockCount();
@@ -1175,7 +1339,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                     + " reallocInPlace=" + reallocInPlace + " reallocMoved=" + reallocMoved
                     + " reallocDelegated=" + reallocDelegated
                     + " trims=" + trims + " trimmedBlocks=" + trimmedBlocks + " leakedBlocks=" + leaked
-                    + " objects=" + objects;
+                    + " objects=" + objects
+                    + " bytesHeap=" + bytesHeap + " bytesDirect=" + bytesDirect
+                    + " liveHeap=" + liveHeap + " liveDirect=" + liveDirect;
         }
     }
 

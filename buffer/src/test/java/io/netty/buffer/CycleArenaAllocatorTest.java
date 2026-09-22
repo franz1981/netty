@@ -54,6 +54,10 @@ class CycleArenaAllocatorTest {
         return direct ? alloc.directBuffer(size) : alloc.heapBuffer(size);
     }
 
+    private static int live(CycleArenaAllocator.Space space, int blockId) {
+        return space.allocs[blockId] - space.frees[blockId];
+    }
+
     private static boolean reusable(CycleArenaAllocator.Space space, int blockId) {
         return (space.reusableMask & (1 << blockId)) != 0;
     }
@@ -240,7 +244,7 @@ class CycleArenaAllocatorTest {
                 buf.release();
             }
             assertEquals(2, space.blockCount());
-            assertEquals(1, space.live[firstBlock]);
+            assertEquals(1, live(space, firstBlock));
 
             alloc.runHookForTest();
             assertEquals(1, space.pinnedBlocks);
@@ -251,7 +255,7 @@ class CycleArenaAllocatorTest {
             assertEquals(1, space.maxPinned);
 
             assertTrue(pinning.release());
-            assertEquals(0, space.live[firstBlock]);
+            assertEquals(0, live(space, firstBlock));
             assertFalse(reusable(space, firstBlock), "release alone must not make a block reusable");
 
             alloc.runHookForTest();
@@ -316,7 +320,7 @@ class CycleArenaAllocatorTest {
             ByteBuf topmost = alloc.heapBuffer(64);        // not topmost: a move is needed
             CycleArenaAllocator.Space space = space(alloc, false);
             int blockId = arenaBuf(buf).blockIdForTest();
-            int liveBefore = space.live[blockId];
+            int liveBefore = live(space, blockId);
 
             buf.capacity(CycleArenaAllocator.CAP + 1024);  // above the cap: only the delegate can serve it
             assertEquals(1, space.reallocDelegated);
@@ -324,13 +328,13 @@ class CycleArenaAllocatorTest {
                     "a delegated buffer has no block");
             assertEquals(0x0102030405060708L, buf.getLong(0));
             assertEquals(CycleArenaAllocator.CAP + 1024, buf.capacity());
-            assertEquals(liveBefore - 1, space.live[blockId]);   // the old region went back to its block
+            assertEquals(liveBefore - 1, live(space, blockId));   // the old region went back to its block
 
             // Releasing a DELEGATED buffer releases the delegate buffer and pools the object again.
             int freeTop = space.freeTop;
             assertTrue(buf.release());
             assertEquals(freeTop + 1, space.freeTop);
-            assertEquals(0, space.live[CycleArenaAllocator.DELEGATE_SLOT]);
+            assertEquals(0, live(space, CycleArenaAllocator.DELEGATE_SLOT));
             assertTrue(topmost.release());
         } finally {
             alloc.removeForTest();
@@ -493,6 +497,41 @@ class CycleArenaAllocatorTest {
     }
 
     // ------------------------------------------------------------------ metrics
+
+    @Test
+    void derivedTotalsMatchTheAllocationsMade() {
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            CycleArenaAllocator.Space space = null;
+            int n = 5000;
+            List<ByteBuf> live = new ArrayList<ByteBuf>();
+            for (int i = 0; i < n; i++) {
+                ByteBuf buf = alloc.heapBuffer(64);
+                arenaBuf(buf);
+                if (space == null) {
+                    space = space(alloc, false);
+                }
+                live.add(buf);
+                if ((i & 63) == 0) {              // release and close iterations as we go
+                    for (ByteBuf b : live) {
+                        b.release();
+                    }
+                    live.clear();
+                    alloc.runHookForTest();
+                }
+            }
+            for (ByteBuf b : live) {
+                b.release();
+            }
+            assertNotNull(space);
+            assertEquals(n, space.arenaAllocations(),
+                    "the totals accumulated at block reset must equal the allocations made");
+            assertEquals(0, space.liveBuffers());
+            assertTrue(space.bytesBumpedTotal() >= (long) n * 64);
+        } finally {
+            alloc.removeForTest();
+        }
+    }
 
     @Test
     void countersMentionEveryArena() {
