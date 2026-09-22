@@ -20,9 +20,28 @@ import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.TooLongFrameException;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class DnsCodecUtilTest {
+
+    @Test
+    void calculateMaxNameLengthIsBoundedRegardlessOfRemainingBytes() {
+        // A decoded name can never exceed MAX_DOMAIN_NAME_LENGTH characters, so the working buffer must stay
+        // bounded even when the message has a huge number of bytes still readable after the name (e.g. many
+        // more records in a large DNS message). Without this bound, a single message could force an oversized
+        // allocation for every name decoded from it.
+        assertEquals(DnsCodecUtil.MAX_DOMAIN_NAME_LENGTH,
+                DnsCodecUtil.calculateMaxNameLength(Integer.MAX_VALUE));
+        assertEquals(DnsCodecUtil.MAX_DOMAIN_NAME_LENGTH,
+                DnsCodecUtil.calculateMaxNameLength(8 * 1024 * 1024));
+        assertEquals(DnsCodecUtil.MAX_DOMAIN_NAME_LENGTH,
+                DnsCodecUtil.calculateMaxNameLength(DnsCodecUtil.MAX_DOMAIN_NAME_LENGTH + 1));
+
+        // For buffers that cannot possibly contain more than a valid name, behavior is unchanged.
+        assertEquals(5, DnsCodecUtil.calculateMaxNameLength(5));
+        assertEquals(0, DnsCodecUtil.calculateMaxNameLength(0));
+    }
 
     @Test
     void rejectTooLongLabelWhileDecoding() {
