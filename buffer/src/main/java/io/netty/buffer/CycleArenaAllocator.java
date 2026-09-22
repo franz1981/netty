@@ -42,8 +42,22 @@ import java.util.List;
  * A space owns at most {@link #MAX_BLOCKS} FIXED-size blocks; a block's memory is a chunk buffer taken from
  * the very same {@link AdaptivePoolingAllocator.ChunkAllocator} the {@link AdaptiveByteBufAllocator} uses,
  * so the backing memory is allocated exactly as adaptive's chunks are (outside adaptive's byte budget, by
- * design - see the metrics). Allocation is a bump of the current block; buffer objects come from a per-arena
- * array with an {@code int} free stack.
+ * design - see the metrics).
+ * <p>
+ * <b>Layout.</b> There is no block object. A block is an id in {@code [0, maxBlocks)} and a column of flat
+ * per-space arrays - {@link Space#live}, {@link Space#mem}, {@link Space#base}, {@link Space#nio},
+ * {@link Space#roots} - plus two {@code int} bit masks. The current block is plain fields of the space:
+ * {@link Space#curId}, {@link Space#curBump}, {@link Space#curMemory}, {@link Space#curAddress}. A buffer
+ * stores its block as an {@code int} id; allocation writes ints, one {@code long} address and - for a heap
+ * buffer that lands in another block - one guarded {@code byte[]} store, which is the only reference store
+ * on any hot path. Switching block is {@code numberOfTrailingZeros(reusableMask)}; the hook scans the live
+ * ints, resets the current block's bump in place and rebuilds the mask. There is no {@code bump[]} column:
+ * only the current block is ever bumped, and a block switched away from is never bumped again.
+ * <p>
+ * <b>No in-band metadata.</b> A block's memory holds user payload only. No allocation header, no block
+ * header, no free-list link, no fill on retire, nothing written at reset. Every piece of bookkeeping lives
+ * on the owner's own cache lines: the buffer objects, {@code int[] live}, the masks, the {@code int[]}
+ * object free stack and the flat cursor. Nothing is ever derived from an address: the buffer carries its id.
  * <p>
  * The lifecycle has exactly one rule: <b>memory freed during an iteration is never handed out again before
  * the end-of-iteration hook</b>. Releasing a buffer only decrements its block's live count; at the hook
@@ -52,7 +66,7 @@ import java.util.List;
  * pinned and is skipped until a later hook finds it empty. Nothing frees a block except {@link #trim()} and
  * thread termination.
  * <p>
- * <b>Invariant A (confinement).</b> Every field of an {@link ArenaBuf} and of a {@link Block} is read and
+ * <b>Invariant A (confinement).</b> Every field of an {@link ArenaBuf} and every block column is read and
  * written only by the owning thread. {@link ArenaBuf#retain()}, {@code retain(int)}, {@link ArenaBuf#release()}
  * and {@code release(int)} compare {@link Thread#currentThread()} with the owner BEFORE touching any field and
  * throw {@link IllegalStateException} otherwise, after counting the violation. There is no cross-thread path:
@@ -69,15 +83,25 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final int MAX_BLOCKS = Integer.getInteger("arena.maxBlocks", 8);
     /** {@code size > cap} is delegated: it keeps the surviving BYTES out of the arena (design section 1). */
     static final int CAP = Integer.getInteger("arena.cap", 8 * 1024);
-    /** Upper bound on the per-arena buffer-object array; past it, allocation delegates. */
+    /** Upper bound on the per-space buffer-object array; past it, allocation delegates. */
     static final int MAX_OBJECTS = Integer.getInteger("arena.maxObjects", 16 * 1024);
     /** {@code -Darena.debug=true}: check that no block is reused before a hook. Folded away when false. */
     static final boolean DEBUG = Boolean.getBoolean("arena.debug");
 
+    /** Every slot of a full space: the block masks are {@code int}s, so {@code maxBlocks <= 32}. */
+    private static final int FULL_MASK = MAX_BLOCKS == 32 ? -1 : (1 << MAX_BLOCKS) - 1;
     private static final int INITIAL_OBJECTS = Math.min(256, MAX_OBJECTS);
+    /**
+     * The DELEGATED state: the buffer wraps a buffer of the delegate allocator. It is a real column slot,
+     * one past the last block, so that release stays branch-free on the block columns; its live count is
+     * the number of delegated buffers in flight.
+     */
+    static final int DELEGATE_SLOT = MAX_BLOCKS;
+    private static final int NO_BLOCK = -1;
+    private static final boolean UNSAFE = PlatformDependent.hasUnsafe();
 
     static {
-        if (((CAP + 7) & ~7) > BLOCK_SIZE || CAP < 0 || MAX_BLOCKS < 1 || MAX_OBJECTS < 1) {
+        if (((CAP + 7) & ~7) > BLOCK_SIZE || CAP < 0 || MAX_BLOCKS < 1 || MAX_BLOCKS > 32 || MAX_OBJECTS < 1) {
             throw new IllegalArgumentException("arena.cap=" + CAP + " arena.blockSize=" + BLOCK_SIZE
                     + " arena.maxBlocks=" + MAX_BLOCKS + " arena.maxObjects=" + MAX_OBJECTS);
         }
@@ -258,43 +282,56 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
     }
 
-    /** A fixed-size bump region: a chunk buffer from the same {@code ChunkAllocator} adaptive uses. */
-    static final class Block {
-        final Space space;
-        final AbstractByteBuf root;
-        final byte[] mem;          // null for a direct block
-        final long address;        // root memory address, 0 when the root has none
-        final boolean hasAddress;
-        final boolean direct;
-        int bump;
-        int live;
-        /** True when the LAST hook found this block empty; cleared when the allocator takes it. */
-        boolean reusable;
-        /** The hook generation that marked this block reusable; only read by the debug check. */
-        long stamp;
-
-        Block(Space space) {
-            this.space = space;
-            root = space.chunks.allocate(BLOCK_SIZE, BLOCK_SIZE);
-            mem = root.hasArray() ? root.array() : null;
-            hasAddress = root.hasMemoryAddress();
-            address = hasAddress ? root.memoryAddress() : 0L;
-            direct = space.direct;
-        }
-    }
-
-    /** The blocks of one memory kind (heap or direct) for one thread. */
+    /**
+     * The blocks of one memory kind (heap or direct) for one thread, as flat columns indexed by block id.
+     * Every field here is written by the owning thread only.
+     */
     static final class Space {
         final Arena arena;
-        final AdaptivePoolingAllocator.ChunkAllocator chunks;
+        final AdaptivePoolingAllocator.ChunkAllocator chunkAllocator;
         final boolean direct;
-        final Block[] blocks = new Block[MAX_BLOCKS];
-        int blockCount;
-        Block current;
-        /** Out parameter of {@link #reserve(int)}, used by the reallocation path only. */
-        Block reserved;
-        /** No block was available since the last hook: do not scan again until then. */
-        boolean exhausted;
+        /** {@link #CAP}, or -1 when this space cannot serve anything (direct without unsafe). */
+        final int cap;
+
+        // --- block columns, indexed by block id ---
+        /** Live buffers per block. The only column a release touches. */
+        final int[] live = new int[MAX_BLOCKS + 1];
+        /** Base address per block, 0 when the chunks of this space have none. */
+        final long[] base = new long[MAX_BLOCKS + 1];
+        /** Backing array per block, null for a direct space. */
+        final byte[][] mem = new byte[MAX_BLOCKS + 1][];
+        /** One NIO view of the whole block, the source the per-buffer views are duplicated from. */
+        final ByteBuffer[] nio = new ByteBuffer[MAX_BLOCKS + 1];
+        /** The chunk buffer per block: bulk access, and the memory to give back. */
+        final AbstractByteBuf[] roots = new AbstractByteBuf[MAX_BLOCKS + 1];
+        /** Debug only: the hook generation that last reset each block. */
+        final long[] stamp = new long[MAX_BLOCKS + 1];
+        /** Bit i: slot i holds a chunk. */
+        int allocatedMask;
+        /** Bit i: block i was empty at the LAST hook and its bump was reset. Zero means "grow or delegate". */
+        int reusableMask;
+        boolean hasAddress;
+        /**
+         * -1 when the chunks of this space have a usable memory address, 0 when they do not. It turns the
+         * offset into the block into zero for a heap space, so that a heap buffer's address stays 0 and
+         * {@code hasMemoryAddress()} is false - as {@link UnpooledHeapByteBuf}'s is. Without it a heap
+         * buffer would report {@code start} as an absolute address and every unsafe copy into it would
+         * write to whatever lives there.
+         */
+        int addressMask;
+
+        // --- the current block, flat ---
+        int curId;
+        int curBump;
+        byte[] curMemory;
+        long curAddress;
+
+        // --- the buffer objects of this space ---
+        ArenaBuf[] objects = new ArenaBuf[INITIAL_OBJECTS];
+        int[] free = new int[INITIAL_OBJECTS];
+        int objectCount;
+        int freeTop;
+
         /** Number of hooks that have run, i.e. the index of the current iteration. */
         long generation;
         IterationHook hook;        // null when this thread is not an event loop thread
@@ -304,6 +341,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long delegateAllocations;
         long blockReuses;
         long blockGrowths;
+        long objectGrowths;
         long reallocInPlace;
         long reallocMoved;
         long reallocDelegated;
@@ -312,253 +350,138 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long leakedBlocks;
         long earlyReuses;
         int pinnedBlocks;
-        int reusableBlocks;
         int maxPinned;
 
-        Space(Arena arena, AdaptivePoolingAllocator.ChunkAllocator chunks, boolean direct) {
+        Space(Arena arena, AdaptivePoolingAllocator.ChunkAllocator chunkAllocator, boolean direct) {
             this.arena = arena;
-            this.chunks = chunks;
+            this.chunkAllocator = chunkAllocator;
             this.direct = direct;
-            current = newBlock();
-        }
-
-        private Block newBlock() {
-            Block block = new Block(this);
-            block.stamp = generation - 1;      // fresh memory: never "reused before its hook"
-            blocks[blockCount++] = block;
-            return block;
+            cap = direct && !UNSAFE ? -1 : CAP;
+            if (cap >= 0) {
+                newBlock();
+            }
         }
 
         /**
-         * THE hot path. Everything rare - arming the hook, growing the object array, taking another block,
-         * giving up - is a call to a separate method on a branch that is not taken in the common case.
+         * THE hot path. It touches the space's own flat fields and the object stack, nothing else.
+         * Everything rare - arming the hook, switching block, growing the object array, giving up - is a
+         * call to a separate method on a branch that is not taken in the common case.
          */
         ByteBuf allocate(int size, int maxCapacity) {
-            if (size > CAP) {
+            if (size > cap) {
                 return null;                   // above the cap: the delegate owns it
             }
             IterationHook h = hook;
             if (h != null && !h.armed) {
                 h.arm();                       // once per iteration: close it at the end of this one
             }
-            Block block = current;
-            int start = block.bump;
+            int start = curBump;
             int end = start + ((size + 7) & ~7);
             if (end > BLOCK_SIZE) {
                 return allocateInAnotherBlock(size, maxCapacity);
             }
-            Arena a = arena;
-            int top = a.freeTop - 1;
+            int top = freeTop - 1;
             if (top < 0) {
-                return allocateWithNewObject(block, start, end, size, maxCapacity);
+                return allocateWithNewObject(start, end, size, maxCapacity);
             }
-            a.freeTop = top;
-            block.bump = end;
-            block.live++;
+            freeTop = top;
+            curBump = end;
+            live[curId]++;
             arenaAllocations++;
-            ArenaBuf buf = a.objects[a.free[top]];
-            buf.init(block, start, size, maxCapacity);
+            ArenaBuf buf = objects[free[top]];
+            buf.init(curId, start, size, maxCapacity);
             return buf;
         }
 
         /** The current block is full: take one the LAST hook marked reusable, or grow, or give up. */
         private ByteBuf allocateInAnotherBlock(int size, int maxCapacity) {
-            Block block = nextBlock();
-            if (block == null) {
+            if (!switchBlock()) {
                 return null;
             }
             int end = (size + 7) & ~7;
-            Arena a = arena;
-            int top = a.freeTop - 1;
+            int top = freeTop - 1;
             if (top < 0) {
-                return allocateWithNewObject(block, 0, end, size, maxCapacity);
+                return allocateWithNewObject(0, end, size, maxCapacity);
             }
-            a.freeTop = top;
-            block.bump = end;
-            block.live++;
+            freeTop = top;
+            curBump = end;
+            live[curId]++;
             arenaAllocations++;
-            ArenaBuf buf = a.objects[a.free[top]];
-            buf.init(block, 0, size, maxCapacity);
+            ArenaBuf buf = objects[free[top]];
+            buf.init(curId, 0, size, maxCapacity);
             return buf;
         }
 
-        /** The object free stack is empty: create one more buffer object, or give up. */
-        private ByteBuf allocateWithNewObject(Block block, int start, int end, int size, int maxCapacity) {
-            ArenaBuf buf = arena.newObject();
+        /** The object stack is empty: create one more buffer object, or give up. */
+        private ByteBuf allocateWithNewObject(int start, int end, int size, int maxCapacity) {
+            ArenaBuf buf = newObject();
             if (buf == null) {
                 return null;                   // maxObjects reached: the delegate owns it
             }
-            block.bump = end;
-            block.live++;
+            curBump = end;
+            live[curId]++;
             arenaAllocations++;
-            buf.init(block, start, size, maxCapacity);
+            buf.init(curId, start, size, maxCapacity);
             return buf;
         }
 
         /**
-         * A block marked reusable by the LAST hook, or a new one, or {@code null} when the bound is reached.
-         * Only the current block is ever bumped, so a reusable block always has {@code live == 0, bump == 0}.
+         * Make another block current: the lowest one the LAST hook marked reusable, else a new one. A zero
+         * mask means "nothing was empty at the last hook", which is also the latch that stops the rescan.
          */
-        private Block nextBlock() {
-            if (exhausted) {
-                return null;                   // nothing changed since the last failure: no rescan
-            }
-            for (int i = 0; i < blockCount; i++) {
-                Block block = blocks[i];
-                if (block.reusable) {
-                    if (DEBUG) {
-                        checkNotReusedBeforeHook(block);
-                    }
-                    block.reusable = false;
-                    reusableBlocks--;
-                    blockReuses++;
-                    current = block;
-                    return block;
+        private boolean switchBlock() {
+            int mask = reusableMask;
+            if (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                if (DEBUG) {
+                    checkNotReusedBeforeHook(id);
                 }
+                reusableMask = mask & (mask - 1);
+                blockReuses++;
+                makeCurrent(id);
+                return true;
             }
-            if (blockCount < MAX_BLOCKS) {
+            if (Integer.bitCount(allocatedMask) < MAX_BLOCKS) {
                 blockGrowths++;
-                current = newBlock();
-                return current;
+                newBlock();
+                return true;
             }
-            exhausted = true;
-            return null;
+            return false;
         }
 
-        private void checkNotReusedBeforeHook(Block block) {
-            if (block.stamp >= generation) {
+        private void makeCurrent(int id) {
+            curId = id;
+            curBump = 0;                       // the hook reset it; nothing has been handed out since
+            curMemory = mem[id];
+            curAddress = base[id];
+        }
+
+        /** Take a free slot and give it a chunk. Cold: growth only. */
+        private void newBlock() {
+            int id = Integer.numberOfTrailingZeros(~allocatedMask & FULL_MASK);
+            AbstractByteBuf root = chunkAllocator.allocate(BLOCK_SIZE, BLOCK_SIZE);
+            roots[id] = root;
+            mem[id] = root.hasArray() ? root.array() : null;
+            hasAddress = root.hasMemoryAddress();
+            addressMask = hasAddress ? -1 : 0;
+            base[id] = hasAddress ? root.memoryAddress() : 0L;
+            nio[id] = root.internalNioBuffer(0, BLOCK_SIZE).duplicate();
+            live[id] = 0;
+            stamp[id] = generation - 1;        // fresh memory: never "reused before its hook"
+            allocatedMask |= 1 << id;
+            makeCurrent(id);
+        }
+
+        private void checkNotReusedBeforeHook(int id) {
+            if (stamp[id] >= generation) {
                 earlyReuses++;
-                throw new IllegalStateException("arena block reused in the iteration that freed it: stamp="
-                        + block.stamp + " generation=" + generation);
-            }
-        }
-
-        /** Reserve a region for a reallocation. Returns the offset, or -1; sets {@link #reserved}. */
-        int reserve(int size) {
-            if (size > CAP) {
-                return -1;
-            }
-            Block block = current;
-            int start = block.bump;
-            int end = start + ((size + 7) & ~7);
-            if (end > BLOCK_SIZE) {
-                block = nextBlock();
-                if (block == null) {
-                    return -1;
-                }
-                start = 0;
-                end = (size + 7) & ~7;
-            }
-            block.bump = end;
-            block.live++;
-            reserved = block;
-            return start;
-        }
-
-        /** End of an iteration: every empty block becomes reusable; the current block stays current. */
-        void endOfIteration() {
-            Block cur = current;
-            long gen = generation;
-            int pinned = 0;
-            int reusable = 0;
-            for (int i = 0; i < blockCount; i++) {
-                Block block = blocks[i];
-                if (block.live == 0) {
-                    block.bump = 0;
-                    block.stamp = gen;
-                    if (block != cur) {
-                        block.reusable = true;
-                        reusable++;
-                    }
-                } else {
-                    pinned++;
-                }
-            }
-            generation = gen + 1;
-            pinnedBlocks = pinned;
-            reusableBlocks = reusable;
-            if (pinned > maxPinned) {
-                maxPinned = pinned;
-            }
-            exhausted = false;
-        }
-
-        /** Give back every reusable block but the first. */
-        void trim() {
-            trims++;
-            int w = 0;
-            boolean keptOne = false;
-            for (int i = 0; i < blockCount; i++) {
-                Block block = blocks[i];
-                if (block.reusable && block != current) {
-                    if (keptOne) {
-                        trimmedBlocks++;
-                        reusableBlocks--;
-                        block.root.release();
-                        continue;
-                    }
-                    keptOne = true;
-                }
-                blocks[w++] = block;
-            }
-            for (int i = w; i < blockCount; i++) {
-                blocks[i] = null;
-            }
-            blockCount = w;
-        }
-
-        /** Thread termination: empty blocks go back, pinned ones leak - no other thread may free them. */
-        void terminate() {
-            for (int i = 0; i < blockCount; i++) {
-                Block block = blocks[i];
-                if (block.live == 0) {
-                    block.root.release();
-                } else {
-                    leakedBlocks++;
-                }
-                blocks[i] = null;
-            }
-            blockCount = 0;
-            current = null;
-            reserved = null;
-            hook = null;
-        }
-    }
-
-    static final class Arena {
-        final CycleArenaAllocator alloc;
-        final Thread owner;
-        final Space heap;
-        final Space direct;
-        ArenaBuf[] objects = new ArenaBuf[INITIAL_OBJECTS];
-        int[] free = new int[INITIAL_OBJECTS];
-        int objectCount;
-        int freeTop;
-        IterationHook hook;
-
-        // Metrics.
-        long violations;           // written by the violating thread, read at shutdown: racy by construction
-        long hooks;
-        long hookRejections;
-        long objectGrowths;
-
-        Arena(CycleArenaAllocator alloc, Thread owner) {
-            this.alloc = alloc;
-            this.owner = owner;
-            heap = new Space(this, alloc.heapChunks, false);
-            direct = new Space(this, alloc.directChunks, true);
-        }
-
-        void checkOwner() {
-            if (Thread.currentThread() != owner) {
-                violations++;
-                throw new IllegalStateException("event-loop arena touched from " + Thread.currentThread()
-                        + ", owner is " + owner);
+                throw new IllegalStateException("arena block reused in the iteration that freed it: block="
+                        + id + " stamp=" + stamp[id] + " generation=" + generation);
             }
         }
 
         /** Grow the object array, up to {@code maxObjects}; {@code null} means "delegate this one". */
-        ArenaBuf newObject() {
+        private ArenaBuf newObject() {
             int count = objectCount;
             if (count == objects.length) {
                 if (count >= MAX_OBJECTS) {
@@ -573,10 +496,148 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 free = grownFree;
                 objectGrowths++;
             }
-            ArenaBuf buf = new ArenaBuf(alloc, this, count);
+            ArenaBuf buf = new ArenaBuf(arena.alloc, this, count);
             objects[count] = buf;
             objectCount = count + 1;
             return buf;
+        }
+
+        /**
+         * Reserve a region for a reallocation. Returns the block id, or -1; the offset is left in
+         * {@link #reservedStart}. Cold path.
+         */
+        int reservedStart;
+
+        int reserve(int size) {
+            if (size > cap) {
+                return NO_BLOCK;
+            }
+            int start = curBump;
+            int end = start + ((size + 7) & ~7);
+            if (end > BLOCK_SIZE) {
+                if (!switchBlock()) {
+                    return NO_BLOCK;
+                }
+                start = 0;
+                end = (size + 7) & ~7;
+            }
+            curBump = end;
+            live[curId]++;
+            reservedStart = start;
+            return curId;
+        }
+
+        /** End of an iteration: every empty block becomes reusable; the current block stays current. */
+        void endOfIteration() {
+            long gen = generation;
+            int cur = curId;
+            int mask = 0;
+            int pinned = 0;
+            for (int id = 0; id < MAX_BLOCKS; id++) {
+                if ((allocatedMask & (1 << id)) == 0) {
+                    continue;
+                }
+                if (live[id] == 0) {
+                    if (DEBUG) {
+                        stamp[id] = gen;
+                    }
+                    if (id == cur) {
+                        curBump = 0;           // the current block restarts in place, and stays current
+                    } else {
+                        mask |= 1 << id;
+                    }
+                } else {
+                    pinned++;
+                }
+            }
+            reusableMask = mask;
+            generation = gen + 1;
+            pinnedBlocks = pinned;
+            if (pinned > maxPinned) {
+                maxPinned = pinned;
+            }
+        }
+
+        /** Give back every reusable block but the first. The slot is freed, block ids never move. */
+        void trim() {
+            trims++;
+            int mask = reusableMask;
+            if (mask == 0) {
+                return;
+            }
+            mask &= mask - 1;                  // keep the first reusable block
+            reusableMask &= ~mask;
+            allocatedMask &= ~mask;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                trimmedBlocks++;
+                dropBlock(id);
+            }
+        }
+
+        /** Thread termination: empty blocks go back, pinned ones leak - no other thread may free them. */
+        void terminate() {
+            int mask = allocatedMask;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                if (live[id] == 0) {
+                    dropBlock(id);
+                } else {
+                    leakedBlocks++;
+                }
+            }
+            allocatedMask = 0;
+            reusableMask = 0;
+            curMemory = null;
+            curAddress = 0;
+            hook = null;
+        }
+
+        private void dropBlock(int id) {
+            AbstractByteBuf root = roots[id];
+            roots[id] = null;
+            mem[id] = null;
+            nio[id] = null;
+            base[id] = 0L;
+            root.release();
+        }
+
+        int blockCount() {
+            return Integer.bitCount(allocatedMask);
+        }
+
+        int reusableBlocks() {
+            return Integer.bitCount(reusableMask);
+        }
+    }
+
+    static final class Arena {
+        final CycleArenaAllocator alloc;
+        final Thread owner;
+        final Space heap;
+        final Space direct;
+        IterationHook hook;
+
+        // Metrics.
+        long violations;           // written by the violating thread, read at shutdown: racy by construction
+        long hooks;
+        long hookRejections;
+
+        Arena(CycleArenaAllocator alloc, Thread owner) {
+            this.alloc = alloc;
+            this.owner = owner;
+            heap = new Space(this, alloc.heapChunks, false);
+            direct = new Space(this, alloc.directChunks, true);
+        }
+
+        void checkOwner() {
+            if (Thread.currentThread() != owner) {
+                violations++;
+                throw new IllegalStateException("event-loop arena touched from " + Thread.currentThread()
+                        + ", owner is " + owner);
+            }
         }
 
         void hookNow() {
@@ -595,52 +656,78 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
     }
 
+    /**
+     * A buffer over a region of a block - or, in the DELEGATED state, over a buffer of the delegate
+     * allocator. Element access goes straight to {@link #memory} + {@link #start} (heap) or to
+     * {@link #address} (direct), never through the block columns.
+     */
     static final class ArenaBuf extends AbstractByteBuf {
         private final ByteBufAllocator alloc;
-        private final Arena arena;       // an object never changes arena: stored once, at construction
+        private final Space space;       // an object belongs to one space for its whole life
         private final Thread owner;      // arena.owner, inlined to keep the confinement check to one load
-        final int index;                 // stable slot in the arena's object array
-        /** The block this buffer's region belongs to, or {@code null} in the DELEGATED state. */
-        private Block block;
-        /** The block's root, or - in the DELEGATED state - the delegate buffer (unwrapped). */
-        private AbstractByteBuf root;
-        /** DELEGATED state only: the buffer to release, leak-aware wrapper and all. */
-        private ByteBuf delegated;
+        final int index;                 // stable slot in the space's object array
+        /** The block this buffer's region belongs to, or {@link #DELEGATE_SLOT} when DELEGATED. */
+        private int blockId;
+        /** Offset of this buffer's index 0 inside {@link #memory} (heap), and inside its block. */
         private int start;
         private int length;
         private int refCnt;
-        // The NIO view must be per buffer: the block's root caches one internal ByteBuffer, and a gathering
-        // write asks several buffers of the same block for theirs before using any of them.
+        /** The block's array (heap), or the delegate buffer's array; null for direct memory. */
+        private byte[] memory;
+        /** The address of this buffer's index 0 (direct), 0 when there is none. */
+        private long address;
+        /** DELEGATED state only: the buffer to release, leak-aware wrapper and all. */
+        private ByteBuf delegated;
+        /** DELEGATED state only: the same buffer, unwrapped, for the bulk and view paths. */
+        private AbstractByteBuf delegateRoot;
+        // The NIO view must be per buffer: several buffers of one block are asked for their view before any
+        // of them is used (a gathering write), so a view shared per block would be handed out twice.
         private ByteBuffer tmpNioBuf;
-        private AbstractByteBuf tmpNioRoot;
+        private int tmpNioBlock = NO_BLOCK;
 
-        ArenaBuf(ByteBufAllocator alloc, Arena arena, int index) {
+        ArenaBuf(ByteBufAllocator alloc, Space space, int index) {
             super(0);
             this.alloc = alloc;
-            this.arena = arena;
-            this.owner = arena.owner;
+            this.space = space;
+            this.owner = space.arena.owner;
             this.index = index;
         }
 
-        /** The block this buffer's region belongs to, {@code null} when DELEGATED. For tests only. */
-        Block blockForTest() {
-            return block;
+        /** The block id, or {@link #DELEGATE_SLOT} when DELEGATED. For tests only. */
+        int blockIdForTest() {
+            return blockId;
         }
 
-        void init(Block block, int start, int length, int maxCapacity) {
-            // Only store the block and the root when they really change: both are reference fields, and a
-            // card-table write barrier per allocation costs more than the whole bump does.
-            if (this.block != block) {
-                this.block = block;
-                this.root = block.root;
-            }
+        /**
+         * Ints, one long, and - only when this buffer lands in another block - one guarded {@code byte[]}
+         * store. That store is the single reference store on the allocation path and it is paid once per
+         * block switch, not once per allocation.
+         */
+        void init(int blockId, int start, int length, int maxCapacity) {
+            this.blockId = blockId;
             this.start = start;
             this.length = length;
             this.refCnt = 1;
+            byte[] m = space.curMemory;
+            if (memory != m) {
+                memory = m;
+            }
+            address = space.curAddress + (space.addressMask & start);
             maxCapacity(maxCapacity);
             setIndex(0, 0);
             markReaderIndex();
             markWriterIndex();
+        }
+
+        /** The buffer that holds the bytes, for the bulk and view paths only. */
+        private AbstractByteBuf root() {
+            int id = blockId;
+            return id == DELEGATE_SLOT ? delegateRoot : space.roots[id];
+        }
+
+        /** This buffer's index 0 inside {@link #root()}. */
+        private int rootStart() {
+            return blockId == DELEGATE_SLOT ? 0 : start;
         }
 
         // --- reference counting: plain int, owner-confined (Invariant A) ---
@@ -699,13 +786,13 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             if (cnt != 1) {
                 return false;
             }
-            Block b = block;
-            if (b == null) {
-                return releaseDelegated();
+            Space s = space;
+            int id = blockId;
+            s.live[id]--;
+            s.free[s.freeTop++] = index;
+            if (id == DELEGATE_SLOT) {
+                releaseDelegated();
             }
-            b.live--;
-            Arena a = arena;
-            a.free[a.freeTop++] = index;
             return true;
         }
 
@@ -722,31 +809,30 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             if (cnt != decrement) {
                 return false;
             }
-            Block b = block;
-            if (b == null) {
-                return releaseDelegated();
+            Space s = space;
+            int id = blockId;
+            s.live[id]--;
+            s.free[s.freeTop++] = index;
+            if (id == DELEGATE_SLOT) {
+                releaseDelegated();
             }
-            b.live--;
-            Arena a = arena;
-            a.free[a.freeTop++] = index;
             return true;
         }
 
-        /** DELEGATED: the region is a buffer of the delegate allocator; the object still goes back. */
-        private boolean releaseDelegated() {
+        /** DELEGATED: the object is already back in the pool; the delegate buffer goes back too. */
+        private void releaseDelegated() {
             ByteBuf buf = delegated;
             delegated = null;
-            root = null;
+            delegateRoot = null;
             tmpNioBuf = null;
-            tmpNioRoot = null;
-            Arena a = arena;
-            a.free[a.freeTop++] = index;
+            tmpNioBlock = NO_BLOCK;
+            memory = null;
+            address = 0;
             buf.release();
-            return true;
         }
 
         private IllegalStateException violation() {
-            arena.violations++;
+            space.arena.violations++;
             return new IllegalStateException("arena buffer of " + owner + " touched from "
                     + Thread.currentThread() + " (event-loop arena buffers are thread confined)");
         }
@@ -770,48 +856,68 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
 
         /**
-         * Grow: in place when this buffer is topmost in its block and the block has the room, else a new
-         * region (arena when it fits and there is room, else the delegate) plus a copy. The old region is
+         * Grow: in place when this buffer is topmost in the CURRENT block and the block has the room, else a
+         * new region (arena when it fits and there is room, else the delegate) plus a copy. The old region is
          * released - so it is handed out again only after the next hook, which keeps any view taken during
          * this iteration valid until the iteration ends.
          */
         private ByteBuf grow(int newCapacity) {
-            Block b = block;
-            if (b == null) {
+            int id = blockId;
+            Space space = this.space;
+            if (id == DELEGATE_SLOT) {
                 delegated.capacity(newCapacity);   // DELEGATED: the delegate buffer grows itself
                 length = newCapacity;
-                tmpNioBuf = null;
-                tmpNioRoot = null;
+                adoptDelegate(delegated);          // its memory may have moved
                 return this;
             }
-            Space space = b.space;
-            int oldEnd = start + ((length + 7) & ~7);
             int newEnd = start + ((newCapacity + 7) & ~7);
-            if (b.bump == oldEnd && newEnd <= BLOCK_SIZE) {
-                b.bump = newEnd;
+            if (id == space.curId && space.curBump == start + ((length + 7) & ~7) && newEnd <= BLOCK_SIZE) {
+                space.curBump = newEnd;
                 length = newCapacity;
                 space.reallocInPlace++;
                 return this;
             }
-            int newStart = space.reserve(newCapacity);
-            if (newStart >= 0) {
-                Block newBlock = space.reserved;
-                space.reserved = null;
-                newBlock.root.setBytes(newStart, b.root, start, length);
+            AbstractByteBuf oldRoot = space.roots[id];
+            int oldStart = start;
+            int oldLength = length;
+            int newId = space.reserve(newCapacity);
+            if (newId >= 0) {
+                int newStart = space.reservedStart;
+                space.roots[newId].setBytes(newStart, oldRoot, oldStart, oldLength);
                 space.reallocMoved++;
-                moveTo(newBlock, newBlock.root, newStart, newCapacity);
+                blockId = newId;
+                start = newStart;
+                length = newCapacity;
+                memory = space.mem[newId];
+                address = space.base[newId] + (space.addressMask & newStart);
+                tmpNioBuf = null;
+                tmpNioBlock = NO_BLOCK;
             } else {
                 ByteBuf buf = space.direct
-                        ? arena.alloc.delegateDirect(space, newCapacity, maxCapacity())
-                        : arena.alloc.delegateHeap(space, newCapacity, maxCapacity());
+                        ? space.arena.alloc.delegateDirect(space, newCapacity, maxCapacity())
+                        : space.arena.alloc.delegateHeap(space, newCapacity, maxCapacity());
                 AbstractByteBuf target = unwrapDelegate(buf);
-                target.setBytes(0, root, start, length);
+                target.setBytes(0, oldRoot, oldStart, oldLength);
                 space.reallocDelegated++;
                 delegated = buf;
-                moveTo(null, target, 0, newCapacity);
+                delegateRoot = target;
+                length = newCapacity;
+                space.live[DELEGATE_SLOT]++;
+                adoptDelegate(buf);
             }
-            b.live--;
+            space.live[id]--;
             return this;
+        }
+
+        /** Point the data fields at a delegate buffer's memory; the id becomes {@link #DELEGATE_SLOT}. */
+        private void adoptDelegate(ByteBuf buf) {
+            AbstractByteBuf target = delegateRoot;
+            blockId = DELEGATE_SLOT;
+            memory = target.hasArray() ? target.array() : null;
+            start = memory != null ? target.arrayOffset() : 0;
+            address = target.hasMemoryAddress() ? target.memoryAddress() : 0L;
+            tmpNioBuf = null;
+            tmpNioBlock = NO_BLOCK;
         }
 
         /** The delegate wraps its buffers when leak detection is on; element access needs the raw one. */
@@ -825,17 +931,6 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 unwrapped = inner;
             }
             return (AbstractByteBuf) unwrapped;
-        }
-
-        private void moveTo(Block newBlock, AbstractByteBuf newRoot, int newStart, int newLength) {
-            block = newBlock;
-            root = newRoot;
-            start = newStart;
-            length = newLength;
-        }
-
-        private int idx(int index) {
-            return start + index;
         }
 
         @Override
@@ -855,50 +950,47 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
         @Override
         public boolean isDirect() {
-            Block b = block;
-            return b == null ? root.isDirect() : b.direct;
+            return space.direct;
         }
 
         @Override
         boolean _isDirect() {
-            return isDirect();
+            return space.direct;
         }
 
         @Override
         public boolean hasArray() {
-            Block b = block;
-            return b == null ? root.hasArray() : b.mem != null;
+            return memory != null;
         }
 
         @Override
         public byte[] array() {
             ensureAccessible();
-            Block b = block;
-            return b == null ? root.array() : b.mem;
+            if (memory == null) {
+                throw new UnsupportedOperationException("direct buffer");
+            }
+            return memory;
         }
 
         @Override
         public int arrayOffset() {
-            Block b = block;
-            return b == null ? root.arrayOffset() : start;
+            return start;
         }
 
         @Override
         public boolean hasMemoryAddress() {
-            Block b = block;
-            return b == null ? root.hasMemoryAddress() : b.hasAddress;
+            return address != 0;
         }
 
         @Override
         public long memoryAddress() {
             ensureAccessible();
-            return _memoryAddress();
+            return address;
         }
 
         @Override
         long _memoryAddress() {
-            Block b = block;
-            return b == null ? root.memoryAddress() : b.address + start;
+            return address;
         }
 
         @Override
@@ -909,23 +1001,23 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public ByteBuffer nioBuffer(int index, int len) {
             checkIndex(index, len);
-            return root.nioBuffer(idx(index), len);      // a fresh view per call, heap and direct alike
+            return root().nioBuffer(rootStart() + index, len);   // a fresh view per call
         }
 
         @Override
         public ByteBuffer internalNioBuffer(int index, int len) {
             checkIndex(index, len);
-            AbstractByteBuf r = root;
-            if (block == null) {
-                return r.internalNioBuffer(index, len);  // DELEGATED: the delegate buffer has its own
+            int id = blockId;
+            if (id == DELEGATE_SLOT) {
+                return delegateRoot.internalNioBuffer(index, len);   // the delegate has its own
             }
             ByteBuffer buf = tmpNioBuf;
-            if (buf == null || tmpNioRoot != r) {
-                buf = r.internalNioBuffer(0, r.capacity()).duplicate();
+            if (buf == null || tmpNioBlock != id) {
+                buf = space.nio[id].duplicate();
                 tmpNioBuf = buf;
-                tmpNioRoot = r;
+                tmpNioBlock = id;
             }
-            buf.clear().position(idx(index)).limit(idx(index) + len);
+            buf.clear().position(start + index).limit(start + index + len);
             return buf;
         }
 
@@ -937,42 +1029,42 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override
         public ByteBuf copy(int index, int len) {
             checkIndex(index, len);
-            return root.copy(idx(index), len);
+            return root().copy(rootStart() + index, len);
         }
 
-        // --- element access: same shape as AdaptiveByteBuf (root + offset) ---
-        @Override protected byte _getByte(int i) { return root._getByte(idx(i)); }
-        @Override protected short _getShort(int i) { return root._getShort(idx(i)); }
-        @Override protected short _getShortLE(int i) { return root._getShortLE(idx(i)); }
-        @Override protected int _getUnsignedMedium(int i) { return root._getUnsignedMedium(idx(i)); }
-        @Override protected int _getUnsignedMediumLE(int i) { return root._getUnsignedMediumLE(idx(i)); }
-        @Override protected int _getInt(int i) { return root._getInt(idx(i)); }
-        @Override protected int _getIntLE(int i) { return root._getIntLE(idx(i)); }
-        @Override protected long _getLong(int i) { return root._getLong(idx(i)); }
-        @Override protected long _getLongLE(int i) { return root._getLongLE(idx(i)); }
-        @Override protected void _setByte(int i, int v) { root._setByte(idx(i), v); }
-        @Override protected void _setShort(int i, int v) { root._setShort(idx(i), v); }
-        @Override protected void _setShortLE(int i, int v) { root._setShortLE(idx(i), v); }
-        @Override protected void _setMedium(int i, int v) { root._setMedium(idx(i), v); }
-        @Override protected void _setMediumLE(int i, int v) { root._setMediumLE(idx(i), v); }
-        @Override protected void _setInt(int i, int v) { root._setInt(idx(i), v); }
-        @Override protected void _setIntLE(int i, int v) { root._setIntLE(idx(i), v); }
-        @Override protected void _setLong(int i, long v) { root._setLong(idx(i), v); }
-        @Override protected void _setLongLE(int i, long v) { root._setLongLE(idx(i), v); }
+        // --- element access: straight to the array or to the address, no block column is read ---
+        @Override protected byte _getByte(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getByte(m, start + i) : HeapByteBufUtil.getByte(m, start + i)) : UnsafeByteBufUtil.getByte(address + i); }
+        @Override protected short _getShort(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getShort(m, start + i) : HeapByteBufUtil.getShort(m, start + i)) : UnsafeByteBufUtil.getShort(address + i); }
+        @Override protected short _getShortLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getShortLE(m, start + i) : HeapByteBufUtil.getShortLE(m, start + i)) : UnsafeByteBufUtil.getShortLE(address + i); }
+        @Override protected int _getUnsignedMedium(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getUnsignedMedium(m, start + i) : HeapByteBufUtil.getUnsignedMedium(m, start + i)) : UnsafeByteBufUtil.getUnsignedMedium(address + i); }
+        @Override protected int _getUnsignedMediumLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getUnsignedMediumLE(m, start + i) : HeapByteBufUtil.getUnsignedMediumLE(m, start + i)) : UnsafeByteBufUtil.getUnsignedMediumLE(address + i); }
+        @Override protected int _getInt(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getInt(m, start + i) : HeapByteBufUtil.getInt(m, start + i)) : UnsafeByteBufUtil.getInt(address + i); }
+        @Override protected int _getIntLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getIntLE(m, start + i) : HeapByteBufUtil.getIntLE(m, start + i)) : UnsafeByteBufUtil.getIntLE(address + i); }
+        @Override protected long _getLong(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getLong(m, start + i) : HeapByteBufUtil.getLong(m, start + i)) : UnsafeByteBufUtil.getLong(address + i); }
+        @Override protected long _getLongLE(int i) { byte[] m = memory; return m != null ? (UNSAFE ? UnsafeByteBufUtil.getLongLE(m, start + i) : HeapByteBufUtil.getLongLE(m, start + i)) : UnsafeByteBufUtil.getLongLE(address + i); }
+        @Override protected void _setByte(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setByte(m, start + i, v); } else { HeapByteBufUtil.setByte(m, start + i, v); } } else { UnsafeByteBufUtil.setByte(address + i, v); } }
+        @Override protected void _setShort(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setShort(m, start + i, v); } else { HeapByteBufUtil.setShort(m, start + i, v); } } else { UnsafeByteBufUtil.setShort(address + i, v); } }
+        @Override protected void _setShortLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setShortLE(m, start + i, v); } else { HeapByteBufUtil.setShortLE(m, start + i, v); } } else { UnsafeByteBufUtil.setShortLE(address + i, v); } }
+        @Override protected void _setMedium(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setMedium(m, start + i, v); } else { HeapByteBufUtil.setMedium(m, start + i, v); } } else { UnsafeByteBufUtil.setMedium(address + i, v); } }
+        @Override protected void _setMediumLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setMediumLE(m, start + i, v); } else { HeapByteBufUtil.setMediumLE(m, start + i, v); } } else { UnsafeByteBufUtil.setMediumLE(address + i, v); } }
+        @Override protected void _setInt(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setInt(m, start + i, v); } else { HeapByteBufUtil.setInt(m, start + i, v); } } else { UnsafeByteBufUtil.setInt(address + i, v); } }
+        @Override protected void _setIntLE(int i, int v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setIntLE(m, start + i, v); } else { HeapByteBufUtil.setIntLE(m, start + i, v); } } else { UnsafeByteBufUtil.setIntLE(address + i, v); } }
+        @Override protected void _setLong(int i, long v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setLong(m, start + i, v); } else { HeapByteBufUtil.setLong(m, start + i, v); } } else { UnsafeByteBufUtil.setLong(address + i, v); } }
+        @Override protected void _setLongLE(int i, long v) { byte[] m = memory; if (m != null) { if (UNSAFE) { UnsafeByteBufUtil.setLongLE(m, start + i, v); } else { HeapByteBufUtil.setLongLE(m, start + i, v); } } else { UnsafeByteBufUtil.setLongLE(address + i, v); } }
 
-        // --- bulk access, delegated to the root ---
-        @Override public ByteBuf getBytes(int i, ByteBuf dst, int di, int len) { checkIndex(i, len); root.getBytes(idx(i), dst, di, len); return this; }
-        @Override public ByteBuf getBytes(int i, byte[] dst, int di, int len) { checkIndex(i, len); root.getBytes(idx(i), dst, di, len); return this; }
-        @Override public ByteBuf getBytes(int i, ByteBuffer dst) { checkIndex(i, dst.remaining()); root.getBytes(idx(i), dst); return this; }
-        @Override public ByteBuf getBytes(int i, OutputStream out, int len) throws IOException { checkIndex(i, len); root.getBytes(idx(i), out, len); return this; }
-        @Override public int getBytes(int i, GatheringByteChannel out, int len) throws IOException { checkIndex(i, len); return root.getBytes(idx(i), out, len); }
-        @Override public int getBytes(int i, FileChannel out, long pos, int len) throws IOException { checkIndex(i, len); return root.getBytes(idx(i), out, pos, len); }
-        @Override public ByteBuf setBytes(int i, ByteBuf src, int si, int len) { checkIndex(i, len); root.setBytes(idx(i), src, si, len); return this; }
-        @Override public ByteBuf setBytes(int i, byte[] src, int si, int len) { checkIndex(i, len); root.setBytes(idx(i), src, si, len); return this; }
-        @Override public ByteBuf setBytes(int i, ByteBuffer src) { checkIndex(i, src.remaining()); root.setBytes(idx(i), src); return this; }
-        @Override public int setBytes(int i, InputStream in, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, len); }
-        @Override public int setBytes(int i, ScatteringByteChannel in, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, len); }
-        @Override public int setBytes(int i, FileChannel in, long pos, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, pos, len); }
+        // --- bulk access, through the block's chunk (or the delegate buffer) ---
+        @Override public ByteBuf getBytes(int i, ByteBuf dst, int di, int len) { checkIndex(i, len); root().getBytes(rootStart() + i, dst, di, len); return this; }
+        @Override public ByteBuf getBytes(int i, byte[] dst, int di, int len) { checkIndex(i, len); root().getBytes(rootStart() + i, dst, di, len); return this; }
+        @Override public ByteBuf getBytes(int i, ByteBuffer dst) { checkIndex(i, dst.remaining()); root().getBytes(rootStart() + i, dst); return this; }
+        @Override public ByteBuf getBytes(int i, OutputStream out, int len) throws IOException { checkIndex(i, len); root().getBytes(rootStart() + i, out, len); return this; }
+        @Override public int getBytes(int i, GatheringByteChannel out, int len) throws IOException { checkIndex(i, len); return root().getBytes(rootStart() + i, out, len); }
+        @Override public int getBytes(int i, FileChannel out, long pos, int len) throws IOException { checkIndex(i, len); return root().getBytes(rootStart() + i, out, pos, len); }
+        @Override public ByteBuf setBytes(int i, ByteBuf src, int si, int len) { checkIndex(i, len); root().setBytes(rootStart() + i, src, si, len); return this; }
+        @Override public ByteBuf setBytes(int i, byte[] src, int si, int len) { checkIndex(i, len); root().setBytes(rootStart() + i, src, si, len); return this; }
+        @Override public ByteBuf setBytes(int i, ByteBuffer src) { checkIndex(i, src.remaining()); root().setBytes(rootStart() + i, src); return this; }
+        @Override public int setBytes(int i, InputStream in, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, len); }
+        @Override public int setBytes(int i, ScatteringByteChannel in, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, len); }
+        @Override public int setBytes(int i, FileChannel in, long pos, int len) throws IOException { checkIndex(i, len); return root().setBytes(rootStart() + i, in, pos, len); }
     }
 
     /** A snapshot of every counter of section 6, summed over arenas. */
@@ -1032,10 +1124,10 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             arenaDirect += arena.direct.arenaAllocations;
             delegateHeap += arena.heap.delegateAllocations;
             delegateDirect += arena.direct.delegateAllocations;
-            blocksHeap += arena.heap.blockCount;
-            blocksDirect += arena.direct.blockCount;
+            blocksHeap += arena.heap.blockCount();
+            blocksDirect += arena.direct.blockCount();
             pinned += arena.heap.pinnedBlocks + arena.direct.pinnedBlocks;
-            reusable += arena.heap.reusableBlocks + arena.direct.reusableBlocks;
+            reusable += arena.heap.reusableBlocks() + arena.direct.reusableBlocks();
             maxPinnedHeap += arena.heap.maxPinned;
             maxPinnedDirect += arena.direct.maxPinned;
             violations += arena.violations;
@@ -1050,7 +1142,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             earlyReuses += arena.heap.earlyReuses + arena.direct.earlyReuses;
             blockReuses += arena.heap.blockReuses + arena.direct.blockReuses;
             blockGrowths += arena.heap.blockGrowths + arena.direct.blockGrowths;
-            objects += arena.objectCount;
+            objects += arena.heap.objectCount + arena.direct.objectCount;
         }
 
         @Override

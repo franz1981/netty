@@ -54,6 +54,10 @@ class CycleArenaAllocatorTest {
         return direct ? alloc.directBuffer(size) : alloc.heapBuffer(size);
     }
 
+    private static boolean reusable(CycleArenaAllocator.Space space, int blockId) {
+        return (space.reusableMask & (1 << blockId)) != 0;
+    }
+
     private static CycleArenaAllocator.Space space(CycleArenaAllocator alloc, boolean direct) {
         CycleArenaAllocator.Arena arena = alloc.arenaForTest();
         assertNotNull(arena);
@@ -225,34 +229,34 @@ class CycleArenaAllocatorTest {
         try {
             ByteBuf pinning = alloc.heapBuffer(64);
             CycleArenaAllocator.Space space = space(alloc, false);
-            CycleArenaAllocator.Block firstBlock = space.current;
+            int firstBlock = space.curId;
 
             // Fill the first block and let the space move on to a second one.
             List<ByteBuf> filler = new ArrayList<ByteBuf>();
-            while (space.blockCount < 2) {
+            while (space.blockCount() < 2) {
                 filler.add(alloc.heapBuffer(CycleArenaAllocator.CAP));
             }
             for (ByteBuf buf : filler) {
                 buf.release();
             }
-            assertEquals(2, space.blockCount);
-            assertEquals(1, firstBlock.live);
+            assertEquals(2, space.blockCount());
+            assertEquals(1, space.live[firstBlock]);
 
             alloc.runHookForTest();
             assertEquals(1, space.pinnedBlocks);
-            assertFalse(firstBlock.reusable);
+            assertFalse(reusable(space, firstBlock));
             alloc.runHookForTest();
             assertEquals(1, space.pinnedBlocks);
-            assertFalse(firstBlock.reusable);
+            assertFalse(reusable(space, firstBlock));
             assertEquals(1, space.maxPinned);
 
             assertTrue(pinning.release());
-            assertEquals(0, firstBlock.live);
-            assertFalse(firstBlock.reusable, "release alone must not make a block reusable");
+            assertEquals(0, space.live[firstBlock]);
+            assertFalse(reusable(space, firstBlock), "release alone must not make a block reusable");
 
             alloc.runHookForTest();
             assertEquals(0, space.pinnedBlocks);
-            assertTrue(firstBlock.reusable);
+            assertTrue(reusable(space, firstBlock));
         } finally {
             alloc.removeForTest();
         }
@@ -310,20 +314,23 @@ class CycleArenaAllocatorTest {
             ByteBuf buf = alloc.heapBuffer(64);
             buf.writeLong(0x0102030405060708L);
             ByteBuf topmost = alloc.heapBuffer(64);        // not topmost: a move is needed
-            CycleArenaAllocator.Block block = arenaBuf(buf).blockForTest();
+            CycleArenaAllocator.Space space = space(alloc, false);
+            int blockId = arenaBuf(buf).blockIdForTest();
+            int liveBefore = space.live[blockId];
 
             buf.capacity(CycleArenaAllocator.CAP + 1024);  // above the cap: only the delegate can serve it
-            assertEquals(1, space(alloc, false).reallocDelegated);
-            assertNull(arenaBuf(buf).blockForTest(), "a delegated buffer has no block");
+            assertEquals(1, space.reallocDelegated);
+            assertEquals(CycleArenaAllocator.DELEGATE_SLOT, arenaBuf(buf).blockIdForTest(),
+                    "a delegated buffer has no block");
             assertEquals(0x0102030405060708L, buf.getLong(0));
             assertEquals(CycleArenaAllocator.CAP + 1024, buf.capacity());
-            assertEquals(0, block.live - 1);               // the old region was given back to its block
+            assertEquals(liveBefore - 1, space.live[blockId]);   // the old region went back to its block
 
             // Releasing a DELEGATED buffer releases the delegate buffer and pools the object again.
-            CycleArenaAllocator.Arena arena = alloc.arenaForTest();
-            int freeTop = arena.freeTop;
+            int freeTop = space.freeTop;
             assertTrue(buf.release());
-            assertEquals(freeTop + 1, arena.freeTop);
+            assertEquals(freeTop + 1, space.freeTop);
+            assertEquals(0, space.live[CycleArenaAllocator.DELEGATE_SLOT]);
             assertTrue(topmost.release());
         } finally {
             alloc.removeForTest();
@@ -393,7 +400,7 @@ class CycleArenaAllocatorTest {
                 live.add(buf);
             }
             assertNotNull(space);
-            assertEquals(CycleArenaAllocator.MAX_BLOCKS, space.blockCount);
+            assertEquals(CycleArenaAllocator.MAX_BLOCKS, space.blockCount());
             assertTrue(space.delegateAllocations > 0);
             for (ByteBuf buf : live) {
                 buf.release();
@@ -419,15 +426,15 @@ class CycleArenaAllocatorTest {
                 live.add(buf);
             }
             CycleArenaAllocator.Space space = space(alloc, false);
-            assertEquals(CycleArenaAllocator.MAX_BLOCKS, space.blockCount);
+            assertEquals(CycleArenaAllocator.MAX_BLOCKS, space.blockCount());
             for (ByteBuf buf : live) {
                 buf.release();
             }
             alloc.runHookForTest();
-            assertEquals(CycleArenaAllocator.MAX_BLOCKS - 1, space.reusableBlocks);
+            assertEquals(CycleArenaAllocator.MAX_BLOCKS - 1, space.reusableBlocks());
 
             alloc.trim();
-            assertEquals(2, space.blockCount, "the current block and one reusable block are kept");
+            assertEquals(2, space.blockCount(), "the current block and one reusable block are kept");
             assertEquals(CycleArenaAllocator.MAX_BLOCKS - 2, space.trimmedBlocks);
         } finally {
             alloc.removeForTest();
@@ -440,15 +447,49 @@ class CycleArenaAllocatorTest {
         ByteBuf pinning = alloc.heapBuffer(64);
         CycleArenaAllocator.Space heap = space(alloc, false);
         CycleArenaAllocator.Space direct = space(alloc, true);
-        CycleArenaAllocator.Block leaked = heap.current;
+        int leaked = heap.curId;
+        AbstractByteBuf leakedRoot = heap.roots[leaked];
         alloc.removeForTest();
-        assertEquals(0, heap.blockCount);
+        assertEquals(0, heap.blockCount());
         assertEquals(1, heap.leakedBlocks, "a block with a live buffer cannot be freed by anyone");
         assertEquals(0, direct.leakedBlocks);
         assertEquals(1, pinning.refCnt());
         // The arena leaks this block on purpose (design section 7); free it here so that the leak
         // detector of the test suite does not report what the test is asserting.
-        leaked.root.release();
+        leakedRoot.release();
+    }
+
+    // ------------------------------------------------------------------ no in-band metadata
+
+    @Test
+    void blockMemoryHoldsNothingButPayload() {
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf first = alloc.heapBuffer(64);
+            CycleArenaAllocator.Space space = space(alloc, false);
+            byte[] block = space.mem[space.curId];
+            java.util.Arrays.fill(block, (byte) 0x5A);     // paint the whole block, payload included
+
+            // Allocate, release, grow in place, switch nothing, run the hook, allocate again: the arena
+            // must not write one byte of bookkeeping into the block.
+            ByteBuf second = alloc.heapBuffer(128);
+            second.capacity(256);
+            assertTrue(second.release());
+            assertTrue(first.release());
+            alloc.runHookForTest();
+            ByteBuf third = alloc.heapBuffer(64);
+            assertTrue(third.release());
+            alloc.trim();
+
+            for (int i = 0; i < block.length; i++) {
+                if (block[i] != (byte) 0x5A) {
+                    throw new AssertionError("the arena wrote metadata into block memory at " + i
+                            + ": 0x" + Integer.toHexString(block[i] & 0xff));
+                }
+            }
+        } finally {
+            alloc.removeForTest();
+        }
     }
 
     // ------------------------------------------------------------------ metrics
