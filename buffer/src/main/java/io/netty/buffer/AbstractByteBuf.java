@@ -93,6 +93,18 @@ public abstract class AbstractByteBuf extends ByteBuf {
         return Unpooled.unmodifiableBuffer(this);
     }
 
+    /**
+     * EXPERIMENT (event-loop arena): reset a recycled buffer to a fresh state with five plain stores and
+     * no checks, so that the allocator's init method stays small enough for C2 to inline it.
+     */
+    final void resetForReuse(int maxCapacity) {
+        this.maxCapacity = maxCapacity;
+        readerIndex = 0;
+        writerIndex = 0;
+        markedReaderIndex = 0;
+        markedWriterIndex = 0;
+    }
+
     @Override
     public int maxCapacity() {
         return maxCapacity;

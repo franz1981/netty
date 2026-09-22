@@ -164,7 +164,8 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         if (buf != null) {
             return buf;
         }
-        return delegateHeap(space, initialCapacity, maxCapacity);
+        space.delegateAllocations++;
+        return delegate.heapBuffer(initialCapacity, maxCapacity);
     }
 
     @Override
@@ -174,17 +175,15 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         if (buf != null) {
             return buf;
         }
-        return delegateDirect(space, initialCapacity, maxCapacity);
-    }
-
-    private ByteBuf delegateHeap(Space space, int initialCapacity, int maxCapacity) {
-        space.delegateAllocations++;
-        return delegate.heapBuffer(initialCapacity, maxCapacity);
-    }
-
-    private ByteBuf delegateDirect(Space space, int initialCapacity, int maxCapacity) {
         space.delegateAllocations++;
         return delegate.directBuffer(initialCapacity, maxCapacity);
+    }
+
+    /** The reallocation path's delegate call; the allocation path calls the delegate in place. */
+    private ByteBuf delegateForGrow(Space space, int capacity, int maxCapacity) {
+        space.delegateAllocations++;
+        return space.direct ? delegate.directBuffer(capacity, maxCapacity)
+                : delegate.heapBuffer(capacity, maxCapacity);
     }
 
     @Override
@@ -206,13 +205,22 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         arena.direct.trim();
     }
 
-    /** Run the end-of-iteration hook on the calling thread's arena. Package private: for tests only. */
-    void runHookForTest() {
+    /**
+     * Close the current iteration on the calling thread, exactly as the event-loop hook does. On an event
+     * loop nothing calls this: the hook is armed from the allocation path. It exists for drivers that are
+     * not event loops and still have an iteration boundary - tests, and benchmarks that model a cycle.
+     */
+    public void endOfIteration() {
         Arena arena = arenas.getIfExists();
         if (arena != null) {
             arena.checkOwner();
             arena.hookNow();
         }
+    }
+
+    /** Run the end-of-iteration hook on the calling thread's arena. Package private: for tests only. */
+    void runHookForTest() {
+        endOfIteration();
     }
 
     /** The calling thread's arena, or {@code null}. Package private: for tests only. */
@@ -310,6 +318,11 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         int allocatedMask;
         /** Bit i: block i was empty at the LAST hook and its bump was reset. Zero means "grow or delegate". */
         int reusableMask;
+        /**
+         * Every block is pinned and the bound is reached: allocation delegates without touching anything
+         * else. Set by {@link #switchBlock()}, cleared by the hook and by {@link #trim()}.
+         */
+        boolean exhausted;
         boolean hasAddress;
         /**
          * -1 when the chunks of this space have a usable memory address, 0 when they do not. It turns the
@@ -370,6 +383,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         ByteBuf allocate(int size, int maxCapacity) {
             if (size > cap) {
                 return null;                   // above the cap: the delegate owns it
+            }
+            if (exhausted) {
+                return null;                   // every block pinned and the bound reached
             }
             IterationHook h = hook;
             if (h != null && !h.armed) {
@@ -446,6 +462,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 newBlock();
                 return true;
             }
+            exhausted = true;
             return false;
         }
 
@@ -551,6 +568,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 }
             }
             reusableMask = mask;
+            exhausted = false;
             generation = gen + 1;
             pinnedBlocks = pinned;
             if (pinned > maxPinned) {
@@ -561,6 +579,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         /** Give back every reusable block but the first. The slot is freed, block ids never move. */
         void trim() {
             trims++;
+            exhausted = false;
             int mask = reusableMask;
             if (mask == 0) {
                 return;
@@ -713,10 +732,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 memory = m;
             }
             address = space.curAddress + (space.addressMask & start);
-            maxCapacity(maxCapacity);
-            setIndex(0, 0);
-            markReaderIndex();
-            markWriterIndex();
+            resetForReuse(maxCapacity);
         }
 
         /** The buffer that holds the bytes, for the bulk and view paths only. */
@@ -893,9 +909,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 tmpNioBuf = null;
                 tmpNioBlock = NO_BLOCK;
             } else {
-                ByteBuf buf = space.direct
-                        ? space.arena.alloc.delegateDirect(space, newCapacity, maxCapacity())
-                        : space.arena.alloc.delegateHeap(space, newCapacity, maxCapacity());
+                ByteBuf buf = space.arena.alloc.delegateForGrow(space, newCapacity, maxCapacity());
                 AbstractByteBuf target = unwrapDelegate(buf);
                 target.setBytes(0, oldRoot, oldStart, oldLength);
                 space.reallocDelegated++;
