@@ -272,9 +272,23 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override public boolean hasMemoryAddress() { return false; }
         @Override public long memoryAddress() { throw new UnsupportedOperationException(); }
         @Override public int nioBufferCount() { return 1; }
-        @Override public ByteBuffer nioBuffer(int index, int len) { return root.nioBuffer(idx(index), len); }
-        @Override public ByteBuffer internalNioBuffer(int index, int len) { return root.internalNioBuffer(idx(index), len); }
-        @Override public ByteBuffer[] nioBuffers(int index, int len) { return root.nioBuffers(idx(index), len); }
+        // NIO views must be per buffer: the block's root caches one internal ByteBuffer, and a gathering write asks
+        // several buffers of the same block for theirs before using any of them.
+        private ByteBuffer tmpNioBuf;
+        @Override public ByteBuffer nioBuffer(int index, int len) {
+            checkIndex(index, len);
+            return ByteBuffer.wrap(block.mem, idx(index), len).slice();
+        }
+        @Override public ByteBuffer internalNioBuffer(int index, int len) {
+            checkIndex(index, len);
+            ByteBuffer b = tmpNioBuf;
+            if (b == null || b.array() != block.mem) {
+                b = tmpNioBuf = ByteBuffer.wrap(block.mem);
+            }
+            b.clear().position(idx(index)).limit(idx(index) + len);
+            return b;
+        }
+        @Override public ByteBuffer[] nioBuffers(int index, int len) { return new ByteBuffer[] { nioBuffer(index, len) }; }
         @Override public ByteBuf copy(int index, int len) { return alloc.heapBuffer(len).writeBytes(root, idx(index), len); }
 
         // --- element access: same shape as AdaptiveByteBuf (root + offset) ---
