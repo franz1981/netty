@@ -15,8 +15,12 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThreadExecutorMap;
+
+import java.lang.reflect.Method;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -62,6 +66,14 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final int RELEASE_LIFO = 1;
     static final int RELEASE_HOOK = 2;
     static final int RELEASE = parseRelease(System.getProperty("arena.release", "lifo"));
+    /**
+     * {@code -Darena.hook}: {@code iteration} (the default) makes the first allocation on an event loop thread
+     * register a tail task with {@code SingleThreadEventLoop.executeAfterEventLoopIteration}, Netty's own
+     * end-of-iteration hook, which then closes a cycle after every loop iteration and re-registers itself.
+     * {@code off} leaves closing a cycle entirely to whoever calls {@link #endOfCycle()} - the e2e launcher's
+     * channelReadComplete handler, for instance. Only consulted with {@code -Darena.release=hook}.
+     */
+    static final boolean HOOK_ITERATION = !"off".equals(System.getProperty("arena.hook", "iteration"));
 
     private static int parseRelease(String name) {
         if ("zero".equals(name)) {
@@ -85,7 +97,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final LongAdder T_GROW = new LongAdder();
     static final LongAdder T_RESET_ZERO = new LongAdder();
     static final LongAdder T_LIFO_POP = new LongAdder();
-    static final LongAdder T_HOOK_CALL = new LongAdder();
+    static final LongAdder T_HOOK_ITERATION = new LongAdder();
+    static final LongAdder T_HOOK_READ_COMPLETE = new LongAdder();
+    static final LongAdder T_HOOK_REGISTERED = new LongAdder();
     static final LongAdder T_HOOK_RESET = new LongAdder();
     static final LongAdder T_HOOK_DROP = new LongAdder();
     static final LongAdder T_TRIM_DROP = new LongAdder();
@@ -100,7 +114,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 + " fallbackHeap=" + T_FB_HEAP.sum() + " fallbackDirect=" + T_FB_DIRECT.sum()
                 + " blockReuse=" + T_BLOCK_REUSE.sum() + " grow=" + T_GROW.sum()
                 + " resetOnZero=" + T_RESET_ZERO.sum() + " lifoPop=" + T_LIFO_POP.sum()
-                + " endOfCycle=" + T_HOOK_CALL.sum() + " hookReset=" + T_HOOK_RESET.sum()
+                + " hookIteration=" + T_HOOK_ITERATION.sum()
+                + " hookReadComplete=" + T_HOOK_READ_COMPLETE.sum()
+                + " hookRegistered=" + T_HOOK_REGISTERED.sum() + " hookReset=" + T_HOOK_RESET.sum()
                 + " hookDrop=" + T_HOOK_DROP.sum() + " trimDrop=" + T_TRIM_DROP.sum()
                 + " capInPlace=" + T_CAP_IN_PLACE.sum() + " capMove=" + T_CAP_MOVE.sum()
                 + " capSolo=" + T_CAP_SOLO.sum() + " unpooledObjects=" + T_UNPOOLED_OBJ.sum();
@@ -114,7 +130,26 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     private final FastThreadLocal<Arena> arenas = new FastThreadLocal<Arena>() {
         @Override
         protected Arena initialValue() {
-            return new Arena(CycleArenaAllocator.this, Thread.currentThread());
+            Arena arena = new Arena(CycleArenaAllocator.this, Thread.currentThread());
+            IterationHook hook = newIterationHook();
+            arena.heap.hook = hook;
+            arena.direct.hook = hook;
+            return arena;
+        }
+    };
+
+    // One thread local per memory kind: going through the Arena to reach its Space would put one more
+    // dependent load on the allocation path, which measures as ~1.8ns/op on the E_COMMERCE pattern.
+    private final FastThreadLocal<Space> heapSpaces = new FastThreadLocal<Space>() {
+        @Override
+        protected Space initialValue() {
+            return arenas.get().heap;
+        }
+    };
+    private final FastThreadLocal<Space> directSpaces = new FastThreadLocal<Space>() {
+        @Override
+        protected Space initialValue() {
+            return arenas.get().direct;
         }
     };
 
@@ -124,7 +159,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
     @Override
     protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
-        ByteBuf b = arenas.get().heap.allocate(initialCapacity, maxCapacity);
+        ByteBuf b = heapSpaces.get().allocate(initialCapacity, maxCapacity);
         if (b != null) {
             T_ARENA_HEAP.increment();
             return b;
@@ -135,7 +170,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
     @Override
     protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
-        ByteBuf b = arenas.get().direct.allocate(initialCapacity, maxCapacity);
+        ByteBuf b = directSpaces.get().allocate(initialCapacity, maxCapacity);
         if (b != null) {
             T_ARENA_DIRECT.increment();
             return b;
@@ -155,14 +190,79 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
      * released. A no-op when the calling thread never allocated from this allocator.
      */
     public void endOfCycle() {
+        T_HOOK_READ_COMPLETE.increment();
+        endOfCycle0();
+    }
+
+    private void endOfCycle0() {
         Arena a = arenas.getIfExists();
         if (a == null) {
             return;
         }
-        T_HOOK_CALL.increment();
         a.checkOwner();
         a.heap.endOfCycle();
         a.direct.endOfCycle();
+    }
+
+    /**
+     * Netty's own per-iteration hook. {@code SingleThreadEventLoop.executeAfterEventLoopIteration} lives in
+     * netty-transport, which netty-buffer cannot depend on, so it is reached reflectively: once per thread to
+     * look the method up, then one queue offer per iteration in which the arena allocated at all.
+     * <p>
+     * The task deliberately does NOT re-register itself from inside its own {@code run()}: the tail queue is
+     * drained by {@code runAllTasksFrom(tailTasks)}, which polls until the queue is empty, so a self
+     * re-registering tail task spins the event loop forever (measured: the loop never returns). Re-arming it
+     * from the allocation path instead also means an idle loop keeps no task queued and can still block in
+     * select.
+     */
+    private IterationHook newIterationHook() {
+        if (RELEASE != RELEASE_HOOK || !HOOK_ITERATION) {
+            return null;
+        }
+        EventExecutor executor = ThreadExecutorMap.currentExecutor();
+        if (executor == null) {
+            return null;         // not an event loop thread: endOfCycle() stays the caller's job
+        }
+        try {
+            Method register = executor.getClass().getMethod("executeAfterEventLoopIteration", Runnable.class);
+            T_HOOK_REGISTERED.increment();
+            return new IterationHook(this, executor, register);
+        } catch (Throwable ignored) {
+            return null;         // not a SingleThreadEventLoop: nothing to hook
+        }
+    }
+
+    /** Closes a cycle at the end of the event loop iteration it was armed in. */
+    static final class IterationHook implements Runnable {
+        private final CycleArenaAllocator allocator;
+        private final EventExecutor loop;
+        private final Method register;
+        boolean armed;
+
+        IterationHook(CycleArenaAllocator allocator, EventExecutor loop, Method register) {
+            this.allocator = allocator;
+            this.loop = loop;
+            this.register = register;
+        }
+
+        void arm() {
+            armed = true;
+            if (loop.isShuttingDown()) {
+                return;
+            }
+            try {
+                register.invoke(loop, this);
+            } catch (Throwable ignored) {
+                armed = false;
+            }
+        }
+
+        @Override
+        public void run() {
+            armed = false;
+            T_HOOK_ITERATION.increment();
+            allocator.endOfCycle0();
+        }
     }
 
     /** Drop every wholly-free block but the first, on the calling thread, for any release policy. */
@@ -208,6 +308,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         int blockCount;
         Block current;
         Block reserved;            // out parameter of reserve()
+        IterationHook hook;        // only with -Darena.release=hook on an event loop thread
 
         Space(Arena arena, AdaptivePoolingAllocator.ChunkAllocator chunks, boolean direct) {
             this.arena = arena;
@@ -244,13 +345,34 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             return start;
         }
 
+        /**
+         * The hot path keeps the block in a local: storing it in a field would cost a card-table write
+         * barrier on every allocation, which {@link #reserve(int)} (only used when a buffer grows) can afford.
+         */
         ByteBuf allocate(int size, int maxCapacity) {
-            size = Math.max(size, MIN_SIZE);
-            int start = reserve(size);
-            if (start < 0) {
-                return null;
+            if (size < MIN_SIZE) {
+                size = MIN_SIZE;
+            } else if (size > MAX_BLOCK) {
+                return null;          // never fits a block: the delegate owns it
             }
-            Block b = reserved;
+            if (RELEASE == RELEASE_HOOK) {
+                IterationHook h = hook;
+                if (h != null && !h.armed) {
+                    h.arm();       // close this cycle at the end of the event loop iteration
+                }
+            }
+            Block b = current;
+            int start = b.bump;
+            int end = start + size;
+            if (end > b.size) {
+                b = nextBlock(size);
+                if (b == null) {
+                    return null;
+                }
+                start = 0;
+                end = size;
+            }
+            b.bump = end;
             b.live++;
             ArenaBuf buf = arena.newBuf();
             buf.init(b, start, size, maxCapacity);
@@ -424,7 +546,14 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
 
         void init(Block block, int start, int length, int maxCapacity) {
-            moveTo(block, start, length);
+            // Only store the block and the root when they really change: both are reference fields, and a
+            // card-table write barrier per allocation is more than the whole bump costs.
+            if (this.block != block) {
+                this.block = block;
+                this.root = block.root;
+            }
+            this.start = start;
+            this.length = length;
             this.refCnt = 1;
             maxCapacity(maxCapacity);
             setIndex(0, 0);

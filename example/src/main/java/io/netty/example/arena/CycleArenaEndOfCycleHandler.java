@@ -25,9 +25,15 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
  * EXPERIMENT: closes a cycle of the {@link CycleArenaAllocator} at the natural Netty boundary.
  * <p>
  * {@code channelReadComplete} is the end of one read cycle of the event loop: every inbound handler before
- * this one has already seen the reads and written whatever it wanted to write. With
- * {@code -Darena.release=hook} that is the only moment a block is reset, so this handler belongs at the end
- * of the pipeline. It does nothing unless the channel actually allocates from a {@link CycleArenaAllocator}.
+ * this one has already seen the reads and written whatever it wanted to write, so this handler belongs at the
+ * end of the pipeline. It does nothing unless the channel actually allocates from a
+ * {@link CycleArenaAllocator}.
+ * <p>
+ * This is the per-channel alternative to {@code -Darena.hook=iteration}, which arms a tail task on the event
+ * loop itself and therefore fires once per loop iteration rather than once per channel read cycle. Counted
+ * separately: {@code hookReadComplete} here, {@code hookIteration} there. Note that a handler which does not
+ * propagate {@code channelReadComplete} (netty's own HttpSnoopServerHandler only flushes) hides the event
+ * from this handler, which is one reason the event loop hook exists.
  */
 @ChannelHandler.Sharable
 public final class CycleArenaEndOfCycleHandler extends ChannelInboundHandlerAdapter {
