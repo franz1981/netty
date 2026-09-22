@@ -15,131 +15,107 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.ThreadExecutorMap;
 
-import java.lang.reflect.Method;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
-import java.util.concurrent.atomic.LongAdder;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * EXPERIMENT (2026-09-22): a per-event-loop bump arena for cycle-scoped buffers - the PoC measured in
- * netty-bench/docs/BACKLOG.md (block B2).
+ * EXPERIMENT (2026-09-22): the event-loop arena of {@code netty-bench/docs/event-loop-arena-design.md}
+ * (draft 3, sections 3-6). A proof of concept: the architecture and the lifecycle are the designed ones,
+ * the polish is not.
  * <p>
- * One {@link Arena} per thread, two {@link Space}s per arena (heap and direct). A space owns up to
- * {@code arena.maxBlocks} blocks; a block's memory is a chunk buffer taken from the very same
- * {@link AdaptivePoolingAllocator.ChunkAllocator} the {@link AdaptiveByteBufAllocator} uses, so the backing
- * memory is accounted and allocated exactly as adaptive's chunks are. Allocation is a bump pointer in the
- * current block; when it does not fit, the space reuses a wholly-free block, grows (x2 up to
- * {@code arena.maxBlock}), or gives up and the request goes to a delegate {@link AdaptiveByteBufAllocator}.
+ * One {@link Arena} per thread ({@link FastThreadLocal}), two {@link Space}s per arena - heap and direct.
+ * A space owns at most {@link #MAX_BLOCKS} FIXED-size blocks; a block's memory is a chunk buffer taken from
+ * the very same {@link AdaptivePoolingAllocator.ChunkAllocator} the {@link AdaptiveByteBufAllocator} uses,
+ * so the backing memory is allocated exactly as adaptive's chunks are (outside adaptive's byte budget, by
+ * design - see the metrics). Allocation is a bump of the current block; buffer objects come from a per-arena
+ * array with an {@code int} free stack.
  * <p>
- * Release must happen on the allocating thread (throws otherwise) and uses a plain int refcount plus a per
- * block live counter - no atomics anywhere. What happens when a block goes idle is chosen by
- * {@code -Darena.release}:
- * <ul>
- *   <li>{@code zero}: a block whose live count returns to zero resets its bump pointer.</li>
- *   <li>{@code lifo} (default): {@code zero}, plus a LIFO pop of the topmost buffer of a block.</li>
- *   <li>{@code hook}: nothing is reset automatically; {@link #endOfCycle()} resets every wholly-free block
- *       and keeps at most {@code arena.retainBytes} worth of blocks, releasing the rest.</li>
- * </ul>
- * {@link #trim()} drops every wholly-free block but the first, for any policy.
+ * The lifecycle has exactly one rule: <b>memory freed during an iteration is never handed out again before
+ * the end-of-iteration hook</b>. Releasing a buffer only decrements its block's live count; at the hook
+ * ({@code SingleThreadEventLoop.executeAfterEventLoopIteration}, armed from the allocation path once per
+ * iteration) every block whose live count is zero becomes reusable. A block with live buffers at the hook is
+ * pinned and is skipped until a later hook finds it empty. Nothing frees a block except {@link #trim()} and
+ * thread termination.
+ * <p>
+ * <b>Invariant A (confinement).</b> Every field of an {@link ArenaBuf} and of a {@link Block} is read and
+ * written only by the owning thread. {@link ArenaBuf#retain()}, {@code retain(int)}, {@link ArenaBuf#release()}
+ * and {@code release(int)} compare {@link Thread#currentThread()} with the owner BEFORE touching any field and
+ * throw {@link IllegalStateException} otherwise, after counting the violation. There is no cross-thread path:
+ * no list, no atomics, no wake-up, no drain.
+ * <p>
+ * Anything the arena cannot serve - a request above {@link #CAP}, an exhausted object pool, a space whose
+ * blocks are all pinned - goes to a delegate {@link AdaptiveByteBufAllocator}.
  */
 public final class CycleArenaAllocator extends AbstractByteBufAllocator {
-    static final int INITIAL_BLOCK = Integer.getInteger("arena.initialBlock", 256 * 1024);
-    static final int MAX_BLOCK = Integer.getInteger("arena.maxBlock", 8 * 1024 * 1024);
-    static final int MAX_BLOCKS = Integer.getInteger("arena.maxBlocks", 4);
-    static final long RETAIN_BYTES = Long.getLong("arena.retainBytes", 1024L * 1024L);
-    static final int MIN_SIZE = 32;
 
-    /** {@code -Darena.release}: what happens to a block when its live count returns to zero. */
-    static final int RELEASE_ZERO = 0;
-    static final int RELEASE_LIFO = 1;
-    static final int RELEASE_HOOK = 2;
-    static final int RELEASE = parseRelease(System.getProperty("arena.release", "lifo"));
-    /**
-     * {@code -Darena.hook}: {@code iteration} (the default) makes the first allocation on an event loop thread
-     * register a tail task with {@code SingleThreadEventLoop.executeAfterEventLoopIteration}, Netty's own
-     * end-of-iteration hook, which then closes a cycle after every loop iteration and re-registers itself.
-     * {@code off} leaves closing a cycle entirely to whoever calls {@link #endOfCycle()} - the e2e launcher's
-     * channelReadComplete handler, for instance. Only consulted with {@code -Darena.release=hook}.
-     */
-    static final boolean HOOK_ITERATION = !"off".equals(System.getProperty("arena.hook", "iteration"));
+    /** Fixed block size. Fixed, not geometric: a pinned block must cost little (design section 2.2). */
+    static final int BLOCK_SIZE = Integer.getInteger("arena.blockSize", 256 * 1024);
+    /** At most this many blocks per space; when none is reusable and the bound is reached, we delegate. */
+    static final int MAX_BLOCKS = Integer.getInteger("arena.maxBlocks", 8);
+    /** {@code size > cap} is delegated: it keeps the surviving BYTES out of the arena (design section 1). */
+    static final int CAP = Integer.getInteger("arena.cap", 8 * 1024);
+    /** Upper bound on the per-arena buffer-object array; past it, allocation delegates. */
+    static final int MAX_OBJECTS = Integer.getInteger("arena.maxObjects", 16 * 1024);
+    /** {@code -Darena.debug=true}: check that no block is reused before a hook. Folded away when false. */
+    static final boolean DEBUG = Boolean.getBoolean("arena.debug");
 
-    private static int parseRelease(String name) {
-        if ("zero".equals(name)) {
-            return RELEASE_ZERO;
+    private static final int INITIAL_OBJECTS = Math.min(256, MAX_OBJECTS);
+
+    static {
+        if (((CAP + 7) & ~7) > BLOCK_SIZE || CAP < 0 || MAX_BLOCKS < 1 || MAX_OBJECTS < 1) {
+            throw new IllegalArgumentException("arena.cap=" + CAP + " arena.blockSize=" + BLOCK_SIZE
+                    + " arena.maxBlocks=" + MAX_BLOCKS + " arena.maxObjects=" + MAX_OBJECTS);
         }
-        if ("lifo".equals(name)) {
-            return RELEASE_LIFO;
-        }
-        if ("hook".equals(name)) {
-            return RELEASE_HOOK;
-        }
-        throw new IllegalArgumentException("-Darena.release must be zero|lifo|hook, was: " + name);
     }
 
-    // TELEMETRY (PoC): where allocations went, and every event that moves a block's bump pointer.
-    static final LongAdder T_ARENA_HEAP = new LongAdder();
-    static final LongAdder T_ARENA_DIRECT = new LongAdder();
-    static final LongAdder T_FB_HEAP = new LongAdder();
-    static final LongAdder T_FB_DIRECT = new LongAdder();
-    static final LongAdder T_BLOCK_REUSE = new LongAdder();
-    static final LongAdder T_GROW = new LongAdder();
-    static final LongAdder T_RESET_ZERO = new LongAdder();
-    static final LongAdder T_LIFO_POP = new LongAdder();
-    static final LongAdder T_HOOK_ITERATION = new LongAdder();
-    static final LongAdder T_HOOK_READ_COMPLETE = new LongAdder();
-    static final LongAdder T_HOOK_REGISTERED = new LongAdder();
-    static final LongAdder T_HOOK_RESET = new LongAdder();
-    static final LongAdder T_HOOK_DROP = new LongAdder();
-    static final LongAdder T_TRIM_DROP = new LongAdder();
-    static final LongAdder T_CAP_IN_PLACE = new LongAdder();
-    static final LongAdder T_CAP_MOVE = new LongAdder();
-    static final LongAdder T_CAP_SOLO = new LongAdder();
-    static final LongAdder T_UNPOOLED_OBJ = new LongAdder();
+    /** Every live arena, for {@link #counters()} only: touched when an arena is created or terminated. */
+    private static final List<Arena> ARENAS = new ArrayList<Arena>();
+    /** Counters of arenas whose thread is gone, so that termination does not lose them. */
+    private static final Counters DEAD = new Counters();
 
-    public static String counters() {
-        return "ARENATELE release=" + System.getProperty("arena.release", "lifo")
-                + " arenaHeap=" + T_ARENA_HEAP.sum() + " arenaDirect=" + T_ARENA_DIRECT.sum()
-                + " fallbackHeap=" + T_FB_HEAP.sum() + " fallbackDirect=" + T_FB_DIRECT.sum()
-                + " blockReuse=" + T_BLOCK_REUSE.sum() + " grow=" + T_GROW.sum()
-                + " resetOnZero=" + T_RESET_ZERO.sum() + " lifoPop=" + T_LIFO_POP.sum()
-                + " hookIteration=" + T_HOOK_ITERATION.sum()
-                + " hookReadComplete=" + T_HOOK_READ_COMPLETE.sum()
-                + " hookRegistered=" + T_HOOK_REGISTERED.sum() + " hookReset=" + T_HOOK_RESET.sum()
-                + " hookDrop=" + T_HOOK_DROP.sum() + " trimDrop=" + T_TRIM_DROP.sum()
-                + " capInPlace=" + T_CAP_IN_PLACE.sum() + " capMove=" + T_CAP_MOVE.sum()
-                + " capSolo=" + T_CAP_SOLO.sum() + " unpooledObjects=" + T_UNPOOLED_OBJ.sum();
-    }
-
-    private final AdaptiveByteBufAllocator fallback = new AdaptiveByteBufAllocator();
+    private final AdaptiveByteBufAllocator delegate = new AdaptiveByteBufAllocator();
     private final AdaptivePoolingAllocator.ChunkAllocator heapChunks =
             new AdaptiveByteBufAllocator.HeapChunkAllocator(this);
     private final AdaptivePoolingAllocator.ChunkAllocator directChunks =
             new AdaptiveByteBufAllocator.DirectChunkAllocator(this);
+
     private final FastThreadLocal<Arena> arenas = new FastThreadLocal<Arena>() {
         @Override
         protected Arena initialValue() {
             Arena arena = new Arena(CycleArenaAllocator.this, Thread.currentThread());
-            IterationHook hook = newIterationHook();
+            IterationHook hook = newIterationHook(arena);
             arena.heap.hook = hook;
             arena.direct.hook = hook;
+            arena.hook = hook;
+            synchronized (ARENAS) {
+                ARENAS.add(arena);
+            }
             return arena;
+        }
+
+        @Override
+        protected void onRemoval(Arena arena) {
+            arena.terminate();
         }
     };
 
-    // One thread local per memory kind: going through the Arena to reach its Space would put one more
-    // dependent load on the allocation path, which measures as ~1.8ns/op on the E_COMMERCE pattern.
+    // One thread local per memory kind: reaching the Space through the Arena would put one more dependent
+    // load on the allocation path (measured at ~1.8ns/op on the E_COMMERCE pattern with the first PoC).
     private final FastThreadLocal<Space> heapSpaces = new FastThreadLocal<Space>() {
         @Override
         protected Space initialValue() {
@@ -159,24 +135,32 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
     @Override
     protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
-        ByteBuf b = heapSpaces.get().allocate(initialCapacity, maxCapacity);
-        if (b != null) {
-            T_ARENA_HEAP.increment();
-            return b;
+        Space space = heapSpaces.get();
+        ByteBuf buf = space.allocate(initialCapacity, maxCapacity);
+        if (buf != null) {
+            return buf;
         }
-        T_FB_HEAP.increment();
-        return fallback.heapBuffer(initialCapacity, maxCapacity);
+        return delegateHeap(space, initialCapacity, maxCapacity);
     }
 
     @Override
     protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
-        ByteBuf b = directSpaces.get().allocate(initialCapacity, maxCapacity);
-        if (b != null) {
-            T_ARENA_DIRECT.increment();
-            return b;
+        Space space = directSpaces.get();
+        ByteBuf buf = space.allocate(initialCapacity, maxCapacity);
+        if (buf != null) {
+            return buf;
         }
-        T_FB_DIRECT.increment();
-        return fallback.directBuffer(initialCapacity, maxCapacity);
+        return delegateDirect(space, initialCapacity, maxCapacity);
+    }
+
+    private ByteBuf delegateHeap(Space space, int initialCapacity, int maxCapacity) {
+        space.delegateAllocations++;
+        return delegate.heapBuffer(initialCapacity, maxCapacity);
+    }
+
+    private ByteBuf delegateDirect(Space space, int initialCapacity, int maxCapacity) {
+        space.delegateAllocations++;
+        return delegate.directBuffer(initialCapacity, maxCapacity);
     }
 
     @Override
@@ -185,23 +169,38 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     }
 
     /**
-     * End of a cycle on the calling thread: with {@code -Darena.release=hook} this is the only thing that
-     * resets a block. Wholly-free blocks are reset and all but {@code arena.retainBytes} worth of them are
-     * released. A no-op when the calling thread never allocated from this allocator.
+     * Give back every reusable block but the first, on the calling thread. Explicit only: nothing else ever
+     * returns a block to the chunk allocator.
      */
-    public void endOfCycle() {
-        T_HOOK_READ_COMPLETE.increment();
-        endOfCycle0();
-    }
-
-    private void endOfCycle0() {
-        Arena a = arenas.getIfExists();
-        if (a == null) {
+    public void trim() {
+        Arena arena = arenas.getIfExists();
+        if (arena == null) {
             return;
         }
-        a.checkOwner();
-        a.heap.endOfCycle();
-        a.direct.endOfCycle();
+        arena.checkOwner();
+        arena.heap.trim();
+        arena.direct.trim();
+    }
+
+    /** Run the end-of-iteration hook on the calling thread's arena. Package private: for tests only. */
+    void runHookForTest() {
+        Arena arena = arenas.getIfExists();
+        if (arena != null) {
+            arena.checkOwner();
+            arena.hookNow();
+        }
+    }
+
+    /** The calling thread's arena, or {@code null}. Package private: for tests only. */
+    Arena arenaForTest() {
+        return arenas.getIfExists();
+    }
+
+    /** Terminate the calling thread's arena, as {@code FastThreadLocal} removal does. For tests only. */
+    void removeForTest() {
+        heapSpaces.remove();
+        directSpaces.remove();
+        arenas.remove();
     }
 
     /**
@@ -211,91 +210,76 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
      * <p>
      * The task deliberately does NOT re-register itself from inside its own {@code run()}: the tail queue is
      * drained by {@code runAllTasksFrom(tailTasks)}, which polls until the queue is empty, so a self
-     * re-registering tail task spins the event loop forever (measured: the loop never returns). Re-arming it
-     * from the allocation path instead also means an idle loop keeps no task queued and can still block in
-     * select.
+     * re-registering tail task spins the event loop forever (measured: the loop never returns). It is
+     * re-armed from the allocation path instead, which also lets an idle loop keep no task queued and go
+     * back to sleep in select.
      */
-    private IterationHook newIterationHook() {
-        if (RELEASE != RELEASE_HOOK || !HOOK_ITERATION) {
-            return null;
-        }
+    private static IterationHook newIterationHook(Arena arena) {
         EventExecutor executor = ThreadExecutorMap.currentExecutor();
         if (executor == null) {
-            return null;         // not an event loop thread: endOfCycle() stays the caller's job
+            return null;             // not an event loop thread: nothing ever closes an iteration here
         }
         try {
             Method register = executor.getClass().getMethod("executeAfterEventLoopIteration", Runnable.class);
-            T_HOOK_REGISTERED.increment();
-            return new IterationHook(this, executor, register);
+            return new IterationHook(arena, executor, register);
         } catch (Throwable ignored) {
-            return null;         // not a SingleThreadEventLoop: nothing to hook
+            return null;             // not a SingleThreadEventLoop: nothing to hook
         }
     }
 
-    /** Closes a cycle at the end of the event loop iteration it was armed in. */
+    /** Closes the iteration it was armed in. Armed from the allocation path, never from its own run(). */
     static final class IterationHook implements Runnable {
-        private final CycleArenaAllocator allocator;
+        private final Arena arena;
         private final EventExecutor loop;
         private final Method register;
         boolean armed;
 
-        IterationHook(CycleArenaAllocator allocator, EventExecutor loop, Method register) {
-            this.allocator = allocator;
+        IterationHook(Arena arena, EventExecutor loop, Method register) {
+            this.arena = arena;
             this.loop = loop;
             this.register = register;
         }
 
         void arm() {
             armed = true;
-            if (loop.isShuttingDown()) {
-                return;
-            }
             try {
                 register.invoke(loop, this);
             } catch (Throwable ignored) {
+                // Rejected after isShutdown(), or not an event loop after all: swallow, as the design says.
                 armed = false;
+                arena.hookRejections++;
             }
         }
 
         @Override
         public void run() {
             armed = false;
-            T_HOOK_ITERATION.increment();
-            allocator.endOfCycle0();
+            arena.hookNow();
         }
     }
 
-    /** Drop every wholly-free block but the first, on the calling thread, for any release policy. */
-    public void trim() {
-        Arena a = arenas.getIfExists();
-        if (a == null) {
-            return;
-        }
-        a.checkOwner();
-        a.heap.trim();
-        a.direct.trim();
-    }
-
-    /** A bump region: a chunk buffer from the same {@code ChunkAllocator} the adaptive allocator uses. */
+    /** A fixed-size bump region: a chunk buffer from the same {@code ChunkAllocator} adaptive uses. */
     static final class Block {
         final Space space;
         final AbstractByteBuf root;
         final byte[] mem;          // null for a direct block
         final long address;        // root memory address, 0 when the root has none
         final boolean hasAddress;
-        final int size;
-        final boolean solo;        // not part of the space's block array: freed as soon as it goes idle
+        final boolean direct;
         int bump;
         int live;
+        /** True when the LAST hook found this block empty; cleared when the allocator takes it. */
+        boolean reusable;
+        /** The hook generation that marked this block reusable; only read by the debug check. */
+        long stamp;
 
-        Block(Space space, int size, boolean solo) {
+        Block(Space space) {
             this.space = space;
-            this.size = size;
-            this.solo = solo;
-            root = space.chunks.allocate(size, size);
+            root = space.chunks.allocate(BLOCK_SIZE, BLOCK_SIZE);
             mem = root.hasArray() ? root.array() : null;
             hasAddress = root.hasMemoryAddress();
             address = hasAddress ? root.memoryAddress() : 0L;
+            direct = space.direct;
         }
     }
 
@@ -307,158 +291,237 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         final Block[] blocks = new Block[MAX_BLOCKS];
         int blockCount;
         Block current;
-        Block reserved;            // out parameter of reserve()
-        IterationHook hook;        // only with -Darena.release=hook on an event loop thread
+        /** Out parameter of {@link #reserve(int)}, used by the reallocation path only. */
+        Block reserved;
+        /** No block was available since the last hook: do not scan again until then. */
+        boolean exhausted;
+        /** Number of hooks that have run, i.e. the index of the current iteration. */
+        long generation;
+        IterationHook hook;        // null when this thread is not an event loop thread
+
+        // Metrics (plain longs, owner-written).
+        long arenaAllocations;
+        long delegateAllocations;
+        long blockReuses;
+        long blockGrowths;
+        long reallocInPlace;
+        long reallocMoved;
+        long reallocDelegated;
+        long trims;
+        long trimmedBlocks;
+        long leakedBlocks;
+        long earlyReuses;
+        int pinnedBlocks;
+        int reusableBlocks;
+        int maxPinned;
 
         Space(Arena arena, AdaptivePoolingAllocator.ChunkAllocator chunks, boolean direct) {
             this.arena = arena;
             this.chunks = chunks;
             this.direct = direct;
-            current = newBlock(INITIAL_BLOCK);
+            current = newBlock();
         }
 
-        private Block newBlock(int size) {
-            Block b = new Block(this, size, false);
-            blocks[blockCount++] = b;
-            return b;
-        }
-
-        /**
-         * Reserve {@code size} bytes; on success {@link #reserved} holds the block and the offset is returned,
-         * on failure -1 is returned and the caller must go elsewhere. The block's live count is NOT bumped.
-         */
-        int reserve(int size) {
-            if (size > MAX_BLOCK) {
-                return -1;            // never fits a block: the delegate owns it
-            }
-            Block b = current;
-            int start = b == null ? size + 1 : b.bump;
-            if (b == null || start + size > b.size) {
-                b = nextBlock(size);
-                if (b == null) {
-                    return -1;
-                }
-                start = b.bump;
-            }
-            b.bump = start + size;
-            reserved = b;
-            return start;
+        private Block newBlock() {
+            Block block = new Block(this);
+            block.stamp = generation - 1;      // fresh memory: never "reused before its hook"
+            blocks[blockCount++] = block;
+            return block;
         }
 
         /**
-         * The hot path keeps the block in a local: storing it in a field would cost a card-table write
-         * barrier on every allocation, which {@link #reserve(int)} (only used when a buffer grows) can afford.
+         * THE hot path. Everything rare - arming the hook, growing the object array, taking another block,
+         * giving up - is a call to a separate method on a branch that is not taken in the common case.
          */
         ByteBuf allocate(int size, int maxCapacity) {
-            if (size < MIN_SIZE) {
-                size = MIN_SIZE;
-            } else if (size > MAX_BLOCK) {
-                return null;          // never fits a block: the delegate owns it
+            if (size > CAP) {
+                return null;                   // above the cap: the delegate owns it
             }
-            if (RELEASE == RELEASE_HOOK) {
-                IterationHook h = hook;
-                if (h != null && !h.armed) {
-                    h.arm();       // close this cycle at the end of the event loop iteration
-                }
+            IterationHook h = hook;
+            if (h != null && !h.armed) {
+                h.arm();                       // once per iteration: close it at the end of this one
             }
-            Block b = current;
-            int start = b.bump;
-            int end = start + size;
-            if (end > b.size) {
-                b = nextBlock(size);
-                if (b == null) {
-                    return null;
-                }
-                start = 0;
-                end = size;
+            Block block = current;
+            int start = block.bump;
+            int end = start + ((size + 7) & ~7);
+            if (end > BLOCK_SIZE) {
+                return allocateInAnotherBlock(size, maxCapacity);
             }
-            b.bump = end;
-            b.live++;
-            ArenaBuf buf = arena.newBuf();
-            buf.init(b, start, size, maxCapacity);
+            Arena a = arena;
+            int top = a.freeTop - 1;
+            if (top < 0) {
+                return allocateWithNewObject(block, start, end, size, maxCapacity);
+            }
+            a.freeTop = top;
+            block.bump = end;
+            block.live++;
+            arenaAllocations++;
+            ArenaBuf buf = a.objects[a.free[top]];
+            buf.init(block, start, size, maxCapacity);
             return buf;
         }
 
-        /** The current block cannot serve the request: reuse an idle one, grow, or give up (fallback). */
-        private Block nextBlock(int size) {
+        /** The current block is full: take one the LAST hook marked reusable, or grow, or give up. */
+        private ByteBuf allocateInAnotherBlock(int size, int maxCapacity) {
+            Block block = nextBlock();
+            if (block == null) {
+                return null;
+            }
+            int end = (size + 7) & ~7;
+            Arena a = arena;
+            int top = a.freeTop - 1;
+            if (top < 0) {
+                return allocateWithNewObject(block, 0, end, size, maxCapacity);
+            }
+            a.freeTop = top;
+            block.bump = end;
+            block.live++;
+            arenaAllocations++;
+            ArenaBuf buf = a.objects[a.free[top]];
+            buf.init(block, 0, size, maxCapacity);
+            return buf;
+        }
+
+        /** The object free stack is empty: create one more buffer object, or give up. */
+        private ByteBuf allocateWithNewObject(Block block, int start, int end, int size, int maxCapacity) {
+            ArenaBuf buf = arena.newObject();
+            if (buf == null) {
+                return null;                   // maxObjects reached: the delegate owns it
+            }
+            block.bump = end;
+            block.live++;
+            arenaAllocations++;
+            buf.init(block, start, size, maxCapacity);
+            return buf;
+        }
+
+        /**
+         * A block marked reusable by the LAST hook, or a new one, or {@code null} when the bound is reached.
+         * Only the current block is ever bumped, so a reusable block always has {@code live == 0, bump == 0}.
+         */
+        private Block nextBlock() {
+            if (exhausted) {
+                return null;                   // nothing changed since the last failure: no rescan
+            }
             for (int i = 0; i < blockCount; i++) {
-                Block b = blocks[i];
-                if (b.live == 0 && b.size >= size) {
-                    T_BLOCK_REUSE.increment();
-                    b.bump = 0;
-                    current = b;
-                    return b;
+                Block block = blocks[i];
+                if (block.reusable) {
+                    if (DEBUG) {
+                        checkNotReusedBeforeHook(block);
+                    }
+                    block.reusable = false;
+                    reusableBlocks--;
+                    blockReuses++;
+                    current = block;
+                    return block;
                 }
             }
             if (blockCount < MAX_BLOCKS) {
-                int previous = blockCount == 0 ? INITIAL_BLOCK : blocks[blockCount - 1].size;
-                int next = Math.min(MAX_BLOCK, Math.max(size, previous << 1));
-                if (next < size) {
-                    return null;
-                }
-                T_GROW.increment();
-                current = newBlock(next);
+                blockGrowths++;
+                current = newBlock();
                 return current;
             }
+            exhausted = true;
             return null;
         }
 
-        /** A block that is not in {@link #blocks}: its root is freed as soon as the block goes idle. */
-        Block soloBlock(int size) {
-            T_CAP_SOLO.increment();
-            return new Block(this, size, true);
+        private void checkNotReusedBeforeHook(Block block) {
+            if (block.stamp >= generation) {
+                earlyReuses++;
+                throw new IllegalStateException("arena block reused in the iteration that freed it: stamp="
+                        + block.stamp + " generation=" + generation);
+            }
         }
 
-        void endOfCycle() {
-            long kept = 0;
-            int w = 0;
-            for (int i = 0; i < blockCount; i++) {
-                Block b = blocks[i];
-                boolean free = b.live == 0;
-                if (free && b.bump != 0) {
-                    b.bump = 0;
-                    T_HOOK_RESET.increment();
+        /** Reserve a region for a reallocation. Returns the offset, or -1; sets {@link #reserved}. */
+        int reserve(int size) {
+            if (size > CAP) {
+                return -1;
+            }
+            Block block = current;
+            int start = block.bump;
+            int end = start + ((size + 7) & ~7);
+            if (end > BLOCK_SIZE) {
+                block = nextBlock();
+                if (block == null) {
+                    return -1;
                 }
-                if (!free || w == 0 || kept + b.size <= RETAIN_BYTES) {
-                    kept += b.size;
-                    blocks[w++] = b;
+                start = 0;
+                end = (size + 7) & ~7;
+            }
+            block.bump = end;
+            block.live++;
+            reserved = block;
+            return start;
+        }
+
+        /** End of an iteration: every empty block becomes reusable; the current block stays current. */
+        void endOfIteration() {
+            Block cur = current;
+            long gen = generation;
+            int pinned = 0;
+            int reusable = 0;
+            for (int i = 0; i < blockCount; i++) {
+                Block block = blocks[i];
+                if (block.live == 0) {
+                    block.bump = 0;
+                    block.stamp = gen;
+                    if (block != cur) {
+                        block.reusable = true;
+                        reusable++;
+                    }
                 } else {
-                    T_HOOK_DROP.increment();
-                    drop(b);
+                    pinned++;
                 }
             }
-            compact(w);
+            generation = gen + 1;
+            pinnedBlocks = pinned;
+            reusableBlocks = reusable;
+            if (pinned > maxPinned) {
+                maxPinned = pinned;
+            }
+            exhausted = false;
         }
 
+        /** Give back every reusable block but the first. */
         void trim() {
+            trims++;
             int w = 0;
+            boolean keptOne = false;
             for (int i = 0; i < blockCount; i++) {
-                Block b = blocks[i];
-                if (w > 0 && b.live == 0) {
-                    T_TRIM_DROP.increment();
-                    drop(b);
-                } else {
-                    blocks[w++] = b;
+                Block block = blocks[i];
+                if (block.reusable && block != current) {
+                    if (keptOne) {
+                        trimmedBlocks++;
+                        reusableBlocks--;
+                        block.root.release();
+                        continue;
+                    }
+                    keptOne = true;
                 }
+                blocks[w++] = block;
             }
-            compact(w);
-        }
-
-        private void drop(Block b) {
-            if (current == b) {
-                current = null;
-            }
-            b.root.release();
-        }
-
-        private void compact(int w) {
             for (int i = w; i < blockCount; i++) {
                 blocks[i] = null;
             }
             blockCount = w;
-            if (current == null && w > 0) {
-                current = blocks[0];
+        }
+
+        /** Thread termination: empty blocks go back, pinned ones leak - no other thread may free them. */
+        void terminate() {
+            for (int i = 0; i < blockCount; i++) {
+                Block block = blocks[i];
+                if (block.live == 0) {
+                    block.root.release();
+                } else {
+                    leakedBlocks++;
+                }
+                blocks[i] = null;
             }
+            blockCount = 0;
+            current = null;
+            reserved = null;
+            hook = null;
         }
     }
 
@@ -467,11 +530,17 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         final Thread owner;
         final Space heap;
         final Space direct;
-        static final int POOL = Integer.getInteger("arena.objects", 8192);
-        final ArenaBuf[] objects = new ArenaBuf[POOL];   // written once per object, when it is created
-        final int[] free = new int[POOL];                // indexes of pooled objects: an int stack, no barriers
-        int objCount;
+        ArenaBuf[] objects = new ArenaBuf[INITIAL_OBJECTS];
+        int[] free = new int[INITIAL_OBJECTS];
+        int objectCount;
         int freeTop;
+        IterationHook hook;
+
+        // Metrics.
+        long violations;           // written by the violating thread, read at shutdown: racy by construction
+        long hooks;
+        long hookRejections;
+        long objectGrowths;
 
         Arena(CycleArenaAllocator alloc, Thread owner) {
             this.alloc = alloc;
@@ -482,72 +551,85 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
         void checkOwner() {
             if (Thread.currentThread() != owner) {
-                throw new IllegalStateException("cycle arena touched from a thread other than its event loop");
+                violations++;
+                throw new IllegalStateException("event-loop arena touched from " + Thread.currentThread()
+                        + ", owner is " + owner);
             }
         }
 
-        ArenaBuf newBuf() {
-            if (freeTop > 0) {
-                return objects[free[--freeTop]];
-            }
-            if (objCount < POOL) {
-                ArenaBuf buf = new ArenaBuf(alloc, this, objCount);
-                objects[objCount++] = buf;
-                return buf;
-            }
-            T_UNPOOLED_OBJ.increment();
-            return new ArenaBuf(alloc, this, -1);        // beyond the pool: garbage after release
-        }
-
-        /** Give a region back to its block, without recycling the buffer object. */
-        void releaseRegion(Block b, int start, int end) {
-            if (--b.live == 0) {
-                if (b.solo) {
-                    b.root.release();
-                } else if (RELEASE != RELEASE_HOOK) {
-                    T_RESET_ZERO.increment();
-                    b.bump = 0;              // wholly free: the block is a fresh bump region again
+        /** Grow the object array, up to {@code maxObjects}; {@code null} means "delegate this one". */
+        ArenaBuf newObject() {
+            int count = objectCount;
+            if (count == objects.length) {
+                if (count >= MAX_OBJECTS) {
+                    return null;
                 }
-            } else if (RELEASE == RELEASE_LIFO && end == b.bump) {
-                T_LIFO_POP.increment();
-                b.bump = start;              // the topmost buffer: LIFO pop, its memory is reusable at once
+                int size = Math.min(MAX_OBJECTS, count * 2);
+                ArenaBuf[] grown = new ArenaBuf[size];
+                System.arraycopy(objects, 0, grown, 0, count);
+                objects = grown;
+                int[] grownFree = new int[size];
+                System.arraycopy(free, 0, grownFree, 0, freeTop);
+                free = grownFree;
+                objectGrowths++;
             }
+            ArenaBuf buf = new ArenaBuf(alloc, this, count);
+            objects[count] = buf;
+            objectCount = count + 1;
+            return buf;
         }
 
-        void release(ArenaBuf buf, Block b, int start, int end) {
-            checkOwner();
-            releaseRegion(b, start, end);
-            int index = buf.index;
-            if (index >= 0) {
-                free[freeTop++] = index;
+        void hookNow() {
+            hooks++;
+            heap.endOfIteration();
+            direct.endOfIteration();
+        }
+
+        void terminate() {
+            heap.terminate();
+            direct.terminate();
+            synchronized (ARENAS) {
+                DEAD.add(this);
+                ARENAS.remove(this);
             }
         }
     }
 
     static final class ArenaBuf extends AbstractByteBuf {
         private final ByteBufAllocator alloc;
-        private final Arena arena;   // an object never changes arena: stored once
-        final int index;             // slot in the arena's object pool, -1 when not pooled
+        private final Arena arena;       // an object never changes arena: stored once, at construction
+        private final Thread owner;      // arena.owner, inlined to keep the confinement check to one load
+        final int index;                 // stable slot in the arena's object array
+        /** The block this buffer's region belongs to, or {@code null} in the DELEGATED state. */
         private Block block;
+        /** The block's root, or - in the DELEGATED state - the delegate buffer (unwrapped). */
         private AbstractByteBuf root;
+        /** DELEGATED state only: the buffer to release, leak-aware wrapper and all. */
+        private ByteBuf delegated;
         private int start;
         private int length;
         private int refCnt;
         // The NIO view must be per buffer: the block's root caches one internal ByteBuffer, and a gathering
         // write asks several buffers of the same block for theirs before using any of them.
         private ByteBuffer tmpNioBuf;
-        private Block tmpNioBlock;
+        private AbstractByteBuf tmpNioRoot;
 
         ArenaBuf(ByteBufAllocator alloc, Arena arena, int index) {
             super(0);
             this.alloc = alloc;
             this.arena = arena;
+            this.owner = arena.owner;
             this.index = index;
+        }
+
+        /** The block this buffer's region belongs to, {@code null} when DELEGATED. For tests only. */
+        Block blockForTest() {
+            return block;
         }
 
         void init(Block block, int start, int length, int maxCapacity) {
             // Only store the block and the root when they really change: both are reference fields, and a
-            // card-table write barrier per allocation is more than the whole bump costs.
+            // card-table write barrier per allocation costs more than the whole bump does.
             if (this.block != block) {
                 this.block = block;
                 this.root = block.root;
@@ -561,110 +643,299 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             markWriterIndex();
         }
 
-        private void moveTo(Block block, int start, int length) {
-            this.block = block;
-            this.root = block.root;
-            this.start = start;
-            this.length = length;
+        // --- reference counting: plain int, owner-confined (Invariant A) ---
+
+        @Override
+        public int refCnt() {
+            return refCnt;              // unspecified off-thread, by contract
         }
 
-        private int idx(int index) {
-            return start + index;
+        @Override
+        public ByteBuf touch() {
+            return this;
         }
 
-        // --- reference counting: plain int, thread-confined by contract ---
-        @Override public int refCnt() { return refCnt; }
-        @Override public ByteBuf retain() { refCnt++; return this; }
-        @Override public ByteBuf retain(int increment) { refCnt += increment; return this; }
-        @Override public ByteBuf touch() { return this; }
-        @Override public ByteBuf touch(Object hint) { return this; }
-        @Override public boolean release() {
-            if (--refCnt == 0) {
-                arena.release(this, block, start, start + length);   // block and root are left in place
-                return true;
+        @Override
+        public ByteBuf touch(Object hint) {
+            return this;
+        }
+
+        @Override
+        public ByteBuf retain() {
+            if (Thread.currentThread() != owner) {
+                throw violation();
             }
-            return false;
+            int cnt = refCnt;
+            if (cnt <= 0) {
+                throw new IllegalReferenceCountException(cnt, 1);
+            }
+            refCnt = cnt + 1;
+            return this;
         }
-        @Override public boolean release(int decrement) {
-            refCnt -= decrement - 1;
-            return release();
+
+        @Override
+        public ByteBuf retain(int increment) {
+            if (Thread.currentThread() != owner) {
+                throw violation();
+            }
+            int cnt = refCnt;
+            if (cnt <= 0 || increment <= 0) {
+                throw new IllegalReferenceCountException(cnt, increment);
+            }
+            refCnt = cnt + increment;
+            return this;
+        }
+
+        @Override
+        public boolean release() {
+            if (Thread.currentThread() != owner) {
+                throw violation();
+            }
+            int cnt = refCnt;
+            if (cnt <= 0) {
+                throw new IllegalReferenceCountException(cnt, -1);
+            }
+            refCnt = cnt - 1;
+            if (cnt != 1) {
+                return false;
+            }
+            Block b = block;
+            if (b == null) {
+                return releaseDelegated();
+            }
+            b.live--;
+            Arena a = arena;
+            a.free[a.freeTop++] = index;
+            return true;
+        }
+
+        @Override
+        public boolean release(int decrement) {
+            if (Thread.currentThread() != owner) {
+                throw violation();
+            }
+            int cnt = refCnt;
+            if (decrement <= 0 || cnt < decrement) {
+                throw new IllegalReferenceCountException(cnt, -decrement);
+            }
+            refCnt = cnt - decrement;
+            if (cnt != decrement) {
+                return false;
+            }
+            Block b = block;
+            if (b == null) {
+                return releaseDelegated();
+            }
+            b.live--;
+            Arena a = arena;
+            a.free[a.freeTop++] = index;
+            return true;
+        }
+
+        /** DELEGATED: the region is a buffer of the delegate allocator; the object still goes back. */
+        private boolean releaseDelegated() {
+            ByteBuf buf = delegated;
+            delegated = null;
+            root = null;
+            tmpNioBuf = null;
+            tmpNioRoot = null;
+            Arena a = arena;
+            a.free[a.freeTop++] = index;
+            buf.release();
+            return true;
+        }
+
+        private IllegalStateException violation() {
+            arena.violations++;
+            return new IllegalStateException("arena buffer of " + owner + " touched from "
+                    + Thread.currentThread() + " (event-loop arena buffers are thread confined)");
         }
 
         // --- geometry ---
-        @Override public int capacity() { return length; }
 
-        @Override public ByteBuf capacity(int newCapacity) {
+        @Override
+        public int capacity() {
+            return length;
+        }
+
+        @Override
+        public ByteBuf capacity(int newCapacity) {
             checkNewCapacity(newCapacity);
             if (newCapacity <= length) {
                 length = newCapacity;
                 trimIndicesToCapacity(newCapacity);
                 return this;
             }
+            return grow(newCapacity);
+        }
+
+        /**
+         * Grow: in place when this buffer is topmost in its block and the block has the room, else a new
+         * region (arena when it fits and there is room, else the delegate) plus a copy. The old region is
+         * released - so it is handed out again only after the next hook, which keeps any view taken during
+         * this iteration valid until the iteration ends.
+         */
+        private ByteBuf grow(int newCapacity) {
             Block b = block;
-            // The last buffer of its block grows in place: bump the block's tail.
-            if (b.bump == start + length && start + newCapacity <= b.size) {
-                T_CAP_IN_PLACE.increment();
-                b.bump = start + newCapacity;
+            if (b == null) {
+                delegated.capacity(newCapacity);   // DELEGATED: the delegate buffer grows itself
                 length = newCapacity;
+                tmpNioBuf = null;
+                tmpNioRoot = null;
                 return this;
             }
-            // Otherwise take a fresh region and copy, the way AdaptiveByteBuf reallocates.
             Space space = b.space;
-            int newStart = space.reserve(newCapacity);
-            Block newBlock;
-            if (newStart < 0) {
-                newBlock = space.soloBlock(newCapacity);
-                newBlock.bump = newCapacity;
-                newStart = 0;
-            } else {
-                T_CAP_MOVE.increment();
-                newBlock = space.reserved;
+            int oldEnd = start + ((length + 7) & ~7);
+            int newEnd = start + ((newCapacity + 7) & ~7);
+            if (b.bump == oldEnd && newEnd <= BLOCK_SIZE) {
+                b.bump = newEnd;
+                length = newCapacity;
+                space.reallocInPlace++;
+                return this;
             }
-            newBlock.live++;
-            newBlock.root.setBytes(newStart, b.root, start, length);
-            int oldStart = start;
-            int oldLength = length;
-            moveTo(newBlock, newStart, newCapacity);
-            tmpNioBuf = null;
-            arena.releaseRegion(b, oldStart, oldStart + oldLength);
+            int newStart = space.reserve(newCapacity);
+            if (newStart >= 0) {
+                Block newBlock = space.reserved;
+                space.reserved = null;
+                newBlock.root.setBytes(newStart, b.root, start, length);
+                space.reallocMoved++;
+                moveTo(newBlock, newBlock.root, newStart, newCapacity);
+            } else {
+                ByteBuf buf = space.direct
+                        ? arena.alloc.delegateDirect(space, newCapacity, maxCapacity())
+                        : arena.alloc.delegateHeap(space, newCapacity, maxCapacity());
+                AbstractByteBuf target = unwrapDelegate(buf);
+                target.setBytes(0, root, start, length);
+                space.reallocDelegated++;
+                delegated = buf;
+                moveTo(null, target, 0, newCapacity);
+            }
+            b.live--;
             return this;
         }
 
-        @Override public ByteBufAllocator alloc() { return alloc; }
-        @Override public ByteOrder order() { return ByteOrder.BIG_ENDIAN; }
-        @Override public ByteBuf unwrap() { return null; }
-        @Override public boolean isDirect() { return block.space.direct; }
-        @Override boolean _isDirect() { return block.space.direct; }
-        @Override public boolean hasArray() { return block.mem != null; }
-        @Override public byte[] array() { ensureAccessible(); return block.mem; }
-        @Override public int arrayOffset() { return start; }
-        @Override public boolean hasMemoryAddress() { return block.hasAddress; }
-        @Override public long memoryAddress() { ensureAccessible(); return block.address + start; }
-        @Override long _memoryAddress() { return block.address + start; }
-        @Override public int nioBufferCount() { return 1; }
-
-        @Override public ByteBuffer nioBuffer(int index, int len) {
-            checkIndex(index, len);
-            return root.nioBuffer(idx(index), len);      // a fresh view, per call, for heap and direct alike
-        }
-
-        @Override public ByteBuffer internalNioBuffer(int index, int len) {
-            checkIndex(index, len);
-            ByteBuffer b = tmpNioBuf;
-            if (b == null || tmpNioBlock != block) {
-                b = root.internalNioBuffer(0, block.size).duplicate();
-                tmpNioBuf = b;
-                tmpNioBlock = block;
+        /** The delegate wraps its buffers when leak detection is on; element access needs the raw one. */
+        private static AbstractByteBuf unwrapDelegate(ByteBuf buf) {
+            ByteBuf unwrapped = buf;
+            while (!(unwrapped instanceof AbstractByteBuf)) {
+                ByteBuf inner = unwrapped.unwrap();
+                if (inner == null) {
+                    throw new IllegalStateException("the delegate returned " + unwrapped.getClass());
+                }
+                unwrapped = inner;
             }
-            b.clear().position(idx(index)).limit(idx(index) + len);
-            return b;
+            return (AbstractByteBuf) unwrapped;
         }
 
-        @Override public ByteBuffer[] nioBuffers(int index, int len) {
+        private void moveTo(Block newBlock, AbstractByteBuf newRoot, int newStart, int newLength) {
+            block = newBlock;
+            root = newRoot;
+            start = newStart;
+            length = newLength;
+        }
+
+        private int idx(int index) {
+            return start + index;
+        }
+
+        @Override
+        public ByteBufAllocator alloc() {
+            return alloc;
+        }
+
+        @Override
+        public ByteOrder order() {
+            return ByteOrder.BIG_ENDIAN;
+        }
+
+        @Override
+        public ByteBuf unwrap() {
+            return null;
+        }
+
+        @Override
+        public boolean isDirect() {
+            Block b = block;
+            return b == null ? root.isDirect() : b.direct;
+        }
+
+        @Override
+        boolean _isDirect() {
+            return isDirect();
+        }
+
+        @Override
+        public boolean hasArray() {
+            Block b = block;
+            return b == null ? root.hasArray() : b.mem != null;
+        }
+
+        @Override
+        public byte[] array() {
+            ensureAccessible();
+            Block b = block;
+            return b == null ? root.array() : b.mem;
+        }
+
+        @Override
+        public int arrayOffset() {
+            Block b = block;
+            return b == null ? root.arrayOffset() : start;
+        }
+
+        @Override
+        public boolean hasMemoryAddress() {
+            Block b = block;
+            return b == null ? root.hasMemoryAddress() : b.hasAddress;
+        }
+
+        @Override
+        public long memoryAddress() {
+            ensureAccessible();
+            return _memoryAddress();
+        }
+
+        @Override
+        long _memoryAddress() {
+            Block b = block;
+            return b == null ? root.memoryAddress() : b.address + start;
+        }
+
+        @Override
+        public int nioBufferCount() {
+            return 1;
+        }
+
+        @Override
+        public ByteBuffer nioBuffer(int index, int len) {
+            checkIndex(index, len);
+            return root.nioBuffer(idx(index), len);      // a fresh view per call, heap and direct alike
+        }
+
+        @Override
+        public ByteBuffer internalNioBuffer(int index, int len) {
+            checkIndex(index, len);
+            AbstractByteBuf r = root;
+            if (block == null) {
+                return r.internalNioBuffer(index, len);  // DELEGATED: the delegate buffer has its own
+            }
+            ByteBuffer buf = tmpNioBuf;
+            if (buf == null || tmpNioRoot != r) {
+                buf = r.internalNioBuffer(0, r.capacity()).duplicate();
+                tmpNioBuf = buf;
+                tmpNioRoot = r;
+            }
+            buf.clear().position(idx(index)).limit(idx(index) + len);
+            return buf;
+        }
+
+        @Override
+        public ByteBuffer[] nioBuffers(int index, int len) {
             return new ByteBuffer[] { nioBuffer(index, len) };
         }
 
-        @Override public ByteBuf copy(int index, int len) {
+        @Override
+        public ByteBuf copy(int index, int len) {
             checkIndex(index, len);
             return root.copy(idx(index), len);
         }
@@ -689,7 +960,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override protected void _setLong(int i, long v) { root._setLong(idx(i), v); }
         @Override protected void _setLongLE(int i, long v) { root._setLongLE(idx(i), v); }
 
-        // --- bulk access, delegated ---
+        // --- bulk access, delegated to the root ---
         @Override public ByteBuf getBytes(int i, ByteBuf dst, int di, int len) { checkIndex(i, len); root.getBytes(idx(i), dst, di, len); return this; }
         @Override public ByteBuf getBytes(int i, byte[] dst, int di, int len) { checkIndex(i, len); root.getBytes(idx(i), dst, di, len); return this; }
         @Override public ByteBuf getBytes(int i, ByteBuffer dst) { checkIndex(i, dst.remaining()); root.getBytes(idx(i), dst); return this; }
@@ -702,5 +973,125 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         @Override public int setBytes(int i, InputStream in, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, len); }
         @Override public int setBytes(int i, ScatteringByteChannel in, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, len); }
         @Override public int setBytes(int i, FileChannel in, long pos, int len) throws IOException { checkIndex(i, len); return root.setBytes(idx(i), in, pos, len); }
+    }
+
+    /** A snapshot of every counter of section 6, summed over arenas. */
+    static final class Counters {
+        long arenaHeap;
+        long arenaDirect;
+        long delegateHeap;
+        long delegateDirect;
+        long blocksHeap;
+        long blocksDirect;
+        long pinned;
+        long reusable;
+        long maxPinnedHeap;
+        long maxPinnedDirect;
+        long violations;
+        long hooks;
+        long hookRejections;
+        long reallocInPlace;
+        long reallocMoved;
+        long reallocDelegated;
+        long trims;
+        long trimmedBlocks;
+        long leaked;
+        long earlyReuses;
+        long blockReuses;
+        long blockGrowths;
+        long objects;
+
+        void add(Counters other) {
+            arenaHeap += other.arenaHeap;
+            arenaDirect += other.arenaDirect;
+            delegateHeap += other.delegateHeap;
+            delegateDirect += other.delegateDirect;
+            blocksHeap += other.blocksHeap;
+            blocksDirect += other.blocksDirect;
+            pinned += other.pinned;
+            reusable += other.reusable;
+            maxPinnedHeap += other.maxPinnedHeap;
+            maxPinnedDirect += other.maxPinnedDirect;
+            violations += other.violations;
+            hooks += other.hooks;
+            hookRejections += other.hookRejections;
+            reallocInPlace += other.reallocInPlace;
+            reallocMoved += other.reallocMoved;
+            reallocDelegated += other.reallocDelegated;
+            trims += other.trims;
+            trimmedBlocks += other.trimmedBlocks;
+            leaked += other.leaked;
+            earlyReuses += other.earlyReuses;
+            blockReuses += other.blockReuses;
+            blockGrowths += other.blockGrowths;
+            objects += other.objects;
+        }
+
+        void add(Arena arena) {
+            arenaHeap += arena.heap.arenaAllocations;
+            arenaDirect += arena.direct.arenaAllocations;
+            delegateHeap += arena.heap.delegateAllocations;
+            delegateDirect += arena.direct.delegateAllocations;
+            blocksHeap += arena.heap.blockCount;
+            blocksDirect += arena.direct.blockCount;
+            pinned += arena.heap.pinnedBlocks + arena.direct.pinnedBlocks;
+            reusable += arena.heap.reusableBlocks + arena.direct.reusableBlocks;
+            maxPinnedHeap += arena.heap.maxPinned;
+            maxPinnedDirect += arena.direct.maxPinned;
+            violations += arena.violations;
+            hooks += arena.hooks;
+            hookRejections += arena.hookRejections;
+            reallocInPlace += arena.heap.reallocInPlace + arena.direct.reallocInPlace;
+            reallocMoved += arena.heap.reallocMoved + arena.direct.reallocMoved;
+            reallocDelegated += arena.heap.reallocDelegated + arena.direct.reallocDelegated;
+            trims += arena.heap.trims + arena.direct.trims;
+            trimmedBlocks += arena.heap.trimmedBlocks + arena.direct.trimmedBlocks;
+            leaked += arena.heap.leakedBlocks + arena.direct.leakedBlocks;
+            earlyReuses += arena.heap.earlyReuses + arena.direct.earlyReuses;
+            blockReuses += arena.heap.blockReuses + arena.direct.blockReuses;
+            blockGrowths += arena.heap.blockGrowths + arena.direct.blockGrowths;
+            objects += arena.objectCount;
+        }
+
+        @Override
+        public String toString() {
+            long arena = arenaHeap + arenaDirect;
+            long all = arena + delegateHeap + delegateDirect;
+            return "arenaHeap=" + arenaHeap + " arenaDirect=" + arenaDirect
+                    + " delegateHeap=" + delegateHeap + " delegateDirect=" + delegateDirect
+                    + " arenaShare=" + (all == 0 ? "n/a" : String.format("%.2f%%", 100.0 * arena / all))
+                    + " blocksHeap=" + blocksHeap + " blocksDirect=" + blocksDirect
+                    + " pinned=" + pinned + " reusable=" + reusable
+                    + " maxPinnedHeap=" + maxPinnedHeap + " maxPinnedDirect=" + maxPinnedDirect
+                    + " blockReuses=" + blockReuses + " blockGrowths=" + blockGrowths
+                    + " hooks=" + hooks + " hookRejections=" + hookRejections
+                    + " violations=" + violations + " earlyReuses=" + earlyReuses
+                    + " reallocInPlace=" + reallocInPlace + " reallocMoved=" + reallocMoved
+                    + " reallocDelegated=" + reallocDelegated
+                    + " trims=" + trims + " trimmedBlocks=" + trimmedBlocks + " leakedBlocks=" + leaked
+                    + " objects=" + objects;
+        }
+    }
+
+    /**
+     * Every counter of design section 6, summed over every arena of every instance, plus one line per live
+     * arena (per event loop). Called off the hot path - at shutdown, or by a benchmark's teardown - so it
+     * reads other threads' plain longs: the values are a snapshot, not a linearizable total.
+     */
+    public static String counters() {
+        StringBuilder sb = new StringBuilder(1024);
+        Counters total = new Counters();
+        synchronized (ARENAS) {
+            total.add(DEAD);
+            for (int i = 0; i < ARENAS.size(); i++) {
+                Arena arena = ARENAS.get(i);
+                total.add(arena);
+                Counters one = new Counters();
+                one.add(arena);
+                sb.append("\nARENALOOP thread=").append(arena.owner.getName()).append(' ').append(one);
+            }
+        }
+        return "ARENATELE blockSize=" + BLOCK_SIZE + " maxBlocks=" + MAX_BLOCKS + " cap=" + CAP
+                + " maxObjects=" + MAX_OBJECTS + " debug=" + DEBUG + ' ' + total + sb;
     }
 }
