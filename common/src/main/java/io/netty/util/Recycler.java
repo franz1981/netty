@@ -344,12 +344,44 @@ public abstract class Recycler<T> {
      * {@link FastThreadLocalThread#runWithFastThreadLocal(Runnable)}: they can be created in very large numbers and
      * are usually short-lived, so a per-thread pool would cost far more memory than the pooling saves.
      */
+    // EXPERIMENT (candidate fix): skip the fallback-thread-set probe on platform threads.
+    private static final boolean CHEAP_POOL_CHECK =
+            SystemPropertyUtil.getBoolean("io.netty.recycler.cheapPoolCheck", false);
+
     @VisibleForTesting
     static boolean currentThreadCanPool() {
+        if (CHEAP_POOL_CHECK) {
+            final Thread current = Thread.currentThread();
+            if (!PlatformDependent.isVirtualThread(current)) {
+                return !POOL_FAST_TL_ONLY
+                        || current instanceof FastThreadLocalThread
+                           && ((FastThreadLocalThread) current).willCleanupFastThreadLocals();
+            }
+            return FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals();
+        }
         if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
             return true;
         }
         return !POOL_FAST_TL_ONLY && !PlatformDependent.isVirtualThread(Thread.currentThread());
+    }
+
+    // EXPERIMENT ONLY (do not merge): upper bound for a lookup-free platform path.
+    private static final boolean CACHE_OWNER_POOL =
+            SystemPropertyUtil.getBoolean("io.netty.recycler.cacheOwnerPool", false);
+    private Thread cachedOwner;
+    private LocalPool<?, T> cachedPool;
+
+    /** EXPERIMENT ONLY (do not merge): the calling thread's pool, so a benchmark can hoist the lookup. */
+    @VisibleForTesting
+    public final Object currentThreadPool() {
+        return localPool != null? localPool : threadLocalPool.get();
+    }
+
+    /** EXPERIMENT ONLY (do not merge): allocate from an already-looked-up pool. */
+    @SuppressWarnings("unchecked")
+    @VisibleForTesting
+    public final T getFromPool(Object pool) {
+        return ((LocalPool<?, T>) pool).getWith(this);
     }
 
     @SuppressWarnings("unchecked")
@@ -357,10 +389,21 @@ public abstract class Recycler<T> {
         if (localPool != null) {
             return localPool.getWith(this);
         } else {
+            if (CACHE_OWNER_POOL) {
+                // EXPERIMENT ONLY (do not merge): racy single-slot cache, measurement scaffolding.
+                if (Thread.currentThread() == cachedOwner) {
+                    return cachedPool.getWith(this);
+                }
+            }
             if (!currentThreadCanPool()) {
                 return newObject((Handle<T>) NOOP_HANDLE);
             }
-            return threadLocalPool.get().getWith(this);
+            LocalPool<?, T> pool = threadLocalPool.get();
+            if (CACHE_OWNER_POOL) {
+                cachedPool = pool;
+                cachedOwner = Thread.currentThread();
+            }
+            return pool.getWith(this);
         }
     }
 
