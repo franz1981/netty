@@ -346,10 +346,22 @@ public abstract class Recycler<T> {
      */
     @VisibleForTesting
     static boolean currentThreadCanPool() {
-        if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
-            return true;
+        // Ordered so that the common cases answer without consulting the fallback thread set:
+        // FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals() ends up in
+        // FastThreadLocalThread.isFastThreadLocalVirtualThread() for every thread that is not a
+        // FastThreadLocalThread, and that is a LongLongHashMap lookup on the allocation path.
+        // Only a virtual thread can answer "yes" there, so platform threads never need to ask.
+        final Thread current = Thread.currentThread();
+        if (current instanceof FastThreadLocalThread) {
+            return !POOL_FAST_TL_ONLY || ((FastThreadLocalThread) current).willCleanupFastThreadLocals();
         }
-        return !POOL_FAST_TL_ONLY && !PlatformDependent.isVirtualThread(Thread.currentThread());
+        if (!PlatformDependent.isVirtualThread(current)) {
+            // A plain platform thread pools too; only POOL_FAST_TL_ONLY makes it ask whether it opted in
+            // via FastThreadLocalThread.runWithFastThreadLocal(Runnable).
+            return !POOL_FAST_TL_ONLY || FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals();
+        }
+        // A virtual thread only pools when it opted in via runWithFastThreadLocal(Runnable).
+        return FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals();
     }
 
     @SuppressWarnings("unchecked")
