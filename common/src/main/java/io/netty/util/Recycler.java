@@ -81,6 +81,7 @@ public abstract class Recycler<T> {
     private static final int DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD;
     private static final boolean BLOCKING_POOL;
     private static final boolean BATCH_FAST_TL_ONLY;
+    private static final boolean POOL_FAST_TL_ONLY;
 
     static {
         // In the future, we might have different maxCapacity for different object types.
@@ -102,6 +103,7 @@ public abstract class Recycler<T> {
 
         BLOCKING_POOL = SystemPropertyUtil.getBoolean("io.netty.recycler.blocking", false);
         BATCH_FAST_TL_ONLY = SystemPropertyUtil.getBoolean("io.netty.recycler.batchFastThreadLocalOnly", true);
+        POOL_FAST_TL_ONLY = SystemPropertyUtil.getBoolean("io.netty.recycler.poolFastThreadLocalOnly", false);
 
         if (logger.isDebugEnabled()) {
             if (DEFAULT_MAX_CAPACITY_PER_THREAD == 0) {
@@ -110,12 +112,14 @@ public abstract class Recycler<T> {
                 logger.debug("-Dio.netty.recycler.chunkSize: disabled");
                 logger.debug("-Dio.netty.recycler.blocking: disabled");
                 logger.debug("-Dio.netty.recycler.batchFastThreadLocalOnly: disabled");
+                logger.debug("-Dio.netty.recycler.poolFastThreadLocalOnly: disabled");
             } else {
                 logger.debug("-Dio.netty.recycler.maxCapacityPerThread: {}", DEFAULT_MAX_CAPACITY_PER_THREAD);
                 logger.debug("-Dio.netty.recycler.ratio: {}", RATIO);
                 logger.debug("-Dio.netty.recycler.chunkSize: {}", DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD);
                 logger.debug("-Dio.netty.recycler.blocking: {}", BLOCKING_POOL);
                 logger.debug("-Dio.netty.recycler.batchFastThreadLocalOnly: {}", BATCH_FAST_TL_ONLY);
+                logger.debug("-Dio.netty.recycler.poolFastThreadLocalOnly: {}", POOL_FAST_TL_ONLY);
             }
         }
     }
@@ -321,12 +325,39 @@ public abstract class Recycler<T> {
         }
     }
 
+    /**
+     * Returns {@code true} if the calling thread should be given its own thread-local pool.
+     * <p>
+     * Threads that extend {@link FastThreadLocalThread}, or that run inside
+     * {@link FastThreadLocalThread#runWithFastThreadLocal(Runnable)}, always pool: their
+     * {@link FastThreadLocal}s are cleaned up deterministically when the thread (or the wrapped task) completes,
+     * so {@link FastThreadLocal#onRemoval(Object)} runs and the pool is emptied right away.
+     * <p>
+     * Any other platform thread also pools, but its pool is backed by the plain {@link ThreadLocal} fallback in
+     * {@link io.netty.util.internal.InternalThreadLocalMap}, which the JVM discards when the thread terminates.
+     * Cleanup is therefore left to the garbage collector. That is fine for the Recycler, because objects sitting in
+     * a pool have already been released by their owner, but it can be disabled with
+     * {@code -Dio.netty.recycler.poolFastThreadLocalOnly=true} for code that needs the pool to be emptied at a
+     * precise point in time.
+     * <p>
+     * Virtual threads never pool unless they opt in via
+     * {@link FastThreadLocalThread#runWithFastThreadLocal(Runnable)}: they can be created in very large numbers and
+     * are usually short-lived, so a per-thread pool would cost far more memory than the pooling saves.
+     */
+    @VisibleForTesting
+    static boolean currentThreadCanPool() {
+        if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+            return true;
+        }
+        return !POOL_FAST_TL_ONLY && !PlatformDependent.isVirtualThread(Thread.currentThread());
+    }
+
     @SuppressWarnings("unchecked")
     public final T get() {
         if (localPool != null) {
             return localPool.getWith(this);
         } else {
-            if (!FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+            if (!currentThreadCanPool()) {
                 return newObject((Handle<T>) NOOP_HANDLE);
             }
             return threadLocalPool.get().getWith(this);
@@ -365,7 +396,7 @@ public abstract class Recycler<T> {
         if (localPool != null) {
             return localPool.size();
         } else {
-            if (!FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+            if (!currentThreadCanPool()) {
                 return 0;
             }
             final LocalPool<?, T> pool = threadLocalPool.getIfExists();
