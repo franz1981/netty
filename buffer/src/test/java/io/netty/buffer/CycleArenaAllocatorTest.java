@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -791,10 +792,156 @@ class CycleArenaAllocatorTest {
         }
     }
 
+    // ------------------------------------------- the bitmap at a block edge, and re-entry into a block
+
+    /** The word of {@code blockId}'s bitmap row that holds {@code start}'s live bit. */
+    private static int bitWord(int start) {
+        return start >>> 9;
+    }
+
+    private static boolean liveBitSet(CycleArenaAllocator.Space space, int blockId, int start) {
+        return (space.startBits[blockId][bitWord(start)] & 1L << (start >>> 3)) != 0;
+    }
+
     /**
-     * A zero-length buffer must still occupy a slot. The ring's bitmap has one bit per 8-byte slot and
-     * indexes it by START, so a 0-byte buffer handed out without moving the tail would share its bit
-     * with the buffer that comes next: releasing the empty one would clear a LIVE buffer's bit.
+     * (7) The bitmap at a block boundary. The last 8-byte slot of block 0 is the LAST bit of block 0's
+     * row and the first slot of block 1 the FIRST bit of block 1's - the same word index in two rows.
+     * Releasing either must leave the other alone, whatever the rows are laid out in.
+     */
+    @Test
+    void theBitmapSeparatesTheBlockBoundary() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            int blockSize = CycleArenaAllocator.BLOCK_SIZE;
+            ByteBuf bottom = alloc.heapBuffer(8);              // pins [0, 8): the ring can never wrap
+            CycleArenaAllocator.Space space = space(alloc, false);
+            assertEquals(CycleArenaAllocator.MAX_BLOCKS + 1, space.startBits.length,
+                    "one bitmap row per block, plus the delegate slot");
+
+            ByteBuf top = null;                                // run the tail to the very top of block 0
+            while (space.curBump < blockSize) {
+                ByteBuf buf = alloc.heapBuffer(8);
+                if (space.curBump == blockSize) {
+                    top = buf;
+                } else {
+                    assertTrue(buf.release());
+                }
+            }
+            assertNotNull(top);
+            assertEquals(0, arenaBuf(top).blockIdForTest());
+            assertEquals(blockSize - 8, arenaBuf(top).startForTest());
+            int topWord = bitWord(blockSize - 8);
+            assertEquals(CycleArenaAllocator.BLOCK_LONGS - 1, topWord, "the last word of block 0's row");
+            assertTrue(liveBitSet(space, 0, blockSize - 8));
+
+            // The tail is at the wall and the bottom is pinned, so the next one opens block 1 at 0.
+            ByteBuf first = alloc.heapBuffer(8);
+            assertEquals(2, space.blockCount());
+            assertEquals(1, arenaBuf(first).blockIdForTest());
+            assertEquals(0, arenaBuf(first).startForTest());
+            assertEquals(0, bitWord(0), "block 1's first slot is the first word of block 1's row");
+            assertNotSame(space.startBits[0], space.startBits[1], "the two blocks must not share a row");
+            assertTrue(liveBitSet(space, 1, 0));
+
+            assertTrue(first.release());
+            assertFalse(liveBitSet(space, 1, 0), "block 1's bit must be the one that was cleared");
+            assertTrue(liveBitSet(space, 0, blockSize - 8), "block 0's top slot must still be live");
+            assertTrue(liveBitSet(space, 0, 0), "and so must its bottom");
+
+            assertTrue(top.release());
+            assertTrue(bottom.release());
+            assertFalse(liveBitSet(space, 0, blockSize - 8));
+            assertFalse(liveBitSet(space, 0, 0));
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * (8) Re-entry below the head. Block 0 is abandoned with its bottom pinned, then that survivor goes:
+     * the block is now free but no hook has run, so nothing marks it reusable. When block 1 stalls the
+     * space must come BACK to block 0 instead of taking a third block.
+     */
+    @Test
+    void aStalledRingReentersTheBlockWhoseHeadHasDied() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf bottom0 = alloc.heapBuffer(8);             // pins block 0 at [0, 8)
+            CycleArenaAllocator.Space space = space(alloc, false);
+            fillToTheWall(alloc, space);
+            ByteBuf bottom1 = alloc.heapBuffer(8);             // block 0 gave up: this opens block 1 at 0
+            assertEquals(2, space.blockCount());
+            assertEquals(1, arenaBuf(bottom1).blockIdForTest());
+            assertEquals(0, space.ringReentries);
+
+            assertTrue(bottom0.release());                     // block 0 is empty now - but no hook ran
+            assertEquals(0, space.reusableMask);
+            fillToTheWall(alloc, space);
+
+            ByteBuf back = alloc.heapBuffer(8);
+            assertEquals(1, space.ringReentries, "the stalled ring must re-enter block 0");
+            assertEquals(2, space.blockCount(), "and must NOT have taken a third block");
+            assertEquals(0, arenaBuf(back).blockIdForTest());
+            assertEquals(0, arenaBuf(back).startForTest());
+
+            assertTrue(back.release());
+            assertTrue(bottom1.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * (9) Re-entry into the window at a block's TAIL. Block 0 is abandoned by a request too big for the
+     * bytes left in front of its tail; those bytes are still free, and a later small request must land
+     * exactly there rather than grow the space.
+     */
+    @Test
+    void aStalledRingReentersTheWindowLeftAtATail() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        int blockSize = CycleArenaAllocator.BLOCK_SIZE;
+        int window = 4096;
+        assumeTrue(CycleArenaAllocator.CAP >= window * 2, "the cap cannot straddle the window");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf bottom0 = alloc.heapBuffer(8);             // pins block 0 at [0, 8): no wrap, ever
+            CycleArenaAllocator.Space space = space(alloc, false);
+            while (space.curBump < blockSize - window) {       // leave exactly `window` in front of the tail
+                assertTrue(alloc.heapBuffer(8).release());
+            }
+            assertEquals(blockSize - window, space.curBump);
+
+            ByteBuf tooBig = alloc.heapBuffer(window * 2);     // does not fit: block 0 is abandoned
+            assertEquals(2, space.blockCount());
+            assertEquals(1, arenaBuf(tooBig).blockIdForTest());
+            assertEquals(0, space.ringReentries);
+
+            ByteBuf bottom1 = alloc.heapBuffer(8);             // pin block 1 too, so it cannot wrap either
+            fillToTheWall(alloc, space);
+
+            ByteBuf back = alloc.heapBuffer(window);           // fits the window block 0 kept, and only it
+            assertEquals(1, space.ringReentries, "the stalled ring must re-enter block 0's tail window");
+            assertEquals(2, space.blockCount(), "and must NOT have taken a third block");
+            assertEquals(0, arenaBuf(back).blockIdForTest());
+            assertEquals(blockSize - window, arenaBuf(back).startForTest());
+            assertTrue(liveBitSet(space, 0, blockSize - window));
+
+            assertTrue(back.release());
+            assertTrue(tooBig.release());
+            assertTrue(bottom0.release());
+            assertTrue(bottom1.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * (10) A zero-length buffer must still occupy a slot. The bitmap has one bit per 8-byte slot and
+     * indexes it by START, so if a 0-byte buffer were handed out at the tail without moving it, it
+     * would share its bit with the buffer that comes next: releasing the empty one would clear a LIVE
+     * buffer's bit and the ring could then hand out its bytes.
      */
     @Test
     void aZeroLengthBufferTakesItsOwnSlot() {
@@ -806,11 +953,13 @@ class CycleArenaAllocatorTest {
             assertEquals(0, arenaBuf(empty).startForTest());
             assertEquals(8, arenaBuf(next).startForTest(), "the empty buffer must not share a start");
             assertEquals(16, space.curBump);
-            int block = arenaBuf(next).blockIdForTest();
-            assertTrue(empty.release());
             if (CycleArenaAllocator.RING) {
-                assertTrue((space.startBits[block][0] & 1L << 1) != 0,
+                assertTrue(liveBitSet(space, arenaBuf(next).blockIdForTest(), 8));
+                assertTrue(empty.release());
+                assertTrue(liveBitSet(space, arenaBuf(next).blockIdForTest(), 8),
                         "releasing the empty buffer must not clear its neighbour's bit");
+            } else {
+                assertTrue(empty.release());
             }
             assertTrue(next.release());
         } finally {
@@ -819,8 +968,8 @@ class CycleArenaAllocatorTest {
     }
 
     /**
-     * The same at the very top of a block: with the tail exactly at the wall, a zero-length request must
-     * move to another block rather than index the bitmap one word past its end.
+     * (11) The same at the very top of a block: with the tail exactly at the wall a zero-length request
+     * must move to another block, not index the bitmap one word past its end.
      */
     @Test
     void aZeroLengthBufferAtTheWallSwitchesBlock() {
@@ -829,9 +978,7 @@ class CycleArenaAllocatorTest {
         try {
             ByteBuf bottom = alloc.heapBuffer(8);              // pins [0, 8): the ring cannot wrap
             CycleArenaAllocator.Space space = space(alloc, false);
-            while (space.curBump < CycleArenaAllocator.BLOCK_SIZE) {
-                assertTrue(alloc.heapBuffer(8).release());
-            }
+            fillToTheWall(alloc, space);
             assertEquals(CycleArenaAllocator.BLOCK_SIZE, space.curBump);
 
             ByteBuf zero = alloc.heapBuffer(0);                // the request that used to throw
@@ -844,5 +991,15 @@ class CycleArenaAllocatorTest {
         } finally {
             alloc.removeForTest();
         }
+    }
+
+    /** Bump the current block's tail to its wall with 8-byte buffers, keeping none of them. */
+    private static void fillToTheWall(CycleArenaAllocator alloc, CycleArenaAllocator.Space space) {
+        int before = space.curId;
+        while (space.curBump < CycleArenaAllocator.BLOCK_SIZE && space.curId == before) {
+            assertTrue(alloc.heapBuffer(8).release());
+        }
+        assertEquals(before, space.curId, "the fill must not have switched block by itself");
+        assertEquals(CycleArenaAllocator.BLOCK_SIZE, space.curBump);
     }
 }

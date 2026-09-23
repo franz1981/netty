@@ -92,6 +92,12 @@ import java.util.List;
  *       {@code BLOCK_SIZE} when nothing is live up there). If the request still does not fit, the space
  *       switches block.</li>
  * </ul>
+ * <b>Re-entry.</b> When the ring stalls and no block is EMPTY, the space does not grow or delegate until it
+ * has looked at the OTHER blocks: a pinned block is not a full one - it still holds the window the ring was
+ * left at ({@code tailBump..tailLimit}) and whatever has died below its head since. The block with the
+ * largest such window is made current again at that window ({@code ringReentries}). The scan is cold and
+ * latched on {@code frees[]}: a block nothing has been released from is never rescanned.
+ * <p>
  * <b>Invariant B (the ring never hands out live bytes).</b> {@code [curBump, curLimit)} holds no live
  * buffer. Proof. A live buffer that STARTS in that region would have its start bit set in it, and both
  * branches above put the wall at the lowest live start at or above the tail - so there is none. A live
@@ -125,9 +131,15 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final boolean DEBUG = Boolean.getBoolean("arena.debug");
     /**
      * {@code -Darena.ring=true}: reuse inside a block, as a ring. OFF by default, on measured cost: the two
-     * bitmap stores and the {@code curLimit} load are 30 x86 instructions per allocate/release pair on this
-     * Zen 4 box (perfnorm, cycle k=64 FIFO SMALL: 12774 -> 14650 instructions per 64 pairs), against a
-     * budget of ~5. It is worth turning on where no hook ever runs - that is the one setting in which a
+     * bitmap stores and the {@code curLimit} load are 29 x86 instructions per allocate/release pair direct
+     * and 9 heap on this Zen 4 box (perfnorm, cycle k=64 FIFO SMALL, 2300 MHz: 12783 -> 14648 and
+     * 14559 -> 15107 instructions per 64 pairs), against a budget of ~6. Two cheaper layouts were measured
+     * and are NOT here because neither is cheaper: ONE flat {@code long[]} for the space, indexed
+     * {@code (id << log2(BLOCK_LONGS)) + (start >>> 9)}, costs +36.0/+17.5 per pair, and that flat array with
+     * {@code PlatformDependent}'s unchecked {@code long[]} access costs +29.1/+17.5 - the unchecked form
+     * buys back exactly the bounds-check pair on the direct path (6.9 instructions, so 3.5 per bit) and
+     * nothing at all on the heap path, and it never beats the row below.
+     * It is worth turning on where no hook ever runs - that is the one setting in which a
      * block is otherwise never reused at all. A {@code static final} read once, so every ring branch and
      * every bitmap store folds away when it is false.
      */
@@ -146,11 +158,11 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
 
     /**
      * The bytes a buffer occupies: its size rounded up to an 8-byte slot, and NEVER zero. The ring's
-     * live-start bitmap has one bit per slot and indexes it by START, so two buffers must never share
-     * one - a zero-length buffer handed out at the tail would set, and on release clear, the bit of the
-     * buffer that came after it, and the ring would then be free to hand out live bytes. It also keeps
-     * {@code start < BLOCK_SIZE}: a zero-length request at {@code curBump == curLimit == BLOCK_SIZE}
-     * passes the {@code end > curLimit} test and would index the bitmap one word past its end.
+     * live-start bitmap has one bit per slot, so two buffers must never share a start - a zero-length
+     * buffer handed out at the tail would set, and on release clear, the bit of the buffer that came
+     * after it, and the ring would then hand out live bytes. It also keeps {@code start < BLOCK_SIZE}:
+     * a zero-length request at {@code curBump == curLimit == BLOCK_SIZE} passes the
+     * {@code end > curLimit} test and indexes the bitmap one word past its end.
      */
     static int slotBytes(int size) {
         return Math.max(8, (size + 7) & ~7);
@@ -392,9 +404,28 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         /** Debug only: the hook generation that last reset each block. */
         final long[] stamp = new long[MAX_BLOCKS + 1];
         /**
-         * RING only: per block, one bit per 8-byte slot, set at the START of every live buffer. The
-         * {@link #DELEGATE_SLOT} column is a one-long scratch: a DELEGATED buffer's start is always 0, so
-         * release can clear its bit without a branch.
+         * RING re-entry. A block switched away from still has free bytes - the tail region the ring left
+         * behind, and whatever has died at the bottom since. {@link #tailBump}/{@link #tailLimit} are the
+         * ring's tail and wall at the moment the block stopped being current; {@link #freeBase}/
+         * {@link #freeLimit} are the best free window found for it and {@link #freeHint} its size, all
+         * computed by {@link #refreshHint(int)} on the COLD path only. {@link #hintFrees} is the latch:
+         * {@code frees[id]} when the hint was taken, so a block whose occupancy has not changed is never
+         * rescanned - -1 forces the next scan.
+         */
+        final int[] tailBump = RING ? new int[MAX_BLOCKS + 1] : null;
+        final int[] tailLimit = RING ? new int[MAX_BLOCKS + 1] : null;
+        final int[] freeBase = RING ? new int[MAX_BLOCKS + 1] : null;
+        final int[] freeLimit = RING ? new int[MAX_BLOCKS + 1] : null;
+        final int[] freeHint = RING ? new int[MAX_BLOCKS + 1] : null;
+        final int[] hintFrees = RING ? new int[MAX_BLOCKS + 1] : null;
+        /**
+         * RING only: per block, one bit per 8-byte slot, set at the START of every live buffer. A row per
+         * block, with the CURRENT row cached in {@link #curBits}: that cache is why allocation pays one
+         * field load and one bounds check for a bit, and it is why ONE flat array measured WORSE - the
+         * flat form has to add a base to every index and load the array as well, costing allocation more
+         * than it saves release (+35.8 instructions per allocate/release pair direct against +29.1 here).
+         * The {@link #DELEGATE_SLOT} column is a one-long scratch: a DELEGATED buffer's start is always 0,
+         * so release can clear its bit without a branch.
          */
         final long[][] startBits = RING ? new long[MAX_BLOCKS + 1][] : null;
         /** Bit i: slot i holds a chunk. */
@@ -403,13 +434,14 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         int reusableMask;
         /**
          * Every block is pinned and the bound is reached: allocation delegates without touching anything
-         * else. Set by {@link #switchBlock()}, cleared by the hook and by {@link #trim()}.
+         * else. Set by {@link #switchBlock(int)}, cleared by the hook and by {@link #trim()}.
          */
         boolean exhausted;
         /**
-         * RING: {@code frees[curId]} when the ring last gave up on the current block. A failed ring pass can
-         * only become a winning one once a buffer of that block has gone, so this is the exact latch that
-         * stops the rescan - and the only thing that un-latches {@link #exhausted} when no hook ever runs.
+         * RING: the space's total {@code frees[]} when the ring last gave up. A failed pass can only become
+         * a winning one once SOME buffer of the space has gone - of the current block for a wrap, of any
+         * block for a re-entry - so this is the exact latch that stops the rescan, and the only thing that
+         * un-latches {@link #exhausted} when no hook ever runs.
          */
         int ringGiveUpFrees;
 
@@ -423,6 +455,12 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         int curLimit = BLOCK_SIZE;
         /** RING: {@code startBits[curId]}, so the allocation path reads no column to set a start bit. */
         long[] curBits;
+        /**
+         * Where the current pass over the current block started. Zero except after a re-entry, which
+         * resumes at a tail the block kept; {@code curBump - curPassStart} is what THIS pass bump-allocated
+         * and is what {@link #bytesBumped} takes when the pass ends, so re-entry cannot count bytes twice.
+         */
+        int curPassStart;
         /** {@code roots[curId]}: allocation reads no column at all to give a buffer its root parent. */
         AbstractByteBuf curRoot;
 
@@ -464,6 +502,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long ringWraps;
         long ringResets;
         long ringScans;
+        long ringReentries;
         // RING_STATS only: what a stalled ring leaves behind. See ringStall().
         long ringStalls;
         long stallBytes;
@@ -532,7 +571,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          */
         private ByteBuf allocateInAnotherBlock(int size, int maxCapacity) {
             int need = slotBytes(size);
-            if (!(RING && advanceRing(need)) && !switchBlock()) {
+            if (!(RING && advanceRing(need)) && !switchBlock(need)) {
                 return null;
             }
             int start = curBump;
@@ -577,8 +616,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 // Not wrapped: the tail is at the top of the block. Where is the lowest live buffer?
                 int head = lowestLiveStart(0);
                 if (head < 0) {
-                    bytesBumped += curBump;    // nothing is live: the block restarts in place
+                    bytesBumped += curBump - curPassStart;   // nothing is live: it restarts in place
                     curBump = 0;
+                    curPassStart = 0;
                     curLimit = BLOCK_SIZE;
                     ringResets++;
                     return true;               // need <= align8(cap) <= BLOCK_SIZE, checked at class init
@@ -592,8 +632,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 if (RING_STATS) {
                     ringStall(head);           // measure BEFORE the tail moves: it is the ring's head
                 }
-                bytesBumped += curBump;        // this pass's bytes, counted once, as at a block switch
+                bytesBumped += curBump - curPassStart;   // this pass's bytes, counted once
                 curBump = 0;
+                curPassStart = 0;
                 curLimit = head;
                 ringWraps++;
                 return true;
@@ -706,7 +747,11 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          */
         private int lowestLiveStart(int from) {
             ringScans++;
-            long[] bits = curBits;
+            return lowestLiveStart(curBits, from);
+        }
+
+        /** {@link #lowestLiveStart(int)} over any block's row of the bitmap. */
+        private static int lowestLiveStart(long[] bits, int from) {
             int w = from >>> 9;
             if (w >= bits.length) {
                 return -1;
@@ -727,7 +772,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          * Make another block current: the lowest one the LAST hook marked reusable, else a new one. A zero
          * mask means "nothing was empty at the last hook", which is also the latch that stops the rescan.
          */
-        private boolean switchBlock() {
+        private boolean switchBlock(int need) {
             boolean record = PlatformDependent.isJfrEnabled() && ArenaEvents.BlockSwitch.isEventEnabled();
             blockSwitches++;
             int mask = reusableMask;
@@ -735,7 +780,6 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 switchEvent(mask != 0 ? NEXT_REUSE
                         : Integer.bitCount(allocatedMask) < MAX_BLOCKS ? NEXT_GROWTH : NEXT_DELEGATE);
             }
-            bytesBumped += curBump;            // the retired block's used bytes, counted once
             if (++jfrTick >= JFR_PERIOD && PlatformDependent.isJfrEnabled()
                     && ArenaEvents.AllocationSample.isEventEnabled()) {
                 jfrTick = 0;
@@ -746,11 +790,16 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 if (DEBUG) {
                     checkNotReusedBeforeHook(id);
                 }
+                leaveCurrent();
                 reusableMask = mask & (mask - 1);
                 blockReuses++;
                 makeCurrent(id);
                 return true;
             }
+            if (RING && reenter(need)) {       // no block is EMPTY: is one of them re-enterable?
+                return true;
+            }
+            leaveCurrent();
             if (Integer.bitCount(allocatedMask) < MAX_BLOCKS) {
                 blockGrowths++;
                 newBlock();
@@ -758,18 +807,108 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             exhausted = true;
             if (RING) {
-                ringGiveUpFrees = frees[curId];
+                ringGiveUpFrees = spaceFrees();
             }
             return false;
         }
 
-        /** Worth another ring pass? Only if a buffer of the current block was released since we gave up. */
+        /**
+         * Stop bumping the current block: bank what THIS pass used, remember where its ring stood so a
+         * later {@link #reenter(int)} can resume there, and drop its hint.
+         */
+        private void leaveCurrent() {
+            bytesBumped += curBump - curPassStart;   // the retired pass's used bytes, counted once
+            if (RING) {
+                int id = curId;
+                tailBump[id] = curBump;
+                tailLimit[id] = curLimit;
+                hintFrees[id] = -1;            // frees[] is never negative: this forces the next scan
+            }
+        }
+
+        /**
+         * RING re-entry. Every block is pinned, so none is EMPTY - but a pinned block is not a FULL block:
+         * it still has the window the ring left at its tail, and whatever has died below its head since.
+         * Take the block with the largest such window, if the request fits in it. Cold: one pass over the
+         * {@code int} columns, and a bitmap scan only of the blocks whose {@code frees[]} has moved since
+         * the last scan - a block nothing has been released from is never rescanned.
+         */
+        private boolean reenter(int need) {
+            int mask = allocatedMask & ~(1 << curId);
+            int best = NO_BLOCK;
+            int bestFree = 0;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                if (hintFrees[id] != frees[id]) {
+                    refreshHint(id);
+                }
+                int free = freeHint[id];
+                if (free > bestFree) {
+                    bestFree = free;
+                    best = id;
+                }
+            }
+            if (best == NO_BLOCK || bestFree < need) {
+                return false;
+            }
+            leaveCurrent();
+            ringReentries++;
+            int base = freeBase[best];
+            curId = best;
+            curBump = base;
+            curPassStart = base;
+            curLimit = freeLimit[best];
+            if (RING) {
+                curBits = startBits[best];
+            }
+            curRoot = roots[best];
+            hintFrees[best] = -1;              // the window is being consumed: the hint is spent
+            return true;
+        }
+
+        /**
+         * The best free window of a block that is not current, and the latch that says when to look again.
+         * Two candidates, both free by Invariant B: {@code [0, head)} - no live buffer starts there and
+         * none reaches in from below - and {@code [tailBump, tailLimit)}, the window the ring was left
+         * holding, which nothing has been handed out of since.
+         */
+        private void refreshHint(int id) {
+            hintFrees[id] = frees[id];
+            ringScans++;
+            int head = lowestLiveStart(startBits[id], 0);
+            int headFree = head < 0 ? BLOCK_SIZE : head;
+            int tailFree = tailLimit[id] - tailBump[id];
+            if (headFree >= tailFree) {
+                freeBase[id] = 0;
+                freeLimit[id] = headFree;
+                freeHint[id] = headFree;
+            } else {
+                freeBase[id] = tailBump[id];
+                freeLimit[id] = tailLimit[id];
+                freeHint[id] = tailFree;
+            }
+        }
+
+        /** Worth another ring pass? Only if a buffer of this space was released since we gave up. */
         private boolean ringRetry() {
-            if (!RING || frees[curId] == ringGiveUpFrees) {
+            if (!RING || spaceFrees() == ringGiveUpFrees) {
                 return false;
             }
             exhausted = false;
             return true;
+        }
+
+        /** Releases this space has seen into its blocks. Only read when the space is {@link #exhausted}. */
+        private int spaceFrees() {
+            int total = 0;
+            int mask = allocatedMask;
+            while (mask != 0) {
+                int id = Integer.numberOfTrailingZeros(mask);
+                mask &= mask - 1;
+                total += frees[id];
+            }
+            return total;
         }
 
         /** One delegated allocation: a counter, and - when recording - one ArenaAllocationOutside event. */
@@ -840,6 +979,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         private void makeCurrent(int id) {
             curId = id;
             curBump = 0;                       // the hook reset it; nothing has been handed out since
+            curPassStart = 0;
             if (RING) {
                 curLimit = BLOCK_SIZE;         // the block is empty, so the whole of it is free
                 curBits = startBits[id];
@@ -856,6 +996,11 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             }
             allocs[id] = 0;
             frees[id] = 0;
+            if (RING) {
+                tailBump[id] = 0;
+                tailLimit[id] = BLOCK_SIZE;
+                hintFrees[id] = -1;
+            }
             stamp[id] = generation - 1;        // fresh memory: never "reused before its hook"
             allocatedMask |= 1 << id;
             makeCurrent(id);
@@ -905,7 +1050,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             int start = curBump;
             int end = start + need;
             if (end > (RING ? curLimit : BLOCK_SIZE)) {
-                if (!(RING && advanceRing(need)) && !switchBlock()) {
+                if (!(RING && advanceRing(need)) && !switchBlock(need)) {
                     return NO_BLOCK;
                 }
                 start = curBump;
@@ -943,12 +1088,19 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                         stamp[id] = gen;
                     }
                     if (id == cur) {
-                        bytesBumped += curBump;
+                        bytesBumped += curBump - curPassStart;
                         curBump = 0;           // the current block restarts in place, and stays current
+                        curPassStart = 0;
                         if (RING) {
                             curLimit = BLOCK_SIZE;    // it is empty: the whole block is free again
+                            hintFrees[id] = -1;
                         }
                     } else {
+                        if (RING) {
+                            tailBump[id] = 0;
+                            tailLimit[id] = BLOCK_SIZE;
+                            hintFrees[id] = -1;
+                        }
                         mask |= 1 << id;
                     }
                 } else {
@@ -1028,9 +1180,9 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             return total;
         }
 
-        /** Bytes bump-allocated: what the retired blocks used plus the current cursor. */
+        /** Bytes bump-allocated: what the retired passes used plus what the current one has taken. */
         long bytesBumpedTotal() {
-            return bytesBumped + curBump;
+            return bytesBumped + curBump - curPassStart;
         }
 
         int liveBuffers() {
@@ -1711,6 +1863,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long ringWraps;
         long ringResets;
         long ringScans;
+        long ringReentries;
         long ringStalls;
         long stallBytes;
         long strandedBytes;
@@ -1752,6 +1905,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             ringWraps += other.ringWraps;
             ringResets += other.ringResets;
             ringScans += other.ringScans;
+            ringReentries += other.ringReentries;
             ringStalls += other.ringStalls;
             stallBytes += other.stallBytes;
             strandedBytes += other.strandedBytes;
@@ -1798,6 +1952,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             ringWraps += arena.heap.ringWraps + arena.direct.ringWraps;
             ringResets += arena.heap.ringResets + arena.direct.ringResets;
             ringScans += arena.heap.ringScans + arena.direct.ringScans;
+            ringReentries += arena.heap.ringReentries + arena.direct.ringReentries;
             ringStalls += arena.heap.ringStalls + arena.direct.ringStalls;
             stallBytes += arena.heap.stallBytes + arena.direct.stallBytes;
             strandedBytes += arena.heap.strandedBytes + arena.direct.strandedBytes;
@@ -1822,6 +1977,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                     + " blockReuses=" + blockReuses + " blockGrowths=" + blockGrowths
                     + " blockSwitches=" + blockSwitches
                     + " ringWraps=" + ringWraps + " ringResets=" + ringResets + " ringScans=" + ringScans
+                    + " ringReentries=" + ringReentries
                     + " ringStalls=" + ringStalls + " stallBytes=" + stallBytes
                     + " strandedBytes=" + strandedBytes
                     + " strandedShare=" + (stallBytes == 0 ? "n/a"
