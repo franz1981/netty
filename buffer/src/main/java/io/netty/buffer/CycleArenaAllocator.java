@@ -144,6 +144,18 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     /** One {@code ArenaIteration} event every this many hooks, and one {@code ArenaAllocationSample}. */
     static final int JFR_PERIOD = Integer.getInteger("arena.jfr.period", 1000);
 
+    /**
+     * The bytes a buffer occupies: its size rounded up to an 8-byte slot, and NEVER zero. The ring's
+     * live-start bitmap has one bit per slot and indexes it by START, so two buffers must never share
+     * one - a zero-length buffer handed out at the tail would set, and on release clear, the bit of the
+     * buffer that came after it, and the ring would then be free to hand out live bytes. It also keeps
+     * {@code start < BLOCK_SIZE}: a zero-length request at {@code curBump == curLimit == BLOCK_SIZE}
+     * passes the {@code end > curLimit} test and would index the bitmap one word past its end.
+     */
+    static int slotBytes(int size) {
+        return Math.max(8, (size + 7) & ~7);
+    }
+
     static final String REASON_CAP = "CAP";
     static final String REASON_BOUND = "BOUND";
     static final String REASON_OBJECTS = "OBJECTS";
@@ -495,7 +507,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 h.arm();                       // once per iteration: close it at the end of this one
             }
             int start = curBump;
-            int end = start + ((size + 7) & ~7);
+            int end = start + slotBytes(size);
             if (end > (RING ? curLimit : BLOCK_SIZE)) {
                 return allocateInAnotherBlock(size, maxCapacity);
             }
@@ -519,7 +531,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
          * else grow, else give up.
          */
         private ByteBuf allocateInAnotherBlock(int size, int maxCapacity) {
-            int need = (size + 7) & ~7;
+            int need = slotBytes(size);
             if (!(RING && advanceRing(need)) && !switchBlock()) {
                 return null;
             }
@@ -639,7 +651,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 ArenaBuf buf = objects[i];
                 if (buf.refCnt > 0 && buf.blockId == id) {
                     int start = buf.start;
-                    out[n++] = ((long) start << 32) | (start + ((buf.length + 7) & ~7));
+                    out[n++] = ((long) start << 32) | (start + slotBytes(buf.length));
                 }
             }
             java.util.Arrays.sort(out, 0, n);
@@ -889,7 +901,7 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             if (size > cap) {
                 return NO_BLOCK;
             }
-            int need = (size + 7) & ~7;
+            int need = slotBytes(size);
             int start = curBump;
             int end = start + need;
             if (end > (RING ? curLimit : BLOCK_SIZE)) {
@@ -1318,10 +1330,10 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                 tmpNioBuf = null;                  // its memory may have moved
                 return this;
             }
-            int newEnd = start + ((newCapacity + 7) & ~7);
+            int newEnd = start + slotBytes(newCapacity);
             // Growing in place moves the tail, so it must stop at the ring's wall, not at the block's top:
             // that is what keeps "a live buffer below the tail ends at or before the tail" true.
-            if (id == space.curId && space.curBump == start + ((length + 7) & ~7)
+            if (id == space.curId && space.curBump == start + slotBytes(length)
                     && newEnd <= (RING ? space.curLimit : BLOCK_SIZE)) {
                 space.curBump = newEnd;
                 length = newCapacity;

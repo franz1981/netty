@@ -790,4 +790,59 @@ class CycleArenaAllocatorTest {
             alloc.removeForTest();
         }
     }
+
+    /**
+     * A zero-length buffer must still occupy a slot. The ring's bitmap has one bit per 8-byte slot and
+     * indexes it by START, so a 0-byte buffer handed out without moving the tail would share its bit
+     * with the buffer that comes next: releasing the empty one would clear a LIVE buffer's bit.
+     */
+    @Test
+    void aZeroLengthBufferTakesItsOwnSlot() {
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf empty = alloc.heapBuffer(0);
+            ByteBuf next = alloc.heapBuffer(8);
+            CycleArenaAllocator.Space space = space(alloc, false);
+            assertEquals(0, arenaBuf(empty).startForTest());
+            assertEquals(8, arenaBuf(next).startForTest(), "the empty buffer must not share a start");
+            assertEquals(16, space.curBump);
+            int block = arenaBuf(next).blockIdForTest();
+            assertTrue(empty.release());
+            if (CycleArenaAllocator.RING) {
+                assertTrue((space.startBits[block][0] & 1L << 1) != 0,
+                        "releasing the empty buffer must not clear its neighbour's bit");
+            }
+            assertTrue(next.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /**
+     * The same at the very top of a block: with the tail exactly at the wall, a zero-length request must
+     * move to another block rather than index the bitmap one word past its end.
+     */
+    @Test
+    void aZeroLengthBufferAtTheWallSwitchesBlock() {
+        assumeTrue(CycleArenaAllocator.RING, "the ring is off");
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf bottom = alloc.heapBuffer(8);              // pins [0, 8): the ring cannot wrap
+            CycleArenaAllocator.Space space = space(alloc, false);
+            while (space.curBump < CycleArenaAllocator.BLOCK_SIZE) {
+                assertTrue(alloc.heapBuffer(8).release());
+            }
+            assertEquals(CycleArenaAllocator.BLOCK_SIZE, space.curBump);
+
+            ByteBuf zero = alloc.heapBuffer(0);                // the request that used to throw
+            assertEquals(2, space.blockCount());
+            assertEquals(1, arenaBuf(zero).blockIdForTest());
+            assertEquals(0, arenaBuf(zero).startForTest());
+            assertEquals(0, zero.capacity());
+            assertTrue(zero.release());
+            assertTrue(bottom.release());
+        } finally {
+            alloc.removeForTest();
+        }
+    }
 }
