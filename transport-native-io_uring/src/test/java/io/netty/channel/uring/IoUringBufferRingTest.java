@@ -307,14 +307,9 @@ public class IoUringBufferRingTest {
                     new IoUringFixedBufferRingAllocator(64), false);
             try {
                 bufferRing.initialize();
-
-                // allocatedBuffers=4 initially; the report's "allocatedBuffers=12" state is simulated below by
-                // passing 12 explicitly, since nextBid(...) takes the count as an argument.
                 assertEquals(4, bufferRing.allocatedBuffers());
 
-                // Old (buggy) formula: (3 + 1) & (12 - 1) == 0, which is wrong: the correct next bid is 4.
                 assertEquals((short) 4, bufferRing.nextBid((short) 3, 12));
-                // Old (buggy) formula: (11 + 1) & (12 - 1) == 8, which is wrong: the correct next bid is 0.
                 assertEquals((short) 0, bufferRing.nextBid((short) 11, 12));
             } finally {
                 // Releases the outstanding buffers and unregisters the ring.
