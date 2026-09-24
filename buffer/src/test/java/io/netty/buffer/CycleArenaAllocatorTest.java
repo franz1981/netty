@@ -993,6 +993,56 @@ class CycleArenaAllocatorTest {
         }
     }
 
+    // ------------------------------------------------- pinned-block attribution (-Darena.debugPinned)
+
+    /**
+     * The attribution walk charges a pinned block to the allocation stack of the OLDEST buffer still live
+     * in it. {@code arena.debugPinned} is a {@code static final} read at class initialisation, so this
+     * test drives the walk directly and plants the stacks the allocation path would have captured.
+     */
+    @Test
+    void pinnedBlockIsChargedToTheOldestLiveBuffer() {
+        CycleArenaAllocator alloc = new CycleArenaAllocator();
+        try {
+            ByteBuf old = alloc.heapBuffer(64);
+            ByteBuf young = alloc.heapBuffer(128);
+            CycleArenaAllocator.Space space = space(alloc, false);
+            arenaBuf(old).allocGen = 0;
+            arenaBuf(old).allocSite = siteOf("io.netty.buffer.CycleArenaAllocator", "allocate",
+                    "io.netty.example.Older", "read");
+            arenaBuf(young).allocGen = 5;
+            arenaBuf(young).allocSite = siteOf("io.netty.example.Younger", "write");
+
+            alloc.runHookForTest();                 // both live: the block is pinned
+            space.attributePinnedForTest();
+
+            String report = CycleArenaAllocator.pinnedSitesReport();
+            assertTrue(report.contains("Older.read"), report);
+            assertFalse(report.contains("Younger.write"), report);
+            // The allocator's own frames are dropped from the top of the stack.
+            assertFalse(report.contains("CycleArenaAllocator.allocate"), report);
+            assertTrue(report.contains("ARENAPINNEDSITE blocks=1"), report);
+
+            assertTrue(old.release());
+            assertTrue(young.release());
+            alloc.runHookForTest();                 // empty now: a second walk must find nothing
+            long before = space.pinnedSamples;
+            space.attributePinnedForTest();
+            assertEquals(before, space.pinnedSamples);
+        } finally {
+            alloc.removeForTest();
+        }
+    }
+
+    /** A synthetic trace from (class, method) pairs, innermost first. */
+    private static StackTraceElement[] siteOf(String... classAndMethod) {
+        StackTraceElement[] trace = new StackTraceElement[classAndMethod.length / 2];
+        for (int i = 0; i < trace.length; i++) {
+            trace[i] = new StackTraceElement(classAndMethod[i * 2], classAndMethod[i * 2 + 1], null, -1);
+        }
+        return trace;
+    }
+
     /** Bump the current block's tail to its wall with 8-byte buffers, keeping none of them. */
     private static void fillToTheWall(CycleArenaAllocator alloc, CycleArenaAllocator.Space space) {
         int before = space.curId;

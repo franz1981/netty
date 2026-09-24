@@ -32,7 +32,11 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * EXPERIMENT (2026-09-22): the event-loop arena of {@code netty-bench/docs/event-loop-arena-design.md}
@@ -155,6 +159,25 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
     static final boolean RING_STATS = Boolean.getBoolean("arena.ringStats");
     /** One {@code ArenaIteration} event every this many hooks, and one {@code ArenaAllocationSample}. */
     static final int JFR_PERIOD = Integer.getInteger("arena.jfr.period", 1000);
+
+    /**
+     * {@code -Darena.debugPinned=true}: attribute the blocks that a hook finds PINNED. Every arena
+     * allocation then captures its own allocation stack ({@code new Throwable().getStackTrace()}) and the
+     * hook generation it was made in; every {@link #DEBUG_PINNED_PERIOD}-th hook that finds at least one
+     * pinned block walks the space's buffer objects and charges each pinned block to the allocation stack
+     * of the OLDEST buffer still live in it. Reported by {@link #pinnedSites()}.
+     * <p>
+     * This is a diagnostic mode and it is expensive: one stack capture per allocation. Cap the captured
+     * depth with {@code -XX:MaxJavaStackTraceDepth=<n>} and compare a run that sets it only with another
+     * run that sets it. Every field and branch below folds away when the flag is false.
+     */
+    static final boolean DEBUG_PINNED = Boolean.getBoolean("arena.debugPinned");
+    /** Hooks between two pinned-block attribution walks. Only hooks that find a pinned block count. */
+    static final int DEBUG_PINNED_PERIOD = Integer.getInteger("arena.debugPinned.period", 64);
+    /** Frames kept per attributed stack, after the allocator's own {@code io.netty.buffer} frames. */
+    static final int DEBUG_PINNED_FRAMES = Integer.getInteger("arena.debugPinned.frames", 16);
+    /** Pinned-block attribution of arenas whose thread is gone. Key: the formatted allocation stack. */
+    private static final Map<String, long[]> DEAD_SITES = new HashMap<String, long[]>();
 
     /**
      * The bytes a buffer occupies: its size rounded up to an 8-byte slot, and NEVER zero. The ring's
@@ -515,6 +538,12 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         long[] statScratch;
         int pinnedBlocks;
         int maxPinned;
+        // DEBUG_PINNED only: the attribution of the blocks a hook found pinned. Owner-written, read at
+        // shutdown - racy by construction, exactly as the plain long counters above are.
+        int pinnedTick;
+        long pinnedSamples;        // pinned blocks looked at
+        long pinnedUnattributed;   // pinned blocks with no live buffer object carrying a stack
+        Map<String, long[]> pinnedSites;
 
         Space(Arena arena, AdaptivePoolingAllocator.ChunkAllocator chunkAllocator, boolean direct) {
             this.arena = arena;
@@ -1123,6 +1152,64 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
                     sampleEvent();
                 }
             }
+            if (DEBUG_PINNED && pinned > 0 && ++pinnedTick >= DEBUG_PINNED_PERIOD) {
+                pinnedTick = 0;
+                attributePinned();
+            }
+        }
+
+        /**
+         * DEBUG_PINNED, cold: charge every block this hook left pinned to the allocation stack of the
+         * oldest buffer still live in it. One walk of the space's buffer objects per pinned block - which
+         * is why it runs once every {@link #DEBUG_PINNED_PERIOD} hooks that find one, and never otherwise.
+         */
+        void attributePinnedForTest() {
+            attributePinned();
+        }
+
+        private void attributePinned() {
+            Map<String, long[]> sites = pinnedSites;
+            if (sites == null) {
+                sites = new HashMap<String, long[]>();
+                pinnedSites = sites;
+            }
+            long gen = generation - 1;          // the generation this hook closed
+            int count = objectCount;
+            ArenaBuf[] objs = objects;
+            for (int id = 0; id < MAX_BLOCKS; id++) {
+                if ((allocatedMask & (1 << id)) == 0 || allocs[id] == frees[id]) {
+                    continue;                   // never allocated, or reset by this hook
+                }
+                pinnedSamples++;
+                ArenaBuf oldest = null;
+                int live = 0;
+                for (int i = 0; i < count; i++) {
+                    ArenaBuf b = objs[i];
+                    if (b.refCnt > 0 && b.blockId == id) {
+                        live++;
+                        if (oldest == null || b.allocGen < oldest.allocGen) {
+                            oldest = b;
+                        }
+                    }
+                }
+                if (oldest == null || oldest.allocSite == null) {
+                    pinnedUnattributed++;
+                    continue;
+                }
+                String key = formatSite(oldest.allocSite);
+                long[] v = sites.get(key);
+                if (v == null) {
+                    v = new long[4];
+                    sites.put(key, v);
+                }
+                v[0]++;                                  // pinned blocks charged to this stack
+                long age = gen - oldest.allocGen;        // hooks the oldest buffer has survived
+                if (age > v[1]) {
+                    v[1] = age;
+                }
+                v[2] += live;                            // live buffers in the block at this hook
+                v[3] += oldest.length;                   // bytes of the oldest live buffer
+            }
         }
 
         /** Give back every reusable block but the first. The slot is freed, block ids never move. */
@@ -1243,6 +1330,17 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             direct.terminate();
             synchronized (ARENAS) {
                 DEAD.add(this);
+                if (DEBUG_PINNED) {
+                    mergeSites(DEAD_SITES, heap.pinnedSites);
+                    mergeSites(DEAD_SITES, direct.pinnedSites);
+                    long[] totals = DEAD_SITES.get(DEAD_TOTALS);
+                    if (totals == null) {
+                        totals = new long[4];
+                        DEAD_SITES.put(DEAD_TOTALS, totals);
+                    }
+                    totals[0] += heap.pinnedSamples + direct.pinnedSamples;
+                    totals[1] += heap.pinnedUnattributed + direct.pinnedUnattributed;
+                }
                 ARENAS.remove(this);
             }
         }
@@ -1274,6 +1372,10 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         // of them is used (a gathering write), so a view shared per block would be handed out twice. It is
         // anchored at this buffer's index 0, so it is dropped whenever the region moves.
         private ByteBuffer tmpNioBuf;
+        /** DEBUG_PINNED only: the hook generation this buffer was allocated in. */
+        long allocGen;
+        /** DEBUG_PINNED only: where it was allocated. Never read on any hot path. */
+        StackTraceElement[] allocSite;
 
         ArenaBuf(ByteBufAllocator alloc, Space space, int index) {
             super(0);
@@ -1311,7 +1413,16 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
             if (tmpNioBuf != null) {
                 tmpNioBuf = null;
             }
+            if (DEBUG_PINNED) {
+                debugPinnedInit();
+            }
             resetForReuse(maxCapacity);
+        }
+
+        /** DEBUG_PINNED only, never inlined into anything that matters: folded away when the flag is off. */
+        private void debugPinnedInit() {
+            allocGen = space.generation;
+            allocSite = new Throwable().getStackTrace();
         }
 
         /** The buffer that holds the bytes: the block's chunk, or the delegate buffer when DELEGATED. */
@@ -2015,6 +2126,112 @@ public final class CycleArenaAllocator extends AbstractByteBufAllocator {
         }
         return "ARENATELE blockSize=" + BLOCK_SIZE + " maxBlocks=" + MAX_BLOCKS + " cap=" + CAP
                 + " maxObjects=" + MAX_OBJECTS + " debug=" + DEBUG + " ring=" + RING
-                + " ringStats=" + RING_STATS + ' ' + total + sb;
+                + " ringStats=" + RING_STATS + ' ' + total + sb + pinnedSites();
+    }
+
+    /**
+     * The pinned-block attribution collected under {@code -Darena.debugPinned=true}: one
+     * {@code ARENAPINNED} summary line and one {@code ARENAPINNEDSITE} line per allocation stack, most
+     * frequent first. Empty when the flag is off. Read off the owner threads' maps without
+     * synchronisation with them, exactly as {@link #counters()} reads their plain longs: call it at
+     * shutdown, not while the loops run.
+     */
+    public static String pinnedSites() {
+        return DEBUG_PINNED ? pinnedSitesReport() : "";
+    }
+
+    /** The report itself, without the flag test: {@link #pinnedSites()} and the tests. */
+    static String pinnedSitesReport() {
+        Map<String, long[]> merged = new HashMap<String, long[]>();
+        long samples = 0;
+        long unattributed = 0;
+        synchronized (ARENAS) {
+            mergeSites(merged, DEAD_SITES);
+            for (int i = 0; i < ARENAS.size(); i++) {
+                Arena arena = ARENAS.get(i);
+                samples += arena.heap.pinnedSamples + arena.direct.pinnedSamples;
+                unattributed += arena.heap.pinnedUnattributed + arena.direct.pinnedUnattributed;
+                mergeSites(merged, arena.heap.pinnedSites);
+                mergeSites(merged, arena.direct.pinnedSites);
+            }
+            long[] dead = DEAD_SITES.get(DEAD_TOTALS);
+            if (dead != null) {
+                samples += dead[0];
+                unattributed += dead[1];
+            }
+        }
+        List<Map.Entry<String, long[]>> rows = new ArrayList<Map.Entry<String, long[]>>(merged.entrySet());
+        Collections.sort(rows, new Comparator<Map.Entry<String, long[]>>() {
+            @Override
+            public int compare(Map.Entry<String, long[]> a, Map.Entry<String, long[]> b) {
+                return Long.compare(b.getValue()[0], a.getValue()[0]);
+            }
+        });
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("\nARENAPINNED period=").append(DEBUG_PINNED_PERIOD)
+          .append(" frames=").append(DEBUG_PINNED_FRAMES)
+          .append(" pinnedBlockSamples=").append(samples)
+          .append(" unattributed=").append(unattributed)
+          .append(" sites=").append(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            Map.Entry<String, long[]> e = rows.get(i);
+            if (DEAD_TOTALS.equals(e.getKey())) {
+                continue;
+            }
+            long[] v = e.getValue();
+            sb.append("\nARENAPINNEDSITE blocks=").append(v[0])
+              .append(" maxAgeHooks=").append(v[1])
+              .append(" avgLiveInBlock=").append(v[0] == 0 ? 0 : v[2] / v[0])
+              .append(" avgOldestBytes=").append(v[0] == 0 ? 0 : v[3] / v[0])
+              .append(" stack=").append(e.getKey());
+        }
+        return sb.toString();
+    }
+
+    /** The key {@link #DEAD_SITES} parks the dead arenas' sample/unattributed totals under. */
+    private static final String DEAD_TOTALS = "<totals>";
+
+    private static void mergeSites(Map<String, long[]> into, Map<String, long[]> from) {
+        if (from == null) {
+            return;
+        }
+        for (Map.Entry<String, long[]> e : from.entrySet()) {
+            long[] v = into.get(e.getKey());
+            if (v == null) {
+                v = new long[4];
+                into.put(e.getKey(), v);
+            }
+            long[] o = e.getValue();
+            v[0] += o[0];
+            v[1] = Math.max(v[1], o[1]);
+            v[2] += o[2];
+            v[3] += o[3];
+        }
+    }
+
+    /**
+     * The allocation stack as one line: the allocator's own {@code io.netty.buffer} frames dropped from
+     * the top, then at most {@link #DEBUG_PINNED_FRAMES} frames, innermost first, separated by {@code <-}.
+     */
+    static String formatSite(StackTraceElement[] trace) {
+        int i = 0;
+        while (i < trace.length && trace[i].getClassName().startsWith("io.netty.buffer.")) {
+            i++;
+        }
+        if (i == trace.length) {
+            i = 0;                             // nothing but allocator frames: report them rather than ""
+        }
+        StringBuilder sb = new StringBuilder(256);
+        int kept = 0;
+        for (; i < trace.length && kept < DEBUG_PINNED_FRAMES; i++, kept++) {
+            if (kept > 0) {
+                sb.append(" <- ");
+            }
+            StackTraceElement f = trace[i];
+            String cls = f.getClassName();
+            int dot = cls.lastIndexOf('.');
+            sb.append(dot < 0 ? cls : cls.substring(dot + 1)).append('.').append(f.getMethodName());
+        }
+        return sb.toString();
     }
 }
