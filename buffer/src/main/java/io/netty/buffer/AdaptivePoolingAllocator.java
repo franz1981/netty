@@ -1525,6 +1525,12 @@ final class AdaptivePoolingAllocator {
      */
     private static final class SizeClassMagazine {
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
+        /**
+         * Initial size of {@link #wrapperPool}; it doubles on demand up to
+         * {@link AdaptivePoolingAllocator#MAGAZINE_BUFFER_QUEUE_CAPACITY}. Kept small because every size class of
+         * every thread-local heap has one.
+         */
+        private static final int INITIAL_WRAPPER_POOL_CAPACITY = 16;
 
         private SizeClassedChunk current;
         final AdaptivePoolingAllocator allocator;
@@ -1539,7 +1545,20 @@ final class AdaptivePoolingAllocator {
         private final SizeClassMagazine[] heapMagazines;
         final int sizeClassIndex;
         final SizeClassChunkRecycler chunkRecycler;
-        final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
+        final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → wrapperPool
+        /**
+         * The wrapper pool of a thread-local magazine: a plain LIFO of {@link AdaptiveByteBuf} instances this
+         * magazine handed out, in state the allocation path already has in hand. Non-null exactly when this
+         * magazine belongs to a {@link ThreadLocalSizeClassHeap}, i.e. when {@link #ownerThread} is set and
+         * {@link #bufRecycler} is not; {@code null} on a shared stripe.
+         * <p>
+         * Only {@link #ownerThread} touches it: {@link #newBuffer()} pops, {@link #recycleWrapper} pushes, and a
+         * release from any other thread falls back to the wrapper's recycler handle, so no synchronization and no
+         * {@link FastThreadLocal} lookup is needed on either side. Double pushes cannot happen because
+         * {@link AdaptiveByteBuf#deallocate()} runs once per reference count reaching zero.
+         */
+        private AdaptiveByteBuf[] wrapperPool;
+        private int wrapperTop;
         private final int purgeTickThreshold;
         private int allocCount;
 
@@ -1553,6 +1572,7 @@ final class AdaptivePoolingAllocator {
             this.sizeClassIndex = sizeClassIndex;
             this.chunkRecycler = chunkRecycler;
             this.bufRecycler = bufRecycler;
+            this.wrapperPool = bufRecycler == null ? new AdaptiveByteBuf[INITIAL_WRAPPER_POOL_CAPACITY] : null;
             this.chunkController = strategy.createController(allocator);
             this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
@@ -1694,13 +1714,58 @@ final class AdaptivePoolingAllocator {
                 current = null;
             }
             chunkCache.free();
+            AdaptiveByteBuf[] pool = wrapperPool;
+            if (pool != null) {
+                Arrays.fill(pool, 0, wrapperTop, null);
+                wrapperTop = 0;
+            }
         }
 
         AdaptiveByteBuf newBuffer() {
-            AdaptiveByteBuf buf = bufRecycler != null ? bufRecycler.get() : EVENT_LOOP_LOCAL_BUFFER_POOL.get();
+            AdaptiveByteBuf buf;
+            AdaptiveByteBuf[] pool = wrapperPool;
+            if (pool == null) {
+                buf = bufRecycler.get();
+            } else {
+                assert ownerThread == Thread.currentThread();
+                int top = wrapperTop - 1;
+                if (top >= 0) {
+                    buf = pool[top];
+                    pool[top] = null;
+                    wrapperTop = top;
+                } else {
+                    // The pool is empty: take one from the recycler, which is both the source of new wrappers
+                    // (they need a handle for the foreign-thread release path) and where the wrappers this
+                    // magazine could not take back went. Re-home it here, whatever magazine handed it out before.
+                    buf = EVENT_LOOP_LOCAL_BUFFER_POOL.get();
+                    buf.wrapperMagazine = this;
+                }
+            }
             buf.resetRefCnt();
             buf.discardMarks();
             return buf;
+        }
+
+        /**
+         * Take {@code buf} back into this magazine's {@link #wrapperPool}, if this is the owner thread and the pool
+         * has room. Returns {@code false} when the caller must fall back to the wrapper's recycler handle, which is
+         * what a release from a foreign thread does.
+         */
+        boolean recycleWrapper(AdaptiveByteBuf buf) {
+            if (ownerThread != Thread.currentThread()) {
+                return false;
+            }
+            AdaptiveByteBuf[] pool = wrapperPool;
+            int top = wrapperTop;
+            if (top == pool.length) {
+                if (top >= MAGAZINE_BUFFER_QUEUE_CAPACITY) {
+                    return false;
+                }
+                pool = wrapperPool = Arrays.copyOf(pool, Math.min(top * 2, MAGAZINE_BUFFER_QUEUE_CAPACITY));
+            }
+            pool[top] = buf;
+            wrapperTop = top + 1;
+            return true;
         }
     }
 
@@ -2754,6 +2819,12 @@ final class AdaptivePoolingAllocator {
     static final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
 
         private final EnhancedHandle<AdaptiveByteBuf> handle;
+        /**
+         * The magazine whose plain wrapper pool this instance belongs to, or {@code null} when only {@link #handle}
+         * can take it back. Sticky across reuse: a wrapper keeps returning to the magazine that homed it, and a
+         * release that the magazine will not take falls back to {@link #handle}, so the wrapper is never lost.
+         */
+        SizeClassMagazine wrapperMagazine;
 
         // this both act as adjustment and the start index for a free list segment allocation
         private int startIndex;
@@ -3273,6 +3344,10 @@ final class AdaptivePoolingAllocator {
             tmpNioBuf = null;
             chunk = null;
             rootParent = null;
+            SizeClassMagazine magazine = wrapperMagazine;
+            if (magazine != null && magazine.recycleWrapper(this)) {
+                return;
+            }
             handle.unguardedRecycle(this);
         }
     }

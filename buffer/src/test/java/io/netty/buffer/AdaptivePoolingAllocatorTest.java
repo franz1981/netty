@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -31,6 +32,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.StampedLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -291,6 +294,73 @@ class AdaptivePoolingAllocatorTest {
         for (ByteBuf buf : live) {
             buf.release();
         }
+    }
+
+    /**
+     * On the thread-local (event-loop) heap the wrapper pool lives in the magazine's own fields, so a release on the
+     * owner thread hands the very same wrapper back to the next allocation, and a release on a foreign thread - which
+     * must not touch those fields - still returns the wrapper through its recycler handle, from where the owner picks
+     * it up again. Nothing is lost either way.
+     */
+    @Test
+    void threadLocalWrapperIsReusedAndAForeignReleaseIsNotLost() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final int size = 256;
+        final AtomicReference<Object> result = new AtomicReference<Object>();
+        Runnable body = () -> {
+            ExecutorService helper = Executors.newSingleThreadExecutor();
+            try {
+                AdaptivePoolingAllocator allocator =
+                        new AdaptivePoolingAllocator(new CountingChunkAllocator(), true);
+                ByteBuf b1 = allocator.allocate(size, size);
+                ByteBuf b2 = allocator.allocate(size, size);
+                assertNotSame(b1, b2);
+                // b1 goes back through its handle: the magazine's plain pool is owner-only.
+                releaseOn(helper, b1, null);
+                // b2 goes into the magazine's plain pool, and comes straight back out. The pool is read back
+                // directly: the identity assertions alone would also hold with the recycler doing the pooling.
+                assertEquals(0, wrapperTop(allocator, size));
+                b2.release();
+                assertEquals(1, wrapperTop(allocator, size), "the owner release must land in the magazine's pool");
+                ByteBuf b3 = allocator.allocate(size, size);
+                assertEquals(0, wrapperTop(allocator, size));
+                assertSame(b2, b3, "a wrapper released by the owner thread must be pooled in the magazine");
+                // The magazine's pool is empty again, so the next allocation must find the foreign release.
+                ByteBuf b4 = allocator.allocate(size, size);
+                assertSame(b1, b4, "a wrapper released on a foreign thread must still be reusable");
+                assertEquals(1, b4.refCnt());
+                b4.writeInt(42);
+                assertEquals(42, b4.readInt());
+                b3.release();
+                b4.release();
+                result.set("ok");
+            } catch (Throwable t) {
+                result.set(t);
+            } finally {
+                helper.shutdownNow();
+            }
+        };
+        Thread thread = new FastThreadLocalThread(body);
+        thread.start();
+        thread.join();
+        if (result.get() instanceof Throwable) {
+            throw (Throwable) result.get();
+        }
+        assertEquals("ok", result.get());
+    }
+
+    /** The number of wrappers parked in this thread's magazine for {@code size}, read straight off the fields. */
+    private static int wrapperTop(AdaptivePoolingAllocator allocator, int size) throws Exception {
+        Field heapField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalSizeClassHeap");
+        heapField.setAccessible(true);
+        FastThreadLocal<?> tl = (FastThreadLocal<?>) heapField.get(allocator);
+        Object heap = tl.get();
+        Field magsField = heap.getClass().getDeclaredField("magazines");
+        magsField.setAccessible(true);
+        Object mag = ((Object[]) magsField.get(heap))[AdaptivePoolingAllocator.sizeClassIndexOf(size)];
+        Field topField = mag.getClass().getDeclaredField("wrapperTop");
+        topField.setAccessible(true);
+        return topField.getInt(mag);
     }
 
     /** Release {@code buf} on {@code helper} and wait; with {@code locks}, while holding every one of them. */
