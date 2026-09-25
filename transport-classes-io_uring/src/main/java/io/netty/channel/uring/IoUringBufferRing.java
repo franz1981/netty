@@ -222,18 +222,49 @@ final class IoUringBufferRing {
         ByteBuf byteBuf = buffers[bid];
 
         allocator.lastBytesRead(byteBuf.writableBytes(), read);
-        // We always slice so the user will not mess up things later.
-        ByteBuf buffer = byteBuf.retainedSlice(byteBuf.writerIndex(), read);
-        byteBuf.writerIndex(byteBuf.writerIndex() + read);
+        final int start = byteBuf.writerIndex();
+        // What byteBuf.isWritable() would say once the writerIndex has been advanced by read, decided
+        // before advancing it: isWritable() is capacity() - writerIndex > 0.
+        final boolean keepInRing = incremental && more && start + read < byteBuf.capacity();
 
-        if (incremental && more && byteBuf.isWritable()) {
+        if (keepInRing) {
             // The buffer will be used later again, just slice out what we did read so far.
-            return buffer;
+            ByteBuf slice = byteBuf.retainedSlice(start, read);
+            byteBuf.writerIndex(start + read);
+            if (IoUringBufferRingTelemetry.ENABLED) {
+                IoUringBufferRingTelemetry.countSlice();
+            }
+            return slice;
         }
 
-        // The buffer is considered to be used, null out the slot.
-        buffers[bid] = null;
-        byteBuf.release();
+        // The bid is retired by this read.
+        final ByteBuf buffer;
+        if (IoUringBufferRingTelemetry.NO_SLICE_HANDOFF) {
+            // Hand the buffer itself over and transfer the ring's own reference with it: no slice
+            // object and no retain/release pair for this read.  The caller sees a buffer whose
+            // capacity is the whole ring chunk instead of the bytes read.
+            byteBuf.setIndex(start, start + read);
+            buffer = byteBuf;
+            IoUringBufferRingTelemetry.countHandoff();
+            if (IoUringBufferRingTelemetry.REFCNT_TELE) {
+                IoUringBufferRingTelemetry.recordRetireRefCnt(byteBuf.refCnt());
+            }
+            // The buffer is considered to be used, null out the slot.
+            buffers[bid] = null;
+        } else {
+            // We always slice so the user will not mess up things later.
+            buffer = byteBuf.retainedSlice(start, read);
+            byteBuf.writerIndex(start + read);
+            if (IoUringBufferRingTelemetry.ENABLED) {
+                IoUringBufferRingTelemetry.countSlice();
+                if (IoUringBufferRingTelemetry.REFCNT_TELE) {
+                    IoUringBufferRingTelemetry.recordRetireRefCnt(byteBuf.refCnt());
+                }
+            }
+            // The buffer is considered to be used, null out the slot.
+            buffers[bid] = null;
+            byteBuf.release();
+        }
         if (--usableBuffers == 0) {
             int numBuffers = allocatedBuffers;
             if (needExpand) {
