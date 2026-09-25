@@ -32,6 +32,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.StampedLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -347,6 +350,83 @@ class AdaptivePoolingAllocatorTest {
             throw (Throwable) result.get();
         }
         assertEquals("ok", result.get());
+    }
+
+    /**
+     * On a shared stripe every release comes from a thread that does not hold the stripe lock, so the wrapper goes
+     * on the magazine's hand-back queue and the next lock holder drains it into the magazine's pool. The wrapper
+     * must not be lost, and must come back out reusable.
+     */
+    @Test
+    void sharedStripeWrapperReleasedOnAForeignThreadIsNotLost() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode pools fewer size classes");
+        final int size = 256;
+        final AtomicReference<Object> result = new AtomicReference<Object>();
+        Runnable body = () -> {
+            ExecutorService helper = Executors.newSingleThreadExecutor();
+            try {
+                // A plain Thread never takes the thread-local heap, so this is the shared-stripe path.
+                assertFalse(FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals());
+                AdaptivePoolingAllocator allocator =
+                        new AdaptivePoolingAllocator(new CountingChunkAllocator(), true);
+                ByteBuf b1 = allocator.allocate(size, size);
+                Object mag = sharedMagazine(allocator, size);
+                assertEquals(0, handBackSize(mag));
+                // The releasing thread holds no stripe lock, so the wrapper can only go on the hand-back queue.
+                releaseOn(helper, b1, null);
+                assertEquals(1, handBackSize(mag), "the release must land on the magazine's hand-back queue");
+                ByteBuf b2 = allocator.allocate(size, size);
+                assertEquals(0, handBackSize(mag), "the lock holder must have drained the hand-back queue");
+                assertSame(b1, b2, "a handed-back wrapper must be reusable");
+                assertEquals(1, b2.refCnt());
+                b2.writeInt(42);
+                assertEquals(42, b2.readInt());
+                b2.release();
+                result.set("ok");
+            } catch (Throwable t) {
+                result.set(t);
+            } finally {
+                helper.shutdownNow();
+            }
+        };
+        Thread thread = new Thread(body);
+        thread.start();
+        thread.join();
+        if (result.get() instanceof Throwable) {
+            throw (Throwable) result.get();
+        }
+        assertEquals("ok", result.get());
+    }
+
+    /** The one shared magazine for {@code size}, whichever stripe created it. */
+    private static Object sharedMagazine(AdaptivePoolingAllocator allocator, int size) throws Exception {
+        Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
+        stripesField.setAccessible(true);
+        Object found = null;
+        for (Object stripe : (Object[]) stripesField.get(allocator)) {
+            if (stripe == null) {
+                continue;
+            }
+            Field magsField = stripe.getClass().getDeclaredField("magazines");
+            magsField.setAccessible(true);
+            Object[] mags = (Object[]) magsField.get(stripe);
+            if (mags == null) {
+                continue;
+            }
+            Object mag = mags[AdaptivePoolingAllocator.sizeClassIndexOf(size)];
+            if (mag != null) {
+                assertNull(found, "more than one stripe has a magazine for " + size);
+                found = mag;
+            }
+        }
+        assertNotNull(found, "no shared magazine for " + size);
+        return found;
+    }
+
+    private static int handBackSize(Object magazine) throws Exception {
+        Field f = magazine.getClass().getDeclaredField("wrapperHandBack");
+        f.setAccessible(true);
+        return ((java.util.Queue<?>) f.get(magazine)).size();
     }
 
     /** The number of wrappers parked in this thread's magazine for {@code size}, read straight off the fields. */

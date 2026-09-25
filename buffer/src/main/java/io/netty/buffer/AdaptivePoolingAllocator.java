@@ -43,6 +43,7 @@ import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.Arrays;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -1547,18 +1548,29 @@ final class AdaptivePoolingAllocator {
         final SizeClassChunkRecycler chunkRecycler;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → wrapperPool
         /**
-         * The wrapper pool of a thread-local magazine: a plain LIFO of {@link AdaptiveByteBuf} instances this
-         * magazine handed out, in state the allocation path already has in hand. Non-null exactly when this
-         * magazine belongs to a {@link ThreadLocalSizeClassHeap}, i.e. when {@link #ownerThread} is set and
-         * {@link #bufRecycler} is not; {@code null} on a shared stripe.
+         * This magazine's wrapper pool: a plain LIFO of the {@link AdaptiveByteBuf} instances it handed out, in
+         * state the allocation path already has in hand, so {@link #newBuffer()} is an array pop with no
+         * {@link FastThreadLocal} lookup, no handle indirection and no handle state exchange.
          * <p>
-         * Only {@link #ownerThread} touches it: {@link #newBuffer()} pops, {@link #recycleWrapper} pushes, and a
-         * release from any other thread falls back to the wrapper's recycler handle, so no synchronization and no
-         * {@link FastThreadLocal} lookup is needed on either side. Double pushes cannot happen because
-         * {@link AdaptiveByteBuf#deallocate()} runs once per reference count reaching zero.
+         * Exactly one thread may touch it at a time, and the allocation path has already established that: on a
+         * thread-local heap it is {@link #ownerThread}, on a shared stripe it is the holder of the stripe lock.
+         * Double pushes cannot happen because {@link AdaptiveByteBuf#deallocate()} runs once per reference count
+         * reaching zero, so no state CAS is needed.
          */
         private AdaptiveByteBuf[] wrapperPool;
         private int wrapperTop;
+        /**
+         * Where a release that may not touch {@link #wrapperPool} puts the wrapper, on a shared stripe: the
+         * releasing thread does not hold the stripe lock, and taking it per release would both add an atomic and
+         * serialize releases against allocations that are lock-free today. The offer is the same single operation
+         * the {@code sharedExclusiveGet} recycler already performs on release, and the lock holder drains the
+         * queue into {@link #wrapperPool} in one batch when the pool runs dry, so the cost is amortized over a
+         * whole pool's worth of allocations instead of being paid per get. Bounded, so it cannot grow without
+         * limit on a stripe that has gone idle; an offer that does not fit falls back to the recycler handle.
+         * <p>
+         * {@code null} on a thread-local heap, where {@link #ownerThread} decides instead.
+         */
+        private final Queue<AdaptiveByteBuf> wrapperHandBack;
         private final int purgeTickThreshold;
         private int allocCount;
 
@@ -1572,7 +1584,11 @@ final class AdaptivePoolingAllocator {
             this.sizeClassIndex = sizeClassIndex;
             this.chunkRecycler = chunkRecycler;
             this.bufRecycler = bufRecycler;
-            this.wrapperPool = bufRecycler == null ? new AdaptiveByteBuf[INITIAL_WRAPPER_POOL_CAPACITY] : null;
+            this.wrapperPool = new AdaptiveByteBuf[INITIAL_WRAPPER_POOL_CAPACITY];
+            // Chunked, not fixed: a fixed queue would allocate its whole capacity up front, once per size class
+            // per stripe. Same shape the recycler's own single-consumer pool uses.
+            this.wrapperHandBack = bufRecycler == null ? null
+                    : PlatformDependent.<AdaptiveByteBuf>newMpscQueue(32, MAGAZINE_BUFFER_QUEUE_CAPACITY);
             this.chunkController = strategy.createController(allocator);
             this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
@@ -1714,32 +1730,23 @@ final class AdaptivePoolingAllocator {
                 current = null;
             }
             chunkCache.free();
-            AdaptiveByteBuf[] pool = wrapperPool;
-            if (pool != null) {
-                Arrays.fill(pool, 0, wrapperTop, null);
-                wrapperTop = 0;
+            Arrays.fill(wrapperPool, 0, wrapperTop, null);
+            wrapperTop = 0;
+            if (wrapperHandBack != null) {
+                wrapperHandBack.clear();
             }
         }
 
         AdaptiveByteBuf newBuffer() {
             AdaptiveByteBuf buf;
-            AdaptiveByteBuf[] pool = wrapperPool;
-            if (pool == null) {
-                buf = bufRecycler.get();
+            int top = wrapperTop - 1;
+            if (top >= 0) {
+                AdaptiveByteBuf[] pool = wrapperPool;
+                buf = pool[top];
+                pool[top] = null;
+                wrapperTop = top;
             } else {
-                assert ownerThread == Thread.currentThread();
-                int top = wrapperTop - 1;
-                if (top >= 0) {
-                    buf = pool[top];
-                    pool[top] = null;
-                    wrapperTop = top;
-                } else {
-                    // The pool is empty: take one from the recycler, which is both the source of new wrappers
-                    // (they need a handle for the foreign-thread release path) and where the wrappers this
-                    // magazine could not take back went. Re-home it here, whatever magazine handed it out before.
-                    buf = EVENT_LOOP_LOCAL_BUFFER_POOL.get();
-                    buf.wrapperMagazine = this;
-                }
+                buf = refillWrapperPool();
             }
             buf.resetRefCnt();
             buf.discardMarks();
@@ -1747,25 +1754,65 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Take {@code buf} back into this magazine's {@link #wrapperPool}, if this is the owner thread and the pool
-         * has room. Returns {@code false} when the caller must fall back to the wrapper's recycler handle, which is
-         * what a release from a foreign thread does.
+         * The wrapper pool is empty: take the handed-back wrappers in one batch and return the first of them, or,
+         * when there are none, a wrapper from the recycler. The recycler is both where new wrappers come from -
+         * they need a handle for the releases this magazine cannot take - and where the wrappers it could not take
+         * back went, so this also picks those up. The wrapper is re-homed here, whoever handed it out before.
          */
-        boolean recycleWrapper(AdaptiveByteBuf buf) {
-            if (ownerThread != Thread.currentThread()) {
-                return false;
+        private AdaptiveByteBuf refillWrapperPool() {
+            Queue<AdaptiveByteBuf> handBack = wrapperHandBack;
+            if (handBack == null) {
+                AdaptiveByteBuf buf = EVENT_LOOP_LOCAL_BUFFER_POOL.get();
+                buf.wrapperMagazine = this;
+                return buf;
+            }
+            AdaptiveByteBuf first = handBack.poll();
+            if (first == null) {
+                AdaptiveByteBuf buf = bufRecycler.get();
+                buf.wrapperMagazine = this;
+                return buf;
             }
             AdaptiveByteBuf[] pool = wrapperPool;
-            int top = wrapperTop;
-            if (top == pool.length) {
-                if (top >= MAGAZINE_BUFFER_QUEUE_CAPACITY) {
-                    return false;
+            int top = 0;
+            for (;;) {
+                if (top == pool.length) {
+                    if (top >= MAGAZINE_BUFFER_QUEUE_CAPACITY) {
+                        break;
+                    }
+                    pool = wrapperPool = Arrays.copyOf(pool, Math.min(top * 2, MAGAZINE_BUFFER_QUEUE_CAPACITY));
                 }
-                pool = wrapperPool = Arrays.copyOf(pool, Math.min(top * 2, MAGAZINE_BUFFER_QUEUE_CAPACITY));
+                AdaptiveByteBuf next = handBack.poll();
+                if (next == null) {
+                    break;
+                }
+                pool[top++] = next;
             }
-            pool[top] = buf;
-            wrapperTop = top + 1;
-            return true;
+            wrapperTop = top;
+            return first;
+        }
+
+        /**
+         * Take {@code buf} back. On a thread-local heap only the owner thread may push, straight into
+         * {@link #wrapperPool}; on a shared stripe the wrapper goes on {@link #wrapperHandBack}, which the lock
+         * holder drains. Returns {@code false} when the caller must fall back to the wrapper's recycler handle:
+         * a foreign release of a thread-local wrapper, a full pool, or a full hand-back queue.
+         */
+        boolean recycleWrapper(AdaptiveByteBuf buf) {
+            if (ownerThread == Thread.currentThread()) {
+                AdaptiveByteBuf[] pool = wrapperPool;
+                int top = wrapperTop;
+                if (top == pool.length) {
+                    if (top >= MAGAZINE_BUFFER_QUEUE_CAPACITY) {
+                        return false;
+                    }
+                    pool = wrapperPool = Arrays.copyOf(pool, Math.min(top * 2, MAGAZINE_BUFFER_QUEUE_CAPACITY));
+                }
+                pool[top] = buf;
+                wrapperTop = top + 1;
+                return true;
+            }
+            Queue<AdaptiveByteBuf> handBack = wrapperHandBack;
+            return handBack != null && handBack.offer(buf);
         }
     }
 
