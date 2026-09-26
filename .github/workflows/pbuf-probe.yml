@@ -1,0 +1,45 @@
+name: pbuf-ring probe (diagnostic)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "diag/pbuf-ring-probe" ]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static probe
+        run: gcc -O0 -static -o pbufprobe .github/pbufprobe.c
+
+      - name: Host environment
+        run: |
+          uname -a
+          cat /proc/sys/kernel/io_uring_disabled || true
+          ulimit -a
+          docker version --format '{{.Server.Version}}' || true
+          docker info 2>/dev/null | grep -iA5 'Default Ulimits' || true
+          cat /etc/docker/daemon.json || true
+
+      - name: Probe on host
+        run: ./pbufprobe
+
+      - name: Probe in plain container (default ulimits, seccomp unconfined)
+        run: docker run --rm -v "$PWD:/p:ro" --security-opt seccomp=unconfined ubuntu:22.04 sh -c 'ulimit -a; /p/pbufprobe'
+
+      - name: Probe in plain container (memlock unlimited)
+        run: docker run --rm -v "$PWD:/p:ro" --security-opt seccomp=unconfined --ulimit memlock=-1:-1 ubuntu:22.04 /p/pbufprobe
+
+      - name: Probe in plain container (default seccomp)
+        run: docker run --rm -v "$PWD:/p:ro" ubuntu:22.04 /p/pbufprobe
+
+      - name: Build netty centos7 image
+        run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build
+
+      - name: Probe in netty centos7 container
+        run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run --rm build /bin/bash -c 'ulimit -a; /code/pbufprobe'
