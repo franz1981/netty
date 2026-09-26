@@ -29,6 +29,26 @@ public final class RingSinkServer {
     // only written by the kernel's recv copy. -Dsink.touch=true
     private static final boolean TOUCH = Boolean.getBoolean("sink.touch");
     private static volatile long CHECKSUM;
+    // Every allocate() the ring makes: initial fill + one refill per read + growth after ENOBUFS.
+    // ring size at the end = ALLOCS - reads (the initial fill and the growth batches are what is left).
+    private static volatile long ALLOCS;
+
+    /** Counts the ring's allocate() calls; everything else is delegated. */
+    private static final class Counting implements IoUringBufferRingAllocator {
+        private final IoUringBufferRingAllocator delegate;
+        Counting(IoUringBufferRingAllocator delegate) {
+            this.delegate = delegate;
+        }
+        @Override
+        public ByteBuf allocate() {
+            ALLOCS++;
+            return delegate.allocate();
+        }
+        @Override
+        public void lastBytesRead(int attempted, int actual) {
+            delegate.lastBytesRead(attempted, actual);
+        }
+    }
 
     public static void main(String[] args) throws Exception {
         String type = args[0];
@@ -44,18 +64,25 @@ public final class RingSinkServer {
         if ("fixed".equals(type)) {
             allocator = new IoUringFixedBufferRingAllocator(ByteBufAllocator.DEFAULT, slotSize);
         } else if ("recycling".equals(type)) {
-            allocator = new IoUringRecyclingBufferRingAllocator(ByteBufAllocator.DEFAULT, ringSize, slotSize);
+            // -Dsink.inflight=<n>: headroom beyond the ring (default: the allocator's own, a quarter of the ring)
+            int inflight = Integer.getInteger("sink.inflight", -1);
+            allocator = inflight > 0
+                    ? new IoUringRecyclingBufferRingAllocator(ByteBufAllocator.DEFAULT, ringSize, slotSize, inflight)
+                    : new IoUringRecyclingBufferRingAllocator(ByteBufAllocator.DEFAULT, ringSize, slotSize);
         } else {
             throw new IllegalArgumentException(type);
         }
         short bgId = 1;
+        // -Dsink.batch=<n>: the ring starts with this many buffers and grows by this much after ENOBUFS;
+        // ringSize makes it full from the start.
+        int batch = Integer.getInteger("sink.batch", ringSize / 4);
         IoUringBufferRingConfig ringConfig = IoUringBufferRingConfig.builder()
                 .bufferGroupId(bgId)
                 .bufferRingSize(ringSize)
-                .batchSize(ringSize / 4)
+                .batchSize(batch)
                 .incremental(false)
                 .batchAllocation(false)
-                .allocator(allocator)
+                .allocator(new Counting(allocator))
                 .build();
         IoUringIoHandlerConfig handlerConfig = new IoUringIoHandlerConfig();
         handlerConfig.setBufferRingConfig(ringConfig);
@@ -131,7 +158,7 @@ public final class RingSinkServer {
                     try {
                         while (true) {
                             Thread.sleep(200);
-                            System.out.println("STAT " + System.nanoTime() + " " + READS + " " + BYTES);
+                            System.out.println("STAT " + System.nanoTime() + " " + READS + " " + BYTES + " " + ALLOCS);
                         }
                     } catch (InterruptedException ignore) {
                         // exit
@@ -152,6 +179,10 @@ public final class RingSinkServer {
                     }
                     System.out.println("EXHAUSTED " + EXHAUSTED.get());
                     System.out.println("CHECKSUM " + CHECKSUM);
+                    System.out.println("ALLOCS " + ALLOCS + " READS " + READS + " RING_END " + (ALLOCS - READS));
+                    // region + fallbacks + everything else the default allocator holds; doubles if the region extended
+                    System.out.println("USED_DIRECT " + ((io.netty.buffer.ByteBufAllocatorMetricProvider)
+                            ByteBufAllocator.DEFAULT).metric().usedDirectMemory());
                     System.out.flush();
                 }
             }));

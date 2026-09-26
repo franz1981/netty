@@ -27,7 +27,16 @@ W=/path/to/netty ./run-sink.sh recycling 64 19001 tag 5 20   # one cell
 W=/path/to/netty ./sink-ab.sh                                # fixed vs recycling, 64/256/4096 B, 3 reps
 W=/path/to/netty ./sink-thp-ab.sh                            # THP=madvise vs always, 4096 B slots
 W=/path/to/netty ./sink-thp-touch-ab.sh                      # same, with a payload checksum in the handler
+W=/path/to/netty ./sink-full-ab.sh                           # fixed vs recycling with the ring FULL from the start
+W=/path/to/netty ./sink-inflight1.sh                         # recycling, full ring, 1 buffer of headroom
+W=/path/to/netty ./sink-thp-isolate.sh                       # huge pages: none / JVM heap only / everything
 ```
+
+`-Dsink.batch=<n>` sets the ring's batch size (`n = bufferRingSize` keeps the ring full from the start, which is the
+honest configuration: with the default quarter the ring never grows unless it hits ENOBUFS, and `EXHAUSTED` only counts
+ENOBUFS once the ring cannot grow any more). `-Dsink.inflight=<n>` sets the recycling allocator's headroom. The server
+counts the ring's `allocate()` calls: `ALLOCS - READS` at the end is the ring size, and `USED_DIRECT` is the default
+allocator's direct memory, which doubles if the region extended.
 
 `-Dsink.touch=true` makes the handler sum the payload, so user space reads the mapping too instead of only the
 kernel's recv copy writing it.
