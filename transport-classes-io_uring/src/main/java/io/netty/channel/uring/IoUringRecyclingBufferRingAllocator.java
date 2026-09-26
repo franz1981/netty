@@ -28,6 +28,7 @@ import io.netty.util.internal.PlatformDependent;
 import java.nio.ByteBuffer;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -177,11 +178,19 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
 
         /** Refcount and indices back to their initial state, so the ring can write into the buffer again. */
         ByteBuf reuse();
+
+        /** The owner-biased reference count of this buffer. */
+        Region.BiasedRefCnt counts();
     }
 
     /**
      * The buffers of one event loop. Only {@link #handback} is touched by any other thread.
      */
+    private static final AtomicIntegerFieldUpdater<Region.BiasedRefCnt> SHARED =
+            AtomicIntegerFieldUpdater.newUpdater(Region.BiasedRefCnt.class, "shared");
+    private static final AtomicIntegerFieldUpdater<Region.BiasedRefCnt> QUEUED =
+            AtomicIntegerFieldUpdater.newUpdater(Region.BiasedRefCnt.class, "queued");
+
     private final class Region {
         private final Thread owner = Thread.currentThread();
         private final Slot[] slots = new Slot[maxBuffers];
@@ -211,18 +220,9 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
             return slots[unused[--numUnused]].reuse();
         }
 
+        /** Only the owner, before closing: everything else comes back over {@link #handback} and {@link #drain()}. */
         void put(Slot slot) {
-            // Only before closing: afterwards the stack is mutated under the monitor in complete() alone, and the
-            // owner can still release a buffer that a FastThreadLocal removed after the region's own one held.
-            if (Thread.currentThread() == owner && !closing) {
-                unused[numUnused++] = slot.index();
-                return;
-            }
-            boolean offered = handback.offer(slot);
-            assert offered;
-            if (closing) {
-                complete();
-            }
+            unused[numUnused++] = slot.index();
         }
 
         void free() {
@@ -264,9 +264,76 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
 
         private boolean drain() {
             for (Slot slot = handback.poll(); slot != null; slot = handback.poll()) {
-                unused[numUnused++] = slot.index();
+                BiasedRefCnt cnt = slot.counts();
+                cnt.queued = 0;
+                // A foreign thread brought its count to zero or below, but the owner may still hold references of
+                // its own: the buffer is free only when both counts cancel out. Reading local here is safe: it is
+                // the owner's own field, or the owner is gone (closing) and stopped touching it.
+                if (!cnt.free && cnt.local + cnt.shared == 0) {
+                    cnt.free = true;
+                    unused[numUnused++] = slot.index();
+                }
             }
             return numUnused > 0;
+        }
+
+        /**
+         * Reference count with the owner's operations plain and everyone else's atomic. The two counts are never
+         * mixed: the owner adds to {@link #local}, any other thread adds to {@link #shared}, which goes negative
+         * when another thread releases references the owner took. The buffer is free once they cancel out, and
+         * only the owner decides that: it reads its own {@link #local} plus a snapshot of {@link #shared} on its
+         * release, and merges again when a foreign release hands the buffer back over the queue. Once the region
+         * is closing the owner counts as foreign too, so {@link #local} is final and any thread may read it.
+         */
+        final class BiasedRefCnt {
+            int local = 1;               // the owner thread only
+            volatile int shared;         // any other thread, atomically
+            boolean free;                // owner only: on the stack, do not push again
+            volatile int queued;         // 1 while in the hand-back queue, so a slot is offered at most once
+
+            void reset() {
+                local = 1;
+                shared = 0;
+                free = false;
+            }
+
+            boolean isOwner() {
+                return Thread.currentThread() == owner && !closing;
+            }
+
+            void retain(int n) {
+                if (isOwner()) {
+                    local += n;
+                } else {
+                    SHARED.getAndAdd(this, n);
+                }
+            }
+
+            /** @return true if this call made the buffer free; a foreign release never does, the owner merges. */
+            boolean release(Slot slot, int n) {
+                if (isOwner()) {
+                    local -= n;
+                    if (local + shared == 0) {
+                        free = true;
+                        put(slot);
+                        return true;
+                    }
+                    return false;
+                }
+                int s = SHARED.addAndGet(this, -n);
+                if (s <= 0 && QUEUED.compareAndSet(this, 0, 1)) {
+                    boolean offered = handback.offer(slot);
+                    assert offered;
+                    if (closing) {
+                        complete();
+                    }
+                }
+                return false;
+            }
+
+            int count() {
+                return local + shared;
+            }
         }
 
         private boolean extend() {
@@ -330,11 +397,45 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
                 return index;
             }
 
+            private final BiasedRefCnt cnt = new BiasedRefCnt();
+
             @Override
             public ByteBuf reuse() {
-                resetRefCnt();
+                cnt.reset();
                 setIndex(0, 0);
                 return this;
+            }
+
+            @Override
+            public BiasedRefCnt counts() {
+                return cnt;
+            }
+
+            @Override
+            public int refCnt() {
+                return cnt.count();
+            }
+
+            @Override
+            public ByteBuf retain() {
+                cnt.retain(1);
+                return this;
+            }
+
+            @Override
+            public ByteBuf retain(int increment) {
+                cnt.retain(ObjectUtil.checkPositive(increment, "increment"));
+                return this;
+            }
+
+            @Override
+            public boolean release() {
+                return cnt.release(this, 1);
+            }
+
+            @Override
+            public boolean release(int decrement) {
+                return cnt.release(this, ObjectUtil.checkPositive(decrement, "decrement"));
             }
 
             @Override
@@ -348,7 +449,8 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
 
             @Override
             protected void deallocate() {
-                put(this);
+                // Never reached: release() is handled by the biased count.
+                throw new AssertionError();
             }
         }
 
@@ -366,11 +468,45 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
                 return index;
             }
 
+            private final BiasedRefCnt cnt = new BiasedRefCnt();
+
             @Override
             public ByteBuf reuse() {
-                resetRefCnt();
+                cnt.reset();
                 setIndex(0, 0);
                 return this;
+            }
+
+            @Override
+            public BiasedRefCnt counts() {
+                return cnt;
+            }
+
+            @Override
+            public int refCnt() {
+                return cnt.count();
+            }
+
+            @Override
+            public ByteBuf retain() {
+                cnt.retain(1);
+                return this;
+            }
+
+            @Override
+            public ByteBuf retain(int increment) {
+                cnt.retain(ObjectUtil.checkPositive(increment, "increment"));
+                return this;
+            }
+
+            @Override
+            public boolean release() {
+                return cnt.release(this, 1);
+            }
+
+            @Override
+            public boolean release(int decrement) {
+                return cnt.release(this, ObjectUtil.checkPositive(decrement, "decrement"));
             }
 
             @Override
@@ -384,7 +520,8 @@ public final class IoUringRecyclingBufferRingAllocator implements IoUringBufferR
 
             @Override
             protected void deallocate() {
-                put(this);
+                // Never reached: release() is handled by the biased count.
+                throw new AssertionError();
             }
         }
     }

@@ -32,6 +32,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -184,6 +185,62 @@ public class IoUringRecyclingBufferRingAllocatorTest {
             assertEquals(0, allocator.fallbackAllocations());
             buffer.release();
             spare.release();
+        });
+    }
+
+    private static void onOtherThread(Runnable task) {
+        Thread other = new Thread(task);
+        other.start();
+        try {
+            other.join();
+        } catch (InterruptedException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    @Test
+    public void ownerAndForeignReferencesCancelOut() throws Exception {
+        onEventLoopThread(() -> {
+            IoUringRecyclingBufferRingAllocator allocator = newAllocator(1);
+            final ByteBuf buffer = allocator.allocate();
+            ByteBuf spare = allocator.allocate();
+            assertEquals(1, buffer.refCnt());
+
+            // Owner retains twice, another thread releases one of those: the count reflects both sides.
+            buffer.retain().retain();
+            assertEquals(3, buffer.refCnt());
+            onOtherThread(buffer::release);
+            assertEquals(2, buffer.refCnt());
+            assertTrue(buffer.refCnt() > 0);
+            assertFalse(buffer.release());
+            assertTrue(buffer.release());
+            assertEquals(0, buffer.refCnt());
+            assertEquals(0, buffer.refCnt());
+            assertSame(buffer, allocator.allocate());
+            assertEquals(1, buffer.refCnt());
+
+            // Another thread retains, the owner releases its own reference first: not free until the other
+            // thread lets go, then the owner picks it up again from the hand-back queue.
+            onOtherThread(buffer::retain);
+            assertEquals(2, buffer.refCnt());
+            assertFalse(buffer.release());
+            assertEquals(1, buffer.refCnt());
+            assertTrue(buffer.refCnt() > 0);
+            onOtherThread(buffer::release);
+            assertEquals(0, buffer.refCnt());
+            assertSame(buffer, allocator.allocate());
+
+            // Released twice from other threads while the owner holds two: handed back twice, freed once.
+            buffer.retain();
+            onOtherThread(buffer::release);
+            onOtherThread(buffer::release);
+            assertEquals(0, buffer.refCnt());
+            assertSame(buffer, allocator.allocate());
+            assertEquals(1, buffer.refCnt());
+
+            buffer.release();
+            spare.release();
+            assertEquals(0, allocator.fallbackAllocations());
         });
     }
 

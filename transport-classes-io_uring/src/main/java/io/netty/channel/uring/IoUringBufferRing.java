@@ -226,18 +226,21 @@ final class IoUringBufferRing {
         // entry can hold. Clamp to what this entry can actually provide; the caller loops over the
         // remainder using the next bid (see nextBid(short)).
         int len = Math.min(read, byteBuf.writableBytes());
-        // We always slice so the user will not mess up things later.
-        ByteBuf buffer = byteBuf.retainedSlice(byteBuf.writerIndex(), len);
-        byteBuf.writerIndex(byteBuf.writerIndex() + len);
+        int offset = byteBuf.writerIndex();
+        byteBuf.writerIndex(offset + len);
 
         if (incremental && more && byteBuf.isWritable()) {
-            // The buffer will be used later again, just slice out what we did read so far.
-            return buffer;
+            // The kernel writes into this buffer again, so the ring keeps its own reference.
+            return byteBuf.retainedSlice(offset, len);
         }
 
-        // The buffer is considered to be used, null out the slot.
+        // The buffer is considered to be used: null out the slot and hand the ring's reference to the caller
+        // instead of retain() + release().
         buffers[bid] = null;
-        byteBuf.release();
+        // offset == 0: nobody else has a view of this buffer, return it as is.
+        // offset > 0: earlier incremental slices share this memory, so return a view; a discardReadBytes() on
+        // the parent would otherwise corrupt them.
+        ByteBuf buffer = offset == 0 ? byteBuf : byteBuf.slice(offset, len);
         if (--usableBuffers == 0) {
             int numBuffers = allocatedBuffers;
             if (needExpand) {
