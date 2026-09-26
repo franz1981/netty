@@ -10,6 +10,7 @@ permissions:
 
 env:
   MAVEN_OPTS: -Xmx6g -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false
+  COMPOSE_BAKE: "true"
 
 jobs:
   uring-tests:
@@ -31,6 +32,17 @@ jobs:
           key: ${{ runner.os }}-uring-diag-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             ${{ runner.os }}-uring-diag-maven-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build docker image
         run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build
