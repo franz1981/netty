@@ -1,0 +1,51 @@
+name: io_uring module tests per runner image (diagnostic)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "diag/pbuf-ring-probe" ]
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_OPTS: -Xmx6g -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false
+
+jobs:
+  uring-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kernel
+        run: uname -r
+
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-uring-diag-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-uring-diag-maven-
+
+      - name: Build docker image
+        run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build
+
+      - name: Build io_uring module and run its tests
+        run: |
+          docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run --rm build /bin/bash -cl "
+            ./mvnw -B -ntp -pl transport-native-io_uring -am clean install -DskipTests -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true &&
+            ./mvnw -B -ntp -pl transport-native-io_uring test -Dio.netty.testsuite.badHost=netty.io -Dtcnative.classifier=linux-x86_64-fedora -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true
+          " | tee uring-tests.output
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "== io_uring support dump"; grep -m1 -o 'IoUring support is available.*REGISTER_BUFFER_RING_SUPPORTED=[a-z]*' uring-tests.output | tr ',' '\n' | grep -E 'kernel|BUFFER_RING' || true
+          echo "== buffer ring test classes: run counts"; grep -E 'Tests run:.*IoUringBufferRing' uring-tests.output | sed 's/.*Tests run/Tests run/' || true
+          echo "== module total"; grep -E '^\[INFO\] Tests run: [0-9]+, Failures: [0-9]+, Errors: [0-9]+, Skipped: [0-9]+$' uring-tests.output | tail -1 || true
+          grep -E '<<< (FAILURE|ERROR)!' uring-tests.output || true
