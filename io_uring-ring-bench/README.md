@@ -26,7 +26,11 @@ buffer on a saturated loop, not aggregate throughput.
 W=/path/to/netty ./run-sink.sh recycling 64 19001 tag 5 20   # one cell
 W=/path/to/netty ./sink-ab.sh                                # fixed vs recycling, 64/256/4096 B, 3 reps
 W=/path/to/netty ./sink-thp-ab.sh                            # THP=madvise vs always, 4096 B slots
+W=/path/to/netty ./sink-thp-touch-ab.sh                      # same, with a payload checksum in the handler
 ```
+
+`-Dsink.touch=true` makes the handler sum the payload, so user space reads the mapping too instead of only the
+kernel's recv copy writing it.
 
 `W` points at a netty checkout with the PR built (`mvn install -pl transport-native-io_uring -am` plus
 `microbench`); `io_uring-ring-bench/classes` holds the compiled harness. `CORE`, `CONNS`, `RING`, `JAVA`,

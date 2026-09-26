@@ -25,6 +25,10 @@ public final class RingSinkServer {
     // Written by the single event loop, read by the stat thread: plain volatile counters (no atomics on the hot path).
     private static volatile long READS;
     private static volatile long BYTES;
+    // Optional consumer-side work: sum the payload, so the mapping is read by user space too and not
+    // only written by the kernel's recv copy. -Dsink.touch=true
+    private static final boolean TOUCH = Boolean.getBoolean("sink.touch");
+    private static volatile long CHECKSUM;
 
     public static void main(String[] args) throws Exception {
         String type = args[0];
@@ -61,7 +65,8 @@ public final class RingSinkServer {
                 + " allocator=" + allocator.getClass().getSimpleName()
                 + " channelAllocator=" + ByteBufAllocator.DEFAULT.getClass().getSimpleName()
                 + " recvMultishot=" + IoUring.isRecvMultishotEnabled()
-                + " recvsendBundle=" + IoUring.isRecvsendBundleEnabled());
+                + " recvsendBundle=" + IoUring.isRecvsendBundleEnabled()
+                + " touch=" + TOUCH);
         MultiThreadIoEventLoopGroup group =
                 new MultiThreadIoEventLoopGroup(loops, IoUringIoHandler.newFactory(handlerConfig));
         try {
@@ -76,17 +81,34 @@ public final class RingSinkServer {
                             ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                                 private long reads;
                                 private long bytes;
+                                private long sum;
                                 @Override
                                 public void channelRead(ChannelHandlerContext ctx, Object msg) {
                                     ByteBuf buf = (ByteBuf) msg;
-                                    bytes += buf.readableBytes();
+                                    int n = buf.readableBytes();
+                                    bytes += n;
                                     reads++;
+                                    if (TOUCH) {
+                                        long s = sum;
+                                        int i = buf.readerIndex();
+                                        int end = i + n;
+                                        for (; i + 8 <= end; i += 8) {
+                                            s += buf.getLong(i);
+                                        }
+                                        for (; i < end; i++) {
+                                            s += buf.getByte(i);
+                                        }
+                                        sum = s;
+                                    }
                                     buf.release();
                                 }
                                 @Override
                                 public void channelReadComplete(ChannelHandlerContext ctx) {
                                     // one loop: publish per read-complete, not per read
                                     READS += reads; BYTES += bytes; reads = 0; bytes = 0;
+                                    if (TOUCH) {
+                                        CHECKSUM += sum; sum = 0;
+                                    }
                                 }
                                 @Override
                                 public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
@@ -129,6 +151,7 @@ public final class RingSinkServer {
                         System.out.println("FALLBACKS n/a");
                     }
                     System.out.println("EXHAUSTED " + EXHAUSTED.get());
+                    System.out.println("CHECKSUM " + CHECKSUM);
                     System.out.flush();
                 }
             }));

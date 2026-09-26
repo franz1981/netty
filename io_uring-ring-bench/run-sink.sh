@@ -7,7 +7,7 @@ JAVA=${JAVA:-java}
 TYPE=$1; SLOT=$2; PORT=$3; TAG=$4; WARM=${5:-5}; MEASURE=${6:-20}
 LOOPS=1; RING=${RING:-16384}; CONNS=${CONNS:-8}; CORE=${CORE:-3}
 OUT=${OUTDIR:-/tmp}/sink-$TAG-$TYPE-$SLOT
-JOPTS="-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g -Dio.netty.leakDetection.level=disabled"
+JOPTS="-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g -Dio.netty.leakDetection.level=disabled ${EXTRA_JOPTS:-}"
 
 taskset -c $CORE ${SERVER_NUMA:-numactl --membind=0} $JAVA $JOPTS -cp "$CP" RingSinkServer "$TYPE" $SLOT $LOOPS $PORT $RING > "$OUT.server" 2>&1 &
 SPID=$!
