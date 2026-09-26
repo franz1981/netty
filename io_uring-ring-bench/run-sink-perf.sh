@@ -7,7 +7,7 @@ JAVA=${JAVA:-java}
 TYPE=$1; SLOT=$2; PORT=$3; TAG=$4; WARM=${5:-5}; MEASURE=${6:-20}
 LOOPS=1; RING=${RING:-16384}; CONNS=${CONNS:-8}; CORE=${CORE:-3}
 OUT=${OUTDIR:-/tmp}/sinkthp-$TAG-$TYPE-$SLOT
-JOPTS="-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g -Dio.netty.leakDetection.level=disabled ${EXTRA_JOPTS:-}"
+JOPTS="-Xms1g -Xmx1g -XX:MaxDirectMemorySize=2g -Dio.netty.leakDetection.level=disabled -XX:+UnlockDiagnosticVMOptions -XX:+DumpPerfMapAtExit -XX:+PreserveFramePointer ${EXTRA_JOPTS:-}"
 
 taskset -c $CORE ${SERVER_NUMA:-numactl --membind=0} $JAVA $JOPTS -cp "$CP" RingSinkServer "$TYPE" $SLOT $LOOPS $PORT $RING > "$OUT.server" 2>&1 &
 SPID=$!
@@ -22,7 +22,7 @@ sleep $WARM
 ( for i in 1 2 3 4 5 6; do cut -d' ' -f4 /proc/loadavg; sleep 3; done ) > "$OUT.runnable" &
 ( sleep 8; grep -E "^(Rss|AnonHugePages)" /proc/$SPID/smaps_rollup ) > "$OUT.smaps" &
 S0=$(grep STAT "$OUT.server" | tail -1)
-perf stat -e task-clock,cycles,instructions,cycles:u,cycles:k,instructions:u -p $SPID -- sleep $MEASURE 2> "$OUT.perf"
+perf record -e cycles -c 400000 -o "$OUT.perfdata" -p $SPID -- sleep $MEASURE 2> "$OUT.perf"; perf stat -e task-clock -p $SPID -- sleep 1 2>> "$OUT.perf"
 S1=$(grep STAT "$OUT.server" | tail -1)
 wait $CPID
 kill -TERM $SPID 2>/dev/null; wait $SPID 2>/dev/null
@@ -39,6 +39,6 @@ grep -E "^FALLBACKS|^EXHAUSTED" "$OUT.server" | tr '\n' ' '; echo
 echo "window: reads=$((R1-R0)) bytes=$((B1-B0)) secs=$(echo "scale=3; ($T1-$T0)/1000000000" | bc) taskclock_ms=$TC"
 echo "per read: ns_cpu=$(echo "scale=1; $TC*1000000/($R1-$R0)" | bc) cycles=$(echo "scale=0; $CYC/($R1-$R0)" | bc) insns=$(echo "scale=0; $INS/($R1-$R0)" | bc) bytes=$(echo "scale=1; ($B1-$B0)/($R1-$R0)" | bc)"
 echo "rates: reads/s=$(echo "scale=0; ($R1-$R0)*1000000000/($T1-$T0)" | bc) MB/s=$(echo "scale=1; ($B1-$B0)*1000000000/($T1-$T0)/1048576" | bc) cpu_share=$(echo "scale=3; $TC/1000/(($T1-$T0)/1000000000)" | bc)"
-CU=$(grep "cycles:u" "$OUT.perf" | awk '{gsub(",","",$1); print $1}'); CK=$(grep "cycles:k" "$OUT.perf" | awk '{gsub(",","",$1); print $1}'); IU=$(grep "instructions:u" "$OUT.perf" | awk '{gsub(",","",$1); print $1}')
-echo "split: cycles_u=$(echo "scale=0; $CU/($R1-$R0)" | bc) cycles_k=$(echo "scale=0; $CK/($R1-$R0)" | bc) insns_u=$(echo "scale=0; $IU/($R1-$R0)" | bc) $(tr '\n' ' ' < "$OUT.smaps")"
+TLB=$(grep "ls_l1_d_tlb_miss.all_l2_miss" "$OUT.perf" | awk '{gsub(",","",$1); print $1}')
+echo "walks_per_read=$(echo "scale=2; $TLB/($R1-$R0)" | bc) thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled) $(tr '\n' ' ' < "$OUT.smaps")"
 echo "runnable=$(tr '\n' ',' < "$OUT.runnable")"

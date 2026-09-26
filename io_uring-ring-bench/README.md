@@ -52,3 +52,12 @@ kernel's recv copy writing it.
 
 Sanity fields to check in every cell before reading a number: server core at ~99% share, `FALLBACKS 0`,
 `EXHAUSTED 0`, bytes received == bytes sent, low runnable count.
+
+## useBuffer() handover experiment (2026-09-27)
+
+`sink-handover-ab.sh`, `sink-biased-ab.sh` and `sink-profiles.sh` compare three benchmark jars (`JARS=<dir>` holding
+`mb-before.jar`, `mb-after.jar`, `mb-biased.jar`): the PR head, the PR head with `IoUringBufferRing.useBuffer()` handing
+its own reference to the pipeline instead of `retainedSlice()` + `release()`, and that plus an owner-biased reference
+count on the recycling slots. `run-sink-thp.sh` now also reports `cycles:u` / `cycles:k` per read, which is the number
+that bounds any user-space work: the kernel owns ~86% of a 64 B read on this box. `run-sink-perf.sh` records a
+`perf` profile of the server with JIT symbols (`-XX:+DumpPerfMapAtExit`).

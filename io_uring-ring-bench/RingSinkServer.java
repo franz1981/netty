@@ -80,7 +80,7 @@ public final class RingSinkServer {
                 .bufferGroupId(bgId)
                 .bufferRingSize(ringSize)
                 .batchSize(batch)
-                .incremental(false)
+                .incremental(Boolean.getBoolean("sink.incremental"))
                 .batchAllocation(false)
                 .allocator(new Counting(allocator))
                 .build();
