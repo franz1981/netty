@@ -10,36 +10,41 @@ permissions:
 
 jobs:
   probe:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build static probe
-        run: gcc -O0 -static -o pbufprobe .github/pbufprobe.c
+      - name: Install liburing and strace
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq liburing-dev strace > /dev/null
+
+      - name: Build probes
+        run: |
+          gcc -O0 -static -o pbufprobe .github/pbufprobe.c
+          gcc -O0 -o liburingprobe .github/liburingprobe.c -luring
 
       - name: Host environment
         run: |
-          uname -a
+          uname -a; cat /proc/version
           cat /proc/sys/kernel/io_uring_disabled || true
-          ulimit -a
-          docker version --format '{{.Server.Version}}' || true
-          docker info 2>/dev/null | grep -iA5 'Default Ulimits' || true
-          cat /etc/docker/daemon.json || true
+          sudo aa-status 2>/dev/null | head -5 || true
+          cat /sys/kernel/security/lsm || true
+          sudo sysctl -a 2>/dev/null | grep -i uring || true
 
-      - name: Probe on host
+      - name: Raw probe (unprivileged)
         run: ./pbufprobe
 
-      - name: Probe in plain container (default ulimits, seccomp unconfined)
-        run: docker run --rm -v "$PWD:/p:ro" --security-opt seccomp=unconfined ubuntu:22.04 sh -c 'ulimit -a; /p/pbufprobe'
+      - name: Raw probe (root)
+        run: sudo ./pbufprobe
 
-      - name: Probe in plain container (memlock unlimited)
-        run: docker run --rm -v "$PWD:/p:ro" --security-opt seccomp=unconfined --ulimit memlock=-1:-1 ubuntu:22.04 /p/pbufprobe
+      - name: liburing probe
+        run: ./liburingprobe
 
-      - name: Probe in plain container (default seccomp)
-        run: docker run --rm -v "$PWD:/p:ro" ubuntu:22.04 /p/pbufprobe
+      - name: strace io_uring_register
+        run: strace -f -e trace=io_uring_setup,io_uring_register ./pbufprobe 2>&1 | tail -20
 
-      - name: Build netty centos7 image
-        run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build
-
-      - name: Probe in netty centos7 container
-        run: docker compose -f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run --rm build /bin/bash -c 'ulimit -a; /code/pbufprobe'
+      - name: dmesg tail
+        run: sudo dmesg 2>/dev/null | tail -30 || true
