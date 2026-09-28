@@ -212,6 +212,99 @@ public class SizeClassChunkRecyclerTest {
         assertNull(recycler.takeBuffer());
     }
 
+    /** Offer {@code count} accounted buffers of {@code sizeClassIndex}, oldest first. */
+    private static List<AbstractByteBuf> offerAccounted(AdaptivePoolingAllocator allocator,
+                                                        SizeClassChunkRecycler recycler,
+                                                        int sizeClassIndex, int count) {
+        List<AbstractByteBuf> offered = new ArrayList<AbstractByteBuf>();
+        for (int i = 0; i < count; i++) {
+            AbstractByteBuf buf = buffer(sizeClassIndex);
+            allocator.chunkBufferAllocated(chunkInfo(buf), true, false);
+            assertTrue(recycler.offer(buf, freeList(64), localFreeList(64), sizeClassIndex));
+            offered.add(buf);
+        }
+        return offered;
+    }
+
+    /**
+     * Buffers that sat in a pool through a whole interval are freed half at a time, oldest first: a buffer offered
+     * just before a decay survives it, and a pool drains 8, 4, 2, 1, 1 over consecutive intervals.
+     */
+    @Test
+    public void coldBuffersAreFreedHalfAtATimeOldestFirst() {
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
+        SizeClassChunkRecycler recycler = new SizeClassChunkRecycler(allocator);
+        List<AbstractByteBuf> offered = offerAccounted(allocator, recycler, LARGE, 8);
+        int chunk = chunkSize(LARGE);
+        long t = System.nanoTime();
+
+        recycler.decay(t += SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        assertEquals(8, recycler.size(LARGE), "offered during this interval: not cold yet");
+
+        int[] expected = {4, 2, 1, 0, 0};
+        for (int remaining : expected) {
+            recycler.decay(t += SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+            assertEquals(remaining, recycler.size(LARGE));
+            assertEquals((long) remaining * chunk, recycler.retainedBytes());
+            assertEquals((long) remaining * chunk, allocator.usedMemory(), "freed buffers leave the account");
+            for (int i = 0; i < offered.size(); i++) {
+                assertEquals(i < offered.size() - remaining ? 0 : 1, offered.get(i).refCnt(),
+                        "the oldest are freed first, buffer " + i);
+            }
+        }
+    }
+
+    /** A buffer taken during an interval is not cold, even when it comes back before the decay. */
+    @Test
+    public void buffersTakenDuringTheIntervalAreNotCold() {
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
+        SizeClassChunkRecycler recycler = new SizeClassChunkRecycler(allocator);
+        offerAccounted(allocator, recycler, LARGE, 8);
+        long t = System.nanoTime();
+        recycler.decay(t += SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+
+        // Three are taken and given back: five sat untouched.
+        List<AbstractByteBuf> taken = new ArrayList<AbstractByteBuf>();
+        for (int i = 0; i < 3; i++) {
+            assertTrue(recycler.poll(LARGE));
+            taken.add(recycler.takeBuffer());
+            recycler.takeFreeList();
+            recycler.takeLocalFreeList();
+        }
+        for (AbstractByteBuf buf : taken) {
+            assertTrue(recycler.offer(buf, freeList(64), localFreeList(64), LARGE));
+        }
+
+        recycler.decay(t + SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        assertEquals(8 - 3, recycler.size(LARGE), "half of the five cold ones, rounded up, are freed");
+        for (AbstractByteBuf buf : taken) {
+            assertEquals(1, buf.refCnt(), "a buffer taken during the interval survives");
+        }
+        recycler.freeAll();
+    }
+
+    /**
+     * A purge tick decays only once the interval has passed and the heap made enough allocations since the last
+     * decay, whichever comes last; the ticks themselves are far more frequent.
+     */
+    @Test
+    public void ticksDecayOnlyAfterTheIntervalAndEnoughAllocations() {
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
+        SizeClassChunkRecycler recycler = new SizeClassChunkRecycler(allocator);
+        offerAccounted(allocator, recycler, LARGE, 2);
+        // Both buffers are cold from here, and the last decay was long ago.
+        recycler.decay(System.nanoTime() - 2 * SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+
+        recycler.tick(SizeClassChunkRecycler.DECAY_MIN_ALLOCATIONS - 1);
+        assertEquals(2, recycler.size(LARGE), "the interval passed, but not enough allocations");
+        recycler.tick(1);
+        assertEquals(1, recycler.size(LARGE), "both passed: half of the cold ones are freed");
+        recycler.tick(2 * SizeClassChunkRecycler.DECAY_MIN_ALLOCATIONS);
+        assertEquals(1, recycler.size(LARGE), "enough allocations, but the interval started again");
+        recycler.freeAll();
+        assertEquals(0, allocator.usedMemory());
+    }
+
     /**
      * Whatever the chunk sizes are, two size classes share a recycler pool exactly when their chunks have the same
      * size, adjacent or not.
