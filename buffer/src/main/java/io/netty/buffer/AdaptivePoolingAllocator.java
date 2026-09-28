@@ -801,9 +801,10 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * When a heap gives back the memory it keeps idle: the chunk buffers of its {@link SizeClassChunkRecycler} and
-     * the wholly free chunks of its {@link BuddyMagazine}. On a thread-local heap both age with all of the thread's
-     * allocations, whatever their size.
+     * When a heap gives back the memory it keeps idle: the chunk buffers of its {@link SizeClassChunkRecycler}, the
+     * wholly free chunks of its {@link BuddyMagazine}, and the chunks of a size class that made no allocation through
+     * a whole interval, which go to the recycler first (see {@link SizeClassMagazine#decayIfIdle}). On a thread-local
+     * heap all of it ages with all of the thread's allocations, whatever their size.
      * <p>
      * The only signal is the heap's own allocations, counted where the heap already does work: each purge tick of a
      * size class adds the allocations it counted, and each slow path of the large-buffer magazine adds one, which
@@ -824,6 +825,8 @@ final class AdaptivePoolingAllocator {
 
         /** Set once the heap has one. */
         SizeClassChunkRecycler recycler;
+        /** The heap's size-class magazines, set once the heap has them; see {@link SizeClassMagazine#decayIfIdle}. */
+        SizeClassMagazine[] magazines;
         /** Set once the heap has one: a stripe's, or a thread-local heap's for its buffers above the size classes. */
         BuddyMagazine buddyMagazine;
         // Visible for testing.
@@ -837,28 +840,30 @@ final class AdaptivePoolingAllocator {
             if (allocationsSinceCheck < DECAY_MIN_ALLOCATIONS) {
                 return;
             }
-            // A new count starts whether or not the interval passed: one look at the clock per count, no more.
+            // A new count starts whether or not the interval passed: one look at the clock per count, no more. Every
+            // count looks: a heap that allocates always holds something a decay may find idle (a size class it
+            // stopped using, a large-buffer chunk it no longer fills), so there is nothing cheaper to test first.
             allocationsSinceCheck = 0;
-            if (!holdsIdleMemory()) {
-                return;
-            }
             long now = System.nanoTime();
             if (now - lastDecayNanos >= DECAY_INTERVAL_NANOS) {
                 decay(now);
             }
         }
 
-        private boolean holdsIdleMemory() {
-            SizeClassChunkRecycler recycler = this.recycler;
-            BuddyMagazine buddyMagazine = this.buddyMagazine;
-            return recycler != null && recycler.retainedBytes() != 0 ||
-                    buddyMagazine != null && (buddyMagazine.idleChunks() != 0 || !buddyMagazine.pending.isEmpty());
-        }
-
         // Visible for testing.
         void decay(long now) {
             lastDecayNanos = now;
             allocationsSinceCheck = 0;
+            // Size classes first: what an idle one gives up goes to the recycler, which halves it from the decay
+            // after next, like any buffer offered to it.
+            SizeClassMagazine[] mags = magazines;
+            if (mags != null) {
+                for (SizeClassMagazine mag : mags) {
+                    if (mag != null) {
+                        mag.decayIfIdle();
+                    }
+                }
+            }
             if (recycler != null) {
                 recycler.decay();
             }
@@ -894,6 +899,7 @@ final class AdaptivePoolingAllocator {
             magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
             chunkRecycler = new SizeClassChunkRecycler(allocator);
             idleDecay.recycler = chunkRecycler;
+            idleDecay.magazines = magazines;
             return createMagazine(sizeClassIndex, allocator);
         }
 
@@ -1003,6 +1009,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             chunkRecycler = new SizeClassChunkRecycler(allocator);
             idleDecay.recycler = chunkRecycler;
+            idleDecay.magazines = magazines;
         }
 
         AdaptiveByteBuf allocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -1538,6 +1545,23 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        /**
+         * Evict every wholly free reusable chunk, the retention floor included: for a size class that stayed idle
+         * through a whole decay interval (see {@link SizeClassMagazine#decayIfIdle}).
+         */
+        void evictWhollyFree() {
+            drainPending();
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
+            while (cur != null) {
+                SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
+                if (cur.hasFullCapacity()) {
+                    reusable.remove(cur);
+                    cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+                }
+                cur = next;
+            }
+        }
+
         void offerChunk(SizeClassedChunk chunk) {
             if (chunk.hasRemainingCapacity()) {
                 reusable.pushFront(chunk);
@@ -1817,6 +1841,10 @@ final class AdaptivePoolingAllocator {
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
         private final int purgeTickThreshold;
         private int allocCount;
+        /** Purge ticks so far; with {@link #allocCount} it tells whether the class allocated since the last decay. */
+        private int purgeTicks;
+        private int purgeTicksAtDecay;
+        private int allocCountAtDecay;
 
         SizeClassMagazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
                           SizeClassChunkRecycler chunkRecycler, IdleDecay idleDecay, int sizeClassIndex,
@@ -1845,10 +1873,35 @@ final class AdaptivePoolingAllocator {
         void tickAllocPurge() {
             if (++allocCount >= purgeTickThreshold) {
                 allocCount = 0;
+                purgeTicks++;
                 chunkCache.tickPurge();
                 purgeHeapSiblings();
                 idleDecay.count(purgeTickThreshold);
             }
+        }
+
+        /**
+         * Called by the heap's {@link IdleDecay}: a size class that made no allocation since the previous decay gives
+         * up its current chunk and every wholly free chunk it keeps, the one it keeps as its floor included, to the
+         * heap's recycler. Its floor is for a class in use; one unused through a whole interval keeps nothing, and
+         * the recycler gives the buffers back by halves unless a size class takes them first. Chunks with buffers
+         * out stay. Reads only counters the allocations already keep.
+         */
+        void decayIfIdle() {
+            int ticks = purgeTicks;
+            int allocs = allocCount;
+            boolean idle = ticks == purgeTicksAtDecay && allocs == allocCountAtDecay;
+            purgeTicksAtDecay = ticks;
+            allocCountAtDecay = allocs;
+            if (!idle) {
+                return;
+            }
+            SizeClassedChunk curr = current;
+            if (curr != null && curr.hasFullCapacity()) {
+                current = null;
+                curr.releaseFromMagazine();
+            }
+            chunkCache.evictWhollyFree();
         }
 
         /**

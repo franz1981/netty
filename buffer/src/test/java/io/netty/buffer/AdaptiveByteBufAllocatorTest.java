@@ -1494,6 +1494,92 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
+    /** The calling thread's thread-local heap. */
+    private static Object threadLocalHeap(AdaptiveByteBufAllocator allocator) throws Exception {
+        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
+        heapField.setAccessible(true);
+        Object pooling = heapField.get(allocator);
+        Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
+        tlField.setAccessible(true);
+        return ((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(pooling)).get();
+    }
+
+    /** The current chunk of the calling thread's size-class magazine for {@code size}, or null. */
+    private static Object currentChunk(AdaptiveByteBufAllocator allocator, int size) throws Exception {
+        Object heap = threadLocalHeap(allocator);
+        Field magsField = heap.getClass().getDeclaredField("magazines");
+        magsField.setAccessible(true);
+        Object mag = ((Object[]) magsField.get(heap))[AdaptivePoolingAllocator.sizeClassIndexOf(size)];
+        Field currentField = mag.getClass().getDeclaredField("current");
+        currentField.setAccessible(true);
+        return currentField.get(mag);
+    }
+
+    /**
+     * A size class that made no allocation through a whole decay interval gives up its chunks, the one it keeps as
+     * its floor included, to the heap's recycler, which gives them back by halves; a class still allocating keeps its
+     * own.
+     */
+    @Test
+    void sizeClassIdleForAWholeIntervalGivesUpItsChunks() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int idleSize = 64 * 1024;
+            final int busySize = 256;
+            allocator.heapBuffer(idleSize, idleSize).release();
+            long idleChunk = allocator.usedHeapMemory();
+            allocator.heapBuffer(busySize).release();
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            SizeClassChunkRecycler recycler = idleDecay.recycler;
+            long used = allocator.usedHeapMemory();
+            assertNotNull(currentChunk(allocator, idleSize));
+
+            // The first decay only records where each class stands.
+            idleDecay.decay(System.nanoTime());
+            assertNotNull(currentChunk(allocator, idleSize), "allocated since the heap was created: not idle");
+            allocator.heapBuffer(busySize).release();
+
+            // Idle through a whole interval: its chunk goes to the recycler, still counted as used.
+            idleDecay.decay(System.nanoTime());
+            assertNull(currentChunk(allocator, idleSize), "the idle class gave its chunk up");
+            assertNotNull(currentChunk(allocator, busySize), "the class in use keeps its chunk");
+            assertEquals(idleChunk, recycler.retainedBytes());
+            assertEquals(used, allocator.usedHeapMemory());
+
+            // Then the recycler gives it back once it stayed there through a whole interval.
+            allocator.heapBuffer(busySize).release();
+            idleDecay.decay(System.nanoTime());
+            allocator.heapBuffer(busySize).release();
+            idleDecay.decay(System.nanoTime());
+            assertEquals(0, recycler.retainedBytes());
+            assertEquals(used - idleChunk, allocator.usedHeapMemory());
+        });
+    }
+
+    /** A chunk with a buffer out is never given up, however long its class stays idle. */
+    @Test
+    void idleSizeClassKeepsAChunkWithABufferOut() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int size = 64 * 1024;
+            ByteBuf out = allocator.heapBuffer(size, size);
+            try {
+                IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+                long used = allocator.usedHeapMemory();
+                Object chunk = currentChunk(allocator, size);
+                for (int i = 0; i < 4; i++) {
+                    idleDecay.decay(System.nanoTime());
+                }
+                assertSame(chunk, currentChunk(allocator, size));
+                assertEquals(used, allocator.usedHeapMemory());
+            } finally {
+                out.release();
+            }
+        });
+    }
+
     private static boolean isLowMemory() throws Exception {
         Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         f.setAccessible(true);
