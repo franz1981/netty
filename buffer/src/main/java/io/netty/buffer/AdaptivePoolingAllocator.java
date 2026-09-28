@@ -1709,20 +1709,22 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class BuddyChunkManagementStrategy {
-        private final AtomicInteger maxChunkSize = new AtomicInteger();
-
         BuddyChunkController createController(AdaptivePoolingAllocator allocator) {
-            return new BuddyChunkController(allocator.chunkAllocator, maxChunkSize);
+            return new BuddyChunkController(allocator.chunkAllocator);
         }
     }
 
     private static final class BuddyChunkController {
         private final ChunkAllocator chunkAllocator;
-        private final AtomicInteger maxChunkSize;
+        /**
+         * The largest chunk this magazine made so far; its chunks never shrink below it, so a magazine serving mixed
+         * sizes does not go back and forth between chunk sizes. One per magazine, guarded like it: a heap that only
+         * sees small large-buffers keeps small chunks whatever other heaps allocate.
+         */
+        private int maxChunkSize;
 
-        BuddyChunkController(ChunkAllocator chunkAllocator, AtomicInteger maxChunkSize) {
+        BuddyChunkController(ChunkAllocator chunkAllocator) {
             this.chunkAllocator = chunkAllocator;
-            this.maxChunkSize = maxChunkSize;
         }
 
         /**
@@ -1736,12 +1738,11 @@ final class AdaptivePoolingAllocator {
          * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}.
          */
         BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
-            int maxChunkSize = this.maxChunkSize.get();
+            int maxChunkSize = this.maxChunkSize;
             int proposedChunkSize = MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize);
             int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(maxChunkSize, proposedChunkSize));
             if (chunkSize > maxChunkSize) {
-                // Update our stored max chunk size. It's fine that this is racy.
-                this.maxChunkSize.set(chunkSize);
+                this.maxChunkSize = chunkSize;
             }
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             // Buddy magazines live on the shared stripes only, so a buddy chunk is never thread-local.
