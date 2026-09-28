@@ -583,20 +583,22 @@ final class AdaptivePoolingAllocator {
      * size classes, whose chunks are given up at the rate of the small ones (measured on E_COMMERCE heap 16384:
      * 12 GiB of chunk buffers allocated in 20 s, and four times the garbage collections).
      * <p>
-     * <p>
-     * Buffers nobody takes go back to the chunk allocator slowly, like the Java mimalloc port's reserved segments: at
-     * most once every {@link #DECAY_INTERVAL_NANOS}, and only after the heap made {@link #DECAY_MIN_ALLOCATIONS}
-     * allocations since the last time, half of the buffers that sat in a pool through the whole interval are freed.
-     * The check runs on the heap's purge ticks, which are far more frequent than that, so the interval and not the
-     * ticks set the pace; a heap that stops allocating keeps its buffers until it is freed. Nothing is allocated on
-     * the way, and no thread but the heap's own is involved.
+     * Buffers nobody takes go back to the chunk allocator slowly, like the Java mimalloc port's reserved segments.
+     * Every {@link #DECAY_MIN_ALLOCATIONS} allocations of the heap the recycler looks at the clock, and when
+     * {@link #DECAY_INTERVAL_NANOS} passed since its last decay it frees half, rounded up, of the buffers that sat in
+     * its pools through the whole interval, oldest first; otherwise it waits for the next such count, exactly as the
+     * port checks its interval only when it collects. The port counts its generic allocations, which are every one
+     * above 1 KiB but only the slow paths below: a heap of small buffers reaches the count sooner here, a stripe of
+     * buffers above the size classes, which never tick, later. The count is carried by the heap's purge ticks, so it
+     * costs nothing per allocation. A heap that stops allocating keeps its buffers until it is freed. Nothing is
+     * allocated on the way, and no thread but the heap's own is involved.
      * <p>
      * Accessed only under the owning stripe lock, or by the owner thread of a thread-local heap.
      */
     static final class SizeClassChunkRecycler {
         /** At most one decay per this interval: 10 s, as the Java mimalloc port decays its reserved segments. */
         static final long DECAY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
-        /** And only after this many allocations on the heap: the Java mimalloc port's collect interval. */
+        /** How many allocations of the heap between two looks at the clock: the Java port's collect count. */
         static final long DECAY_MIN_ALLOCATIONS = 10000;
 
         /**
@@ -773,7 +775,12 @@ final class AdaptivePoolingAllocator {
          */
         void tick(long allocations) {
             allocationsSinceDecay += allocations;
-            if (retainedBytes == 0 || allocationsSinceDecay < DECAY_MIN_ALLOCATIONS) {
+            if (allocationsSinceDecay < DECAY_MIN_ALLOCATIONS) {
+                return;
+            }
+            // A new count starts whether or not the interval passed: one look at the clock per count, no more.
+            allocationsSinceDecay = 0;
+            if (retainedBytes == 0) {
                 return;
             }
             long now = System.nanoTime();
@@ -783,15 +790,22 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Free half of every pool's cold buffers, rounded up, from the bottom of its stack, and start a new interval
-         * in which the buffers still pooled are the candidates.
+         * Free half of the cold buffers, rounded up once over all the pools as the port rounds its one deque, each
+         * pool's from the bottom of its stack, and start a new interval in which the buffers still pooled are the
+         * candidates.
          */
         // Visible for testing.
         void decay(long now) {
             lastDecayNanos = now;
             allocationsSinceDecay = 0;
+            int cold = 0;
             for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
-                int free = (coldCounts[pool] + 1) >>> 1;
+                cold += coldCounts[pool];
+            }
+            int allowance = (cold + 1) >>> 1;
+            for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
+                int free = Math.min((coldCounts[pool] + 1) >>> 1, allowance);
+                allowance -= free;
                 int size = sizes[pool];
                 if (free > 0) {
                     AbstractByteBuf[] buffers = this.buffers[pool];

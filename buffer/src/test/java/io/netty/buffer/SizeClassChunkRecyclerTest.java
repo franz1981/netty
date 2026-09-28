@@ -230,6 +230,56 @@ public class SizeClassChunkRecyclerTest {
      * Buffers that sat in a pool through a whole interval are freed half at a time, oldest first: a buffer offered
      * just before a decay survives it, and a pool drains 8, 4, 2, 1, 1 over consecutive intervals.
      */
+    /**
+     * Freeing the oldest buffers moves the others down their pool: each must still come out with its own free lists.
+     */
+    @Test
+    public void buffersKeepTheirFreeListsAcrossADecay() {
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
+        SizeClassChunkRecycler recycler = new SizeClassChunkRecycler(allocator);
+        List<AbstractByteBuf> offered = new ArrayList<AbstractByteBuf>();
+        List<MpscIntQueue> external = new ArrayList<MpscIntQueue>();
+        List<IntStack> local = new ArrayList<IntStack>();
+        for (int i = 0; i < 6; i++) {
+            AbstractByteBuf buf = buffer(LARGE);
+            allocator.chunkBufferAllocated(chunkInfo(buf), true, false);
+            external.add(freeList(64));
+            local.add(localFreeList(64));
+            assertTrue(recycler.offer(buf, external.get(i), local.get(i), LARGE));
+            offered.add(buf);
+        }
+        long t = System.nanoTime();
+        recycler.decay(t += SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        recycler.decay(t + SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        assertEquals(3, recycler.size(LARGE));
+        for (int i = offered.size() - 1; i >= 3; i--) {
+            assertTrue(recycler.poll(LARGE));
+            assertSame(offered.get(i), recycler.takeBuffer(), "newest first");
+            assertSame(external.get(i), recycler.takeFreeList(), "with its own external free list");
+            assertSame(local.get(i), recycler.takeLocalFreeList(), "and its own local free list");
+            offered.get(i).release();
+        }
+        assertFalse(recycler.poll(LARGE));
+    }
+
+    /**
+     * Half of the cold buffers, rounded up once over all the pools: two pools with one cold buffer each give up one,
+     * not two, as the Java port rounds its single deque.
+     */
+    @Test
+    public void halfIsRoundedUpOnceOverAllThePools() {
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
+        SizeClassChunkRecycler recycler = new SizeClassChunkRecycler(allocator);
+        offerAccounted(allocator, recycler, SMALL, 1);
+        offerAccounted(allocator, recycler, LARGE, 1);
+        long t = System.nanoTime();
+        recycler.decay(t += SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        recycler.decay(t + SizeClassChunkRecycler.DECAY_INTERVAL_NANOS);
+        assertEquals(1, recycler.size(SMALL) + recycler.size(LARGE), "ceil(2 / 2) = 1 freed in total");
+        recycler.freeAll();
+        assertEquals(0, allocator.usedMemory());
+    }
+
     @Test
     public void coldBuffersAreFreedHalfAtATimeOldestFirst() {
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(new UnpooledHeapChunkAllocator(), false);
@@ -301,6 +351,10 @@ public class SizeClassChunkRecyclerTest {
         assertEquals(1, recycler.size(LARGE), "both passed: half of the cold ones are freed");
         recycler.tick(2 * SizeClassChunkRecycler.DECAY_MIN_ALLOCATIONS);
         assertEquals(1, recycler.size(LARGE), "enough allocations, but the interval started again");
+        // That look at the clock started a new count: the interval passing now is not enough on its own.
+        recycler.lastDecayNanos -= 2 * SizeClassChunkRecycler.DECAY_INTERVAL_NANOS;
+        recycler.tick(SizeClassChunkRecycler.DECAY_MIN_ALLOCATIONS - 1);
+        assertEquals(1, recycler.size(LARGE), "the interval passed, but the count restarted at the last look");
         recycler.freeAll();
         assertEquals(0, allocator.usedMemory());
     }
