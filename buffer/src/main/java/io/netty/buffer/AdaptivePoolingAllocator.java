@@ -45,6 +45,7 @@ import java.nio.channels.GatheringByteChannel;
 import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -530,6 +531,22 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    /**
+     * As {@link #chunkBufferFreed}, for a buffer a {@link SizeClassChunkRecycler} held: allocates nothing unless a
+     * JFR event is committed.
+     */
+    void recycledChunkBufferFreed(AbstractByteBuf buffer) {
+        chunkRegistry.remove(buffer.capacity());
+        if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
+            FreeChunkEvent event = new FreeChunkEvent();
+            if (event.shouldCommit()) {
+                event.fill(new SizeClassChunkRecycler.PooledChunkBuffer(buffer), AdaptiveByteBufAllocator.class);
+                event.pooled = true;
+                event.commit();
+            }
+        }
+    }
+
     // Ensure that we release all previous pooled resources when this object is finalized. This is needed as otherwise
     // we might end up with leaks. While these leaks are usually harmless in reality it would still at least be
     // very confusing for users.
@@ -566,9 +583,23 @@ final class AdaptivePoolingAllocator {
      * size classes, whose chunks are given up at the rate of the small ones (measured on E_COMMERCE heap 16384:
      * 12 GiB of chunk buffers allocated in 20 s, and four times the garbage collections).
      * <p>
+     * Buffers nobody takes go back to the chunk allocator slowly. Every {@link #DECAY_MIN_ALLOCATIONS} allocations
+     * of the heap the recycler looks at the clock once, and when {@link #DECAY_INTERVAL_NANOS} passed since its last
+     * decay it frees half, rounded up, of the buffers that sat in its pools through the whole interval, oldest first;
+     * otherwise it waits for the next count. A heap that keeps allocating keeps what it reuses, and gives back what
+     * it stopped needing by halves; a heap that stops allocating keeps its buffers until it is freed. The count is
+     * carried by the heap's purge ticks, so it costs nothing per allocation, nothing is allocated on the way, and no
+     * thread but the heap's own is involved. Allocations above the size classes never tick, so a stripe serving only
+     * those does not decay.
+     * <p>
      * Accessed only under the owning stripe lock, or by the owner thread of a thread-local heap.
      */
     static final class SizeClassChunkRecycler {
+        /** At most one decay per this interval: 10 s. */
+        static final long DECAY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
+        /** How many allocations of the heap between two looks at the clock. */
+        static final long DECAY_MIN_ALLOCATIONS = 10000;
+
         /**
          * {@code io.netty.allocator.recycledChunkBytes}: how many bytes of chunk buffers each heap (a stripe, or the
          * thread-local heap of an event loop) keeps for the next chunk of any of its size classes, at most, once the
@@ -586,6 +617,15 @@ final class AdaptivePoolingAllocator {
         private int retainedBytes;
         /** Where the buffers came from, and are accounted: still in its {@link #usedMemory()} while pooled here. */
         private final AdaptivePoolingAllocator allocator;
+        /**
+         * Per pool, the fewest buffers it held since the last decay: the bottom of the stack up to that count was not
+         * touched for the whole interval, so those buffers are the cold ones.
+         */
+        private final int[] coldCounts = new int[CHUNK_POOL_COUNT];
+        /** Allocations of the heap since the last decay, added by each purge tick for the allocations it counted. */
+        private long allocationsSinceDecay;
+        // Visible for testing.
+        long lastDecayNanos = System.nanoTime();
 
         // What the last successful poll() returned, read once by the caller.
         private AbstractByteBuf polledBuffer;
@@ -626,6 +666,9 @@ final class AdaptivePoolingAllocator {
             }
             int idx = --size;
             sizes[pool] = size;
+            if (size < coldCounts[pool]) {
+                coldCounts[pool] = size;
+            }
             retainedBytes -= CHUNK_SIZES[pool];
             polledBuffer = buffers[pool][idx];
             polledFreeList = freeLists[pool][idx];
@@ -684,8 +727,8 @@ final class AdaptivePoolingAllocator {
             return retainedBytes;
         }
 
-        /** A pooled buffer described for {@link #chunkBufferFreed}; allocated only when a chunk buffer is freed. */
-        private static final class PooledChunkBuffer implements ChunkInfo {
+        /** A pooled buffer described for a {@link FreeChunkEvent}; allocated only when one is committed. */
+        static final class PooledChunkBuffer implements ChunkInfo {
             private final AbstractByteBuf buffer;
 
             PooledChunkBuffer(AbstractByteBuf buffer) {
@@ -712,15 +755,77 @@ final class AdaptivePoolingAllocator {
             for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
                 for (int i = 0; i < sizes[pool]; i++) {
                     AbstractByteBuf buffer = buffers[pool][i];
-                    allocator.chunkBufferFreed(new PooledChunkBuffer(buffer), true);
+                    allocator.recycledChunkBufferFreed(buffer);
                     buffer.release();
                     buffers[pool][i] = null;
                     freeLists[pool][i] = null;
                     localFreeLists[pool][i] = null;
                 }
                 sizes[pool] = 0;
+                coldCounts[pool] = 0;
             }
             retainedBytes = 0;
+        }
+
+        /**
+         * A purge tick of a size class of this heap, which counted {@code allocations} allocations: decay the cold
+         * buffers when both the interval and enough allocations have passed. Cheap when they have not: no clock read
+         * until the allocation count and the pools say there could be something to do.
+         */
+        void tick(long allocations) {
+            allocationsSinceDecay += allocations;
+            if (allocationsSinceDecay < DECAY_MIN_ALLOCATIONS) {
+                return;
+            }
+            // A new count starts whether or not the interval passed: one look at the clock per count, no more.
+            allocationsSinceDecay = 0;
+            if (retainedBytes == 0) {
+                return;
+            }
+            long now = System.nanoTime();
+            if (now - lastDecayNanos >= DECAY_INTERVAL_NANOS) {
+                decay(now);
+            }
+        }
+
+        /**
+         * Free half of the cold buffers, rounded up once over all the pools rather than once per pool, so that a few
+         * pools of one cold buffer each do not all empty in one go; each pool's from the bottom of its stack. Then
+         * start a new interval in which the buffers still pooled are the candidates.
+         */
+        // Visible for testing.
+        void decay(long now) {
+            lastDecayNanos = now;
+            allocationsSinceDecay = 0;
+            int cold = 0;
+            for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
+                cold += coldCounts[pool];
+            }
+            int allowance = (cold + 1) >>> 1;
+            for (int pool = 0; pool < CHUNK_POOL_COUNT; pool++) {
+                int free = Math.min((coldCounts[pool] + 1) >>> 1, allowance);
+                allowance -= free;
+                int size = sizes[pool];
+                if (free > 0) {
+                    AbstractByteBuf[] buffers = this.buffers[pool];
+                    for (int i = 0; i < free; i++) {
+                        AbstractByteBuf buffer = buffers[i];
+                        allocator.recycledChunkBufferFreed(buffer);
+                        buffer.release();
+                    }
+                    int kept = size - free;
+                    System.arraycopy(buffers, free, buffers, 0, kept);
+                    System.arraycopy(freeLists[pool], free, freeLists[pool], 0, kept);
+                    System.arraycopy(localFreeLists[pool], free, localFreeLists[pool], 0, kept);
+                    Arrays.fill(buffers, kept, size, null);
+                    Arrays.fill(freeLists[pool], kept, size, null);
+                    Arrays.fill(localFreeLists[pool], kept, size, null);
+                    retainedBytes -= free * CHUNK_SIZES[pool];
+                    size = kept;
+                    sizes[pool] = size;
+                }
+                coldCounts[pool] = size;
+            }
         }
     }
 
@@ -1653,7 +1758,7 @@ final class AdaptivePoolingAllocator {
 
         /**
          * Count one successful allocation and, when the budget is spent, purge this magazine's cache
-         * and those of every other size class on this heap.
+         * and those of every other size class on this heap, then let the heap's recycler decay.
          *
          * <p>Call exactly once per successful {@link #allocate}.
          */
@@ -1662,6 +1767,7 @@ final class AdaptivePoolingAllocator {
                 allocCount = 0;
                 chunkCache.tickPurge();
                 purgeHeapSiblings();
+                chunkRecycler.tick(purgeTickThreshold);
             }
         }
 
