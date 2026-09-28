@@ -2240,6 +2240,16 @@ final class AdaptivePoolingAllocator {
         void decay() {
             // Chunks other threads' releases made wholly free are filed as such first, so they start aging now.
             drainPending();
+            // So is the active chunk once nothing in it is in use: it ages like the others from here, and the next
+            // allocation polls it back (one slow path) unless it stayed idle through the whole next interval.
+            BuddyChunk current = active;
+            if (current != null) {
+                current.processFreelistEntries();
+                if (current.isWhollyFree()) {
+                    active = null;
+                    file(current);
+                }
+            }
             int previous = decays++;
             int cold = 0;
             Chunk oldest = null;
