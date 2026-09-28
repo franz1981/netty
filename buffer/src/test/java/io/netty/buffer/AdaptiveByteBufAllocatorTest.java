@@ -64,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import io.netty.buffer.AbstractByteBufTest.TestGatheringByteChannel;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<AdaptiveByteBufAllocator> {
@@ -842,6 +843,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void anotherSizeClassSlowPathAppliesTheNotesOfAnIdleOne(final boolean threadLocal) throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
         onHeapThread(threadLocal, () -> {
             IdleSizeClass idle = leaveNotes(allocator, !threadLocal);
@@ -873,6 +875,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void purgeTickAppliesTheNotesOfAnIdleSizeClassAtItsInterval(final boolean threadLocal) throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
         onHeapThread(threadLocal, () -> {
             // The allocating size class gets its active chunk first: from here on, allocating and releasing one
@@ -960,6 +963,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     @Test
     void buddyReleaseNoteIsAppliedByTheNextSlowPath() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         // The probe looks at the newest full chunks only: the oldest of this many is out of its reach.
         int fullChunks = maxFullProbe() + 2;
@@ -979,6 +983,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     @Test
     void buddyBlockWhoseNoteIsStillInFlightIsFoundByTheProbe() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         int fullChunks = 2;
         // The newest full chunk, which the probe reaches first.
@@ -994,6 +999,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         } finally {
             b.releaseAll();
         }
+    }
+
+    private static boolean isLowMemory() throws Exception {
+        Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
+        f.setAccessible(true);
+        return f.getBoolean(null);
     }
 
     /** How many full chunks the buddy magazine's last-resort probe looks at. */
@@ -1246,7 +1257,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     @Test
-    void memoryFallsBackToTheRetentionFloorAfterAnIdleBurst() throws Exception {
+    void memoryFallsBackToOneChunkPerSizeClassAndTheRecyclerBudgetAfterAnIdleBurst() throws Exception {
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         long peak = runBurstWithCrossThreadReleases(allocator, false);
 

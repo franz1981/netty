@@ -24,6 +24,7 @@ import org.junit.jupiter.api.condition.EnabledForJreRange;
 import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.parallel.Isolated;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 @Timeout(10)
 @EnabledForJreRange(min = JRE.JAVA_17) // RecordingStream
@@ -101,6 +103,9 @@ public class JfrEventsTest {
     @SuppressWarnings("Since15")
     @Test
     public void adaptiveChunkEventsAddUpToUsedMemory() throws Exception {
+        Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
+        lowMem.setAccessible(true);
+        assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
         // useCacheForNonEventLoopThreads: the workload thread gets a thread-local heap, which its end frees.
         final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, true);
         final String threadName = "adaptive-chunk-events";
@@ -111,6 +116,7 @@ public class JfrEventsTest {
         final long[] allocatedFreed = new long[2];
         final int[] oneShots = new int[2];
         final AtomicInteger sizeClassChunksFreed = new AtomicInteger();
+        final AtomicInteger sizeClassChunksAllocated = new AtomicInteger();
         try (RecordingStream stream = new RecordingStream()) {
             stream.enable(AllocateChunkEvent.class);
             stream.enable(FreeChunkEvent.class);
@@ -119,6 +125,9 @@ public class JfrEventsTest {
                     sentinelSeen.countDown();
                 } else if (onWorkloadThread(event, threadName)) {
                     allocatedFreed[0] += event.getInt("capacity");
+                    if (event.getInt("capacity") == 512 * 1024) {
+                        sizeClassChunksAllocated.incrementAndGet();
+                    }
                     oneShots[0] += event.getBoolean("pooled") ? 0 : 1;
                 }
             });
@@ -150,6 +159,10 @@ public class JfrEventsTest {
             new AdaptiveByteBufAllocator(false).heapBuffer(sentinel).release();
             sentinelSeen.await();
         }
+        // 8 chunks of 16 KiB buffers, then 8 of 64 KiB: the second burst must build some of its chunks from the
+        // buffers the first one gave up, or the balance below would not cover the recycled path.
+        assertTrue(sizeClassChunksAllocated.get() < 16,
+                sizeClassChunksAllocated.get() + " chunk buffers allocated: none came from the recycler");
         assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
         assertEquals(1, oneShots[1], "and when it is freed");
         assertTrue(sizeClassChunksFreed.get() > 0, "the dying thread-local heap must free its chunk buffers");

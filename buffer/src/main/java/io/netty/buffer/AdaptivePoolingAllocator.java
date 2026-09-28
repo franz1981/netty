@@ -2095,8 +2095,8 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Constructor for a pooled chunk, created by a magazine over a new buffer or one from a
-         * {@link SizeClassChunkRecycler}.
+         * @param pooled whether the chunk serves many buffers for a magazine, over a new buffer or one from a
+         *               {@link SizeClassChunkRecycler}, or is a one-shot chunk for a single buffer
          */
         Chunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, boolean pooled) {
             this.delegate = delegate;
