@@ -22,13 +22,13 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.DecoderException;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.ImmediateEventExecutor;
-import io.netty.util.concurrent.Promise;
 import io.netty.util.internal.StringUtil;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -56,9 +56,7 @@ public class SslClientHelloHandlerTest {
                 if (hostname == null) {
                     nullRetryOccurred.set(true);
                 }
-                Promise<Object> promise = ImmediateEventExecutor.INSTANCE.newPromise();
-                promise.setSuccess(new Object());
-                return promise;
+                return ImmediateEventExecutor.INSTANCE.newSucceededFuture(new Object());
             }
 
             @Override
@@ -87,5 +85,42 @@ public class SslClientHelloHandlerTest {
         assertNotNull(cause);
         assertInstanceOf(DecoderException.class, cause);
         assertFalse(nullRetryOccurred.get(), "Expected no select(ctx, null) retry");
+    }
+
+    @Test
+    public void testLeadingEmptyHandshakeRecordDoesNotBypassSniSelection() {
+        final AtomicReference<String> hostnameRef = new AtomicReference<String>();
+
+        AbstractSniHandler<Object> handler = new AbstractSniHandler<Object>() {
+            @Override
+            protected Future<Object> lookup(ChannelHandlerContext ctx, String hostname) {
+                hostnameRef.set(hostname);
+                return ImmediateEventExecutor.INSTANCE.newSucceededFuture(new Object());
+            }
+
+            @Override
+            protected void onLookupComplete(ChannelHandlerContext ctx, String hostname,
+                                            Future<Object> future) {
+                // no-op
+            }
+        };
+
+        EmbeddedChannel ch = new EmbeddedChannel(handler);
+        try {
+            // A zero-length TLS handshake record: content type = handshake (0x16), version 3.3, length = 0.
+            String emptyHandshakeRecordHex = "1603030000";
+
+            // Prepend a zero-length handshake record before the real ClientHello. A compliant TLS
+            // stack skips the empty record and still parses the real ClientHello / SNI, so the
+            // handler must do the same instead of selecting based on a null ClientHello.
+            ch.writeInbound(Unpooled.wrappedBuffer(
+                    StringUtil.decodeHexDump(emptyHandshakeRecordHex)));
+            ch.writeInbound(Unpooled.wrappedBuffer(StringUtil.decodeHexDump(TLS_CLIENT_HELLO_HEX_PART1)));
+            ch.writeInbound(Unpooled.wrappedBuffer(StringUtil.decodeHexDump(TLS_CLIENT_HELLO_HEX_PART2)));
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+
+        assertEquals("chat4.leancloud.cn", hostnameRef.get());
     }
 }

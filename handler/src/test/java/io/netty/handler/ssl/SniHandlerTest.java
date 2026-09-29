@@ -310,7 +310,7 @@ public class SniHandlerTest {
 
     @ParameterizedTest(name = "{index}: sslProvider={0}")
     @MethodSource("data")
-    public void testFallbackToDefaultContext(SslProvider provider) throws Exception {
+    public void testEmptyHandshakeRecordDoesNotFallbackToDefaultContext(SslProvider provider) throws Exception {
         SslContext nettyContext = makeSslContext(provider, false);
         SslContext leanContext = makeSslContext(provider, false);
         SslContext leanContext2 = makeSslContext(provider, false);
@@ -328,7 +328,11 @@ public class SniHandlerTest {
             SniHandler handler = new SniHandler(mapping);
             EmbeddedChannel ch = new EmbeddedChannel(handler);
 
-            // invalid
+            // A zero-length handshake record on its own does not carry a ClientHello. It must not be
+            // treated as "no SNI present" and fall back to the default context (that would let an
+            // attacker bypass per-SNI context selection by prefixing a real ClientHello with such a
+            // record, see the empty-handshake-record ClientHello smuggling issue), it should instead
+            // simply be skipped while still waiting for a real ClientHello to arrive.
             byte[] message = {22, 3, 1, 0, 0};
             try {
                 // Push the handshake message.
@@ -353,7 +357,8 @@ public class SniHandlerTest {
 
             assertFalse(ch.finish());
             assertNull(handler.hostname());
-            assertEquals(nettyContext, handler.sslContext());
+            // No ClientHello ever arrived, so no context (in particular not the default one) must be selected.
+            assertNull(handler.sslContext());
         } finally {
             releaseAll(leanContext, leanContext2, nettyContext);
         }

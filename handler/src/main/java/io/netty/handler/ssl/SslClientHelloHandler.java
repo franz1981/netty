@@ -113,10 +113,16 @@ public abstract class SslClientHelloHandler<T> extends ByteToMessageDecoder impl
                                 if (readableBytes < packetLength) {
                                     // client hello incomplete; try again to decode once more data is ready.
                                     return;
-                                } else if (packetLength == SslUtils.SSL_RECORD_HEADER_LENGTH) {
-                                    select(ctx, null);
-                                    return;
                                 }
+
+                                // Note: we deliberately do not treat packetLength == SSL_RECORD_HEADER_LENGTH
+                                // (i.e. a zero-length handshake record) as "no ClientHello present" here. Doing
+                                // so would let an attacker smuggle a real ClientHello (with a security relevant
+                                // SNI value) past this handler by prefixing it with an empty handshake record,
+                                // as compliant TLS stacks skip such empty records and still process the
+                                // following ClientHello. Instead we fall through to the normal handling below,
+                                // which safely accumulates (a no-op for an empty record) and continues scanning
+                                // subsequent records for the real ClientHello.
 
                                 final int endOffset = readerIndex + packetLength;
 
