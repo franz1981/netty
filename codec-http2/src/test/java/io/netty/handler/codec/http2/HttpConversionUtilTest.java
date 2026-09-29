@@ -15,6 +15,7 @@
  */
 package io.netty.handler.codec.http2;
 
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.DefaultHttpRequest;
 import io.netty.handler.codec.http.HttpHeaders;
@@ -184,6 +185,106 @@ public class HttpConversionUtilTest {
     public void connectAuthorityFormInvalid(String uri) {
         HttpRequest msg = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.CONNECT, uri);
         assertThrows(IllegalArgumentException.class, () -> HttpConversionUtil.toHttp2Headers(msg, true));
+    }
+
+    @Test
+    public void toHttpRequestRejectsHttpsAuthorityWithUserInfo() {
+        final Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("https"));
+        headers.authority(new AsciiString("trusted.example@attacker.example"));
+        headers.path(new AsciiString("/admin"));
+
+        Http2Exception exception = assertThrows(Http2Exception.class,
+            () -> HttpConversionUtil.toHttpRequest(3, headers, true));
+        assertEquals(Http2Error.PROTOCOL_ERROR, exception.error());
+    }
+
+    @Test
+    public void toHttpRequestRejectsHttpAuthorityWithUserInfo() {
+        final Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("http"));
+        headers.authority(new AsciiString("trusted.example@attacker.example"));
+        headers.path(new AsciiString("/admin"));
+
+        Http2Exception exception = assertThrows(Http2Exception.class,
+            () -> HttpConversionUtil.toHttpRequest(3, headers, true));
+        assertEquals(Http2Error.PROTOCOL_ERROR, exception.error());
+    }
+
+    @Test
+    public void toFullHttpRequestRejectsAuthorityWithUserInfo() {
+        final Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("https"));
+        headers.authority(new AsciiString("trusted.example@attacker.example"));
+        headers.path(new AsciiString("/admin"));
+
+        assertThrows(Http2Exception.class,
+            () -> HttpConversionUtil.toFullHttpRequest(3, headers, UnpooledByteBufAllocator.DEFAULT, true));
+    }
+
+    @Test
+    public void toHttpRequestAllowsAuthorityWithoutUserInfo() throws Exception {
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("https"));
+        headers.authority(new AsciiString("trusted.example"));
+        headers.path(new AsciiString("/admin"));
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(3, headers, true);
+        assertEquals("trusted.example", request.headers().get(HOST));
+    }
+
+    @Test
+    public void toHttpRequestAllowsAuthorityWithExplicitPort() throws Exception {
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("https"));
+        headers.authority(new AsciiString("trusted.example:8443"));
+        headers.path(new AsciiString("/admin"));
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(3, headers, true);
+        assertEquals("trusted.example:8443", request.headers().get(HOST));
+    }
+
+    @Test
+    public void toHttpRequestAllowsIPv6AuthorityWithPort() throws Exception {
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("https"));
+        headers.authority(new AsciiString("[::1]:8443"));
+        headers.path(new AsciiString("/admin"));
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(3, headers, true);
+        assertEquals("[::1]:8443", request.headers().get(HOST));
+    }
+
+    @Test
+    public void toHttpRequestAllowsUserInfoForNonHttpScheme() throws Exception {
+        // The userinfo prohibition in https://datatracker.ietf.org/doc/html/rfc9113#section-8.3.1 is scoped to
+        // "http" and "https" schemed requests.
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme(new AsciiString("ftp"));
+        headers.authority(new AsciiString("trusted.example@attacker.example"));
+        headers.path(new AsciiString("/admin"));
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(3, headers, true);
+        assertEquals("trusted.example@attacker.example", request.headers().get(HOST));
+    }
+
+    @Test
+    public void toHttpRequestAllowsUserInfoLikeConnectAuthority() throws Exception {
+        // CONNECT requests do not carry a ":scheme" pseudo-header, so the http(s)-specific userinfo
+        // prohibition does not apply; the authority is opaque host:port target information.
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.method(HttpMethod.CONNECT.asciiName());
+        headers.authority(new AsciiString("trusted.example@attacker.example:443"));
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(3, headers, true);
+        assertEquals("trusted.example@attacker.example:443", request.headers().get(HOST));
     }
 
     @Test
