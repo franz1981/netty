@@ -605,8 +605,20 @@ public final class HAProxyMessage extends AbstractReferenceCounted {
 
     int tlvNumBytes() {
         int tlvNumBytes = 0;
+        int skip = 0;
         for (int i = 0; i < tlvs.size(); i++) {
-            tlvNumBytes += tlvs.get(i).totalNumBytes();
+            HAProxyTLV tlv = tlvs.get(i);
+            if (skip > 0) {
+                // This TLV is a flattened depth-1 child of a preceding top-level PP2_TYPE_SSL TLV.
+                // Its bytes are already accounted for by that parent's totalNumBytes(), so it must
+                // not be counted again here.
+                skip--;
+                continue;
+            }
+            if (tlv instanceof HAProxySSLTLV) {
+                skip = ((HAProxySSLTLV) tlv).encapsulatedTLVs().size();
+            }
+            tlvNumBytes += tlv.totalNumBytes();
         }
         return tlvNumBytes;
     }
