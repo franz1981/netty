@@ -215,11 +215,25 @@ public class IpSubnetFilter extends AbstractRemoteAddressFilter<InetSocketAddres
 
             // If parentRule matches childRule, then there's no need to keep the child rule.
             // Otherwise, the rules are distinct and we need both.
-            if (!parentRule.matches(new InetSocketAddress(childRule.getIpAddress(), 1))) {
-                toKeep.add(childRule);
-                // Then we'll keep the child rule around as the parent for the next round.
-                parentRule = childRule;
+            if (parentRule.matches(new InetSocketAddress(childRule.getIpAddress(), 1))) {
+                // The child rule is a subset of the parent rule. If they don't share the same rule type
+                // we can't safely drop the child rule, as doing so would silently change the outcome for
+                // addresses covered by the child but not otherwise expressible with the parent's ruleType.
+                // This binary-search based design can't represent longest-prefix-match semantics, so reject
+                // the unsupported configuration instead of failing open.
+                if (childRule.ruleType() != parentRule.ruleType()) {
+                    throw new IllegalArgumentException(
+                            "IpSubnetFilter does not support overlapping rules with different ruleTypes: "
+                                    + parentRule + " (" + parentRule.ruleType() + ") overlaps "
+                                    + childRule + " (" + childRule.ruleType() + "). "
+                                    + "Use RuleBasedIpFilter for mixed ACCEPT/REJECT carve-outs.");
+                }
+                continue;
             }
+
+            toKeep.add(childRule);
+            // Then we'll keep the child rule around as the parent for the next round.
+            parentRule = childRule;
         }
 
         return toKeep.toArray(new IpSubnetFilterRule[0]);

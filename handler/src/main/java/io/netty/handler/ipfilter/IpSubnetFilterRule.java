@@ -160,6 +160,11 @@ public final class IpSubnetFilterRule implements IpFilterRule, Comparable<IpSubn
         return (x < y) ? -1 : ((x == y) ? 0 : 1);
     }
 
+    @Override
+    public String toString() {
+        return "IpSubnetFilterRule(" + ipAddress + ", " + ruleType() + ')';
+    }
+
     static final class Ip4SubnetFilterRule implements IpFilterRule {
 
         private final int networkAddress;
