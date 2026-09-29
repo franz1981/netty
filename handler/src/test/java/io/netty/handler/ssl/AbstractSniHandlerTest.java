@@ -86,6 +86,21 @@ public class AbstractSniHandlerTest {
         }
     }
 
+    // See GHSA-p889-v4vh-vc4c: a server_name_list containing an unknown NameType entry followed by
+    // a valid host_name entry used to make extractSniHostname() give up on the whole list and return
+    // null, even though a compliant TLS stack (e.g. the JDK's) parses the full list and still honors
+    // the trailing host_name. That parser differential could be used to route a ClientHello for a
+    // protected hostname to a permissive fallback SslContext, bypassing hostname-specific mTLS.
+    @Test
+    public void testExtractSniHostnameSkipsUnknownNameTypeBeforeHostName() {
+        ByteBuf buffer = clientHelloBodyWithUnknownNameTypeBeforeHostName("secure.test");
+        try {
+            assertEquals("secure.test", AbstractSniHandler.extractSniHostname(buffer));
+        } finally {
+            buffer.release();
+        }
+    }
+
     private static ByteBuf validClientHelloBody(String hostname) {
         byte[] hostBytes = hostname.getBytes(CharsetUtil.US_ASCII);
         int serverNameListLength = 1 + 2 + hostBytes.length; // name type (1) + name length (2) + name
@@ -101,6 +116,31 @@ public class AbstractSniHandlerTest {
         buffer.writeShort(0); // extension type: server_name
         buffer.writeShort(serverNameExtensionDataLength);
         buffer.writeShort(serverNameListLength);
+        buffer.writeByte(0); // server name type: host_name
+        buffer.writeShort(hostBytes.length);
+        buffer.writeBytes(hostBytes);
+        return buffer;
+    }
+
+    private static ByteBuf clientHelloBodyWithUnknownNameTypeBeforeHostName(String hostname) {
+        byte[] hostBytes = hostname.getBytes(CharsetUtil.US_ASCII);
+        int unknownEntryLength = 1 + 2; // name type (1) + name length (2), zero-length value
+        int hostNameEntryLength = 1 + 2 + hostBytes.length; // name type (1) + name length (2) + name
+        int serverNameListLength = unknownEntryLength + hostNameEntryLength;
+        int serverNameExtensionDataLength = 2 + serverNameListLength; // server_name_list length (2) + list
+        int extensionsLength = 2 + 2 + serverNameExtensionDataLength; // ext type (2) + ext length (2) + data
+
+        ByteBuf buffer = Unpooled.buffer();
+        buffer.writeZero(34); // client_version (2) + random (32)
+        buffer.writeByte(0); // SessionID length
+        buffer.writeShort(0); // cipher_suites length
+        buffer.writeByte(0); // compression_methods length
+        buffer.writeShort(extensionsLength);
+        buffer.writeShort(0); // extension type: server_name
+        buffer.writeShort(serverNameExtensionDataLength);
+        buffer.writeShort(serverNameListLength);
+        buffer.writeByte(1); // unknown server name type
+        buffer.writeShort(0); // zero-length value
         buffer.writeByte(0); // server name type: host_name
         buffer.writeShort(hostBytes.length);
         buffer.writeBytes(hostBytes);

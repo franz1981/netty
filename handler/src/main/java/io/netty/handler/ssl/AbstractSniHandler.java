@@ -94,29 +94,38 @@ public abstract class AbstractSniHandler<T> extends SslClientHelloHandler<T> {
                                 // SNI
                                 // See https://tools.ietf.org/html/rfc6066#page-6
                                 if (extensionType == 0) {
-                                    offset += 2;
-                                    if (extensionsLimit - offset < 3) {
+                                    final int extensionEnd = offset + extensionLength;
+                                    offset += 2; // skip the server_name_list length
+                                    if (extensionEnd - offset < 3) {
                                         break;
                                     }
 
-                                    final int serverNameType = in.getUnsignedByte(offset);
-                                    offset++;
+                                    // The server_name_list is a vector that may contain more than
+                                    // one ServerName entry. Iterate over the whole list instead of
+                                    // giving up on the first entry, since an unknown NameType may be
+                                    // followed by a valid host_name entry that a peer's TLS stack
+                                    // would still honor.
+                                    while (extensionEnd - offset >= 3) {
+                                        final int serverNameType = in.getUnsignedByte(offset);
+                                        offset++;
 
-                                    if (serverNameType == 0) {
                                         final int serverNameLength = in.getUnsignedShort(offset);
                                         offset += 2;
 
-                                        if (extensionsLimit - offset < serverNameLength) {
+                                        if (extensionEnd - offset < serverNameLength) {
                                             break;
                                         }
 
-                                        final String hostname = in.toString(
-                                                offset, serverNameLength, CharsetUtil.US_ASCII);
-                                        return hostname.toLowerCase(Locale.US);
-                                    } else {
-                                        // invalid enum value
-                                        break;
+                                        if (serverNameType == 0) {
+                                            final String hostname = in.toString(
+                                                    offset, serverNameLength, CharsetUtil.US_ASCII);
+                                            return hostname.toLowerCase(Locale.US);
+                                        }
+
+                                        // Unknown NameType: skip its value and try the next entry.
+                                        offset += serverNameLength;
                                     }
+                                    break;
                                 }
 
                                 offset += extensionLength;
