@@ -29,8 +29,11 @@ import io.netty.util.internal.StringUtil;
 import org.jetbrains.annotations.Nullable;
 
 import static io.netty.channel.ChannelFutureListener.CLOSE_ON_FAILURE;
+import static io.netty.handler.codec.http.HttpScheme.HTTP;
+import static io.netty.handler.codec.http.HttpScheme.HTTPS;
 import static io.netty.handler.codec.http3.Http3ErrorCode.H3_INTERNAL_ERROR;
 import static io.netty.handler.codec.quic.QuicStreamType.UNIDIRECTIONAL;
+import static io.netty.util.AsciiString.contentEqualsIgnoreCase;
 
 final class Http3CodecUtils {
 
@@ -330,5 +333,16 @@ final class Http3CodecUtils {
         if (ch.type() != UNIDIRECTIONAL) {
             throw new IllegalArgumentException("Invalid stream type: " + ch.type() + " for stream: " + ch.streamId());
         }
+    }
+
+    /**
+     * Returns {@code true} if the scheme is either HTTP or HTTPS.
+     *
+     * @param scheme    the scheme
+     * @return          {@code true} if the scheme is either HTTP or HTTPS.
+     */
+    static boolean isHttpOrHttpsScheme(@Nullable CharSequence scheme) {
+        return scheme != null && (contentEqualsIgnoreCase(scheme, HTTP.name()) ||
+            contentEqualsIgnoreCase(scheme, HTTPS.name()));
     }
 }

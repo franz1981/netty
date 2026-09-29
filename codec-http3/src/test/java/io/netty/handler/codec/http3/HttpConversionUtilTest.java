@@ -136,6 +136,55 @@ public class HttpConversionUtilTest {
     }
 
     @Test
+    public void toHttpRequestRejectsAuthorityUserinfoForHttpsScheme() {
+        Http3Headers headers = new DefaultHttp3Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme("https");
+        headers.path("/admin");
+        headers.authority("trusted.example@attacker.example");
+
+        Http3Exception e = assertThrows(Http3Exception.class, () -> HttpConversionUtil.toHttpRequest(0, headers,
+                true));
+        Http3TestUtils.assertException(Http3ErrorCode.H3_MESSAGE_ERROR, e);
+    }
+
+    @Test
+    public void toHttpRequestRejectsAuthorityUserinfoForHttpScheme() {
+        Http3Headers headers = new DefaultHttp3Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme("http");
+        headers.path("/admin");
+        headers.authority("trusted.example@attacker.example");
+
+        Http3Exception e = assertThrows(Http3Exception.class, () -> HttpConversionUtil.toHttpRequest(0, headers,
+                true));
+        Http3TestUtils.assertException(Http3ErrorCode.H3_MESSAGE_ERROR, e);
+    }
+
+    @Test
+    public void toHttpRequestAllowsAuthorityWithoutUserinfoForHttpsScheme() throws Exception {
+        Http3Headers headers = new DefaultHttp3Headers();
+        headers.method(HttpMethod.GET.asciiName());
+        headers.scheme("https");
+        headers.path("/admin");
+        headers.authority("trusted.example");
+
+        HttpRequest request = HttpConversionUtil.toHttpRequest(0, headers, true);
+        assertEquals("trusted.example", request.headers().get(HOST));
+    }
+
+    @Test
+    public void toHttpRequestAllowsAuthorityUserinfoForNonHttpScheme() throws Exception {
+        // CONNECT requests don't carry a :scheme, so the userinfo restriction (which only applies to "http" and
+        // "https" URIs) must not reject them.
+        Http3Headers headers = new DefaultHttp3Headers();
+        headers.authority("trusted.example@attacker.example");
+        headers.method(HttpMethod.CONNECT.asciiName());
+        HttpRequest request = HttpConversionUtil.toHttpRequest(0, headers, true);
+        assertEquals("trusted.example@attacker.example", request.headers().get(HOST));
+    }
+
+    @Test
     public void setHttp3AuthorityWithoutUserInfo() {
         Http3Headers headers = new DefaultHttp3Headers();
 

@@ -22,6 +22,7 @@ import io.netty.util.AsciiString;
 import java.util.List;
 import java.util.function.BiConsumer;
 
+import static io.netty.handler.codec.http3.Http3CodecUtils.isHttpOrHttpsScheme;
 import static io.netty.handler.codec.http3.Http3Headers.PseudoHeaderName.AUTHORITY;
 import static io.netty.handler.codec.http3.Http3Headers.PseudoHeaderName.METHOD;
 import static io.netty.handler.codec.http3.Http3Headers.PseudoHeaderName.PATH;
@@ -130,6 +131,21 @@ final class Http3HeadersSink implements BiConsumer<CharSequence, CharSequence> {
                         throw new Http3HeadersValidationException("Not all mandatory pseudo-headers included.");
                     }
                 }
+
+                // The :authority pseudo-header must not carry the deprecated "userinfo" subcomponent for
+                // http and https requests.
+                // See https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1 and
+                // https://www.rfc-editor.org/rfc/rfc9110#section-4.2.4.
+                CharSequence authority = headers.authority();
+                if (authority == null || !isHttpOrHttpsScheme(headers.scheme())) {
+                    return;
+                }
+                for (int i = 0; i < authority.length(); i++) {
+                    if (authority.charAt(i) == '@') {
+                        throw new Http3HeadersValidationException(
+                            String.format("authority: '%s' contains a forbidden userinfo component.", authority));
+                    }
+                }
             } else {
                 // For responses we must include:
                 // - :status
@@ -166,8 +182,7 @@ final class Http3HeadersSink implements BiConsumer<CharSequence, CharSequence> {
 
     /**
      * Find host header field in case the :authority pseudo header is not specified.
-     * See:
-     * https://www.rfc-editor.org/rfc/rfc9110#section-7.2
+     * See <a href="https://www.rfc-editor.org/rfc/rfc9110#section-7.2">RFC9110 7.2</a>.
      */
     private boolean authorityOrHostHeaderReceived() {
         return (receivedPseudoHeaders & AUTHORITY.getFlag()) == AUTHORITY.getFlag() ||

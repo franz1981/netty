@@ -387,6 +387,24 @@ public class Http3FrameToHttpObjectCodecTest {
     }
 
     @Test
+    public void testDowngradeHeadersRejectsAuthorityUserinfoForHttpsScheme() {
+        EmbeddedQuicStreamChannel ch = new EmbeddedQuicStreamChannel(new Http3FrameToHttpObjectCodec(true));
+        Http3Headers headers = new DefaultHttp3Headers();
+        headers.method("GET");
+        headers.scheme("https");
+        headers.path("/admin");
+        headers.authority("trusted.example@attacker.example");
+
+        // The malformed authority must be rejected instead of being forwarded as a Host header; the default
+        // Http3RequestStreamInboundHandler#handleHttp3Exception logs and swallows the resulting Http3Exception
+        // rather than propagating it out of writeInbound(...), so we assert no HttpRequest was produced instead.
+        ch.writeInbound(new DefaultHttp3HeadersFrame(headers));
+        assertThat(ch.readInbound(), is(nullValue()));
+
+        assertFalse(ch.finish());
+    }
+
+    @Test
     public void testDowngradeTrailers() {
         EmbeddedQuicStreamChannel ch = new EmbeddedQuicStreamChannel(new Http3FrameToHttpObjectCodec(true));
         Http3Headers headers = new DefaultHttp3Headers();
