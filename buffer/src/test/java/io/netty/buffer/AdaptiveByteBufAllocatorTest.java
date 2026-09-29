@@ -2213,6 +2213,33 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
+    /**
+     * A heap keeping one buffer at a time of a size whose first chunk is above the smallest one (room for two of
+     * them) keeps that chunk: halving it would only make the same chunk again at the next allocation, one chunk made
+     * and freed per decay for nothing.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {512 * 1024, 1024 * 1024})
+    void chunkForTwoBuffersIsNotRetiredForOneInUse(final int size) throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            allocator.heapBuffer(size, size).release();
+            long chunk = allocator.usedHeapMemory();
+            assertEquals(2L * size, chunk, "the first chunk has room for two");
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            int retired = buddyRetired(idleDecay);
+            for (int i = 0; i < 4; i++) {
+                ByteBuf buf = allocator.heapBuffer(size, size);
+                idleDecay.decay(System.nanoTime());
+                assertEquals(retired, buddyRetired(idleDecay), "not retired at decay " + i);
+                assertEquals(chunk, largeChunkSizeTarget(idleDecay), "not shrunk below the first chunk");
+                buf.release();
+                assertEquals(chunk, allocator.usedHeapMemory(), "the same chunk stays the magazine's");
+            }
+        });
+    }
+
     /** A decay that finds the chunk the magazine allocates from more than half used leaves it and its size be. */
     @Test
     void activeLargeChunkMoreThanHalfUsedIsNotRetired() throws Throwable {

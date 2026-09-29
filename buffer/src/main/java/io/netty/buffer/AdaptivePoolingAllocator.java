@@ -1773,6 +1773,13 @@ final class AdaptivePoolingAllocator {
          * small chunks whatever other heaps allocate.
          */
         private int chunkSizeTarget;
+        /**
+         * The first chunk for the size that prompted this magazine's latest chunk: room for
+         * {@link #INITIAL_BUFS_PER_CHUNK} of those buffers. The {@link #chunkSizeTarget} is never halved below it,
+         * since the next chunk for that size would be this large again: a magazine keeping one 1 MiB buffer at a time
+         * so keeps its 2 MiB chunk, instead of retiring it and making the same one at every decay.
+         */
+        private int smallestUsefulChunk = MIN_CHUNK_SIZE;
 
         BuddyChunkController(ChunkAllocator chunkAllocator) {
             this.chunkAllocator = chunkAllocator;
@@ -1805,6 +1812,7 @@ final class AdaptivePoolingAllocator {
             if (chunkSize > target) {
                 chunkSizeTarget = chunkSize;
             }
+            smallestUsefulChunk = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, initial));
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.isThreadLocal());
             return chunk;
@@ -1813,10 +1821,10 @@ final class AdaptivePoolingAllocator {
         /**
          * A decay found a free block of half of {@code capacity} in the chunk the magazine allocates from: the
          * magazine's demand fits in half of it, so the {@link #chunkSizeTarget} goes down to half of it, never below
-         * {@link #MIN_CHUNK_SIZE} and never up. Returns the new target.
+         * the {@link #smallestUsefulChunk} and never up. Returns the new target.
          */
         int halveTarget(int capacity) {
-            int target = Math.min(chunkSizeTarget, Math.max(MIN_CHUNK_SIZE, capacity >>> 1));
+            int target = Math.min(chunkSizeTarget, Math.max(smallestUsefulChunk, capacity >>> 1));
             chunkSizeTarget = target;
             return target;
         }
