@@ -32,11 +32,13 @@ import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.TooLongHttpHeaderException;
 import io.netty.handler.codec.spdy.SpdyHttpHeaders.Names;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.internal.ObjectUtil;
 
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
@@ -49,7 +51,10 @@ import static io.netty.util.internal.ObjectUtil.checkPositive;
  */
 public class SpdyHttpDecoder extends MessageToMessageDecoder<SpdyFrame> {
 
+    // Same default as SpdyFrameCodec's maxHeaderSize.
+    private static final int DEFAULT_MAX_HEADER_SIZE = 16384;
     private final int spdyVersion;
+    private final int maxHeaderSize;
     private final int maxContentLength;
     private final Map<Integer, FullHttpMessage> messageMap;
     private final HttpHeadersFactory headersFactory;
@@ -131,8 +136,27 @@ public class SpdyHttpDecoder extends MessageToMessageDecoder<SpdyFrame> {
      */
     protected SpdyHttpDecoder(SpdyVersion version, int maxContentLength, Map<Integer,
             FullHttpMessage> messageMap, HttpHeadersFactory headersFactory, HttpHeadersFactory trailersFactory) {
+        this(version, DEFAULT_MAX_HEADER_SIZE, maxContentLength, messageMap, headersFactory, trailersFactory);
+    }
+
+    /**
+     * Creates a new instance with the specified parameters.
+     *
+     * @param version the protocol version
+     * @param maxHeaderSize the maximum length of all headers.  If the sum of the length of each
+     *        header exceeds this value, a {@link TooLongHttpHeaderException} will be raised.
+     * @param maxContentLength the maximum length of the message content.
+     *        If the length of the message content exceeds this value,
+     *        a {@link TooLongFrameException} will be raised.
+     * @param messageMap the {@link Map} used to hold partially received messages.
+     * @param headersFactory The factory used for creating HTTP headers
+     * @param trailersFactory The factory used for creating HTTP trailers.
+     */
+    protected SpdyHttpDecoder(SpdyVersion version, int maxHeaderSize, int maxContentLength, Map<Integer,
+        FullHttpMessage> messageMap, HttpHeadersFactory headersFactory, HttpHeadersFactory trailersFactory) {
         super(SpdyFrame.class);
         spdyVersion = ObjectUtil.checkNotNull(version, "version").version();
+        this.maxHeaderSize = checkPositive(maxHeaderSize, "maxHeaderSize");
         this.maxContentLength = checkPositive(maxContentLength, "maxContentLength");
         this.messageMap = messageMap;
         this.headersFactory = headersFactory;
@@ -367,7 +391,25 @@ public class SpdyHttpDecoder extends MessageToMessageDecoder<SpdyFrame> {
 
             // Ignore trailers in a truncated HEADERS frame.
             if (!spdyHeadersFrame.isTruncated()) {
+                long headerSize = 0;
+                for (Iterator<Map.Entry<CharSequence, CharSequence>> it =
+                     fullHttpMessage.headers().iteratorCharSequence(); it.hasNext();) {
+                    Map.Entry<CharSequence, CharSequence> e = it.next();
+                    headerSize += headerEntrySize(e.getKey(), e.getValue());
+                }
+
                 for (Map.Entry<CharSequence, CharSequence> e: spdyHeadersFrame.headers()) {
+                    long entrySize = headerEntrySize(e.getKey(), e.getValue());
+                    if (headerSize > maxHeaderSize - entrySize) {
+                        FullHttpMessage removed = removeMessage(streamId);
+                        if (removed != null && removed != fullHttpMessage) {
+                            removed.release();
+                        }
+                        fullHttpMessage.release();
+                        throw new TooLongHttpHeaderException(
+                                "HTTP header size exceeded " + maxHeaderSize + " bytes.");
+                    }
+                    headerSize += entrySize;
                     fullHttpMessage.headers().add(e.getKey(), e.getValue());
                 }
             }
@@ -426,6 +468,11 @@ public class SpdyHttpDecoder extends MessageToMessageDecoder<SpdyFrame> {
                 removed.release();
             }
         }
+    }
+
+    private static long headerEntrySize(CharSequence name, CharSequence value) {
+        // Account for the ": " separator between name and value on the wire.
+        return (long) name.length() + value.length() + 2;
     }
 
     private static FullHttpRequest createHttpRequest(SpdyHeadersFrame requestFrame, ByteBufAllocator alloc)
