@@ -167,6 +167,7 @@ public class CorsHandler extends ChannelDuplexHandler {
         if (origin != null && config != null) {
             if (NULL_ORIGIN.equals(origin) && config.isNullOriginAllowed()) {
                 setNullOrigin(response);
+                setVaryHeader(response);
                 return true;
             }
             if (config.isAnyOriginSupported()) {
