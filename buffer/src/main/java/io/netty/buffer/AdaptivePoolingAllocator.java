@@ -1715,6 +1715,8 @@ final class AdaptivePoolingAllocator {
     }
 
     private static final class BuddyChunkController {
+        /** Buffers of its size the first chunk of a magazine has room for; see {@link #newChunkAllocation}. */
+        private static final int INITIAL_BUFS_PER_CHUNK = 2;
         private final ChunkAllocator chunkAllocator;
         /**
          * The largest chunk this magazine made so far; its chunks never shrink below it, so a magazine serving mixed
@@ -1735,12 +1737,20 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}.
+         * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}, sized by the demand the magazine
+         * shows: the first one has room for {@link #INITIAL_BUFS_PER_CHUNK} buffers of {@code promptingSize}; a new
+         * one while every chunk the magazine holds lacks room is twice the largest so far, since the magazine needs
+         * more at once; one while it holds none (they were given back) is as large as the largest so far. Never above
+         * the chunk for {@link #BUFS_PER_CHUNK} buffers of this size, unless the magazine already made a larger one,
+         * nor above {@link #MAX_CHUNK_SIZE}. A heap that keeps one large buffer at a time so keeps a small chunk, where
+         * a chunk for {@link #BUFS_PER_CHUNK} of them would mostly stay empty; one that keeps more grows to it.
          */
         BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
             int maxChunkSize = this.maxChunkSize;
-            int proposedChunkSize = MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize);
-            int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(maxChunkSize, proposedChunkSize));
+            int initial = MathUtil.safeFindNextPositivePowerOfTwo(INITIAL_BUFS_PER_CHUNK * promptingSize);
+            int upTo = Math.max(maxChunkSize, MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize));
+            int grown = magazine.holdsChunks() ? maxChunkSize << 1 : maxChunkSize;
+            int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.min(upTo, Math.max(initial, grown)));
             if (chunkSize > maxChunkSize) {
                 this.maxChunkSize = chunkSize;
             }
@@ -2197,6 +2207,19 @@ final class AdaptivePoolingAllocator {
 
         int idleChunks() {
             return whollyFree.size;
+        }
+
+        /** Whether the magazine holds any chunk, the one it allocates from included. Slow path only. */
+        boolean holdsChunks() {
+            if (active != null || full.size != 0 || whollyFree.size != 0) {
+                return true;
+            }
+            for (ChunkQueue queue : byLargestFreeOrder) {
+                if (queue.size != 0) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /**
