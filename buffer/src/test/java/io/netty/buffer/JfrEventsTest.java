@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
@@ -118,6 +119,7 @@ public class JfrEventsTest {
         final int[] oneShots = new int[2];
         final AtomicInteger sizeClassChunksFreed = new AtomicInteger();
         final AtomicInteger sizeClassChunksAllocated = new AtomicInteger();
+        final AtomicInteger retiredChunks = new AtomicInteger(-1);
         try (RecordingStream stream = new RecordingStream()) {
             stream.enable(AllocateChunkEvent.class);
             stream.enable(FreeChunkEvent.class);
@@ -154,6 +156,11 @@ public class JfrEventsTest {
                 // Above the size classes: large-buffer chunks of the thread-local heap, kept idle there after the
                 // release.
                 releaseAll(allocateMany(alloc, 512 * 1024, 8));
+                // A decay retires the chunk the heap allocates from, at most half used, and the release of its last
+                // buffer frees it.
+                ByteBuf held = alloc.heapBuffer(512 * 1024, 512 * 1024);
+                retiredChunks.set(decayThreadLocalHeap(alloc));
+                held.release();
                 // The thread-local heap is freed when this thread ends, with what its recycler holds.
             }, threadName);
             thread.start();
@@ -168,8 +175,34 @@ public class JfrEventsTest {
         assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
         assertEquals(1, oneShots[1], "and when it is freed");
         assertTrue(sizeClassChunksFreed.get() > 0, "the dying thread-local heap must free its chunk buffers");
+        assertEquals(1, retiredChunks.get(), "the decay must have retired the large-buffer chunk");
         assertEquals(alloc.metric().usedHeapMemory(), allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
+    }
+
+    /**
+     * Run the calling thread's thread-local heap's decay now, and return how many chunks its large-buffer magazine
+     * retired so far.
+     */
+    private static int decayThreadLocalHeap(AdaptiveByteBufAllocator alloc) {
+        try {
+            Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
+            heapField.setAccessible(true);
+            Object pooling = heapField.get(alloc);
+            Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
+            tlField.setAccessible(true);
+            Object heap = ((FastThreadLocal<?>) tlField.get(pooling)).get();
+            Field decayField = heap.getClass().getDeclaredField("idleDecay");
+            decayField.setAccessible(true);
+            AdaptivePoolingAllocator.IdleDecay idleDecay = (AdaptivePoolingAllocator.IdleDecay) decayField.get(heap);
+            idleDecay.decay(System.nanoTime());
+            Object magazine = idleDecay.buddyMagazine;
+            Field retiredField = magazine.getClass().getDeclaredField("retired");
+            retiredField.setAccessible(true);
+            return retiredField.getInt(magazine);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @SuppressWarnings("Since15")

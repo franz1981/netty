@@ -1763,13 +1763,16 @@ final class AdaptivePoolingAllocator {
     private static final class BuddyChunkController {
         /** Buffers of its size the first chunk of a magazine has room for; see {@link #newChunkAllocation}. */
         private static final int INITIAL_BUFS_PER_CHUNK = 2;
+        /** The smallest chunk a magazine makes, and the lowest {@link #chunkSizeTarget} a decay goes down to. */
+        private static final int MIN_CHUNK_SIZE = 512 * 1024;
         private final ChunkAllocator chunkAllocator;
         /**
-         * The largest chunk this magazine made so far; its chunks never shrink below it, so a magazine serving mixed
-         * sizes does not go back and forth between chunk sizes. One per magazine, guarded like it: a heap that only
-         * sees small large-buffers keeps small chunks whatever other heaps allocate.
+         * The size new chunks of this magazine are made at when it needs no more room at once than before: the
+         * largest chunk it made, until a decay finds the chunk it allocates from at most half used and halves it (see
+         * {@link #halveTarget}). One per magazine, guarded like it: a heap that only sees small large-buffers keeps
+         * small chunks whatever other heaps allocate.
          */
-        private int maxChunkSize;
+        private int chunkSizeTarget;
 
         BuddyChunkController(ChunkAllocator chunkAllocator) {
             this.chunkAllocator = chunkAllocator;
@@ -1785,24 +1788,37 @@ final class AdaptivePoolingAllocator {
         /**
          * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}, sized by the demand the magazine
          * shows: the first one has room for {@link #INITIAL_BUFS_PER_CHUNK} buffers of {@code promptingSize}; a new
-         * one while every chunk the magazine holds lacks room is twice the largest so far, since the magazine needs
-         * more at once; one while it holds none (they were given back) is as large as the largest so far. Never above
-         * the chunk for {@link #BUFS_PER_CHUNK} buffers of this size, unless the magazine already made a larger one,
-         * nor above {@link #MAX_CHUNK_SIZE}. A heap that keeps one large buffer at a time so keeps a small chunk, where
-         * a chunk for {@link #BUFS_PER_CHUNK} of them would mostly stay empty; one that keeps more grows to it.
+         * one while every chunk the magazine holds lacks room is twice the {@link #chunkSizeTarget}, since the
+         * magazine needs more at once; one while it holds none (they were given back or retired) is the target.
+         * Never above the chunk for {@link #BUFS_PER_CHUNK} buffers of this size, unless the target is larger, nor
+         * above {@link #MAX_CHUNK_SIZE}, nor below {@link #MIN_CHUNK_SIZE}. A heap that keeps one large buffer at a
+         * time so keeps a small chunk, where a chunk for {@link #BUFS_PER_CHUNK} of them would mostly stay empty; one
+         * that keeps more grows to it. The target becomes the new chunk's size when that is larger.
          */
         BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
-            int maxChunkSize = this.maxChunkSize;
+            int target = chunkSizeTarget;
             int initial = MathUtil.safeFindNextPositivePowerOfTwo(INITIAL_BUFS_PER_CHUNK * promptingSize);
-            int upTo = Math.max(maxChunkSize, MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize));
-            int grown = magazine.holdsChunks() ? maxChunkSize << 1 : maxChunkSize;
-            int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.min(upTo, Math.max(initial, grown)));
-            if (chunkSize > maxChunkSize) {
-                this.maxChunkSize = chunkSize;
+            int upTo = Math.max(target, MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize));
+            int grown = magazine.holdsChunks() ? target << 1 : target;
+            int chunkSize = Math.max(MIN_CHUNK_SIZE,
+                    Math.min(MAX_CHUNK_SIZE, Math.min(upTo, Math.max(initial, grown))));
+            if (chunkSize > target) {
+                chunkSizeTarget = chunkSize;
             }
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.isThreadLocal());
             return chunk;
+        }
+
+        /**
+         * A decay found a free block of half of {@code capacity} in the chunk the magazine allocates from: the
+         * magazine's demand fits in half of it, so the {@link #chunkSizeTarget} goes down to half of it, never below
+         * {@link #MIN_CHUNK_SIZE} and never up. Returns the new target.
+         */
+        int halveTarget(int capacity) {
+            int target = Math.min(chunkSizeTarget, Math.max(MIN_CHUNK_SIZE, capacity >>> 1));
+            chunkSizeTarget = target;
+            return target;
         }
     }
 
@@ -2092,6 +2108,9 @@ final class AdaptivePoolingAllocator {
      * the full chunks covers notes that are still in flight. On a thread-local heap the heap's size-class slow path
      * applies the notes too (see {@link SizeClassMagazine#drainHeapPending}), since there every other thread's
      * release is a note.
+     * <p>
+     * A chunk larger than the magazine needs is <em>retired</em> by a {@link #decay}: it is never allocated from
+     * again, and it is freed once its last block is released (see {@link #retire}). Only slow paths look at it.
      */
     private static final class BuddyMagazine {
         /** One queue per order of largest free block: {@link BuddyTree#MIN_BLOCK_SIZE} up to the largest chunk. */
@@ -2121,13 +2140,20 @@ final class AdaptivePoolingAllocator {
         private final ChunkQueue whollyFree = new ChunkQueue();
         /** Bytes of the chunks on {@link #whollyFree}; never above {@link #CHUNK_REUSE_QUEUE_BYTES}. */
         private long idleBytes;
+        /**
+         * Retired chunks with blocks still out; never polled, and each is freed by {@link #file} once wholly free.
+         * Visible for testing.
+         */
+        final ChunkQueue retiring = new ChunkQueue();
+        /** How many chunks the decays retired, freed at once or put on {@link #retiring}. Visible for testing. */
+        int retired;
         /** The lock of the stripe this magazine lives on, which guards everything here but {@link #pending}. */
         private final StampedLock stripeLock;
         /** The thread of the thread-local heap this magazine lives on, which alone touches it; null on a stripe. */
         private final Thread ownerThread;
         /**
          * The chunk the magazine allocates from, on no queue; {@code null} before the first allocation, and after a
-         * decay filed it with the idle chunks (see {@link #decay}).
+         * decay filed it with the idle chunks or retired it (see {@link #decay}).
          */
         private BuddyChunk active;
         /** The heap's; counts this magazine's allocations and tells it when to {@link #decay}. */
@@ -2247,10 +2273,19 @@ final class AdaptivePoolingAllocator {
          * instead when keeping it would take the idle chunks above {@link #CHUNK_REUSE_QUEUE_BYTES}, or above
          * {@link #CHUNK_REUSE_QUEUE} chunks: the limits are on idle memory, whatever the number of chunks in use.
          * A count alone is no bound: chunks are 2 to 8 MiB, and a burst of large buffers was kept whole after every
-         * buffer was released.
+         * buffer was released. A retired chunk is freed once wholly free, and goes back to {@link #retiring} until
+         * then.
          */
         private void file(BuddyChunk chunk) {
             chunk.processFreelistEntries();
+            if (chunk.retired) {
+                if (chunk.isWhollyFree()) {
+                    chunk.markToDeallocate();
+                } else {
+                    retiring.pushFront(chunk);
+                }
+                return;
+            }
             if (chunk.isWhollyFree()) {
                 if (whollyFree.size >= CHUNK_REUSE_QUEUE || idleBytes + chunk.capacity > CHUNK_REUSE_QUEUE_BYTES) {
                     chunk.markToDeallocate();
@@ -2274,7 +2309,10 @@ final class AdaptivePoolingAllocator {
             return whollyFree.size;
         }
 
-        /** Whether the magazine holds any chunk, the one it allocates from included. Slow path only. */
+        /**
+         * Whether the magazine holds any chunk it may allocate from, the active one included; retired chunks do not
+         * count. Slow path only.
+         */
         boolean holdsChunks() {
             if (active != null || full.size != 0 || whollyFree.size != 0) {
                 return true;
@@ -2291,18 +2329,30 @@ final class AdaptivePoolingAllocator {
          * Free half, rounded up, of the chunks that stayed wholly free through the whole last interval, oldest first.
          * {@link #whollyFree} is newest first, and a chunk that is taken off it and filed again gets a new stamp, so
          * the cold ones are exactly those stamped before the previous decay.
+         * <p>
+         * First, the chunk the magazine allocates from tells how much it needs: when it has a free block of half its
+         * capacity, the magazine's next chunks are made at half of it at most (see
+         * {@link BuddyChunkController#halveTarget}), and when it is larger than that it is retired. A magazine whose
+         * demand dropped so goes down to chunks of its size by halves, one per interval, instead of keeping the
+         * largest chunk it ever made; a magazine that needs more again grows its chunks as before.
          */
         void decay() {
             // Chunks other threads' releases made wholly free are filed as such first, so they start aging now.
             drainPending();
-            // So is the active chunk once nothing in it is in use: it ages like the others from here, and the next
-            // allocation polls it back (one slow path) unless it stayed idle through the whole next interval. Only
-            // while the idle chunks have room for it: filing would otherwise free it at once, before any interval.
             BuddyChunk current = active;
             if (current != null) {
                 current.processFreelistEntries();
-                if (current.isWhollyFree() && whollyFree.size < CHUNK_REUSE_QUEUE &&
+                // At most half of it in use: the next chunks need be no larger than half of it, and it is retired
+                // when it is larger than that.
+                if (current.hasFreeHalf() && current.capacity > chunkController.halveTarget(current.capacity)) {
+                    active = null;
+                    retire(current);
+                } else if (current.isWhollyFree() && whollyFree.size < CHUNK_REUSE_QUEUE &&
                         idleBytes + current.capacity <= CHUNK_REUSE_QUEUE_BYTES) {
+                    // Filed with the idle chunks once nothing in it is in use: it ages like the others from here, and
+                    // the next allocation polls it back (one slow path) unless it stayed idle through the whole next
+                    // interval. Only while the idle chunks have room for it: filing would otherwise free it at once,
+                    // before any interval.
                     active = null;
                     file(current);
                 }
@@ -2328,6 +2378,21 @@ final class AdaptivePoolingAllocator {
                     free--;
                 }
                 cur = newer;
+            }
+        }
+
+        /**
+         * Retire {@code chunk}, on no queue: free it now if wholly free, else put it on {@link #retiring}, where the
+         * release of its last block frees it (in place, or at the drain of its note). Its buffers are released as
+         * any other's; the chunk stays in the used memory until it is freed.
+         */
+        private void retire(BuddyChunk chunk) {
+            retired++;
+            if (chunk.isWhollyFree()) {
+                chunk.markToDeallocate();
+            } else {
+                chunk.retired = true;
+                retiring.pushFront(chunk);
             }
         }
 
@@ -2398,6 +2463,7 @@ final class AdaptivePoolingAllocator {
             }
             freeAll(full);
             freeAll(whollyFree);
+            freeAll(retiring);
             for (ChunkQueue queue : byLargestFreeOrder) {
                 freeAll(queue);
             }
@@ -2918,6 +2984,8 @@ final class AdaptivePoolingAllocator {
         private final BuddyMagazine owner;
         /** The magazine's decay count when this chunk was last filed wholly free; see {@link BuddyMagazine#decay}. */
         int whollyFreeSince;
+        /** Set once its magazine retired it: never allocated from again, freed once wholly free. */
+        boolean retired;
 
         /**
          * Constructor for a one-shot chunk: no tree, no magazine. The caller owns the reference it gets here and
@@ -3075,6 +3143,11 @@ final class AdaptivePoolingAllocator {
 
         boolean isWhollyFree() {
             return tree.isWhollyFree();
+        }
+
+        /** Whether a block of half the capacity, or the whole of it, is free; exact as {@link #largestFreeOrder}. */
+        boolean hasFreeHalf() {
+            return tree.largestFreeOrder() >= tree.maxOrder - 1;
         }
 
         @Override

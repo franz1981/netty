@@ -1063,15 +1063,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
             assertEquals(chunk, allocator.usedHeapMemory(), "the last idle one");
 
-            // Chunk 4 is the one the magazine allocates from: it stays while a buffer in it is out, and once wholly
-            // free it is filed with the idle chunks at a decay and given back at the next, like any other.
+            // Chunk 4 is the one the magazine allocates from: it stays while it is full, and once wholly free the
+            // decay retires it, larger than the magazine now needs, and frees it at once.
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(chunk, allocator.usedHeapMemory(), "the active chunk has buffers out: it stays");
+            assertEquals(chunk, allocator.usedHeapMemory(), "the active chunk is full: it stays");
             releaseChunk(held, 3, perChunk);
-            idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(chunk, allocator.usedHeapMemory(), "wholly free since this decay only");
             idleDecay.decay(t + IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(0, allocator.usedHeapMemory(), "wholly free through a whole interval: given back");
+            assertEquals(0, allocator.usedHeapMemory(), "wholly free, and retired: given back");
         } finally {
             for (ByteBuf buf : held) {
                 if (buf != null) {
@@ -1090,6 +1088,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         assumeTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE >= 2, "keeps fewer than two idle chunks");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
+        growLargeChunks(allocator, BUDDY_NOTE_SIZE, false);
         List<ByteBuf> held = new ArrayList<ByteBuf>();
         held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         long chunk = allocator.usedHeapMemory();
@@ -1111,10 +1110,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
             // The next allocation finds chunk 3 full: its slow path completes the count and the decay runs. It
             // takes one of the two idle chunks as its new active chunk first, so one cold chunk is left, and freed.
+            // The decay also retires the new active chunk, with its one buffer out: it stays until that is released.
+            int retired = buddyRetired(idleDecay);
             idleDecay.allocationsSinceCheck = IdleDecay.DECAY_MIN_ALLOCATIONS - 1;
             held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             assertEquals(0, idleDecay.allocationsSinceCheck, "the count completed on that slow path");
             assertEquals(2 * chunk, allocator.usedHeapMemory(), "the other idle chunk is given back");
+            assertEquals(retired + 1, buddyRetired(idleDecay), "the chunk the buffer came from is retired");
         } finally {
             for (ByteBuf buf : held) {
                 if (buf != null) {
@@ -1163,7 +1165,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /**
      * A stripe serving a trickle of large buffers from the chunk it allocates from, with no slow path at all, still
-     * gives its idle large-buffer chunks back by halves: the fast path counts.
+     * gives its idle large-buffer chunks back by halves: the fast path counts. That chunk keeps more than half of its
+     * buffers out, so the decays do not retire it.
      */
     @Test
     void largeBufferTrickleAgesTheStripesIdleChunks() throws Exception {
@@ -1179,24 +1182,35 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assumeTrue(false, "keeps fewer than two idle chunks' bytes");
         }
         int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
-        // Three chunks' worth: chunks 1 and 2 become idle, chunk 3 is the one the stripe allocates from.
+        // Three chunks' worth: chunks 1 and 2 become idle, chunk 3 is the one the stripe allocates from, and keeps
+        // more than half of its buffers out.
         while (held.size() < 3 * perChunk) {
             held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
+        int kept = perChunk / 2 + 1;
+        List<ByteBuf> out = new ArrayList<ByteBuf>(held.subList(2 * perChunk, 2 * perChunk + kept));
+        held.subList(2 * perChunk, 2 * perChunk + kept).clear();
         for (ByteBuf buf : held) {
             buf.release();
         }
-        IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
-        assertEquals(2, buddyIdleChunks(idleDecay));
-        long used = allocator.usedHeapMemory();
-        // Each round: the interval has passed, and one large buffer comes from chunk 3, on the fast path.
-        idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
-        assertEquals(used, allocator.usedHeapMemory(), "idle since before the first decay: not a whole interval");
-        idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
-        assertEquals(1, buddyIdleChunks(idleDecay), "half of two");
-        assertEquals(used - chunk, allocator.usedHeapMemory());
+        try {
+            IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
+            assertEquals(2, buddyIdleChunks(idleDecay));
+            long used = allocator.usedHeapMemory();
+            // Each round: the interval has passed, and one large buffer comes from chunk 3, on the fast path.
+            idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
+            allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+            assertEquals(used, allocator.usedHeapMemory(), "idle since before the first decay: not a whole interval");
+            idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
+            allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+            assertEquals(1, buddyIdleChunks(idleDecay), "half of two");
+            assertEquals(used - chunk, allocator.usedHeapMemory());
+            assertEquals(0, buddyRetiring(idleDecay), "more than half used: chunk 3 is not retired");
+        } finally {
+            for (ByteBuf buf : out) {
+                buf.release();
+            }
+        }
     }
 
     private static final int BUDDY_NOTE_SIZE = 512 * 1024;
@@ -1348,32 +1362,43 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /**
      * The chunk a large-buffer magazine allocates from is only filed with the idle ones while they have room: filing it
-     * over the bound would free it at once, before it stayed idle through any interval.
+     * over the bound would free it at once, before it stayed idle through any interval. Only a chunk of the smallest
+     * size gets there: a larger one is retired by the decay that finds it wholly free, and freed at once.
      */
     @Test
     void activeLargeChunkWaitsForRoomAmongTheIdleOnes() throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode does not pool 1 MiB buffers");
+        assumeFalse(isLowMemory(), "low-memory mode does not pool 256 KiB buffers");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
-        final int size = 1024 * 1024;
-        growLargeChunks(allocator, size, false);
-        List<ByteBuf> held = new ArrayList<ByteBuf>();
-        held.add(allocator.heapBuffer(size, size));
-        long chunk = allocator.usedHeapMemory();
-        int perChunk = (int) (chunk / size);
+        final int size = 256 * 1024;
+        final int smallest = 512 * 1024;
+        final int grown = BUFS_PER_LARGE_CHUNK * size;
         int idle = (int) Math.min(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE,
-                AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES / chunk);
-        while (held.size() < (idle + 1) * perChunk) {
+                AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES / grown);
+        List<ByteBuf> held = new ArrayList<ByteBuf>();
+        // Chunk A, the first, has room for two buffers; the chunks after it grow, to 2 MiB from the third on.
+        while (allocator.usedHeapMemory() < smallest + grown / 2 + (long) idle * grown ||
+                held.size() < 2 + 4 + idle * BUFS_PER_LARGE_CHUNK) {
             held.add(allocator.heapBuffer(size, size));
         }
-        for (int c = 0; c < idle; c++) {
-            releaseChunk(held, c, perChunk);
+        assertEquals(smallest + grown / 2 + (long) idle * grown, allocator.usedHeapMemory(), "chunk sizes");
+        // A buffer of chunk A released makes A the only chunk with room: the next allocation makes it the active one.
+        held.remove(0).release();
+        ByteBuf inA = allocator.heapBuffer(size, size);
+        // The 2 MiB chunks become wholly free first and fill the idle bound; the 1 MiB one is then freed.
+        for (int i = held.size() - 1; i >= 1 + 4; i--) {
+            held.remove(i).release();
         }
         IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
         assertEquals(idle, buddyIdleChunks(idleDecay), "the idle bound is full");
-        releaseChunk(held, idle, perChunk);
+        for (ByteBuf buf : held) {
+            buf.release();
+        }
+        inA.release();
         long used = allocator.usedHeapMemory();
+        assertEquals(smallest + (long) idle * grown, used, "the idle chunks and A, wholly free");
         idleDecay.decay(System.nanoTime());
         assertEquals(used, allocator.usedHeapMemory(), "no room: the active chunk stays");
+        assertEquals(smallest, largeChunkSizeTarget(idleDecay), "at the smallest size: not retired");
         idleDecay.decay(System.nanoTime());
         assertTrue(allocator.usedHeapMemory() < used, "the idle ones are given back by halves");
         assertTrue(buddyIdleChunks(idleDecay) <= idle);
@@ -1385,8 +1410,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /**
      * Grows the calling thread's magazine for buffers above the size classes until it makes a chunk with room for
      * {@link #BUFS_PER_LARGE_CHUNK} buffers of {@code size} (it starts smaller and grows with demand), then has the
-     * decay give every chunk back: the chunks the caller makes next all have that size, which it returns. The
-     * thread must hold nothing else in {@code allocator}'s heap.
+     * decay give every chunk back and sets the magazine's chunk size target back to that size (the decay that
+     * retired the chunk it allocated from halved it): the chunks the caller makes next all have that size, which it
+     * returns. The thread must hold nothing else in {@code allocator}'s heap.
      */
     private static long growLargeChunks(AdaptiveByteBufAllocator allocator, int size, boolean threadLocal)
             throws Exception {
@@ -1418,7 +1444,43 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
         assertEquals(before, direct ? metric.usedDirectMemory() : metric.usedHeapMemory(),
                 "the warm-up chunks were given back");
+        setLargeChunkSizeTarget(idleDecay, (int) full);
         return full;
+    }
+
+    private static Object buddyField(Object target, String name) throws Exception {
+        Field f = target.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(target);
+    }
+
+    /** The heap's magazine for buffers above the size classes, which must exist. */
+    private static Object buddyMagazine(IdleDecay idleDecay) {
+        Object magazine = idleDecay.buddyMagazine;
+        assertNotNull(magazine, "no magazine for buffers above the size classes");
+        return magazine;
+    }
+
+    /** The size the heap's large-buffer magazine makes its next chunks at when it needs no more room at once. */
+    private static int largeChunkSizeTarget(IdleDecay idleDecay) throws Exception {
+        return (Integer) buddyField(buddyField(buddyMagazine(idleDecay), "chunkController"), "chunkSizeTarget");
+    }
+
+    private static void setLargeChunkSizeTarget(IdleDecay idleDecay, int target) throws Exception {
+        Object controller = buddyField(buddyMagazine(idleDecay), "chunkController");
+        Field f = controller.getClass().getDeclaredField("chunkSizeTarget");
+        f.setAccessible(true);
+        f.setInt(controller, target);
+    }
+
+    /** How many chunks the heap's large-buffer magazine retired so far. */
+    private static int buddyRetired(IdleDecay idleDecay) throws Exception {
+        return (Integer) buddyField(buddyMagazine(idleDecay), "retired");
+    }
+
+    /** How many retired chunks of the heap's large-buffer magazine wait for their last buffers. */
+    private static int buddyRetiring(IdleDecay idleDecay) throws Exception {
+        return ((AdaptivePoolingAllocator.ChunkQueue) buddyField(buddyMagazine(idleDecay), "retiring")).size;
     }
 
     /** The calling thread's thread-local heap. */
@@ -1653,15 +1715,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * The chunk a large-buffer magazine allocates from is given back like the others once nothing in it is in use
-     * through a whole interval; one with a buffer out stays.
+     * The chunk a large-buffer magazine allocates from, at the smallest chunk size, which no decay retires, is given
+     * back like the others once nothing in it is in use through a whole interval; one with a buffer out stays.
      */
     @Test
     void activeLargeChunkIdleForAWholeIntervalIsGivenBack() throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
+        assumeFalse(isLowMemory(), "low-memory mode does not pool 256 KiB buffers");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
-        ByteBuf out = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
+        final int size = 256 * 1024;
+        ByteBuf out = allocator.heapBuffer(size, size);
         long chunk = allocator.usedHeapMemory();
+        assertEquals(512 * 1024, chunk, "room for two");
         IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
         idleDecay.decay(System.nanoTime());
         idleDecay.decay(System.nanoTime());
@@ -1673,9 +1737,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(chunk, allocator.usedHeapMemory(), "idle since this decay only");
         idleDecay.decay(System.nanoTime());
         assertEquals(0, allocator.usedHeapMemory(), "idle through a whole interval: given back");
+        assertEquals(0, buddyRetired(idleDecay), "never retired");
 
         // The next large allocation opens a new chunk.
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+        allocator.heapBuffer(size, size).release();
         assertEquals(chunk, allocator.usedHeapMemory());
     }
 
@@ -1717,7 +1782,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             }
             int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
             // Three chunks' worth: chunks 1 and 2 become wholly free; chunk 3, the one the magazine allocates from,
-            // keeps one buffer out, so it stays the magazine's.
+            // keeps one buffer out, so it stays in the used memory (the first decay retires it, and only the release
+            // of that buffer frees it).
             while (held.size() < 3 * perChunk) {
                 held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             }
@@ -1927,18 +1993,252 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
-    /** A heap whose large-buffer chunks were all given back starts again at the largest chunk it made. */
+    /**
+     * A heap whose large-buffer chunks were all given back starts again at its chunk size target: the largest chunk
+     * it made, halved by the decay that found the chunk it allocated from unused.
+     */
     @Test
-    void largeBufferChunksRestartAtTheLargestSize() throws Throwable {
+    void largeBufferChunksRestartAtTheirTarget() throws Throwable {
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
             long full = growLargeChunks(allocator, BUDDY_NOTE_SIZE, true);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+            assertEquals(full, allocator.usedHeapMemory(), "at the target");
+            idleDecay.decay(System.nanoTime());
+            assertEquals(0, allocator.usedHeapMemory(), "unused, and retired");
             ByteBuf one = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
             try {
-                assertEquals(full, allocator.usedHeapMemory());
+                assertEquals(full / 2, allocator.usedHeapMemory(), "the halved target");
             } finally {
                 one.release();
+            }
+        });
+    }
+
+    /** The smallest chunk a large-buffer magazine makes, and the lowest its decays shrink its chunks to. */
+    private static final int SMALLEST_LARGE_CHUNK = 512 * 1024;
+
+    /**
+     * A heap that went from 1 MiB buffers to a trickle of 256 KiB ones, one at a time, goes down to the smallest chunk
+     * by halves, one per decay: each decay finds the chunk it allocates from at most half used, halves the size of
+     * its next chunks and retires that chunk, which the release of its buffer then frees. At the smallest chunk it
+     * stays.
+     */
+    @Test
+    void largeChunksShrinkByHalvesUnderATrickle() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int big = 1024 * 1024;
+            final int size = 256 * 1024;
+            long chunk = growLargeChunks(allocator, big, true);
+            allocator.heapBuffer(big, big).release();
+            assertEquals(8 * 1024 * 1024, chunk, "8 x 1 MiB");
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            int retired = buddyRetired(idleDecay);
+            while (chunk > SMALLEST_LARGE_CHUNK) {
+                ByteBuf buf = allocator.heapBuffer(size, size);
+                assertEquals(chunk, allocator.usedHeapMemory(), "from a chunk of " + chunk);
+                idleDecay.decay(System.nanoTime());
+                assertEquals(chunk / 2, largeChunkSizeTarget(idleDecay), "halved");
+                assertEquals(++retired, buddyRetired(idleDecay));
+                assertEquals(1, buddyRetiring(idleDecay), "a buffer is out: retired, not freed");
+                assertEquals(chunk, allocator.usedHeapMemory(), "still used while a buffer is out");
+                buf.release();
+                assertEquals(0, buddyRetiring(idleDecay));
+                assertEquals(0, allocator.usedHeapMemory(), "freed at the release of its last buffer");
+                chunk /= 2;
+            }
+            for (int i = 0; i < 3; i++) {
+                ByteBuf buf = allocator.heapBuffer(size, size);
+                assertEquals(SMALLEST_LARGE_CHUNK, allocator.usedHeapMemory());
+                idleDecay.decay(System.nanoTime());
+                assertEquals(SMALLEST_LARGE_CHUNK, largeChunkSizeTarget(idleDecay));
+                assertEquals(retired, buddyRetired(idleDecay), "the smallest chunk is not retired");
+                buf.release();
+                assertEquals(SMALLEST_LARGE_CHUNK, allocator.usedHeapMemory(), "it stays the magazine's");
+            }
+        });
+    }
+
+    /** A chunk the decay retires with nothing in it in use is freed by that decay. */
+    @Test
+    void retiredChunkWithNothingOutIsFreedByTheDecay() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            long chunk = growLargeChunks(allocator, 1024 * 1024, true);
+            final int size = 256 * 1024;
+            allocator.heapBuffer(size, size).release();
+            assertEquals(chunk, allocator.usedHeapMemory());
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            int retired = buddyRetired(idleDecay);
+            idleDecay.decay(System.nanoTime());
+            assertEquals(retired + 1, buddyRetired(idleDecay));
+            assertEquals(0, buddyRetiring(idleDecay));
+            assertEquals(0, allocator.usedHeapMemory(), "freed by the decay");
+            assertEquals(0, buddyIdleChunks(idleDecay), "not kept idle");
+            ByteBuf next = allocator.heapBuffer(size, size);
+            try {
+                assertEquals(chunk / 2, allocator.usedHeapMemory(), "the next chunk is half the size");
+            } finally {
+                next.release();
+            }
+        });
+    }
+
+    /**
+     * A retired chunk stays as long as a buffer of it is out, whatever else the heap allocates, and is counted in the
+     * used memory until that buffer's release frees it. It is never allocated from again.
+     */
+    @Test
+    void retiredChunkStaysUntilItsLastBufferIsReleased() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            long chunk = growLargeChunks(allocator, 1024 * 1024, true);
+            final int size = 256 * 1024;
+            ByteBuf longLived = allocator.heapBuffer(size, size);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            idleDecay.decay(System.nanoTime());
+            assertEquals(1, buddyRetiring(idleDecay));
+            for (int i = 0; i < 8; i++) {
+                allocator.heapBuffer(size, size).release();
+                assertEquals(chunk + chunk / 2, allocator.usedHeapMemory(),
+                        "a new chunk of half the size serves the allocations; the retired one stays");
+            }
+            // The new chunk, unused at this decay, is retired and freed; the retired one still waits for its buffer.
+            idleDecay.decay(System.nanoTime());
+            assertEquals(chunk, allocator.usedHeapMemory());
+            assertEquals(1, buddyRetiring(idleDecay));
+            longLived.release();
+            assertEquals(0, buddyRetiring(idleDecay));
+            assertEquals(0, allocator.usedHeapMemory());
+        });
+    }
+
+    /**
+     * On a thread-local heap, another thread's release of the last buffer of a retired chunk is a note: the heap's
+     * next size-class slow path applies it, and frees the chunk.
+     */
+    @Test
+    void retiredChunkEmptiedByAnotherThreadIsFreedAtTheNextDrain() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            long chunk = growLargeChunks(allocator, 1024 * 1024, true);
+            final int size = 256 * 1024;
+            ByteBuf out = allocator.heapBuffer(size, size);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            idleDecay.decay(System.nanoTime());
+            assertEquals(1, buddyRetiring(idleDecay));
+            release(out, true);
+            assertEquals(1, buddyRetiring(idleDecay), "only noted so far");
+            assertEquals(chunk, allocator.usedHeapMemory());
+
+            // Two chunks' worth of small buffers: the size class goes to its slow path, which applies the notes.
+            List<ByteBuf> small = new ArrayList<ByteBuf>();
+            for (int i = 0; i < 2 * 1024; i++) {
+                small.add(allocator.heapBuffer(256));
+            }
+            for (ByteBuf buf : small) {
+                buf.release();
+            }
+            assertEquals(0, buddyRetiring(idleDecay));
+            long used = allocator.usedHeapMemory();
+            assertTrue(used < 2 * 1024 * 1024, "only the small buffers' chunks are left: " + used);
+        });
+    }
+
+    /**
+     * On a stripe, a release of the last buffer of a retired chunk that finds the stripe lock busy is a note: the
+     * stripe's next decay (or large-buffer slow path) applies it, and frees the chunk.
+     */
+    @Test
+    void retiredChunkEmptiedUnderABusyStripeLockIsFreedAtTheNextDrain() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
+        long chunk = growLargeChunks(allocator, 1024 * 1024, false);
+        final int size = 256 * 1024;
+        final ByteBuf out = allocator.heapBuffer(size, size);
+        IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
+        idleDecay.decay(System.nanoTime());
+        assertEquals(1, buddyRetiring(idleDecay));
+        underStripeLocks(allocator, true, () -> {
+            try {
+                release(out, true);
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertEquals(1, buddyRetiring(idleDecay), "only noted so far");
+        assertEquals(chunk, allocator.usedHeapMemory());
+        idleDecay.decay(System.nanoTime());
+        assertEquals(0, buddyRetiring(idleDecay));
+        assertEquals(0, allocator.usedHeapMemory(), "freed at the decay's drain");
+    }
+
+    /**
+     * After a halving, a burst that needs more than the target grows the chunks again: the first new chunk is at the
+     * target, and the next, made while that one is full, twice it, back to where it was.
+     */
+    @Test
+    void burstAfterAHalvingGrowsTheChunksBack() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int size = 1024 * 1024;
+            long chunk = growLargeChunks(allocator, size, true);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            ByteBuf one = allocator.heapBuffer(size, size);
+            idleDecay.decay(System.nanoTime());
+            one.release();
+            assertEquals(0, allocator.usedHeapMemory(), "retired, then freed");
+            assertEquals(chunk / 2, largeChunkSizeTarget(idleDecay));
+
+            List<ByteBuf> burst = new ArrayList<ByteBuf>();
+            try {
+                for (int i = 0; i < 12; i++) {
+                    burst.add(allocator.heapBuffer(size, size));
+                }
+                assertEquals(chunk / 2 + chunk, allocator.usedHeapMemory(), "two chunks: 4 MiB, then 8 MiB");
+                assertEquals(chunk, largeChunkSizeTarget(idleDecay), "back to 8 MiB");
+            } finally {
+                for (ByteBuf buf : burst) {
+                    buf.release();
+                }
+            }
+        });
+    }
+
+    /** A decay that finds the chunk the magazine allocates from more than half used leaves it and its size be. */
+    @Test
+    void activeLargeChunkMoreThanHalfUsedIsNotRetired() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int size = 1024 * 1024;
+            long chunk = growLargeChunks(allocator, size, true);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            int retired = buddyRetired(idleDecay);
+            List<ByteBuf> held = new ArrayList<ByteBuf>();
+            try {
+                // Five of eight blocks: the largest free block is a quarter of the chunk.
+                for (int i = 0; i < BUFS_PER_LARGE_CHUNK / 2 + 1; i++) {
+                    held.add(allocator.heapBuffer(size, size));
+                }
+                idleDecay.decay(System.nanoTime());
+                assertEquals(chunk, largeChunkSizeTarget(idleDecay), "not shrunk");
+                assertEquals(retired, buddyRetired(idleDecay), "not retired");
+                assertEquals(0, buddyRetiring(idleDecay));
+                held.add(allocator.heapBuffer(size, size));
+                assertEquals(chunk, allocator.usedHeapMemory(), "still the chunk the magazine allocates from");
+            } finally {
+                for (ByteBuf buf : held) {
+                    buf.release();
+                }
             }
         });
     }

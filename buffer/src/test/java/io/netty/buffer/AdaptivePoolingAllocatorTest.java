@@ -321,7 +321,8 @@ class AdaptivePoolingAllocatorTest {
     /**
      * Grows the calling thread's stripe magazine for buffers above the size classes until it makes a chunk for 8
      * buffers of {@code size} (it starts smaller and grows with demand), then has the stripe's decay give every chunk
-     * back, so the chunks made next all have that size. The allocator must hold nothing else.
+     * back and sets the magazine's chunk size target back to that size (the decay that retired the chunk it allocated
+     * from halved it), so the chunks made next all have that size. The allocator must hold nothing else.
      */
     private static void growLargeChunks(AdaptivePoolingAllocator allocator, int size) throws Exception {
         long full = Long.highestOneBit(8L * size - 1) << 1;
@@ -342,7 +343,8 @@ class AdaptivePoolingAllocatorTest {
         for (Object stripe : (Object[]) stripesField.get(allocator)) {
             Field magField = stripe.getClass().getDeclaredField("buddyMagazine");
             magField.setAccessible(true);
-            if (magField.get(stripe) != null) {
+            Object magazine = magField.get(stripe);
+            if (magazine != null) {
                 Field decayField = stripe.getClass().getDeclaredField("idleDecay");
                 decayField.setAccessible(true);
                 AdaptivePoolingAllocator.IdleDecay idleDecay =
@@ -350,6 +352,12 @@ class AdaptivePoolingAllocatorTest {
                 for (int i = 0; i < 16 && allocator.usedMemory() > 0; i++) {
                     idleDecay.decay(System.nanoTime());
                 }
+                Field controllerField = magazine.getClass().getDeclaredField("chunkController");
+                controllerField.setAccessible(true);
+                Object controller = controllerField.get(magazine);
+                Field targetField = controller.getClass().getDeclaredField("chunkSizeTarget");
+                targetField.setAccessible(true);
+                targetField.setInt(controller, (int) full);
             }
         }
         assertEquals(0, allocator.usedMemory(), "the warm-up chunks were given back");
