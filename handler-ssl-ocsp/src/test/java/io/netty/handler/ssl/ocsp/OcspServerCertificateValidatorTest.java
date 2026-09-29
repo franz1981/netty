@@ -17,6 +17,7 @@ package io.netty.handler.ssl.ocsp;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -264,7 +265,32 @@ class OcspServerCertificateValidatorTest extends AbstractOcspTest {
      * @param spec describes the OCSP response the responder will serve
      * @param assertions the assertions to verify on the {@link ValidationOutcome}
      */
+    /**
+     * closeAndThrowIfNotValid=false leaves the decision to the application. The server writes 8 bytes right after
+     * the handshake, and 8 more bytes (then closes) once the client pings it on the OcspValidationEvent. The
+     * application must see either the whole stream or none of it, not the second half only.
+     */
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void revokedWithoutCloseDeliversAllOrNothing() throws Exception {
+        ResponseSpec responseSpec = new ResponseSpec(
+            true /*revoked*/, FRESH_THIS_UPDATE_AGE_MILLIS, NEXT_UPDATE_AHEAD_MILLIS);
+        validateCertificate(responseSpec, false, outcome -> {
+            assertEquals(OcspResponse.Status.REVOKED, outcome.status);
+            assertTrue(outcome.channelClosedFuture.awaitUninterruptibly(10, TimeUnit.SECONDS),
+                "server closes after its second write");
+            int received = outcome.bytesReceivedCount.get();
+            System.err.println("m3w2-false: status=" + outcome.status + " bytesReceived=" + received + " of 16");
+            assertTrue(received == 16 || received == 0, "application received " + received + " of 16 bytes");
+        });
+    }
+
     private void validateCertificate(ResponseSpec spec, Consumer<ValidationOutcome> assertions) throws Exception {
+        validateCertificate(spec, true, assertions);
+    }
+
+    private void validateCertificate(ResponseSpec spec, final boolean closeAndThrowIfNotValid,
+                                     Consumer<ValidationOutcome> assertions) throws Exception {
         final X509Bundle issuer = new CertificateBuilder()
                 .algorithm(CertificateBuilder.Algorithm.ecp256)
                 .subject("CN=OcspIssuerCA")
@@ -343,6 +369,14 @@ class OcspServerCertificateValidatorTest extends AbstractOcspTest {
                             ch.pipeline().addLast(serverSslCtx.newHandler(ch.alloc()));
                             // Write back some bytes so we can validate if these are discarded or not.
                             ch.writeAndFlush(ch.alloc().buffer(8).writeZero(8));
+                            ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                                @Override
+                                public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                                    ReferenceCountUtil.release(msg);
+                                    ctx.writeAndFlush(ctx.alloc().buffer(8).writeZero(8))
+                                            .addListener(ChannelFutureListener.CLOSE);
+                                }
+                            });
                         }
                     })
                     .bind(NetUtil.LOCALHOST4, 0)
@@ -368,12 +402,15 @@ class OcspServerCertificateValidatorTest extends AbstractOcspTest {
                             ChannelPipeline pipeline = ch.pipeline();
                             pipeline.addLast(clientSslCtx.newHandler(ch.alloc(), "localhost", tlsPort));
                             pipeline.addLast(new OcspServerCertificateValidator(
-                                    true, false, ioTransport, dnsNameResolver));
+                                    closeAndThrowIfNotValid, false, ioTransport, dnsNameResolver));
                             pipeline.addLast(new ChannelInboundHandlerAdapter() {
                                 @Override
                                 public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
                                     if (evt instanceof OcspValidationEvent) {
                                         outcome.status = ((OcspValidationEvent) evt).response().status();
+                                        if (!closeAndThrowIfNotValid) {
+                                            ctx.writeAndFlush(ctx.alloc().buffer(1).writeByte(1));
+                                        }
                                         verdictLatch.countDown();
                                     }
                                     if (evt instanceof SslHandshakeCompletionEvent) {
@@ -394,6 +431,7 @@ class OcspServerCertificateValidatorTest extends AbstractOcspTest {
                                 public void channelRead(ChannelHandlerContext ctx, Object msg) {
                                     // Ensure forwarded bytes are released
                                     outcome.bytesReceived = true;
+                                    outcome.bytesReceivedCount.addAndGet(((ByteBuf) msg).readableBytes());
                                     ReferenceCountUtil.release(msg);
                                 }
                             });
@@ -487,5 +525,6 @@ class OcspServerCertificateValidatorTest extends AbstractOcspTest {
         volatile ChannelFuture channelClosedFuture;
         volatile int ocspRequests;
         volatile boolean bytesReceived;
+        final AtomicInteger bytesReceivedCount = new AtomicInteger();
     }
 }
