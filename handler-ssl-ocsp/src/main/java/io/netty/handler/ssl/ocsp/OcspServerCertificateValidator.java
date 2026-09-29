@@ -179,6 +179,8 @@ public class OcspServerCertificateValidator extends ByteToMessageDecoder impleme
                 ocspQueryInProgress = true;
                 ocspRespPromise.addListener((GenericFutureListener<Future<BasicOCSPResp>>) future -> {
                     ocspQueryInProgress = false;
+                    // Assume revoked as default.
+                    OcspResponse.Status status = OcspResponse.Status.REVOKED;
                     try {
                         // If Future is success then we have successfully received OCSP response
                         // from OCSP responder. We will validate it now and process.
@@ -199,7 +201,6 @@ public class OcspServerCertificateValidator extends ByteToMessageDecoder impleme
                                 return;
                             }
 
-                            OcspResponse.Status status;
                             if (response.getCertStatus() == null) {
                                 // 'null' means certificate is valid
                                 status = OcspResponse.Status.VALID;
@@ -232,7 +233,13 @@ public class OcspServerCertificateValidator extends ByteToMessageDecoder impleme
                             ctx.close();
                         }
                     } finally {
+                        if (status != OcspResponse.Status.VALID) {
+                            // When the status is revoked we should drop all bytes on the floor so following handlers
+                            // will not receive these.
+                            internalBuffer().clear();
+                        }
                         ctx.fireUserEventTriggered(evt);
+
                         // Lets remove ourselves from the pipeline because we are done processing validation.
                         ctx.pipeline().remove(this);
                         if (readPending) {
