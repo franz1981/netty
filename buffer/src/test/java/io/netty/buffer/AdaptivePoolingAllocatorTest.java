@@ -65,12 +65,12 @@ class AdaptivePoolingAllocatorTest {
      * decay runs during the trace (it takes well under the decay interval), so the values do not depend on time.
      */
     private static final long[][] EXPECTED = {
-            {0, 0}, {38, 17563648}, {67, 31981568}, {67, 31981568},
-            {67, 31981568}, {67, 31981568}, {69, 36175872}, {69, 36175872},
-            {69, 36175872}, {69, 36175872}, {69, 36175872}, {69, 36175872},
-            {69, 36175872}, {69, 36175872}, {72, 37355520}, {72, 37355520},
-            {72, 37355520}, {72, 37355520}, {72, 37355520}, {72, 37355520},
-            {72, 37355520}, {72, 37355520}, {72, 37355520},
+            {0, 0}, {39, 17039360}, {68, 31457280}, {68, 31457280},
+            {68, 31457280}, {68, 31457280}, {70, 35651584}, {70, 35651584},
+            {70, 35651584}, {70, 35651584}, {70, 35651584}, {70, 35651584},
+            {70, 35651584}, {70, 35651584}, {73, 36831232}, {73, 36831232},
+            {73, 36831232}, {73, 36831232}, {73, 36831232}, {73, 36831232},
+            {73, 36831232}, {73, 36831232}, {73, 36831232},
     };
 
     private static final int[] TRACE_SIZES = {64, 1024, 4096, 16384, 65536};
@@ -127,9 +127,9 @@ class AdaptivePoolingAllocatorTest {
     @ValueSource(booleans = {false, true})
     void seededTraceKeepsChunkAllocationsAndUsedMemory(boolean threadLocal) throws Throwable {
         assumeFalse(isLowMemory(), "low-memory mode pools fewer size classes and has no thread-local heaps");
-        // The recorded memory column keeps three idle 2 MiB chunks of the reallocated buffers above the size classes
-        // (their byte bound is never below 8 MiB); with fewer (one processor gives two) one of them is freed instead.
-        assumeTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE >= 3, "keeps fewer than three idle large-buffer chunks");
+        // The recorded memory column keeps four idle chunks of the reallocated buffers above the size classes (their
+        // byte bound is never below 8 MiB); with fewer (one processor gives two) one of them is freed instead.
+        assumeTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE >= 4, "keeps fewer than four idle large-buffer chunks");
         final AtomicReference<Object> result = new AtomicReference<Object>();
         final CountingChunkAllocator counter = new CountingChunkAllocator();
         final AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(counter, true);
@@ -290,10 +290,12 @@ class AdaptivePoolingAllocatorTest {
         CountingChunkAllocator counter = new CountingChunkAllocator();
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(counter, true);
         int size = 256 * 1024; // above the largest size class, so buddy chunks
+        growLargeChunks(allocator, size);
+        long base = counter.count;
         List<ByteBuf> live = new ArrayList<ByteBuf>();
         live.add(allocator.allocate(size, size));
         // How many buffers a chunk holds comes from the allocator: one chunk was allocated for the first buffer.
-        assertEquals(1, counter.count);
+        assertEquals(1, counter.count - base);
         int buffersPerChunk = (int) (allocator.usedMemory() / size);
         assertTrue(buffersPerChunk >= 2, "buffers per chunk " + buffersPerChunk);
         int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 4;
@@ -301,7 +303,7 @@ class AdaptivePoolingAllocatorTest {
             live.add(allocator.allocate(size, size));
         }
         long allocated = counter.count;
-        assertEquals(chunks, allocated, "one chunk per " + buffersPerChunk + " buffers");
+        assertEquals(chunks, allocated - base, "one chunk per " + buffersPerChunk + " buffers");
         // Empty the first chunk, which served the first buffers; every other chunk stays full.
         for (int i = 0; i < buffersPerChunk; i++) {
             live.remove(0).release();
@@ -314,6 +316,43 @@ class AdaptivePoolingAllocatorTest {
         for (ByteBuf buf : live) {
             buf.release();
         }
+    }
+
+    /**
+     * Grows the calling thread's stripe magazine for buffers above the size classes until it makes a chunk for 8
+     * buffers of {@code size} (it starts smaller and grows with demand), then has the stripe's decay give every chunk
+     * back, so the chunks made next all have that size. The allocator must hold nothing else.
+     */
+    private static void growLargeChunks(AdaptivePoolingAllocator allocator, int size) throws Exception {
+        long full = Long.highestOneBit(8L * size - 1) << 1;
+        List<ByteBuf> held = new ArrayList<ByteBuf>();
+        for (;;) {
+            long used = allocator.usedMemory();
+            held.add(allocator.allocate(size, size));
+            if (allocator.usedMemory() - used >= full) {
+                break;
+            }
+            assertTrue(held.size() < 64, "chunks never grew to " + full);
+        }
+        for (ByteBuf buf : held) {
+            buf.release();
+        }
+        Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
+        stripesField.setAccessible(true);
+        for (Object stripe : (Object[]) stripesField.get(allocator)) {
+            Field magField = stripe.getClass().getDeclaredField("buddyMagazine");
+            magField.setAccessible(true);
+            if (magField.get(stripe) != null) {
+                Field decayField = stripe.getClass().getDeclaredField("idleDecay");
+                decayField.setAccessible(true);
+                AdaptivePoolingAllocator.IdleDecay idleDecay =
+                        (AdaptivePoolingAllocator.IdleDecay) decayField.get(stripe);
+                for (int i = 0; i < 16 && allocator.usedMemory() > 0; i++) {
+                    idleDecay.decay(System.nanoTime());
+                }
+            }
+        }
+        assertEquals(0, allocator.usedMemory(), "the warm-up chunks were given back");
     }
 
     /** Release {@code buf} on {@code helper} and wait; with {@code locks}, while holding every one of them. */
