@@ -62,6 +62,7 @@ import java.util.List;
 public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
 
     private final ByteBuf[] delimiters;
+    private final int maxDelimiterLength;
     private final int maxFrameLength;
     private final boolean stripDelimiter;
     private final boolean failFast;
@@ -69,6 +70,12 @@ public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
     private int tooLongFrameLength;
     /** Set only when decoding with "\n" and "\r\n" as the delimiter.  */
     private final LineBasedFrameDecoder lineBasedDecoder;
+    /**
+     * Last scan position, relative to the reader index, at which no delimiter could be found.
+     * Resuming from this offset avoids rescanning the whole buffer from the reader index on
+     * every {@link #decode(ChannelHandlerContext, ByteBuf)} call.
+     */
+    private int scanOffset;
 
     /**
      * Creates a new instance.
@@ -173,13 +180,17 @@ public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
         if (isLineBased(delimiters) && !isSubclass()) {
             lineBasedDecoder = new LineBasedFrameDecoder(maxFrameLength, stripDelimiter, failFast);
             this.delimiters = null;
+            this.maxDelimiterLength = 0;
         } else {
             this.delimiters = new ByteBuf[delimiters.length];
+            int maxDelimiterLength = 0;
             for (int i = 0; i < delimiters.length; i ++) {
                 ByteBuf d = delimiters[i];
                 validateDelimiter(d);
                 this.delimiters[i] = d.slice(d.readerIndex(), d.readableBytes());
+                maxDelimiterLength = Math.max(maxDelimiterLength, this.delimiters[i].readableBytes());
             }
+            this.maxDelimiterLength = maxDelimiterLength;
             lineBasedDecoder = null;
         }
         this.maxFrameLength = maxFrameLength;
@@ -233,15 +244,24 @@ public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
         // Try all delimiters and choose the delimiter which yields the shortest frame.
         int minFrameLength = Integer.MAX_VALUE;
         ByteBuf minDelim = null;
-        for (ByteBuf delim: delimiters) {
-            int frameLength = indexOf(buffer, delim);
-            if (frameLength >= 0 && frameLength < minFrameLength) {
-                minFrameLength = frameLength;
-                minDelim = delim;
+        int startIndex = buffer.readerIndex() + scanOffset;
+        if (startIndex < buffer.writerIndex()) {
+            ByteBuf scanRegion = buffer.slice(startIndex, buffer.writerIndex() - startIndex);
+            for (ByteBuf delim: delimiters) {
+                int index = ByteBufUtil.indexOf(delim, scanRegion);
+                if (index >= 0) {
+                    int frameLength = index + scanOffset;
+                    if (frameLength < minFrameLength) {
+                        minFrameLength = frameLength;
+                        minDelim = delim;
+                    }
+                }
             }
         }
 
         if (minDelim != null) {
+            // A delimiter was found; the next decode() call starts scanning fresh data only.
+            scanOffset = 0;
             int minDelimLength = minDelim.capacity();
             ByteBuf frame;
 
@@ -276,19 +296,26 @@ public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
             return frame;
         } else {
             if (!discardingTooLongFrame) {
-                if (buffer.readableBytes() > maxFrameLength) {
+                int readableBytes = buffer.readableBytes();
+                if (readableBytes > maxFrameLength) {
                     // Discard the content of the buffer until a delimiter is found.
-                    tooLongFrameLength = buffer.readableBytes();
-                    buffer.skipBytes(buffer.readableBytes());
+                    tooLongFrameLength = readableBytes;
+                    buffer.skipBytes(readableBytes);
                     discardingTooLongFrame = true;
+                    scanOffset = 0;
                     if (failFast) {
                         fail(tooLongFrameLength);
                     }
+                } else {
+                    // No delimiter found yet. Remember how far we've already scanned so the next
+                    // call doesn't rescan bytes that cannot possibly contain the start of a match.
+                    scanOffset = Math.max(0, readableBytes - maxDelimiterLength + 1);
                 }
             } else {
                 // Still discarding the buffer since a delimiter is not found.
                 tooLongFrameLength += buffer.readableBytes();
                 buffer.skipBytes(buffer.readableBytes());
+                scanOffset = 0;
             }
             return null;
         }
@@ -304,19 +331,6 @@ public class DelimiterBasedFrameDecoder extends ByteToMessageDecoder {
                             "frame length exceeds " + maxFrameLength +
                             " - discarding");
         }
-    }
-
-    /**
-     * Returns the number of bytes between the readerIndex of the haystack and
-     * the first needle found in the haystack.  -1 is returned if no needle is
-     * found in the haystack.
-     */
-    private static int indexOf(ByteBuf haystack, ByteBuf needle) {
-        int index = ByteBufUtil.indexOf(needle, haystack);
-        if (index == -1) {
-            return -1;
-        }
-        return index - haystack.readerIndex();
     }
 
     private static void validateDelimiter(ByteBuf delimiter) {
