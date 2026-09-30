@@ -212,11 +212,16 @@ public class AdaptiveHeapPoolingTest {
     }
 
     /**
-     * A size class with no chunk size under the cap that holds two of its buffers is not pooled, nor any above it;
-     * the classes below it still are, in smaller chunks.
+     * A size class with no chunk size under the cap that holds two of its buffers is not pooled; the others still
+     * are, in smaller chunks. Each class is decided on its own: under a cap between 128 and 136 KiB the 4352-byte
+     * class, whose chunks are 136 KiB, is not pooled, while the 8 KiB class above it is, in 128 KiB chunks.
      */
     @Test
     void sizeClassesThatDoNotFitUnderTheCapAreNotPooled() throws Exception {
+        int[] between = AdaptivePoolingAllocator.sizeClassChunkSizes(135000);
+        assertEquals(0, between[AdaptivePoolingAllocator.sizeClassIndexOf(4352)]);
+        assertEquals(128 * KIB, between[AdaptivePoolingAllocator.sizeClassIndexOf(8 * KIB)]);
+
         RecordingChunkAllocator chunks = new RecordingChunkAllocator();
         int cap = 200000;
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(chunks, false, false, cap);
@@ -235,6 +240,67 @@ public class AdaptiveHeapPoolingTest {
         small.release();
         assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
         assertFalse(hasBuddyMagazine(allocator), "not pooled above the size classes either");
+    }
+
+    /**
+     * A size class with no chunk size under the cap goes through the size-class routing like any other: its
+     * magazine's slow path serves every buffer from a one-shot chunk, and the magazine never gets a chunk.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void cappedOutHeapClassIsServedByTheSlowPathFromOneShotChunks(final boolean threadLocal) throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool 128 KiB buffers at all");
+        final RecordingChunkAllocator chunks = new RecordingChunkAllocator();
+        final AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(chunks, true, false, 200000);
+        final int size = 128 * KIB;
+        final int index = AdaptivePoolingAllocator.sizeClassIndexOf(size);
+        assertEquals(0, allocator.chunkSizeOfClass(index));
+        onThread(threadLocal, () -> {
+            List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+            // More buffers than a pooled chunk of this class would hold.
+            for (int i = 0; i < 4 * AdaptivePoolingAllocator.MIN_SEGMENTS_UNDER_CAP; i++) {
+                ByteBuf buf = allocator.allocate(size, size);
+                assertFalse(isPooled(buf), "buffer " + i);
+                assertEquals(size, chunkOf(buf).capacity, "a one-shot chunk of its own");
+                assertEquals(i + 1, chunks.allocated.size(), "one chunk buffer per buffer, none for a chunk");
+                bufs.add(buf);
+            }
+            Object magazine = sizeClassMagazine(allocator, index, threadLocal);
+            assertNotNull(magazine, "routed through the size class's magazine");
+            Field current = magazine.getClass().getDeclaredField("current");
+            current.setAccessible(true);
+            assertNull(current.get(magazine), "the magazine never has a chunk");
+            assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
+            for (ByteBuf buf : bufs) {
+                assertTrue(buf.release());
+            }
+            assertEquals(0, allocator.usedMemory(), "freed with their buffers");
+            assertEquals(0, chunks.unreleasedBytes());
+        });
+    }
+
+    /** The magazine of a size class on the calling thread's thread-local heap, or on the stripe that has one. */
+    private static Object sizeClassMagazine(AdaptivePoolingAllocator allocator, int index, boolean threadLocal)
+            throws Exception {
+        Object[] heaps;
+        if (threadLocal) {
+            Field tlField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalSizeClassHeap");
+            tlField.setAccessible(true);
+            heaps = new Object[] {((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(allocator)).get()};
+        } else {
+            Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
+            stripesField.setAccessible(true);
+            heaps = (Object[]) stripesField.get(allocator);
+        }
+        for (Object heap : heaps) {
+            Field magsField = heap.getClass().getDeclaredField("magazines");
+            magsField.setAccessible(true);
+            Object[] mags = (Object[]) magsField.get(heap);
+            if (mags != null && mags[index] != null) {
+                return mags[index];
+            }
+        }
+        return null;
     }
 
     private static void assertContent(ByteBuf buf, int length) {
