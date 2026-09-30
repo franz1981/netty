@@ -86,7 +86,8 @@ import java.util.function.IntConsumer;
  * {@link Segment}s (4 MiB) and carves every size-class chunk out of one as a span of 64 KiB slices (see
  * {@link HeapSegments}); a chunk given up frees its span at once, for any chunk size of the heap, and a segment that
  * empties is kept by its heap as its one spare, or given back to the allocator's {@link PageStore}; an idle spare is
- * given back by the heap's decay. The buffers above the size classes keep their own chunks. Heap memory keeps chunks
+ * given back by the heap's decay. Where they can be mapped, segments are slots of {@code mmap} regions, whose idle
+ * slots the decays purge. The buffers above the size classes keep their own chunks. Heap memory keeps chunks
  * allocated one by one.
  */
 @UnstableApi
@@ -960,7 +961,8 @@ final class AdaptivePoolingAllocator {
      * <p>
      * With segments (direct memory), a size class that gives up its chunks frees their spans at once, and a segment
      * they empty becomes the heap's spare, which its decay gives back once it stayed unused a whole interval (see
-     * {@link HeapSegments#decay}).
+     * {@link HeapSegments#decay}). The same decay lets the {@link PageStore} purge the region slots that stayed free a
+     * whole interval, at most once per interval for all heaps (see {@link PageStore#purgeIfDue}).
      * <p>
      * What a heap keeps idle is bounded: up to {@link SizeClassChunkRecycler#RECYCLED_BYTES_BUDGET} in its recycler,
      * up to {@link #CHUNK_REUSE_QUEUE_BYTES} of wholly free large-buffer chunks, the large-buffer chunk it allocates
