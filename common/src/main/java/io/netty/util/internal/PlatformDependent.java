@@ -209,7 +209,12 @@ public final class PlatformDependent {
             // See https://github.com/netty/netty/issues/2604
             if (javaVersion() >= 9) {
                 // Try Java 9 cleaner first, because it's based on Unsafe and can skip a few steps.
-                if (CleanerJava9.isSupported()) {
+                // EXPERIMENT (chunk-zeroing 2026-09-30): -Dio.netty.preferLinkerCleaner=true puts the libc malloc
+                // cleaner (no zeroing) ahead of CleanerJava9 (ByteBuffer.allocateDirect, zeroes every byte).
+                if (SystemPropertyUtil.getBoolean("io.netty.preferLinkerCleaner", false)
+                        && CleanerJava24Linker.isSupported()) {
+                    LEGACY_CLEANER = new CleanerJava24Linker();
+                } else if (CleanerJava9.isSupported()) {
                     LEGACY_CLEANER = new CleanerJava9();
                 } else if (CleanerJava24Linker.isSupported()) {
                     // On Java 24+ we'd like to not use Unsafe because it produces warnings. We have MemorySegment,
