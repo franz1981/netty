@@ -16,7 +16,6 @@
 package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
-import io.netty.buffer.AdaptivePoolingAllocator.HeapSegments;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.concurrent.FastThreadLocal;
