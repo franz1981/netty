@@ -55,18 +55,31 @@ final class Region {
         Arrays.fill(freedEpoch, UNCOMMITTED);
     }
 
-    /** Takes the lowest free slot: returns it, or -1 when none is free. Lock-free. */
+    /**
+     * Takes the lowest free slot with memory behind it, else the lowest free slot: returns it, or -1 when none is
+     * free. Lock-free. The memory of a free slot is read racily: a slot purged meanwhile only costs page faults.
+     */
     int takeSlot() {
         for (;;) {
             long current = free;
             if (current == 0) {
                 return -1;
             }
-            int slot = Long.numberOfTrailingZeros(current);
+            int slot = lowestCommitted(current);
             if (FREE.compareAndSet(this, current, current & ~(1L << slot))) {
                 return slot;
             }
         }
+    }
+
+    private int lowestCommitted(long slots) {
+        for (long bits = slots; bits != 0; bits &= bits - 1) {
+            int slot = Long.numberOfTrailingZeros(bits);
+            if (freedEpoch[slot] != UNCOMMITTED) {
+                return slot;
+            }
+        }
+        return Long.numberOfTrailingZeros(slots);
     }
 
     /** Frees {@code slot}, which the caller owns, stamped with {@code epoch}. Lock-free. */

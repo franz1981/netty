@@ -29,8 +29,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * The slot bitmap of a {@link Region}: lowest free slot first, a slot given back exactly once, and, under contention,
- * every slot owned by one thread at a time with takes and give-backs balancing out.
+ * The slot bitmap of a {@link Region}: lowest free slot first, those with memory behind them before the others, a
+ * slot given back exactly once, and, under contention, every slot owned by one thread at a time with takes and
+ * give-backs balancing out.
  */
 final class RegionTest {
     /** The bitmap alone: no memory behind it. */
@@ -54,6 +55,24 @@ final class RegionTest {
             region.giveBack(7, 0);
             region.giveBack(7, 0);
         }, "a slot is given back once");
+    }
+
+    /** A free slot with memory behind it goes before a lower one without: a purged slot is taken last. */
+    @Test
+    void committedSlotsFirst() {
+        Region region = region(9);
+        for (int slot = 0; slot < 9; slot++) {
+            assertEquals(slot, region.takeSlot());
+        }
+        region.freedEpoch[5] = 0; // committed when taken, as the page store does
+        region.freedEpoch[7] = 0;
+        region.giveBack(2, 0);
+        region.giveBack(7, 3);
+        region.giveBack(5, 3);
+        assertEquals(5, region.takeSlot(), "the lowest committed one");
+        assertEquals(7, region.takeSlot());
+        assertEquals(2, region.takeSlot(), "then the lowest without memory");
+        assertEquals(-1, region.takeSlot());
     }
 
     @Test
