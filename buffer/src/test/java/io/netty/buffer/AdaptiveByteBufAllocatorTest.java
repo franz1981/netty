@@ -79,6 +79,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return newAllocator(false);
     }
 
+    /** Heap buffers above the size classes are not pooled: the largest size class is. */
+    @Override
+    protected int reusedHeapBufferSize() {
+        return 128 * 1024;
+    }
+
     @Override
     protected long expectedUsedMemory(AdaptiveByteBufAllocator allocator, int capacity) {
         return 128 * 1024; // Min chunk size
@@ -310,17 +316,16 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      * Blocks released on another thread make their buddy chunks usable again for the thread that allocates: a second
      * round of the same allocations after a foreign release needs no new memory.
      */
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void buddyChunksReleasedByAnotherThreadAreReused(boolean direct) throws Exception {
+    @Test
+    void buddyChunksReleasedByAnotherThreadAreReused() throws Exception {
         final AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         final int size = 512 * 1024; // above the largest size class, below the unpooled fallback
         final ByteBuf[] bufs = new ByteBuf[24];
         for (int i = 0; i < bufs.length; i++) {
-            bufs[i] = direct ? allocator.directBuffer(size, size) : allocator.heapBuffer(size, size);
+            bufs[i] = allocator.directBuffer(size, size);
         }
-        long used = direct ? metric.usedDirectMemory() : metric.usedHeapMemory();
+        long used = metric.usedDirectMemory();
         Thread releaser = new Thread(() -> {
             for (ByteBuf buf : bufs) {
                 buf.release();
@@ -329,9 +334,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         releaser.start();
         releaser.join();
         for (int i = 0; i < bufs.length; i++) {
-            bufs[i] = direct ? allocator.directBuffer(size, size) : allocator.heapBuffer(size, size);
+            bufs[i] = allocator.directBuffer(size, size);
         }
-        assertEquals(used, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        assertEquals(used, metric.usedDirectMemory());
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -346,22 +351,22 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     void idleBuddyMemoryIsBoundedInBytes() {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         int size = 1024 * 1024; // the largest pooled size: the largest chunks
-        ByteBuf first = allocator.heapBuffer(size, size);
-        long chunkSize = allocator.usedHeapMemory();
+        ByteBuf first = allocator.directBuffer(size, size);
+        long chunkSize = allocator.usedDirectMemory();
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         bufs.add(first);
         // Four times the idle bound, in whole chunks.
         long burst = 4L * AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES;
-        while (allocator.usedHeapMemory() < burst) {
-            bufs.add(allocator.heapBuffer(size, size));
+        while (allocator.usedDirectMemory() < burst) {
+            bufs.add(allocator.directBuffer(size, size));
         }
-        long peak = allocator.usedHeapMemory();
+        long peak = allocator.usedDirectMemory();
         for (ByteBuf buf : bufs) {
             buf.release();
         }
         // No allocation follows: a heap that goes quiet must not keep the burst. The releases themselves apply the
         // bound (nothing else holds the stripe lock here, so every release acts in place).
-        long settled = allocator.usedHeapMemory();
+        long settled = allocator.usedDirectMemory();
         long bound = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES;
         assertTrue(settled <= bound + chunkSize, "peak " + peak + ", settled " + settled + ", bound " + bound);
     }
@@ -377,17 +382,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int size = 256 * 1024; // above the largest size class, so buddy chunks
         // The first buffer creates the first chunk: its size and how many buffers it holds come from the allocator,
         // not from the sizing formula copied here.
-        ByteBuf first = allocator.heapBuffer(size, size);
-        long chunkSize = allocator.usedHeapMemory();
+        ByteBuf first = allocator.directBuffer(size, size);
+        long chunkSize = allocator.usedDirectMemory();
         int buffersPerChunk = (int) (chunkSize / size);
         assertTrue(buffersPerChunk >= 2, "buffers per chunk " + buffersPerChunk);
         int chunks = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 8;
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         bufs.add(first);
         while (bufs.size() < chunks * buffersPerChunk) {
-            bufs.add(allocator.heapBuffer(size, size));
+            bufs.add(allocator.directBuffer(size, size));
         }
-        long peak = allocator.usedHeapMemory();
+        long peak = allocator.usedDirectMemory();
         assertEquals((long) chunks * chunkSize, peak, "one chunk per " + buffersPerChunk + " buffers");
         for (ByteBuf buf : bufs) {
             buf.release();
@@ -396,9 +401,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // releases and frees what is kept beyond the limit.
         List<ByteBuf> again = new ArrayList<ByteBuf>();
         for (int i = 0; i <= buffersPerChunk; i++) {
-            again.add(allocator.heapBuffer(size, size));
+            again.add(allocator.directBuffer(size, size));
         }
-        long settled = allocator.usedHeapMemory();
+        long settled = allocator.usedDirectMemory();
         assertTrue(settled <= (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE + 2) * chunkSize,
                 "peak " + peak + ", settled " + settled + ", chunk " + chunkSize);
         for (ByteBuf buf : again) {
@@ -428,8 +433,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 try {
                     for (int i = 0; i < rounds && failure.get() == null; i++) {
                         int size = sizes[rng.nextInt(sizes.length)];
-                        ByteBuf buf = rng.nextBoolean() ? allocator.heapBuffer(size, size) :
-                                allocator.directBuffer(size, size);
+                        ByteBuf buf = allocator.directBuffer(size, size);
                         byte mark = (byte) rng.nextInt();
                         buf.writerIndex(size);
                         buf.setByte(0, mark);
@@ -475,8 +479,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         int size = 256 * 1024; // above the largest size class, so buddy chunks
-        ByteBuf first = allocator.heapBuffer(size, size);
-        long chunkSize = allocator.usedHeapMemory();
+        ByteBuf first = allocator.directBuffer(size, size);
+        long chunkSize = allocator.usedDirectMemory();
         int perChunk = (int) (chunkSize / size);
         if (perChunk < 8 || perChunk % 4 != 0) {
             first.release();
@@ -487,7 +491,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         bufs.add(first);
         while (bufs.size() < 3 * perChunk) {
-            bufs.add(allocator.heapBuffer(size, size));
+            bufs.add(allocator.directBuffer(size, size));
         }
         Object chunkA = anyChunkOf(bufs.get(0));
         Object chunkB = anyChunkOf(bufs.get(perChunk));
@@ -501,7 +505,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
 
         // C is full, so this takes the slow path: it applies the releases and picks between A and B.
-        ByteBuf next = allocator.heapBuffer(size, size);
+        ByteBuf next = allocator.directBuffer(size, size);
         assertSame(chunkB, anyChunkOf(next), "expected the chunk with the larger free block");
 
         next.release();
@@ -516,9 +520,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      * Buddy chunks given up by a magazine are reused by it: allocating and releasing the same set of large buffers
      * over and over from one thread does not grow the memory held after the first round.
      */
-    @ParameterizedTest
-    @ValueSource(booleans = {true, false})
-    void buddyChunksAreReusedAcrossRounds(boolean direct) throws Exception {
+    @Test
+    void buddyChunksAreReusedAcrossRounds() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
@@ -527,12 +530,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         long afterFirstRound = -1;
         for (int round = 0; round < 50; round++) {
             for (int i = 0; i < bufs.length; i++) {
-                bufs[i] = direct ? allocator.directBuffer(size, size) : allocator.heapBuffer(size, size);
+                bufs[i] = allocator.directBuffer(size, size);
             }
             for (ByteBuf buf : bufs) {
                 buf.release();
             }
-            long used = direct ? metric.usedDirectMemory() : metric.usedHeapMemory();
+            long used = metric.usedDirectMemory();
             if (afterFirstRound < 0) {
                 afterFirstRound = used;
                 assertTrue(used >= (long) size * bufs.length, "used " + used);
@@ -969,11 +972,21 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
-    /** The {@link IdleDecay} of the calling thread's thread-local heap. */
+    /** The pooling allocator behind the direct or the heap buffers of {@code allocator}. */
+    static AdaptivePoolingAllocator pooling(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
+        Field field = AdaptiveByteBufAllocator.class.getDeclaredField(direct ? "direct" : "heap");
+        field.setAccessible(true);
+        return (AdaptivePoolingAllocator) field.get(allocator);
+    }
+
+    /** The {@link IdleDecay} of the calling thread's thread-local heap for heap buffers. */
     private static IdleDecay threadLocalIdleDecay(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
+        return threadLocalIdleDecay(allocator, false);
+    }
+
+    /** The {@link IdleDecay} of the calling thread's thread-local heap for direct or heap buffers. */
+    static IdleDecay threadLocalIdleDecay(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
+        Object pooling = pooling(allocator, direct);
         Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
         tlField.setAccessible(true);
         Object heap = ((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(pooling)).get();
@@ -982,11 +995,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return (IdleDecay) decayField.get(heap);
     }
 
-    /** The {@link IdleDecay} of the one stripe that allocated buffers above the size classes. */
+    /** The {@link IdleDecay} of the one stripe that allocated direct buffers above the size classes. */
     private static IdleDecay buddyStripeIdleDecay(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
+        Object pooling = pooling(allocator, true);
         Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
         stripesField.setAccessible(true);
         IdleDecay found = null;
@@ -1016,45 +1027,45 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         // Four chunks' worth: chunks 1 to 3 filled, chunk 4 the one the magazine allocates from.
         List<ByteBuf> held = new ArrayList<ByteBuf>();
-        held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-        long chunk = allocator.usedHeapMemory();
+        held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+        long chunk = allocator.usedDirectMemory();
         if (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES < 3 * chunk) {
             held.get(0).release();
             assumeTrue(false, "keeps fewer than three idle chunks' bytes");
         }
         int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
         while (held.size() < 4 * perChunk) {
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
         try {
             IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
             long t = System.nanoTime();
             releaseChunk(held, 0, perChunk);
             releaseChunk(held, 1, perChunk);
-            assertEquals(4 * chunk, allocator.usedHeapMemory(), "chunks 1 and 2 idle, kept");
+            assertEquals(4 * chunk, allocator.usedDirectMemory(), "chunks 1 and 2 idle, kept");
 
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(4 * chunk, allocator.usedHeapMemory(), "idle for part of the interval only: none is cold");
+            assertEquals(4 * chunk, allocator.usedDirectMemory(), "idle for part of the interval only: none is cold");
 
             releaseChunk(held, 2, perChunk);
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(3 * chunk, allocator.usedHeapMemory(),
+            assertEquals(3 * chunk, allocator.usedDirectMemory(),
                     "chunks 1 and 2 were idle through the interval, chunk 3 only since its middle: one of two freed");
 
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(2 * chunk, allocator.usedHeapMemory(), "now chunk 3 counts too: one of two freed");
+            assertEquals(2 * chunk, allocator.usedDirectMemory(), "now chunk 3 counts too: one of two freed");
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(chunk, allocator.usedHeapMemory(), "the last idle one");
+            assertEquals(chunk, allocator.usedDirectMemory(), "the last idle one");
 
             // Chunk 4 is the one the magazine allocates from: it stays while a buffer in it is out, and once wholly
             // free it is filed with the idle chunks at a decay and given back at the next, like any other.
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(chunk, allocator.usedHeapMemory(), "the active chunk has buffers out: it stays");
+            assertEquals(chunk, allocator.usedDirectMemory(), "the active chunk has buffers out: it stays");
             releaseChunk(held, 3, perChunk);
             idleDecay.decay(t += IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(chunk, allocator.usedHeapMemory(), "wholly free since this decay only");
+            assertEquals(chunk, allocator.usedDirectMemory(), "wholly free since this decay only");
             idleDecay.decay(t + IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(0, allocator.usedHeapMemory(), "wholly free through a whole interval: given back");
+            assertEquals(0, allocator.usedDirectMemory(), "wholly free through a whole interval: given back");
         } finally {
             for (ByteBuf buf : held) {
                 if (buf != null) {
@@ -1074,15 +1085,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE >= 2, "keeps fewer than two idle chunks");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         List<ByteBuf> held = new ArrayList<ByteBuf>();
-        held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-        long chunk = allocator.usedHeapMemory();
+        held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+        long chunk = allocator.usedDirectMemory();
         if (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES < 2 * chunk) {
             held.get(0).release();
             assumeTrue(false, "keeps fewer than two idle chunks' bytes");
         }
         int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
         while (held.size() < 3 * perChunk) {
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
         try {
             // Chunks 1 and 2 idle, chunk 3 active and full; one decay has passed since they became idle.
@@ -1090,14 +1101,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             releaseChunk(held, 1, perChunk);
             IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
             idleDecay.decay(System.nanoTime() - 2 * IdleDecay.DECAY_INTERVAL_NANOS);
-            assertEquals(3 * chunk, allocator.usedHeapMemory());
+            assertEquals(3 * chunk, allocator.usedDirectMemory());
 
             // The next allocation finds chunk 3 full: its slow path completes the count and the decay runs. It
             // takes one of the two idle chunks as its new active chunk first, so one cold chunk is left, and freed.
             idleDecay.allocationsSinceCheck = IdleDecay.DECAY_MIN_ALLOCATIONS - 1;
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             assertEquals(0, idleDecay.allocationsSinceCheck, "the count completed on that slow path");
-            assertEquals(2 * chunk, allocator.usedHeapMemory(), "the other idle chunk is given back");
+            assertEquals(2 * chunk, allocator.usedDirectMemory(), "the other idle chunk is given back");
         } finally {
             for (ByteBuf buf : held) {
                 if (buf != null) {
@@ -1131,11 +1142,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         List<ByteBuf> held = new ArrayList<ByteBuf>();
         try {
             // The first allocation opens a chunk on the slow path.
-            held.add(allocator.heapBuffer(size, size));
+            held.add(allocator.directBuffer(size, size));
             IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
             assertEquals(256 * 1024 / 32, idleDecay.allocationsSinceCheck, "the slow path counts the block");
             // The second one comes from the same chunk, on the fast path: it counts too, and completes the count.
-            held.add(allocator.heapBuffer(size, size));
+            held.add(allocator.directBuffer(size, size));
             assertEquals(0, idleDecay.allocationsSinceCheck, "the fast path counted and completed the count");
         } finally {
             for (ByteBuf buf : held) {
@@ -1154,8 +1165,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeTrue(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE >= 2, "keeps fewer than two idle chunks");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         List<ByteBuf> held = new ArrayList<ByteBuf>();
-        held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-        long chunk = allocator.usedHeapMemory();
+        held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+        long chunk = allocator.usedDirectMemory();
         if (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES < 2 * chunk) {
             held.get(0).release();
             assumeTrue(false, "keeps fewer than two idle chunks' bytes");
@@ -1163,22 +1174,22 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
         // Three chunks' worth: chunks 1 and 2 become idle, chunk 3 is the one the stripe allocates from.
         while (held.size() < 3 * perChunk) {
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
         for (ByteBuf buf : held) {
             buf.release();
         }
         IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
         assertEquals(2, buddyIdleChunks(idleDecay));
-        long used = allocator.usedHeapMemory();
+        long used = allocator.usedDirectMemory();
         // Each round: the interval has passed, and one large buffer comes from chunk 3, on the fast path.
         idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
-        assertEquals(used, allocator.usedHeapMemory(), "idle since before the first decay: not a whole interval");
+        allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+        assertEquals(used, allocator.usedDirectMemory(), "idle since before the first decay: not a whole interval");
         idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+        allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
         assertEquals(1, buddyIdleChunks(idleDecay), "half of two");
-        assertEquals(used - chunk, allocator.usedHeapMemory());
+        assertEquals(used - chunk, allocator.usedDirectMemory());
     }
 
     private static final int BUDDY_NOTE_SIZE = 512 * 1024;
@@ -1202,15 +1213,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     private static BuddyHeld buddyReleaseThatLeavesANote(AdaptiveByteBufAllocator allocator, int fullChunks,
                                                          int chunk) throws Exception {
         BuddyHeld b = new BuddyHeld();
-        b.held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-        b.perChunk = (int) (allocator.usedHeapMemory() / BUDDY_NOTE_SIZE);
+        b.held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+        b.perChunk = (int) (allocator.usedDirectMemory() / BUDDY_NOTE_SIZE);
         assumeTrue(b.perChunk >= 2, "a buddy chunk holds " + b.perChunk + " buffers");
         // fullChunks full, and one more block that opens the chunk the magazine allocates from next.
         while (b.held.size() < fullChunks * b.perChunk + 1) {
-            b.held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            b.held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
         final ByteBuf victim = b.held.remove(chunk * b.perChunk);
-        underStripeLocks(allocator, true, () -> {
+        underLocks(stripeLocks(allocator, true), () -> {
             try {
                 release(victim, true);
             } catch (InterruptedException e) {
@@ -1223,14 +1234,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /** Allocate until the chunk the magazine allocates from is full, then once more: that one takes the slow path. */
     private static void allocateThroughTheNextSlowPath(AdaptiveByteBufAllocator allocator, BuddyHeld b,
                                                        PendingChunks pending, int notesBefore) {
-        long used = allocator.usedHeapMemory();
+        long used = allocator.usedDirectMemory();
         for (int i = 1; i < b.perChunk; i++) {
-            b.held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            b.held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         }
         assertEquals(notesBefore, pending.size(), "no slow path yet, the notes wait");
-        b.held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+        b.held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
         assertEquals(0, pending.size(), "the slow path must apply the notes");
-        assertEquals(used, allocator.usedHeapMemory(), "the released block must be reused, not a new chunk allocated");
+        assertEquals(used, allocator.usedDirectMemory(),
+                "the released block must be reused, not a new chunk allocated");
     }
 
     /**
@@ -1294,11 +1306,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** How many stripes created a magazine for buffers above the size classes. */
-    private static int stripesWithABuddyMagazine(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
+    /** How many stripes created a magazine for direct or heap buffers above the size classes. */
+    static int stripesWithABuddyMagazine(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
+        Object pooling = pooling(allocator, direct);
         Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
         stripesField.setAccessible(true);
         int stripes = 0;
@@ -1324,7 +1334,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /** Small allocations on the calling thread's heap, enough to complete one count of its {@link IdleDecay}. */
     private static void sizeClassTraffic(AdaptiveByteBufAllocator allocator) {
         for (int i = 0; i < 4 * IdleDecay.DECAY_MIN_ALLOCATIONS; i++) {
-            allocator.heapBuffer(256).release();
+            allocator.directBuffer(256).release();
         }
     }
 
@@ -1338,13 +1348,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         final int size = 1024 * 1024;
         List<ByteBuf> held = new ArrayList<ByteBuf>();
-        held.add(allocator.heapBuffer(size, size));
-        long chunk = allocator.usedHeapMemory();
+        held.add(allocator.directBuffer(size, size));
+        long chunk = allocator.usedDirectMemory();
         int perChunk = (int) (chunk / size);
         int idle = (int) Math.min(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE,
                 AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES / chunk);
         while (held.size() < (idle + 1) * perChunk) {
-            held.add(allocator.heapBuffer(size, size));
+            held.add(allocator.directBuffer(size, size));
         }
         for (int c = 0; c < idle; c++) {
             releaseChunk(held, c, perChunk);
@@ -1352,11 +1362,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
         assertEquals(idle, buddyIdleChunks(idleDecay), "the idle bound is full");
         releaseChunk(held, idle, perChunk);
-        long used = allocator.usedHeapMemory();
+        long used = allocator.usedDirectMemory();
         idleDecay.decay(System.nanoTime());
-        assertEquals(used, allocator.usedHeapMemory(), "no room: the active chunk stays");
+        assertEquals(used, allocator.usedDirectMemory(), "no room: the active chunk stays");
         idleDecay.decay(System.nanoTime());
-        assertTrue(allocator.usedHeapMemory() < used, "the idle ones are given back by halves");
+        assertTrue(allocator.usedDirectMemory() < used, "the idle ones are given back by halves");
         assertTrue(buddyIdleChunks(idleDecay) <= idle);
     }
 
@@ -1602,23 +1612,23 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     void activeLargeChunkIdleForAWholeIntervalIsGivenBack() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
-        ByteBuf out = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
-        long chunk = allocator.usedHeapMemory();
+        ByteBuf out = allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
+        long chunk = allocator.usedDirectMemory();
         IdleDecay idleDecay = buddyStripeIdleDecay(allocator);
         idleDecay.decay(System.nanoTime());
         idleDecay.decay(System.nanoTime());
-        assertEquals(chunk, allocator.usedHeapMemory(), "a buffer is out: the chunk stays");
+        assertEquals(chunk, allocator.usedDirectMemory(), "a buffer is out: the chunk stays");
         out.release();
 
         idleDecay.decay(System.nanoTime());
         assertEquals(1, buddyIdleChunks(idleDecay), "no longer in use: filed with the idle chunks");
-        assertEquals(chunk, allocator.usedHeapMemory(), "idle since this decay only");
+        assertEquals(chunk, allocator.usedDirectMemory(), "idle since this decay only");
         idleDecay.decay(System.nanoTime());
-        assertEquals(0, allocator.usedHeapMemory(), "idle through a whole interval: given back");
+        assertEquals(0, allocator.usedDirectMemory(), "idle through a whole interval: given back");
 
         // The next large allocation opens a new chunk.
-        allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
-        assertEquals(chunk, allocator.usedHeapMemory());
+        allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE).release();
+        assertEquals(chunk, allocator.usedDirectMemory());
     }
 
     /**
@@ -1629,10 +1639,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
-            ByteBuf buf = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
+            ByteBuf buf = allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
             try {
-                assertNotNull(threadLocalIdleDecay(allocator).buddyMagazine, "the heap's own magazine");
-                assertEquals(0, stripesWithABuddyMagazine(allocator), "no stripe involved");
+                assertNotNull(threadLocalIdleDecay(allocator, true).buddyMagazine, "the heap's own magazine");
+                assertEquals(0, stripesWithABuddyMagazine(allocator, true), "no stripe involved");
             } finally {
                 buf.release();
             }
@@ -1650,8 +1660,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
             List<ByteBuf> held = new ArrayList<ByteBuf>();
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-            long chunk = allocator.usedHeapMemory();
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            long chunk = allocator.usedDirectMemory();
             if (AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES < 2 * chunk) {
                 held.get(0).release();
                 assumeTrue(false, "keeps fewer than two idle chunks' bytes");
@@ -1660,31 +1670,31 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             // Three chunks' worth: chunks 1 and 2 become wholly free; chunk 3, the one the magazine allocates from,
             // keeps one buffer out, so it stays the magazine's.
             while (held.size() < 3 * perChunk) {
-                held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+                held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             }
             ByteBuf out = held.remove(held.size() - 1);
             for (ByteBuf buf : held) {
                 buf.release();
             }
             held.clear();
-            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator, true);
             assertEquals(2, buddyIdleChunks(idleDecay));
 
             // Each round: the interval has passed, and only small buffers are allocated.
             idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
             sizeClassTraffic(allocator);
             assertEquals(2, buddyIdleChunks(idleDecay), "idle since before the first decay: not a whole interval");
-            long used = allocator.usedHeapMemory();
+            long used = allocator.usedDirectMemory();
 
             idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
             sizeClassTraffic(allocator);
             assertEquals(1, buddyIdleChunks(idleDecay), "half of two");
-            assertEquals(used - chunk, allocator.usedHeapMemory());
+            assertEquals(used - chunk, allocator.usedDirectMemory());
 
             idleDecay.lastDecayNanos -= 2 * IdleDecay.DECAY_INTERVAL_NANOS;
             sizeClassTraffic(allocator);
             assertEquals(0, buddyIdleChunks(idleDecay), "half of one, rounded up");
-            assertEquals(used - 2 * chunk, allocator.usedHeapMemory());
+            assertEquals(used - 2 * chunk, allocator.usedDirectMemory());
             out.release();
         });
     }
@@ -1699,11 +1709,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
             final List<ByteBuf> held = new ArrayList<ByteBuf>();
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-            int perChunk = (int) (allocator.usedHeapMemory() / BUDDY_NOTE_SIZE);
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            int perChunk = (int) (allocator.usedDirectMemory() / BUDDY_NOTE_SIZE);
             // Chunk 1 full, chunk 2 the one the magazine allocates from.
             while (held.size() < perChunk + 1) {
-                held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+                held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             }
             Thread releaser = new Thread(() -> {
                 for (int i = 0; i < perChunk; i++) {
@@ -1712,7 +1722,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             });
             releaser.start();
             releaser.join();
-            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator, true);
             assertEquals(0, buddyIdleChunks(idleDecay), "only noted, not filed yet");
             // The decay itself, with no allocation before it that could apply the note first.
             idleDecay.decay(System.nanoTime());
@@ -1732,20 +1742,20 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         final AtomicReference<ByteBuf> survivor = new AtomicReference<ByteBuf>();
         onThreadLocalHeap(() -> {
             List<ByteBuf> held = new ArrayList<ByteBuf>();
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-            int perChunk = (int) (allocator.usedHeapMemory() / BUDDY_NOTE_SIZE);
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            int perChunk = (int) (allocator.usedDirectMemory() / BUDDY_NOTE_SIZE);
             while (held.size() < 2 * perChunk + 1) {
-                held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+                held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             }
             survivor.set(held.remove(held.size() - 1));
             for (ByteBuf buf : held) {
                 buf.release();
             }
         });
-        assertEquals(survivor.get().capacity() * (long) BUFS_PER_LARGE_CHUNK, allocator.usedHeapMemory(),
+        assertEquals(survivor.get().capacity() * (long) BUFS_PER_LARGE_CHUNK, allocator.usedDirectMemory(),
                 "only the chunk of the buffer still out");
         survivor.get().release();
-        assertEquals(0, allocator.usedHeapMemory(), "the last buffer freed its chunk");
+        assertEquals(0, allocator.usedDirectMemory(), "the last buffer freed its chunk");
     }
 
     /**
@@ -1759,15 +1769,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
             final List<ByteBuf> held = new ArrayList<ByteBuf>();
-            held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
-            long chunk = allocator.usedHeapMemory();
+            held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+            long chunk = allocator.usedDirectMemory();
             int perChunk = (int) (chunk / BUDDY_NOTE_SIZE);
             long bound = Math.min(AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE * chunk,
                     AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES / chunk * chunk);
             // Four chunks beyond the bound, plus the one the magazine allocates from.
             int chunks = (int) (bound / chunk) + 5;
             while (held.size() < chunks * perChunk) {
-                held.add(allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
+                held.add(allocator.directBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE));
             }
             ByteBuf last = held.remove(held.size() - 1);
             try {
@@ -1778,21 +1788,21 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 });
                 releaser.start();
                 releaser.join();
-                IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+                IdleDecay idleDecay = threadLocalIdleDecay(allocator, true);
                 assertEquals(0, buddyIdleChunks(idleDecay), "only noted so far");
-                assertEquals(chunks * chunk, allocator.usedHeapMemory());
+                assertEquals(chunks * chunk, allocator.usedDirectMemory());
 
                 // Two chunks' worth of small buffers: the size class goes to its slow path, which applies the notes.
                 List<ByteBuf> small = new ArrayList<ByteBuf>();
                 for (int i = 0; i < 2 * 1024; i++) {
-                    small.add(allocator.heapBuffer(256));
+                    small.add(allocator.directBuffer(256));
                 }
                 for (ByteBuf buf : small) {
                     buf.release();
                 }
                 assertEquals(bound / chunk, buddyIdleChunks(idleDecay), "idle large chunks kept to the bound");
                 // The rest was freed: the bound, the active chunk, and what the small buffers took (under 2 MiB).
-                long used = allocator.usedHeapMemory();
+                long used = allocator.usedDirectMemory();
                 assertTrue(used <= bound + chunk + 2 * 1024 * 1024, "used " + used + ", bound " + bound);
             } finally {
                 last.release();
@@ -1809,7 +1819,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
         final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
         onThreadLocalHeap(() -> {
-            ByteBuf buf = allocator.heapBuffer(64 * 1024);
+            ByteBuf buf = allocator.directBuffer(64 * 1024);
             try {
                 for (int i = 0; i < 64 * 1024; i++) {
                     buf.writeByte(i);
@@ -1819,8 +1829,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 for (int i = 0; i < 64 * 1024; i++) {
                     assertEquals((byte) i, buf.getByte(i));
                 }
-                assertNotNull(threadLocalIdleDecay(allocator).buddyMagazine, "the heap's own magazine");
-                assertEquals(0, stripesWithABuddyMagazine(allocator), "no stripe involved");
+                assertNotNull(threadLocalIdleDecay(allocator, true).buddyMagazine, "the heap's own magazine");
+                assertEquals(0, stripesWithABuddyMagazine(allocator, true), "no stripe involved");
             } finally {
                 buf.release();
             }
@@ -1845,11 +1855,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         throw new AssertionError("no BuddyMagazine");
     }
 
-    /** The notes of the buddy magazine of the one stripe this test's thread allocated on. */
+    /** The notes of the direct buddy magazine of the one stripe this test's thread allocated on. */
     private static PendingChunks buddyPending(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
+        Object pooling = pooling(allocator, true);
         Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
         stripesField.setAccessible(true);
         PendingChunks found = null;
@@ -1871,7 +1879,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /** Runs a cache operation the way the allocator does: under the stripe lock when the cache is a stripe's. */
     private static void underStripeLocks(AdaptiveByteBufAllocator allocator, boolean sharedStripe, Runnable action)
             throws Exception {
-        List<StampedLock> locks = sharedStripe ? stripeLocks(allocator) : Collections.<StampedLock>emptyList();
+        underLocks(sharedStripe ? stripeLocks(allocator) : Collections.<StampedLock>emptyList(), action);
+    }
+
+    private static void underLocks(List<StampedLock> locks, Runnable action) {
         List<Long> stamps = new ArrayList<Long>();
         for (StampedLock l : locks) {
             stamps.add(l.writeLock());
@@ -2207,9 +2218,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     private static List<StampedLock> stripeLocks(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
+        return stripeLocks(allocator, false);
+    }
+
+    /** The stripe locks of the pooling allocator behind the direct or the heap buffers of {@code allocator}. */
+    private static List<StampedLock> stripeLocks(AdaptiveByteBufAllocator allocator, boolean direct)
+            throws Exception {
+        Object pooling = pooling(allocator, direct);
         Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
         stripesField.setAccessible(true);
         Object[] stripes = (Object[]) stripesField.get(pooling);

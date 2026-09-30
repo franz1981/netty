@@ -192,7 +192,7 @@ public abstract class AbstractByteBufAllocatorTest<T extends AbstractByteBufAllo
 
     @Test
     public void shouldReuseChunks() throws Exception {
-        int bufSize = 1024 * 1024;
+        int bufSize = reusedHeapBufferSize();
         ByteBufAllocator allocator = newAllocator(false);
         allocator.heapBuffer(bufSize, bufSize).release();
         ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
@@ -259,6 +259,11 @@ public abstract class AbstractByteBufAllocatorTest<T extends AbstractByteBufAllo
         } finally {
             directBuffer.release();
         }
+    }
+
+    /** The size of the heap buffers {@link #shouldReuseChunks()} allocates: one the allocator pools. */
+    protected int reusedHeapBufferSize() {
+        return 1024 * 1024;
     }
 
     protected long expectedUsedMemory(T allocator, int capacity) {

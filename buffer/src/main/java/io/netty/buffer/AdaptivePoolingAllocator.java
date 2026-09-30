@@ -69,6 +69,10 @@ import java.util.function.IntConsumer;
  *       it.</li>
  * </ul>
  * <p>
+ * The allocator of heap buffers is built without the second tier (the {@code poolAboveSizeClasses} argument of its
+ * constructor): a buffer above the largest size class gets a one-shot chunk. This is fixed at construction: the
+ * routing reads it from a final field, not from the buffer or its size.
+ * <p>
  * The magazines are grouped into {@link StripedHeap}s, each guarded by one lock, and a thread picks a stripe by its
  * id; more stripes are used when threads collide on the lock. A {@link FastThreadLocalThread} instead gets a
  * {@link ThreadLocalSizeClassHeap} of its own, which needs no lock at all, for the size classes and for the buffers
@@ -274,6 +278,8 @@ final class AdaptivePoolingAllocator {
     private final ChunkAllocator chunkAllocator;
     private final ChunkRegistry chunkRegistry;
     private final SizeClassChunkManagementStrategy[] sizeClassStrategies;
+    /** Whether buffers above the size classes, up to {@link #MAX_POOLED_BUF_SIZE}, come from buddy chunks. */
+    private final boolean poolsAboveSizeClasses;
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
 
@@ -282,12 +288,23 @@ final class AdaptivePoolingAllocator {
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
+        this(chunkAllocator, useCacheForNonEventLoopThreads, true);
+    }
+
+    /**
+     * @param poolAboveSizeClasses whether buffers above the size classes, up to {@link #MAX_POOLED_BUF_SIZE}, are
+     *                             pooled in buddy chunks; when {@code false} each gets a one-shot chunk and no
+     *                             {@link BuddyMagazine} is ever created. Low-memory mode never pools them.
+     */
+    AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
+                             boolean poolAboveSizeClasses) {
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
         sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
             sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(SIZE_CLASSES[i]);
         }
+        poolsAboveSizeClasses = poolAboveSizeClasses && !IS_LOW_MEM;
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new StripedHeap();
@@ -333,7 +350,7 @@ final class AdaptivePoolingAllocator {
                 } else {
                     allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
                 }
-            } else if (!IS_LOW_MEM) {
+            } else if (poolsAboveSizeClasses) {
                 // Above the size classes: a thread with its own heap never takes a stripe lock for these either.
                 if (heap != null) {
                     allocated = heap.allocateLarge(size, maxCapacity, buf);

@@ -126,7 +126,7 @@ public class JfrEventsTest {
                     sentinelSeen.countDown();
                 } else if (onWorkloadThread(event, threadName)) {
                     allocatedFreed[0] += event.getInt("capacity");
-                    if (event.getInt("capacity") == 512 * 1024) {
+                    if (event.getBoolean("pooled") && event.getInt("capacity") == 512 * 1024) {
                         sizeClassChunksAllocated.incrementAndGet();
                     }
                     oneShots[0] += event.getBoolean("pooled") ? 0 : 1;
@@ -151,8 +151,7 @@ public class JfrEventsTest {
                 releaseAll(allocateMany(alloc, 64 * 1024, 8 * 8));
                 // One-shot: above the largest pooled buffer.
                 alloc.heapBuffer(4 * 1024 * 1024).release();
-                // Above the size classes: large-buffer chunks of the thread-local heap, kept idle there after the
-                // release.
+                // Above the size classes: heap buffers are not pooled there, each gets a one-shot chunk too.
                 releaseAll(allocateMany(alloc, 512 * 1024, 8));
                 // The thread-local heap is freed when this thread ends, with what its recycler holds.
             }, threadName);
@@ -165,8 +164,8 @@ public class JfrEventsTest {
         // buffers the first one gave up, or the balance below would not cover the recycled path.
         assertTrue(sizeClassChunksAllocated.get() < 16,
                 sizeClassChunksAllocated.get() + " chunk buffers allocated: none came from the recycler");
-        assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
-        assertEquals(1, oneShots[1], "and when it is freed");
+        assertEquals(1 + 8, oneShots[0], "the one-shot chunks are announced when they are allocated");
+        assertEquals(1 + 8, oneShots[1], "and when they are freed");
         assertTrue(sizeClassChunksFreed.get() > 0, "the dying thread-local heap must free its chunk buffers");
         assertEquals(alloc.metric().usedHeapMemory(), allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
