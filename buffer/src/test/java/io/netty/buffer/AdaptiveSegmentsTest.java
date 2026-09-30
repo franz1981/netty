@@ -18,7 +18,6 @@ package io.netty.buffer;
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
 import io.netty.buffer.AdaptivePoolingAllocator.HeapSegments;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
-import io.netty.buffer.AdaptivePoolingAllocator.PageStoreConfig;
 import io.netty.buffer.AdaptivePoolingAllocator.Segment;
 import io.netty.buffer.AdaptivePoolingAllocator.SegmentCache;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
@@ -36,7 +35,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.StampedLock;
 
-import static io.netty.buffer.AdaptivePoolingAllocator.SLICE_SIZE;
+import static io.netty.buffer.PageStoreConfig.SLICE_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -715,20 +714,20 @@ public class AdaptiveSegmentsTest {
         assumeFalse(System.getProperty("io.netty.allocator.segmentSize") != null
                 || System.getProperty("io.netty.allocator.segmentCacheBytes") != null
                 || System.getProperty("io.netty.allocator.segmentRegionSize") != null, "set explicitly");
-        assertEquals(lowMemory ? 2 * 1024 * 1024 : 4 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_SIZE);
-        assertEquals(lowMemory ? 8 * 1024 * 1024 : 64 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_CACHE_BYTES);
-        assertEquals(lowMemory ? 0 : 36 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_REGION_SIZE);
+        assertEquals(lowMemory ? 2 * 1024 * 1024 : 4 * 1024 * 1024, PageStoreConfig.SEGMENT_SIZE);
+        assertEquals(lowMemory ? 8 * 1024 * 1024 : 64 * 1024 * 1024, PageStoreConfig.SEGMENT_CACHE_BYTES);
+        assertEquals(lowMemory ? 0 : 36 * 1024 * 1024, PageStoreConfig.SEGMENT_REGION_SIZE);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
-        assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
+        assertEquals(PageStoreConfig.SEGMENT_SIZE, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
         boolean regions = !lowMemory && PlatformDependent.directAllocationLeavesMemoryUntouched();
         assertEquals(regions, AdaptiveByteBufAllocatorTest.directRegions(allocator));
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(allocator);
         if (!regions) {
-            assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, unit);
+            assertEquals(PageStoreConfig.SEGMENT_SIZE, unit);
         } else {
-            int region = AdaptivePoolingAllocator.SEGMENT_REGION_SIZE;
-            assertTrue(unit == region || unit == region + AdaptivePoolingAllocator.REGION_ALIGNMENT,
+            int region = PageStoreConfig.SEGMENT_REGION_SIZE;
+            assertTrue(unit == region || unit == region + PageStoreConfig.REGION_ALIGNMENT,
                     "a region, aligned by aligned_alloc or by over-allocating: " + unit);
             assertNotNull(chunkOf(buf).segment.region);
         }
@@ -781,8 +780,8 @@ public class AdaptiveSegmentsTest {
         PageStoreConfig direct = PageStoreConfig.directDefaults();
         assertEquals(SLICE_SIZE, direct.sliceSize);
         assertEquals(64 * 1024, direct.sliceSize);
-        assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, direct.segmentSize);
-        assertEquals(AdaptivePoolingAllocator.SEGMENT_CACHE_BYTES, direct.segmentCacheBytes);
+        assertEquals(PageStoreConfig.SEGMENT_SIZE, direct.segmentSize);
+        assertEquals(PageStoreConfig.SEGMENT_CACHE_BYTES, direct.segmentCacheBytes);
         assertEquals(IdleDecay.DECAY_INTERVAL_NANOS, direct.decayIntervalNanos);
         assertEquals(0.5, direct.decayFraction);
     }

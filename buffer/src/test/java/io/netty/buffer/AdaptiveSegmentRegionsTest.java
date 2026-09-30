@@ -17,7 +17,6 @@ package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.HeapSegments;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
-import io.netty.buffer.AdaptivePoolingAllocator.PageStoreConfig;
 import io.netty.buffer.AdaptivePoolingAllocator.Region;
 import io.netty.buffer.AdaptivePoolingAllocator.RegionPool;
 import io.netty.buffer.AdaptivePoolingAllocator.RegionSource;
@@ -29,7 +28,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
-import static io.netty.buffer.AdaptivePoolingAllocator.SLICE_SIZE;
+import static io.netty.buffer.PageStoreConfig.SLICE_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -339,18 +338,18 @@ public class AdaptiveSegmentRegionsTest {
     /** The property: 0, or a multiple of the segment size above 32 MiB and at most 64 segments; else the default. */
     @Test
     void badRegionSizesFallBackToTheDefault() {
-        int fallback = AdaptivePoolingAllocator.defaultRegionSize(SEGMENT);
+        int fallback = PageStoreConfig.defaultRegionSize(SEGMENT);
         assertEquals(36 * MIB, fallback);
-        assertEquals(34 * MIB, AdaptivePoolingAllocator.defaultRegionSize(2 * MIB));
-        assertEquals(0, AdaptivePoolingAllocator.regionSizeOf(0, SEGMENT));
-        assertEquals(36 * MIB, AdaptivePoolingAllocator.regionSizeOf(36 * MIB, SEGMENT));
-        assertEquals(40 * MIB, AdaptivePoolingAllocator.regionSizeOf(40 * MIB, SEGMENT));
-        assertEquals(256 * MIB, AdaptivePoolingAllocator.regionSizeOf(256 * MIB, SEGMENT));
-        boolean lowMemory = AdaptivePoolingAllocator.SEGMENT_REGION_SIZE == 0
+        assertEquals(34 * MIB, PageStoreConfig.defaultRegionSize(2 * MIB));
+        assertEquals(0, PageStoreConfig.regionSizeOf(0, SEGMENT));
+        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(36 * MIB, SEGMENT));
+        assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(40 * MIB, SEGMENT));
+        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(256 * MIB, SEGMENT));
+        boolean lowMemory = PageStoreConfig.SEGMENT_REGION_SIZE == 0
                 && System.getProperty("io.netty.allocator.segmentRegionSize") == null;
         int expected = lowMemory ? 0 : fallback;
         for (int bad : new int[] {-1, 4 * MIB, 32 * MIB, 34 * MIB, 260 * MIB}) {
-            assertEquals(expected, AdaptivePoolingAllocator.regionSizeOf(bad, SEGMENT), "" + bad);
+            assertEquals(expected, PageStoreConfig.regionSizeOf(bad, SEGMENT), "" + bad);
         }
         // The config itself: 2 to 64 whole segments, a power-of-two alignment.
         assertThrows(IllegalArgumentException.class,

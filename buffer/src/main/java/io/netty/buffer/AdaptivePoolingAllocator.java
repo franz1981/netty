@@ -92,7 +92,7 @@ import java.util.function.IntConsumer;
 final class AdaptivePoolingAllocator {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AdaptivePoolingAllocator.class);
     private static final int LOW_MEM_THRESHOLD = 512 * 1024 * 1024;
-    private static final boolean IS_LOW_MEM = SystemPropertyUtil.getBoolean(
+    static final boolean IS_LOW_MEM = SystemPropertyUtil.getBoolean(
             "io.netty.allocator.lowMemory",
             Runtime.getRuntime().maxMemory() <= LOW_MEM_THRESHOLD);
 
@@ -188,76 +188,6 @@ final class AdaptivePoolingAllocator {
      */
     private static final boolean DIRECT_SEGMENTS =
             SystemPropertyUtil.getBoolean("io.netty.allocator.directSegments", true);
-    /*
-     * The defaults of a direct allocator's page store, read once; each allocator carries its own parameters in a
-     * PageStoreConfig, and nothing below the constructor reads these.
-     */
-    /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
-    static final int SLICE_SIZE = 64 * 1024;
-    /** One bit per slice in one {@code long}: 4 MiB. */
-    static final int MAX_SEGMENT_SIZE = Long.SIZE * SLICE_SIZE;
-    /** Room for the largest size-class chunk (9 slices) with some to spare. */
-    static final int MIN_SEGMENT_SIZE = 1024 * 1024;
-    /**
-     * {@code io.netty.allocator.segmentSize}: the size of every {@link Segment} of a direct allocator, a multiple of
-     * {@link #SLICE_SIZE} from {@link #MIN_SEGMENT_SIZE} to {@link #MAX_SEGMENT_SIZE}. Default: 4 MiB, 2 MiB in
-     * low-memory mode (where nothing else the allocator holds is above 2 MiB either).
-     */
-    static final int SEGMENT_SIZE = segmentSizeOf(SystemPropertyUtil.getInt(
-            "io.netty.allocator.segmentSize", IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE));
-    /**
-     * {@code io.netty.allocator.segmentCacheBytes}: how many bytes of wholly free {@link Segment}s a direct allocator
-     * keeps for any of its heaps, at most; see {@link SegmentCache}. 0: none, a wholly free segment is given back at
-     * once. Default: 64 MiB, 8 MiB in low-memory mode.
-     */
-    static final int SEGMENT_CACHE_BYTES = Math.max(0, SystemPropertyUtil.getInt(
-            "io.netty.allocator.segmentCacheBytes", IS_LOW_MEM ? 8 * 1024 * 1024 : 64 * 1024 * 1024));
-    /**
-     * glibc's dynamic mmap threshold never rises above {@code DEFAULT_MMAP_THRESHOLD_MAX}, 32 MiB on 64-bit, and a
-     * chunk above it never moves the threshold: a {@code malloc} above 32 MiB is always an {@code mmap}, its
-     * {@code free} always a {@code munmap}, so it leaves no hole in an arena (glibc {@code malloc.c}: the max at 901,
-     * the mmap test {@code nb >= mp_.mmap_threshold} at 2351, the ratchet on free, bounded by the max, at 4404-4409).
-     */
-    static final int MALLOC_MMAP_THRESHOLD_MAX = 32 * 1024 * 1024;
-    /** A direct allocator's regions start at a multiple of 2 MiB, so that a THP-enabled kernel can back them whole. */
-    static final int REGION_ALIGNMENT = 2 * 1024 * 1024;
-    /**
-     * {@code io.netty.allocator.segmentRegionSize}: the size of the regions a direct allocator carves its
-     * {@link Segment}s out of (see {@link RegionPool}), a multiple of the segment size above
-     * {@link #MALLOC_MMAP_THRESHOLD_MAX} and at most {@link Long#SIZE} segments; 0: no regions, one allocation per
-     * segment. Default: the smallest valid size (36 MiB with 4 MiB segments), 0 in low-memory mode. Used only where
-     * allocating direct memory leaves it untouched ({@code PlatformDependent#directAllocationLeavesMemoryUntouched}):
-     * where it is zeroed at allocation, a region would cost its whole size at once.
-     */
-    static final int SEGMENT_REGION_SIZE = regionSizeOf(SystemPropertyUtil.getInt(
-            "io.netty.allocator.segmentRegionSize", IS_LOW_MEM ? 0 : defaultRegionSize(SEGMENT_SIZE)), SEGMENT_SIZE);
-
-    /** The smallest multiple of {@code segmentSize} above {@link #MALLOC_MMAP_THRESHOLD_MAX}. */
-    static int defaultRegionSize(int segmentSize) {
-        return (MALLOC_MMAP_THRESHOLD_MAX / segmentSize + 1) * segmentSize;
-    }
-
-    /** {@code size} if it is 0 or a valid region size for {@code segmentSize}; else, with a warning, the default. */
-    static int regionSizeOf(int size, int segmentSize) {
-        if (size == 0 || size > MALLOC_MMAP_THRESHOLD_MAX && size % segmentSize == 0
-                && size / segmentSize <= Long.SIZE) {
-            return size;
-        }
-        int fallback = IS_LOW_MEM ? 0 : defaultRegionSize(segmentSize);
-        logger.warn("-Dio.netty.allocator.segmentRegionSize={}: not 0 nor a multiple of the segment size {} above {} " +
-                "and at most {} segments, using {}", size, segmentSize, MALLOC_MMAP_THRESHOLD_MAX, Long.SIZE, fallback);
-        return fallback;
-    }
-
-    private static int segmentSizeOf(int size) {
-        if (size % SLICE_SIZE != 0 || size < MIN_SEGMENT_SIZE || size > MAX_SEGMENT_SIZE) {
-            int fallback = IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE;
-            logger.warn("-Dio.netty.allocator.segmentSize={}: not a multiple of {} from {} to {}, using {}",
-                    size, SLICE_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE, fallback);
-            return fallback;
-        }
-        return size;
-    }
 
     static {
         warnIfSet("io.netty.allocator.chunkPurgePollsThreadLocal",
@@ -803,100 +733,6 @@ final class AdaptivePoolingAllocator {
         }
         if (segmentCache != null) {
             segmentCache.close();
-        }
-    }
-
-    /**
-     * The parameters of one allocator's page store, so that allocators of different memory (direct, and later heap)
-     * carve and keep segments their own way: the segment and slice sizes, and how long wholly free segments are kept.
-     * Immutable; read on slow paths only (chunk creation and deallocation, segment take and give-back, decays), never
-     * per buffer.
-     */
-    static final class PageStoreConfig {
-        /** The size of every {@link Segment}: a whole number of slices, at most {@link Long#SIZE} of them. */
-        final int segmentSize;
-        /** The unit spans are claimed in; a size-class chunk is its {@link #chunkSizeOf} rounded up to it. */
-        final int sliceSize;
-        /** The bound of the {@link SegmentCache} in bytes; 0: no cache, a wholly free segment is given back at once. */
-        final int segmentCacheBytes;
-        /**
-         * The {@link SegmentCache} ages at most once per this interval. The ageing is driven by the heaps' own
-         * {@link IdleDecay}s, so an interval shorter than {@link IdleDecay#DECAY_INTERVAL_NANOS} ages it no more often
-         * than they run.
-         */
-        final long decayIntervalNanos;
-        /**
-         * The fraction of the segments that stayed in the cache through a whole interval that one ageing gives back,
-         * rounded up, oldest first: in (0, 1], 0.5 by default (the recycler's halving).
-         */
-        final double decayFraction;
-        /**
-         * The size of the regions segments are carved out of, a whole number of segments (2 to {@link Long#SIZE}), or 0
-         * for one allocation per segment. See {@link RegionPool}.
-         */
-        final int regionSize;
-        /** Where a region starts: a power of two it is a multiple of, if its source can; 0 for no requirement. */
-        final int regionAlignment;
-
-        /** Without regions: one allocation per segment. */
-        PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
-                        double decayFraction) {
-            this(segmentSize, sliceSize, segmentCacheBytes, decayIntervalNanos, decayFraction, 0, 0);
-        }
-
-        PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
-                        double decayFraction, int regionSize, int regionAlignment) {
-            if (sliceSize <= 0 || segmentSize <= 0 || segmentSize % sliceSize != 0
-                    || segmentSize / sliceSize > Long.SIZE) {
-                throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
-                        + " slices of " + sliceSize);
-            }
-            if (segmentCacheBytes < 0) {
-                throw new IllegalArgumentException("segmentCacheBytes: " + segmentCacheBytes);
-            }
-            if (decayIntervalNanos <= 0) {
-                throw new IllegalArgumentException("decayIntervalNanos: " + decayIntervalNanos);
-            }
-            if (!(decayFraction > 0 && decayFraction <= 1)) {
-                throw new IllegalArgumentException("decayFraction: " + decayFraction);
-            }
-            this.segmentSize = segmentSize;
-            this.sliceSize = sliceSize;
-            this.segmentCacheBytes = segmentCacheBytes;
-            this.decayIntervalNanos = decayIntervalNanos;
-            if (regionSize != 0 && (regionSize < 0 || regionSize % segmentSize != 0
-                    || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
-                throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor 2 to " + Long.SIZE
-                        + " segments of " + segmentSize);
-            }
-            if (regionAlignment < 0 || (regionAlignment & regionAlignment - 1) != 0) {
-                throw new IllegalArgumentException("regionAlignment: " + regionAlignment);
-            }
-            this.decayFraction = decayFraction;
-            this.regionSize = regionSize;
-            this.regionAlignment = regionAlignment;
-        }
-
-        /**
-         * The direct defaults: {@link #SEGMENT_SIZE}, {@link #SLICE_SIZE}, {@link #SEGMENT_CACHE_BYTES}, 10 s, half,
-         * {@link #SEGMENT_REGION_SIZE} and {@link #REGION_ALIGNMENT}.
-         */
-        static PageStoreConfig directDefaults() {
-            return new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, SEGMENT_CACHE_BYTES, IdleDecay.DECAY_INTERVAL_NANOS,
-                    0.5, SEGMENT_REGION_SIZE, REGION_ALIGNMENT);
-        }
-
-        int segmentsPerRegion() {
-            return regionSize / segmentSize;
-        }
-
-        int slicesPerSegment() {
-            return segmentSize / sliceSize;
-        }
-
-        /** How many of {@code cold} idle segments one ageing gives back: {@link #decayFraction} of them, rounded up. */
-        int toFree(int cold) {
-            return cold == 0 ? 0 : (int) Math.min(cold, (long) Math.ceil(cold * decayFraction));
         }
     }
 
