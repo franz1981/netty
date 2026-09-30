@@ -66,7 +66,8 @@ public class AdaptiveHeapPoolingTest {
                 assertEquals(before, allocator.usedHeapMemory(), "and freed with it: nothing pooled is left");
             }
             assertEquals(0, stripesWithABuddyMagazine(allocator, false), "no stripe of the heap allocator");
-            if (threadLocal) {
+            if (threadLocal && !isLowMemory()) {
+                // Low-memory mode has no thread-local heaps.
                 assertNull(threadLocalIdleDecay(allocator, false).buddyMagazine, "nor the thread-local heap");
             }
             if (!isLowMemory()) {
