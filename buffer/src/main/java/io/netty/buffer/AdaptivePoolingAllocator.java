@@ -1096,7 +1096,7 @@ final class AdaptivePoolingAllocator {
             // Last: what the size classes gave up above may have emptied a segment, which then stays reserved for a
             // whole interval before its first chance to be given back, like a buffer offered to the recycler.
             if (heapSegments != null) {
-                if (mags != null && heapSegments.count != 0) {
+                if (mags != null && heapSegments.count > 1) {
                     compact(mags, heapSegments);
                 }
                 heapSegments.decay(now);
@@ -1106,8 +1106,7 @@ final class AdaptivePoolingAllocator {
         /**
          * Frees the chunks that hold no buffer and alone keep a segment of the heap in use (see
          * {@link HeapSegments#markEvacuees}): the size classes in use make their next chunk in the fullest segments,
-         * and the emptied segments go to the reserve, or, for a last segment renewed, back to the store. A chunk that
-         * moves costs one chunk creation, no memory.
+         * and the emptied segments go to the reserve. A chunk that moves costs one chunk creation, no memory.
          */
         private static void compact(SizeClassMagazine[] mags, HeapSegments heapSegments) {
             for (SizeClassMagazine mag : mags) {
