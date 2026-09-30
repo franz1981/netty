@@ -19,16 +19,13 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
- * A uniform piece of memory from the {@link SegmentSource}, handed out in slices of its allocator's
- * {@link PageStoreConfig#sliceSize} (at most {@link Long#SIZE} of them): a span is a
- * run of contiguous slices. The free slices are one bit each in {@link #free}, so claiming a span, freeing it and
- * merging it with its free neighbours are bit operations (a freed span is simply free bits next to other free
- * bits), and no metadata lives in the segment's memory. Spans are claimed first fit from the lowest slice, so live
- * spans pack towards the start of a segment.
+ * Memory cut into equal slices (at most {@link Long#SIZE}), claimed and released as spans of contiguous slices. The
+ * state is one bit per slice in {@link #free}, none in the memory: claims are first fit from the lowest slice, and a
+ * released span merges with its free neighbours by construction.
  * <p>
- * A segment belongs to one {@link HeapSegments} at a time ({@link #owner}), which alone claims spans from it; it
- * leaves its heap once wholly free, for the allocator's {@link SegmentCache}. Nothing here runs per buffer: a span
- * is claimed when a chunk is created and freed when it is deallocated.
+ * Single writer: the {@link #owner} heap claims spans, releases them and makes their buffers. Once that heap is
+ * freed, the last releases of its spans may come from any thread, hence the CAS on {@link #free}. Chunk creation and
+ * deallocation only, never per buffer.
  */
 final class Segment implements ChunkInfo {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -37,25 +34,17 @@ final class Segment implements ChunkInfo {
             AtomicReferenceFieldUpdater.newUpdater(Segment.class, HeapSegments.class, "owner");
 
     final AbstractByteBuf buffer;
-    /** The size of a slice, and how many the segment has. */
     final int sliceSize;
     final int slices;
-    /** {@link #free} of a wholly free segment: one bit per slice. */
     final long allFree;
-    /**
-     * Bit {@code i} set when slice {@code i} is free. Changed by compare-and-set: the owner claims and frees
-     * spans, and once its heap was freed, the last releases of its chunks free theirs from any thread.
-     */
+    /** Bit {@code i} set when slice {@code i} is free. */
     volatile long free;
-    /** The heap whose chunks it holds, or {@code null} in the {@link SegmentCache} or on its way to it. */
+    /** {@code null} while in the {@link SegmentCache}, or on its way there. */
     volatile HeapSegments owner;
-    /** The region this segment is carved out of, at slot {@link #slot}; {@code null} for a segment of its own. */
+    /** {@code null} for a segment allocated on its own. */
     final Region region;
     final int slot;
-    /**
-     * The span buffers made so far, by first slice: a span claimed again at the same place with the same length
-     * reuses its buffer, so that re-creating a chunk allocates no buffer object. At most one per slice.
-     */
+    /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
     private final AbstractByteBuf[] spans;
 
     Segment(AbstractByteBuf buffer, int sliceSize) {
@@ -92,7 +81,7 @@ final class Segment implements ChunkInfo {
         return (1L << n) - 1 << start;
     }
 
-    /** Claim the lowest run of {@code n} free slices and return its first slice, or -1 when there is none. */
+    /** The first slice of the lowest run of {@code n} free slices, now claimed, or -1. */
     int claim(int n) {
         for (;;) {
             long current = free;
@@ -106,7 +95,7 @@ final class Segment implements ChunkInfo {
         }
     }
 
-    /** Free the {@code n} slices from {@code start}, claimed before; return the free bits after. Any thread. */
+    /** Returns {@link #free} after. Throws if any of the slices is not claimed. */
     long release(int start, int n) {
         long bits = mask(start, n);
         for (;;) {
@@ -134,10 +123,7 @@ final class Segment implements ChunkInfo {
         return slices - freeSlices();
     }
 
-    /**
-     * The buffer over the {@code n} slices from {@code start}: the one made last time for that exact span, else a
-     * new one from {@code source}. Owner only, when a chunk is created.
-     */
+    /** Owner only. The buffer made last time for this exact span, else a new one from {@code source}. */
     AbstractByteBuf span(SegmentSource source, int start, int n) {
         int length = n * sliceSize;
         AbstractByteBuf span = spans[start];

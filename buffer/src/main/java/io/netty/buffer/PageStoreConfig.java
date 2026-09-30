@@ -20,18 +20,12 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 /**
- * The parameters of one allocator's page store, so that allocators of different memory (direct, and later heap)
- * carve and keep segments their own way: the segment and slice sizes, and how long wholly free segments are kept.
- * Immutable; read on slow paths only (chunk creation and deallocation, segment take and give-back, decays), never
- * per buffer.
+ * The immutable parameters of one allocator's page store, and the direct defaults, read once from the
+ * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
  */
 final class PageStoreConfig {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStoreConfig.class);
 
-    /*
-     * The defaults of a direct allocator's page store, read once; each allocator carries its own parameters in a
-     * PageStoreConfig, and nothing below the constructor reads these.
-     */
     /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
@@ -100,29 +94,21 @@ final class PageStoreConfig {
         return size;
     }
 
-    /** The size of every {@link Segment}: a whole number of slices, at most {@link Long#SIZE} of them. */
+    /** 1 to {@link Long#SIZE} whole slices. */
     final int segmentSize;
-    /** The unit spans are claimed in; a size-class chunk is its {@link #chunkSizeOf} rounded up to it. */
     final int sliceSize;
-    /** The bound of the {@link SegmentCache} in bytes; 0: no cache, a wholly free segment is given back at once. */
+    /** 0: no cache, a wholly free segment is freed at once. */
     final int segmentCacheBytes;
     /**
-     * The {@link SegmentCache} ages at most once per this interval. The ageing is driven by the heaps' own
-     * {@link IdleDecay}s, so an interval shorter than {@link IdleDecay#DECAY_INTERVAL_NANOS} ages it no more often
-     * than they run.
+     * The cache ages at most once per interval, driven by the heaps' decays: an interval shorter than theirs ages it
+     * no more often than they run.
      */
     final long decayIntervalNanos;
-    /**
-     * The fraction of the segments that stayed in the cache through a whole interval that one ageing gives back,
-     * rounded up, oldest first: in (0, 1], 0.5 by default (the recycler's halving).
-     */
+    /** In (0, 1]: the share of the segments cold for a whole interval that one ageing frees, rounded up. */
     final double decayFraction;
-    /**
-     * The size of the regions segments are carved out of, a whole number of segments (2 to {@link Long#SIZE}), or 0
-     * for one allocation per segment. See {@link RegionPool}.
-     */
+    /** 2 to {@link Long#SIZE} whole segments, or 0: one allocation per segment. */
     final int regionSize;
-    /** Where a region starts: a power of two it is a multiple of, if its source can; 0 for no requirement. */
+    /** A power of two, honoured if the region source can; 0: any address. */
     final int regionAlignment;
 
     /** Without regions: one allocation per segment. */

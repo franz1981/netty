@@ -18,33 +18,24 @@ package io.netty.buffer;
 import java.util.Arrays;
 
 /**
- * The regions of an allocator, shared by all its heaps: where a segment comes from when the
- * {@link SegmentCache} has none, and where it goes back when it leaves the cache (evicted by the cache's bound, or
- * aged out by its decay). A segment is taken from the fullest region that has a free slot (the oldest of equally
- * full ones), lowest slot first, and a new region is allocated only when none has one: the emptiest regions are
- * left to drain. A region whose segments are all back is freed at once.
+ * The regions of one allocator that have a segment out, oldest first. A segment comes from the fullest region with a
+ * free slot (the oldest on a tie), its lowest slot; a region is allocated only when none has one, and freed as soon
+ * as its last segment is back. Segments come back only from the {@link SegmentCache}, so a region is never freed
+ * earlier than its last segment would have been without regions.
  * <p>
- * No delay is added before a region is freed: a segment reaches its region only after the cache kept it through at
- * least one whole interval (the ageing frees only segments that stayed there that long), or when the cache was
- * full, where without regions the segment would have been freed at once just the same. A region therefore goes
- * back no earlier than its last segment would have without regions.
+ * Why: with glibc, a {@code malloc} above {@link PageStoreConfig#MALLOC_MMAP_THRESHOLD_MAX} is always an
+ * {@code mmap} and its {@code free} a {@code munmap}; 4 MiB segments fall under the dynamic threshold once it rose,
+ * and their frees leave holes in the arenas. Cost: a region stays allocated while any of its segments is out.
  * <p>
- * Why regions: with glibc, a {@code malloc} above {@link PageStoreConfig#MALLOC_MMAP_THRESHOLD_MAX} is always an
- * {@code mmap} and its {@code free} a {@code munmap}; 4 MiB segments allocated one by one fall under the dynamic
- * threshold once it rose, and their frees leave holes in the arenas. The cost: a region stays allocated while any of
- * its segments is out, which the fullest-first rule is there to keep rare.
- * <p>
- * Guarded by its monitor, taken on slow paths only: a segment taken from or given back to a region, and the
- * dump. A region is allocated outside the lock.
+ * Guarded by its monitor, slow paths only. Regions are allocated and freed outside it.
  */
 final class RegionPool {
     private final PageStore store;
     private final RegionSource source;
     private final PageStoreConfig config;
-    // Visible for dumps and tests: the regions with a segment out, oldest first; guarded by this.
+    // Read by tests and dumps; guarded by this.
     Region[] regions = new Region[4];
     int count;
-    // Counters, for dumps and tests; guarded by this.
     long allocated;
     long freed;
 
@@ -55,7 +46,7 @@ final class RegionPool {
         config = store.config;
     }
 
-    /** A segment of the fullest region with a free slot, else of a new region, which is announced. */
+    /** A new region is accounted as allocated here. */
     Segment take(boolean threadLocal) {
         synchronized (this) {
             Segment segment = takeFromFullest();
@@ -95,7 +86,7 @@ final class RegionPool {
         return best == null ? null : best.takeSlot(store.segmentSource, config);
     }
 
-    /** {@code segment}, wholly free and owned by no heap, is back; its region is freed if it was the last out. */
+    /** {@code segment} is wholly free and owned by no heap. Frees and accounts its region if it was the last out. */
     void giveBack(Segment segment) {
         Region region = segment.region;
         synchronized (this) {

@@ -16,8 +16,8 @@
 package io.netty.buffer;
 
 /**
- * Where the regions of a {@link RegionPool} come from. A region is one buffer that segments are carved out of by
- * {@link SegmentSource#span}; it goes back by {@link AbstractByteBuf#release()}, whole.
+ * Memory for regions: aligned {@code malloc} for the direct allocator. Implementations: {@code MallocRegionSource}
+ * and test sources. Called once per region allocated; a region is freed whole by {@link AbstractByteBuf#release()}.
  */
 interface RegionSource {
     /**

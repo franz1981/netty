@@ -16,22 +16,20 @@
 package io.netty.buffer;
 
 /**
- * Where the {@link Segment}s of a direct allocator come from: the memory the allocator is built on, as for any
- * chunk buffer (libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}). A segment goes back by
- * {@link AbstractByteBuf#release()}.
+ * Memory for segments: libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf} for the direct
+ * allocator. Implementations: the direct chunk allocator and test sources. Called once per segment allocated.
  */
 interface SegmentSource {
-    /** A new segment buffer of {@code size} bytes. */
+    /** Freed by {@link AbstractByteBuf#release()}, which may return memory to the OS. */
     AbstractByteBuf allocateSegment(int size);
 
     /**
-     * A buffer over {@code length} bytes of {@code segment} from {@code offset}, of the same class as
-     * {@code segment} (the chunks of a size class and every other chunk then look alike to the buffers that read
-     * them) and never freeing any memory: releasing it, or not, changes nothing to the segment.
+     * A view of {@code segment} (or of a region) that never frees memory, of the class of {@code segment}, so that
+     * the buffers reading a chunk see one class whatever the chunk.
      */
     AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
 
-    /** Where regions of segments come from, or {@code null} when this source has none. */
+    /** {@code null}: no regions, one allocation per segment. */
     default RegionSource regionSource() {
         return null;
     }

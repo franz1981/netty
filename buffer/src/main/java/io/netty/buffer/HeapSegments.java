@@ -19,30 +19,23 @@ import java.util.Arrays;
 import java.util.concurrent.locks.StampedLock;
 
 /**
- * The segments of one heap (a stripe, or a thread-local heap), in the order the heap took them, and the rules that
- * pack its spans: a span is claimed from the fullest segment that has room for it (the oldest of equally full
- * ones), first fit from the lowest slice in it, and a new segment is taken only when none has room. Filling the
- * fullest segments first leaves the emptiest ones to empty, as tcmalloc's filler and mimalloc's page queues do;
- * a segment that becomes wholly free leaves the heap at once, for the allocator's {@link SegmentCache}.
+ * The segments one heap has spans in, oldest first, and the rule that packs its spans: the fullest segment with a
+ * long enough free run wins (the oldest on a tie), and a segment is taken from the {@link PageStore} only when none
+ * fits. A segment that becomes wholly free leaves the heap for the {@link SegmentCache} at once.
  * <p>
- * Guarded like the heap: by the stripe lock, or by the owner thread of a thread-local heap. Nothing here runs per
- * buffer: only chunk creation (a claim) and chunk deallocation (a release) come here, and both run in the heap's
- * own slow paths. Once the heap is freed ({@link #markFreed}), the chunks still holding spans are deallocated by
- * whichever thread releases their last buffer: from then on a segment is disposed of by the release that empties
- * it, whatever the thread, and the list is not touched again.
+ * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim})
+ * and chunk deallocation ({@link #release}) only. After {@link #markFreed}, releases may come from any thread: the
+ * release that empties a segment hands it to the cache, and the list is no longer touched.
  */
 final class HeapSegments {
     private final PageStore store;
-    /** The stripe's lock, or {@code null} on a thread-local heap. For the assertions only. */
+    /** For assertions only. */
     private final StampedLock stripeLock;
-    /** The thread of a thread-local heap, or {@code null} on a stripe. */
     private final Thread ownerThread;
-    // Visible for testing (and read by dumps): the segments with a span out, oldest first.
+    // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;
-    /** Set once by {@link #markFreed}: the heap is gone, its segments are disposed of by their last release. */
     private volatile boolean freed;
-    /** The first slice of the span the last {@link #claim} returned the segment of. */
     private int claimedStart = -1;
 
     HeapSegments(PageStore store, StampedLock stripeLock, Thread ownerThread) {
@@ -60,11 +53,7 @@ final class HeapSegments {
         return ownerThread != null ? Thread.currentThread() == ownerThread : stripeLock.isWriteLocked();
     }
 
-    /**
-     * Claim a span of {@code slices} for a new chunk and return its segment; {@link #claimedStart()} tells where in
-     * it. The fullest segment with a free run long enough wins, the oldest on a tie; with none, the heap takes a
-     * segment (see {@link PageStore#take}). Scans the heap's segments once.
-     */
+    /** Returns the segment of the span; {@link #claimedStart()} is its first slice. Scans the heap's segments once. */
     Segment claim(int slices) {
         assert inOwnerContext() && !freed;
         Segment best = null;
@@ -96,11 +85,7 @@ final class HeapSegments {
         return claimedStart;
     }
 
-    /**
-     * Free the span of {@code slices} from {@code start} in {@code segment}, one of this heap's, when the chunk it
-     * served is deallocated. A segment that becomes wholly free leaves the heap for the {@link SegmentCache}. On a
-     * live heap this runs in the owner's context only: a chunk is deallocated there unless its heap was freed.
-     */
+    /** Owner only until {@link #markFreed}, then any thread. */
     void release(Segment segment, int start, int slices) {
         long free = segment.release(start, slices);
         if (free != segment.allFree) {
@@ -114,10 +99,7 @@ final class HeapSegments {
         dispose(segment);
     }
 
-    /**
-     * Hand {@code segment} to the cache, if it is still this heap's: of the release that emptied it and the sweep
-     * of {@link #afterFree}, which may both see it wholly free once the heap was freed, only one gets it.
-     */
+    /** The release that emptied it and {@link #afterFree} may both get here: only the owner CAS winner offers it. */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
             store.segmentCache.offer(segment);
@@ -143,19 +125,13 @@ final class HeapSegments {
         throw new IllegalStateException(segment + " is not a segment of this heap");
     }
 
-    /**
-     * The heap is being freed: from now on the release that empties a segment disposes of it, from any thread.
-     * Call before the heap frees its chunks, then {@link #afterFree}.
-     */
+    /** Call before the heap frees its chunks, then {@link #afterFree}. */
     void markFreed() {
         assert inOwnerContext();
         freed = true;
     }
 
-    /**
-     * After the heap freed its chunks: dispose of the segments they emptied, then forget them all; the others go
-     * when their last span does (see {@link #release}).
-     */
+    /** Offers the segments the heap's frees emptied, forgets all; the others go with their last span. */
     void afterFree() {
         assert freed;
         for (int i = 0; i < count; i++) {
@@ -170,7 +146,7 @@ final class HeapSegments {
         count = 0;
     }
 
-    /** Called by the heap's {@link IdleDecay}: the {@link SegmentCache} ages at most once per interval. */
+    /** Ages the shared {@link SegmentCache}: at most once per interval across all heaps. */
     void decay(long now) {
         store.segmentCache.decayIfDue(now);
     }

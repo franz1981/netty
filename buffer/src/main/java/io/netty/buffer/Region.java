@@ -16,23 +16,18 @@
 package io.netty.buffer;
 
 /**
- * A region: one allocation from the {@link RegionSource} that {@link #slots} segments are carved out of, one per
- * slot. It is what the allocator holds from its memory, so it is the unit of
- * {@link AdaptivePoolingAllocator#usedMemory()} and of the chunk events (its {@link #capacity()} is what was allocated
- * for it); the segments carved out of it fire none.
- * <p>
- * A slot is free while its segment is back in the region: neither in a heap nor in the {@link SegmentCache}.
- * Guarded by the {@link RegionPool}'s lock.
+ * One allocation from a {@link RegionSource}, carved into {@link #slots} segments, one per slot: the unit the
+ * allocator accounts ({@link #capacity()} is what was allocated for it, alignment included). A slot is free while its
+ * segment is back in the region: in no heap and not in the cache. Guarded by the {@link RegionPool}'s monitor.
  */
 final class Region implements ChunkInfo {
     final AbstractByteBuf buffer;
     final int allocatedBytes;
     final int slots;
-    /** {@link #freeSlots} of a region whose segments are all back. */
     final long allFree;
     /** Bit {@code i} set when slot {@code i} is free. */
     long freeSlots;
-    /** The segment of each slot, made when the slot is first taken and kept with the region. */
+    /** Made when a slot is first taken, and reused. */
     private final Segment[] segments;
 
     Region(AbstractByteBuf buffer, int allocatedBytes, int slots) {
@@ -45,7 +40,7 @@ final class Region implements ChunkInfo {
         segments = new Segment[slots];
     }
 
-    /** Take the lowest free slot's segment. */
+    /** The lowest free slot's segment. */
     Segment takeSlot(SegmentSource source, PageStoreConfig config) {
         assert freeSlots != 0;
         int slot = Long.numberOfTrailingZeros(freeSlots);

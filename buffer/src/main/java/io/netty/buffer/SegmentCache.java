@@ -19,18 +19,14 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
- * The wholly free segments of an allocator, which any of its heaps takes before a new one from the
- * {@link SegmentSource}: a stack, newest on top, bounded by {@link PageStoreConfig#segmentCacheBytes}; a segment
- * beyond the bound (every one, with a bound of 0) is freed at once. Taken from and given to only when a heap takes
- * a segment or one leaves its heap, never per buffer.
+ * The wholly free segments of one allocator, shared by its heaps: a stack, newest on top, of at most
+ * {@code segmentCacheBytes / segmentSize} segments. A segment offered beyond that is freed at once.
  * <p>
- * It ages like the recycler of a heap: at most once per {@link PageStoreConfig#decayIntervalNanos}, run by the
- * decay of whichever heap comes first after the interval, it frees {@link PageStoreConfig#decayFraction} (half by
- * default), rounded up, of the segments that stayed in it through the whole interval, oldest first. Taking from
- * the top leaves the bottom untouched, so the fewest segments it held since the last decay are exactly those.
+ * Ageing: at most once per {@code decayIntervalNanos}, run by whichever heap's decay comes first, it frees
+ * {@code decayFraction} (rounded up) of the segments that stayed through the whole interval, oldest (bottom) first.
  * <p>
- * Guarded by its monitor: the operations are a few field writes, one per segment taken or given up, and the aging
- * has to take the oldest segments from the bottom, which a lock-free stack cannot.
+ * Guarded by its monitor; slow paths only: a heap taking a segment, a segment leaving its heap, decays. Freeing a
+ * segment may return memory to the OS: outside the monitor on {@link #offer}, inside it on decay and close.
  */
 final class SegmentCache {
     private static final AtomicLongFieldUpdater<SegmentCache> LAST_DECAY_NANOS =
@@ -40,12 +36,11 @@ final class SegmentCache {
     private final long decayIntervalNanos;
     private final Segment[] stack;
     private int size;
-    /** The fewest segments held since the last decay: the bottom ones up to it were not taken since. */
+    /** The fewest segments held since the last decay: the bottom ones up to it were not touched since. */
     private int coldCount;
     private boolean closed;
     private volatile long lastDecayNanos = System.nanoTime();
-    // Counters, for dumps and tests: segments taken from here, given to here and kept, freed by the bound, the
-    // aging or the close.
+    // Read by tests and dumps.
     long taken;
     long returned;
     long freed;
@@ -56,7 +51,6 @@ final class SegmentCache {
         stack = new Segment[Math.max(0, capacity)];
     }
 
-    /** The newest segment, or {@code null}. */
     synchronized Segment poll() {
         if (size == 0) {
             return null;
@@ -70,7 +64,7 @@ final class SegmentCache {
         return segment;
     }
 
-    /** Keep {@code segment}, wholly free and owned by no heap, or free it when the cache is full. */
+    /** {@code segment} is wholly free and owned by no heap. */
     void offer(Segment segment) {
         assert segment.isWhollyFree() && segment.owner == null;
         synchronized (this) {
@@ -84,7 +78,7 @@ final class SegmentCache {
         store.free(segment);
     }
 
-    /** Age the cache if no decay did during the last interval: any heap's decay calls this. */
+    /** Any thread; one caller per interval runs {@link #decay}. */
     void decayIfDue(long now) {
         long last = lastDecayNanos;
         if (now - last >= decayIntervalNanos && LAST_DECAY_NANOS.compareAndSet(this, last, now)) {
@@ -109,7 +103,7 @@ final class SegmentCache {
         coldCount = size;
     }
 
-    /** Free every segment, and every one offered from now on; for an allocator being freed. */
+    /** Also frees every segment offered from now on. */
     synchronized void close() {
         closed = true;
         for (int i = 0; i < size; i++) {
