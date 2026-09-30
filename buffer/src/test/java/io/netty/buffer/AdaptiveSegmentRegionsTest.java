@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
-import static io.netty.buffer.PageStoreConfig.SLICE_SIZE;
+import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -85,7 +85,7 @@ public class AdaptiveSegmentRegionsTest {
 
     private AdaptivePoolingAllocator newAllocator(int cacheBytes, int regionSize, int alignment) {
         return new AdaptivePoolingAllocator(segments, true, segments, regions,
-                new PageStoreConfig(SEGMENT, SLICE_SIZE, cacheBytes, INTERVAL, 0.5, regionSize, alignment));
+                new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, cacheBytes, INTERVAL, 0.5, regionSize, alignment));
     }
 
     private void assertAccounted(AdaptivePoolingAllocator allocator) {
@@ -316,7 +316,7 @@ public class AdaptiveSegmentRegionsTest {
         AdaptivePoolingAllocator noRegions = newAllocator(0, 0, 0);
         assertNull(noRegions.pageStore.regionPool);
         AdaptivePoolingAllocator noSource = new AdaptivePoolingAllocator(segments, true, segments, null,
-                new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, REGION, ALIGNMENT));
+                new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, REGION, ALIGNMENT));
         assertNull(noSource.pageStore.regionPool);
         for (AdaptivePoolingAllocator allocator : new AdaptivePoolingAllocator[] {noRegions, noSource}) {
             HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
@@ -340,7 +340,7 @@ public class AdaptiveSegmentRegionsTest {
         assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(36 * MIB, SEGMENT));
         assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(40 * MIB, SEGMENT));
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(256 * MIB, SEGMENT));
-        boolean lowMemory = PageStoreConfig.SEGMENT_REGION_SIZE == 0
+        boolean lowMemory = PageStoreConfig.SEGMENT_REGION_SIZE_BYTES == 0
                 && System.getProperty("io.netty.allocator.segmentRegionSize") == null;
         int expected = lowMemory ? 0 : fallback;
         for (int bad : new int[] {-1, 4 * MIB, 32 * MIB, 34 * MIB, 260 * MIB}) {
@@ -348,15 +348,15 @@ public class AdaptiveSegmentRegionsTest {
         }
         // The config itself: 2 to 64 whole segments, a power-of-two alignment.
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, SEGMENT, ALIGNMENT));
+                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, SEGMENT, ALIGNMENT));
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, 65 * SEGMENT, ALIGNMENT));
+                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 65 * SEGMENT, ALIGNMENT));
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, REGION + MIB, ALIGNMENT));
+                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, REGION + MIB, ALIGNMENT));
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, REGION, 3 * MIB));
+                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, REGION, 3 * MIB));
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, -REGION, ALIGNMENT));
+                () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, -REGION, ALIGNMENT));
     }
 
     /**

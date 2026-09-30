@@ -23,7 +23,7 @@ import java.util.Arrays;
  * as its last segment is back. Segments come back only from the {@link SegmentCache}, so a region is never freed
  * earlier than its last segment would have been without regions.
  * <p>
- * Why: with glibc, a {@code malloc} above {@link PageStoreConfig#MALLOC_MMAP_THRESHOLD_MAX} is always an
+ * Why: with glibc, a {@code malloc} above {@link PageStoreConfig#MALLOC_MMAP_THRESHOLD_MAX_BYTES} is always an
  * {@code mmap} and its {@code free} a {@code munmap}; 4 MiB segments fall under the dynamic threshold once it rose,
  * and their frees leave holes in the arenas. Cost: a region stays allocated while any of its segments is out.
  * <p>
