@@ -38,6 +38,7 @@ import static io.netty.buffer.PageStoreTestSupport.committedSlots;
 import static io.netty.buffer.PageStoreTestSupport.giveBack;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -332,6 +333,58 @@ final class PageStoreTest {
         assertNull(segment.owner);
         assertEquals(SLOTS, segment.region.freeSlotCount());
         assertAccounted(segments, regions, allocator);
+    }
+
+    /**
+     * A region that cannot be mapped turns the mapping off for good: the free slots of the regions mapped so far are
+     * still taken first, then segments are allocated on their own, and the heaps keep the larger reserve of the
+     * allocations one by one.
+     */
+    @Test
+    void aRegionThatCannotBeMappedFallsBackToOneAllocationPerSegment() {
+        final int[] calls = new int[1];
+        RegionSource failing = new RegionSource() {
+            @Override
+            public AbstractByteBuf allocateRegion(int size, int alignment) {
+                if (++calls[0] > 1) {
+                    throw new OutOfMemoryError("mmap(2) failed to map " + size + " bytes: errno 12");
+                }
+                return regions.allocateRegion(size, alignment);
+            }
+
+            @Override
+            public void purge(AbstractByteBuf region, int offset, int length) {
+                regions.purge(region, offset, length);
+            }
+        };
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(segments, true, segments, failing,
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT));
+        PageStore store = allocator.pageStore;
+        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
+        assertEquals(1, store.reserveLimit());
+        List<Segment> taken = new ArrayList<Segment>();
+        for (int i = 0; i < SLOTS; i++) {
+            taken.add(store.take(heap));
+        }
+        Segment own = store.take(heap);
+        assertNull(own.region, "no region: allocated on its own");
+        assertEquals(2, calls[0]);
+        assertFalse(store.mapsRegions);
+        assertEquals(8, store.reserveLimit());
+        store.free(releaseOwnership(taken.get(4)));
+        assertSame(taken.get(4), store.take(heap), "the free slot of the mapped region first");
+        Segment ownAgain = store.take(heap);
+        assertNull(ownAgain.region);
+        assertEquals(2, calls[0], "never tried again");
+        assertEquals(1, store.regionCount());
+        assertEquals(2, segments.segmentsAllocated());
+        assertEquals((SLOTS + 2L) * SEGMENT_SIZE, allocator.usedMemory());
+        assertAccounted(segments, regions, allocator);
+        store.free(releaseOwnership(own));
+        store.free(releaseOwnership(ownAgain));
+        assertEquals(0, segments.segmentsLive());
+        store.close();
+        assertEquals(0, allocator.usedMemory());
     }
 
     /**

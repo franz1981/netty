@@ -16,6 +16,8 @@
 package io.netty.buffer;
 
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -28,7 +30,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * <p>
  * Regions: a slot is taken and given back by a CAS on its region's bitmap, without a lock; a new region is mapped
  * under this store's monitor, the only lock, when no region has a free slot. Regions are only added, never removed,
- * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}.
+ * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}. Once a region cannot be
+ * mapped, none is mapped again, and a take that finds no free slot allocates its segment on its own.
  * <p>
  * Used memory, reported to {@link AdaptivePoolingAllocator#chunkBufferAllocated} and
  * {@link AdaptivePoolingAllocator#chunkBufferFreed} per segment: without regions, a segment from its allocation to
@@ -39,6 +42,7 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * limit, never whole regions; a segment allocated on its own is charged by its allocation.
  */
 final class PageStore {
+    private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
     private static final AtomicLongFieldUpdater<PageStore> SEGMENTS_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "segmentsCommitted");
     private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
@@ -53,6 +57,11 @@ final class PageStore {
     final SegmentSource segmentSource;
     /** {@code null} when every segment is an allocation of its own. */
     final RegionSource regionSource;
+    /**
+     * Cleared for good when a region cannot be mapped: from then on a take that finds no free slot in the regions
+     * mapped so far allocates its segment on its own.
+     */
+    volatile boolean mapsRegions;
     /** Replaced, one longer, under this store's monitor; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
@@ -77,17 +86,17 @@ final class PageStore {
         this.config = config;
         this.segmentSource = segmentSource;
         this.regionSource = config.regionSize > 0 ? regionSource : null;
+        mapsRegions = this.regionSource != null;
     }
 
     /**
-     * A segment for {@code heap}, which owns it from now on: the lowest free slot of the fullest region (the first
-     * from the heap's offset on a tie), else of a new region; without regions, a new allocation.
+     * A segment for {@code heap}, which owns it from now on: a free slot of the fullest region (the first from the
+     * heap's offset on a tie), else of a new region; without regions, or once one could not be mapped and no slot is
+     * free, a new allocation.
      */
     Segment take(HeapSegments heap) {
-        Segment segment;
-        if (regionSource != null) {
-            segment = takeFromRegions(heap);
-        } else {
+        Segment segment = regionSource != null ? takeFromRegions(heap) : null;
+        if (segment == null) {
             segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
             allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
         }
@@ -117,7 +126,9 @@ final class PageStore {
                 }
             }
             if (fullest == null) {
-                addRegion(regions);
+                if (!mapsRegions || !addRegion(regions)) {
+                    return null;
+                }
                 continue;
             }
             int slot = fullest.takeSlot();
@@ -143,19 +154,34 @@ final class PageStore {
         }
     }
 
-    /** Maps a new region, unless one was added since {@code seen} was read. Three system calls. */
-    private synchronized void addRegion(Region[] seen) {
+    /**
+     * Maps a new region, unless one was added since {@code seen} was read. Three system calls. Returns false, and
+     * maps no region ever again, if it cannot.
+     */
+    private synchronized boolean addRegion(Region[] seen) {
         if (closed) {
             throw new IllegalStateException("closed");
         }
         if (regions != seen) {
-            return;
+            return true;
         }
-        AbstractByteBuf buffer = regionSource.allocateRegion(config.regionSize, config.regionAlignment);
+        if (!mapsRegions) {
+            return false;
+        }
+        AbstractByteBuf buffer;
+        try {
+            buffer = regionSource.allocateRegion(config.regionSize, config.regionAlignment);
+        } catch (OutOfMemoryError | RuntimeException e) {
+            mapsRegions = false;
+            logger.warn("Cannot map a region of {} bytes: segments are allocated one by one from now on.",
+                    config.regionSize, e);
+            return false;
+        }
         assert buffer.capacity() == config.regionSize;
         Region[] grown = Arrays.copyOf(seen, seen.length + 1);
         grown[seen.length] = new Region(buffer, config.segmentsPerRegion());
         regions = grown;
+        return true;
     }
 
     /**
@@ -273,11 +299,11 @@ final class PageStore {
     /**
      * The most wholly free segments a heap keeps (see {@link HeapSegments}). Without regions, a segment given back is
      * freed, and taking one allocates a buffer, a {@link Segment} and later its span views: mimalloc's reserve of
-     * 32 MiB, from 1 to 8 segments, avoids that. With regions, one: a free slot is taken again by a CAS, its
-     * {@link Segment} reused, while a reserved slot is not free to the other heaps nor to the purge.
+     * 32 MiB, from 1 to 8 segments, avoids that. While regions are mapped, one: a free slot is taken again by a CAS,
+     * its {@link Segment} reused, while a reserved slot is not free to the other heaps nor to the purge.
      */
     int reserveLimit() {
-        return regionSource != null ? 1 : maxReserveLimit();
+        return mapsRegions ? 1 : maxReserveLimit();
     }
 
     int maxReserveLimit() {
