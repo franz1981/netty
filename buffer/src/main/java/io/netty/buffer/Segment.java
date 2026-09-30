@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
@@ -93,6 +94,16 @@ final class Segment implements ChunkInfo {
     private static long mask(int start, int n) {
         assert n > 0 && n < Long.SIZE && start >= 0 && start + n <= Long.SIZE;
         return (1L << n) - 1 << start;
+    }
+
+    /**
+     * Its whole memory was used, and is released at {@code now}, by a chunk or buffer that took the segment whole:
+     * every slice may have memory behind it, and is purged in place a whole delay from now at the earliest. By the
+     * thread that owns the segment alone: the one giving it back.
+     */
+    void releasedWhole(long now) {
+        resident = allFree;
+        Arrays.fill(freedAt, now);
     }
 
     /** The first slice of the lowest run of {@code n} free slices, now claimed, or -1. */

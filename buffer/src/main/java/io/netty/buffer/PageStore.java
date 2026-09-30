@@ -117,22 +117,37 @@ final class PageStore {
      * free, a new allocation.
      */
     Segment take(HeapSegments heap) {
-        Segment segment = regionSource != null ? takeFromRegions(heap) : null;
-        if (segment == null) {
-            segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
-            allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
-        }
+        Segment segment = takeSegment(heap.regionOffset, heap.isThreadLocal());
         segment.owner = heap;
         return segment;
     }
 
-    private Segment takeFromRegions(HeapSegments heap) {
+    /**
+     * Any thread. A segment for a chunk that uses it whole, outside any heap's segments: owned by no heap, and given
+     * back with {@link #free} from any thread once it is wholly free, which it stays: see {@link Segment#releasedWhole}.
+     *
+     * @param regionOffset where to start looking among the regions, as {@link HeapSegments#regionOffset}
+     */
+    Segment takeWhole(int regionOffset, boolean threadLocal) {
+        return takeSegment(regionOffset, threadLocal);
+    }
+
+    private Segment takeSegment(int regionOffset, boolean threadLocal) {
+        Segment segment = regionSource != null ? takeFromRegions(regionOffset, threadLocal) : null;
+        if (segment == null) {
+            segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
+            allocator.chunkBufferAllocated(segment, true, threadLocal);
+        }
+        return segment;
+    }
+
+    private Segment takeFromRegions(int regionOffset, boolean threadLocal) {
         for (;;) {
             Region[] regions = this.regions;
             int n = regions.length;
             Region fullest = null;
             int fullestFree = Integer.MAX_VALUE;
-            int i = n == 0 ? 0 : heap.regionOffset % n;
+            int i = n == 0 ? 0 : regionOffset % n;
             for (int k = 0; k < n; k++, i++) {
                 if (i == n) {
                     i = 0;
@@ -165,7 +180,7 @@ final class PageStore {
                     segment.resident = 0;
                     fullest.freedAt[slot] = 0;
                     SEGMENTS_COMMITTED.incrementAndGet(this);
-                    allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
+                    allocator.chunkBufferAllocated(segment, true, threadLocal);
                 }
                 taken = true;
                 return segment;
@@ -205,6 +220,67 @@ final class PageStore {
         grown[seen.length] = new Region(buffer, config.segmentsPerRegion());
         regions = grown;
         return true;
+    }
+
+    /**
+     * Any thread. {@code slots} contiguous free slots of one region, for a buffer larger than a segment: returns the
+     * region's index in {@link #regions} in the high half and the first slot in the low half, or -1 without regions,
+     * or when {@code slots} is more than a region holds. Maps a new region when none has such a run. Each slot is
+     * committed and counted as {@link #take} does; give the run back with {@link #freeRun}, from any thread.
+     */
+    long takeRun(int slots, int regionOffset, boolean threadLocal) {
+        if (regionSource == null || slots > config.segmentsPerRegion()) {
+            return -1;
+        }
+        for (;;) {
+            Region[] regions = this.regions;
+            int n = regions.length;
+            for (int k = 0, i = n == 0 ? 0 : regionOffset % n; k < n; k++, i = i + 1 == n ? 0 : i + 1) {
+                Region region = regions[i];
+                int start = region.takeRun(slots);
+                if (start >= 0) {
+                    commitRun(region, start, slots, threadLocal);
+                    return (long) i << 32 | start;
+                }
+            }
+            if (!mapsRegions || !addRegion(regions)) {
+                return -1;
+            }
+        }
+    }
+
+    /** The run's slots with no memory behind them are charged and counted; on failure the whole run goes back. */
+    private void commitRun(Region region, int start, int slots, boolean threadLocal) {
+        boolean committed = false;
+        try {
+            for (int slot = start; slot < start + slots; slot++) {
+                Segment segment = region.segment(slot, segmentSource, config);
+                if (region.freedAt[slot] == Region.UNCOMMITTED) {
+                    PlatformDependent.incrementMemoryCounter(config.segmentSize);
+                    region.freedAt[slot] = 0;
+                    SEGMENTS_COMMITTED.incrementAndGet(this);
+                    allocator.chunkBufferAllocated(segment, true, threadLocal);
+                }
+            }
+            committed = true;
+        } finally {
+            if (!committed) {
+                region.giveBackRun(start, slots, System.nanoTime());
+            }
+        }
+    }
+
+    /** Any thread: the run {@link #takeRun} returned goes back to its region's free slots, purged as any free slot. */
+    void freeRun(Region region, int start, int slots) {
+        long now = System.nanoTime();
+        for (int slot = start; slot < start + slots; slot++) {
+            region.segmentOrNull(slot).releasedWhole(now);
+        }
+        region.giveBackRun(start, slots, now);
+    }
+
+    Region region(int index) {
+        return regions[index];
     }
 
     /**

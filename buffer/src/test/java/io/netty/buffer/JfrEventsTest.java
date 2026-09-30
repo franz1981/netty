@@ -251,8 +251,9 @@ public class JfrEventsTest {
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment");
         }
-        assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
-        assertEquals(1, oneShots[1], "and when it is freed");
+        // The 4 MiB buffer and the 512 KiB ones take whole segments of the page store: segment events, no one-shot.
+        assertEquals(0, oneShots[0], "no chunk is allocated outside the page store");
+        assertEquals(0, oneShots[1]);
         assertEquals(alloc.metric().usedDirectMemory(), allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
     }

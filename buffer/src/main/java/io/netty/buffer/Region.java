@@ -90,6 +90,34 @@ final class Region {
         giveBackAll(1L << slot);
     }
 
+    /** Takes the lowest run of {@code n} free slots: returns its first slot, or -1 when there is none. Lock-free. */
+    int takeRun(int n) {
+        for (;;) {
+            long current = free;
+            int start = Segment.firstFit(current, n);
+            if (start < 0) {
+                return -1;
+            }
+            if (FREE.compareAndSet(this, current, current & ~run(start, n))) {
+                return start;
+            }
+        }
+    }
+
+    /** Frees the run of {@code n} slots from {@code start}, which the caller owns, stamped with {@code now}. */
+    void giveBackRun(int start, int n, long now) {
+        for (int slot = start; slot < start + n; slot++) {
+            if (freedAt[slot] != UNCOMMITTED) {
+                freedAt[slot] = now;
+            }
+        }
+        giveBackAll(run(start, n));
+    }
+
+    private static long run(int start, int n) {
+        return n == Long.SIZE ? -1L : (1L << n) - 1 << start;
+    }
+
     /** Frees the slots of {@code bits}, which the caller owns. Lock-free. */
     void giveBackAll(long bits) {
         for (;;) {

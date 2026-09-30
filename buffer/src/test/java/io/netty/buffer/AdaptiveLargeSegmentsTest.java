@@ -1,0 +1,288 @@
+/*
+ * Copyright 2026 The Netty Project
+ *
+ * The Netty Project licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+package io.netty.buffer;
+
+import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
+import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.util.concurrent.FastThreadLocalThread;
+import io.netty.util.internal.PlatformDependent;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
+import static io.netty.buffer.PageStoreTestSupport.MIB;
+import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
+import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
+import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
+import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
+import static io.netty.buffer.PageStoreTestSupport.committedSlots;
+import static io.netty.buffer.PageStoreTestSupport.newAllocator;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+/**
+ * Buffers above the size classes in a direct allocator with a page store: their chunks are whole segments of the
+ * store, and buffers above the pooled sizes take a segment or, with regions, a run of slots. Nothing comes from the
+ * chunk allocator but buffers larger than what the store hands out. Both modes: segments allocated one by one, and
+ * regions.
+ */
+@Isolated("Reads PlatformDependent's direct memory counter, which concurrent tests move")
+final class AdaptiveLargeSegmentsTest {
+    /** Pooled: eight fill one 4 MiB chunk. */
+    private static final int POOLED = 512 * 1024;
+    private static final int PER_CHUNK = SEGMENT_SIZE / POOLED;
+
+    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingRegionSource regions = new CountingRegionSource();
+
+    @BeforeEach
+    void pooledAboveTheSizeClasses() {
+        assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
+    }
+
+    private AdaptivePoolingAllocator withoutRegions() {
+        return newAllocator(segments, SEGMENT_SIZE);
+    }
+
+    private AdaptivePoolingAllocator withRegions() {
+        return newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
+    }
+
+    private AdaptivePoolingAllocator allocator(boolean withRegions) {
+        return withRegions ? withRegions() : withoutRegions();
+    }
+
+    private void assertAccountedIn(AdaptivePoolingAllocator allocator) {
+        if (allocator.pageStore.regionSource != null) {
+            assertAccounted(segments, regions, allocator);
+        } else {
+            assertAccounted(segments, allocator);
+        }
+    }
+
+    private static List<ByteBuf> allocate(AdaptivePoolingAllocator allocator, int size, int count) {
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>(count);
+        for (int i = 0; i < count; i++) {
+            ByteBuf buf = allocator.allocate(size, size);
+            buf.setLong(size - 8, size);
+            bufs.add(buf);
+        }
+        return bufs;
+    }
+
+    private static void release(List<ByteBuf> bufs) {
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+    }
+
+    private void assertInRegion(ByteBuf buf) {
+        long base = regions.regions.get(0).memoryAddress();
+        assertTrue(buf.memoryAddress() >= base && buf.memoryAddress() + buf.capacity() <= base + REGION_SIZE);
+    }
+
+    private static int slotsInHeaps(AdaptivePoolingAllocator allocator) {
+        return allocator.pageStore.slotCounts()[0];
+    }
+
+    /** Runs {@code task} on a thread with its own thread-local heap, which is freed when the thread ends. */
+    private static <T> T onThreadLocalHeap(Callable<T> task) throws Exception {
+        AtomicReference<T> result = new AtomicReference<T>();
+        AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        Thread thread = new FastThreadLocalThread(() -> {
+            try {
+                result.set(task.call());
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        });
+        thread.start();
+        thread.join();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        return result.get();
+    }
+
+    /** Without regions a chunk is a segment of its own; once wholly free it waits in the heap's reserve for reuse. */
+    @Test
+    void chunksAreSegmentsKeptInTheHeapReserveWithoutRegions() {
+        AdaptivePoolingAllocator allocator = withoutRegions();
+        for (int round = 0; round < 3; round++) {
+            List<ByteBuf> bufs = allocate(allocator, POOLED, 2 * PER_CHUNK + 1);
+            assertEquals(3, segments.segmentsAllocated(), "three chunks, whatever the round");
+            assertEquals(0, segments.chunks.size(), "nothing from the chunk allocator");
+            assertAccounted(segments, allocator);
+            release(bufs);
+            assertEquals(3, segments.segmentsLive(), "the active chunk, and the two others in the reserve");
+            assertAccounted(segments, allocator);
+        }
+    }
+
+    /**
+     * With regions a chunk is a slot; once wholly free the slot goes back to the region, where it stays committed and
+     * is taken again first.
+     */
+    @Test
+    void chunksAreRegionSlotsGivenBackToTheStore() {
+        AdaptivePoolingAllocator allocator = withRegions();
+        for (int round = 0; round < 3; round++) {
+            List<ByteBuf> bufs = allocate(allocator, POOLED, 2 * PER_CHUNK + 1);
+            for (ByteBuf buf : bufs) {
+                assertInRegion(buf);
+            }
+            assertEquals(3, slotsInHeaps(allocator));
+            assertEquals(3, committedSlots(allocator.pageStore), "the same slots, whatever the round");
+            assertEquals(0, segments.segmentsAllocated() + segments.chunks.size());
+            release(bufs);
+            assertEquals(1, slotsInHeaps(allocator), "only the active chunk's slot is still taken");
+            assertAccounted(segments, regions, allocator);
+        }
+    }
+
+    /**
+     * A thread-local heap's chunk emptied by another thread's releases is applied at the owner's next slow path, which
+     * gives its segment back in the owner's context and takes it again for the next chunk.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void chunksEmptiedByAnotherThreadAreReusedByTheOwner(boolean withRegions) throws Exception {
+        final AdaptivePoolingAllocator allocator = allocator(withRegions);
+        final List<ByteBuf> first = new ArrayList<ByteBuf>();
+        int taken = onThreadLocalHeap(() -> {
+            first.addAll(allocate(allocator, POOLED, PER_CHUNK));
+            List<ByteBuf> second = allocate(allocator, POOLED, 1);
+            Thread releaser = new Thread(() -> release(first));
+            releaser.start();
+            releaser.join();
+            // Fill the second chunk: the slow path applies the notes and makes the first chunk's segment reusable.
+            second.addAll(allocate(allocator, POOLED, PER_CHUNK));
+            int held = withRegions ? committedSlots(allocator.pageStore) : segments.segmentsAllocated();
+            release(second);
+            return held;
+        });
+        assertEquals(2, taken, "the third chunk took the first one's segment");
+        assertEquals(0, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive(),
+                "the dead heap gave everything back");
+        assertAccountedIn(allocator);
+    }
+
+    /**
+     * A buffer outliving its thread-local heap keeps its chunk; releasing it from another thread gives the segment
+     * straight back to the store.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void lastReleaseOnAnotherThreadGivesTheSegmentToTheStore(boolean withRegions) throws Exception {
+        final AdaptivePoolingAllocator allocator = allocator(withRegions);
+        ByteBuf survivor = onThreadLocalHeap(() -> allocator.allocate(POOLED, POOLED));
+        assertEquals(1, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive());
+        survivor.release();
+        assertEquals(0, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive());
+        assertAccountedIn(allocator);
+    }
+
+    /** Above the pooled sizes and up to a segment: a whole segment, from any thread, given back on release. */
+    @Test
+    void oneShotsUpToASegmentTakeASegment() {
+        AdaptivePoolingAllocator allocator = withoutRegions();
+        ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
+        assertEquals(1, segments.segmentsAllocated());
+        assertEquals(0, segments.chunks.size());
+        assertAccounted(segments, allocator);
+        buf.release();
+        assertEquals(0, segments.segmentsLive());
+        assertAccounted(segments, allocator);
+    }
+
+    /**
+     * Above a segment, with regions: a run of contiguous slots, given back on release and purged by the store like any
+     * free slot. Above a region: a buffer of its own from the chunk allocator.
+     */
+    @Test
+    void buffersAboveASegmentTakeRunsOfSlots() {
+        AdaptivePoolingAllocator allocator = withRegions();
+        PageStore store = allocator.pageStore;
+        ByteBuf run = allocate(allocator, 2 * SEGMENT_SIZE + 1, 1).get(0);
+        assertInRegion(run);
+        assertEquals(3, slotsInHeaps(allocator));
+        assertEquals(3, committedSlots(store));
+        ByteBuf huge = allocate(allocator, REGION_SIZE + 1, 1).get(0);
+        assertEquals(1, segments.chunks.size(), "larger than a region: its own allocation");
+        assertAccounted(segments, regions, allocator);
+        run.release();
+        huge.release();
+        assertEquals(0, slotsInHeaps(allocator));
+        assertAccounted(segments, regions, allocator);
+        long now = System.nanoTime();
+        store.purgeIfDue(now += INTERVAL);
+        store.purgeIfDue(now + INTERVAL);
+        assertEquals(3, store.segmentsPurged, "free a whole interval: purged");
+        assertEquals(0, committedSlots(store));
+        assertAccounted(segments, regions, allocator);
+    }
+
+    /** Without regions a buffer above a segment is its own allocation, as before the page store. */
+    @Test
+    void buffersAboveASegmentAreTheirOwnAllocationWithoutRegions() {
+        AdaptivePoolingAllocator allocator = withoutRegions();
+        ByteBuf buf = allocate(allocator, SEGMENT_SIZE + 1, 1).get(0);
+        assertEquals(0, segments.segmentsAllocated());
+        assertEquals(1, segments.chunks.size());
+        assertAccounted(segments, allocator);
+        buf.release();
+        assertAccounted(segments, allocator);
+    }
+
+    /** Every slot the large paths commit is charged once and credited by the purge or the close. */
+    @Test
+    void largeSlotsAreChargedAndCredited() {
+        assumeTrue(PlatformDependent.usedDirectMemory() >= 0, "the direct memory counter is off");
+        // Allocators of earlier tests credit the counter when finalized: let that happen before the base is read.
+        for (int i = 0; i < 3; i++) {
+            System.gc();
+            System.runFinalization();
+        }
+        long base = PlatformDependent.usedDirectMemory();
+        long regionCharge = regions.mmap != null ? 0 : REGION_SIZE;
+        AdaptivePoolingAllocator allocator = withRegions();
+        PageStore store = allocator.pageStore;
+        List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // two chunks
+        bufs.addAll(allocate(allocator, 2 * MIB, 1)); // a segment
+        bufs.addAll(allocate(allocator, SEGMENT_SIZE + 1, 1)); // two slots
+        assertEquals(5, committedSlots(store));
+        assertEquals(base + regionCharge + 5L * SEGMENT_SIZE, PlatformDependent.usedDirectMemory());
+        release(bufs);
+        long now = System.nanoTime();
+        store.purgeIfDue(now += INTERVAL);
+        store.purgeIfDue(now + INTERVAL);
+        int left = committedSlots(store);
+        assertEquals(1, left, "the active chunk's slot is still taken");
+        assertEquals(base + regionCharge + (long) left * SEGMENT_SIZE, PlatformDependent.usedDirectMemory());
+        store.close();
+        assertEquals(base, PlatformDependent.usedDirectMemory());
+    }
+}

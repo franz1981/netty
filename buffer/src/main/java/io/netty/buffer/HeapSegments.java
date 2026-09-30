@@ -130,6 +130,10 @@ final class HeapSegments {
             store.renewed();
             return;
         }
+        pushReserved(segment);
+    }
+
+    private void pushReserved(Segment segment) {
         if (reserved >= Math.min(store.reserveLimit(), reserve.length)) {
             // The oldest, cold if any is, makes room: at a limit of one, the newest wholly free segment is kept.
             disposeOldestReserved(1);
@@ -138,6 +142,32 @@ final class HeapSegments {
             }
         }
         reserve[reserved++] = segment;
+    }
+
+    /**
+     * Owner only. {@code segment}, taken whole with {@link PageStore#takeWhole} and wholly free again, joins the
+     * reserve, where {@link #claim} and {@link #takeReservedWhole} find it. False once the heap is freed: give it back
+     * to the store instead.
+     */
+    boolean reserveWhole(Segment segment) {
+        assert inOwnerContext() && segment.owner == null && segment.isWhollyFree();
+        if (freed) {
+            return false;
+        }
+        segment.owner = this;
+        pushReserved(segment);
+        return true;
+    }
+
+    /** Owner only. The newest reserved segment, owned by no heap as after {@link PageStore#takeWhole}, or null. */
+    Segment takeReservedWhole() {
+        assert inOwnerContext() && !freed;
+        if (reserved == 0) {
+            return null;
+        }
+        Segment segment = takeNewestReserved();
+        segment.owner = null;
+        return segment;
     }
 
     private Segment takeNewestReserved() {

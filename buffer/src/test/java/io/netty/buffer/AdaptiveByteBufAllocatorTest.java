@@ -192,8 +192,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void oneShotChunkIsFreedWithItsBuffer(boolean direct) {
+    void oneShotChunkIsFreedWithItsBuffer(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
+        assumeFalse(direct && storeOneShots(allocator), "see oneShotBuffersTakeWholeSegments");
         ByteBufAllocatorMetric metric = allocator.metric();
         int size = 2 * 1024 * 1024;
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
@@ -212,6 +213,42 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
         assertTrue(buffer.release());
         assertEquals(0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+    }
+
+    /** Whether the direct allocator takes buffers above the pooled sizes from its page store. */
+    private static boolean storeOneShots(AdaptiveByteBufAllocator allocator) throws Exception {
+        return directPageStoreUnit(allocator) != 0 && !isLowMemory();
+    }
+
+    /**
+     * With a page store, a direct buffer above the pooled sizes and up to a segment takes a whole segment, given back
+     * to the store when it is released: with regions its slot stays committed, counted, until a purge; without, the
+     * segment is freed.
+     */
+    @Test
+    void oneShotBuffersTakeWholeSegments() throws Exception {
+        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        assumeTrue(storeOneShots(allocator), "no page store for buffers above the pooled sizes");
+        long unit = directPageStoreUnit(allocator);
+        assumeTrue(unit == 4 * 1024 * 1024, "sized for 4 MiB segments");
+        ByteBufAllocatorMetric metric = allocator.metric();
+        int size = 2 * 1024 * 1024;
+        ByteBuf buffer = allocator.directBuffer(size, Integer.MAX_VALUE);
+        assertEquals(size, buffer.capacity());
+        assertEquals(unit, metric.usedDirectMemory());
+        buffer.writeLong(0x0123456789ABCDEFL);
+        buffer.setLong(size - 8, 0xFEDCBA9876543210L);
+
+        buffer.capacity(2 * size);
+        assertEquals(2 * size, buffer.capacity());
+        boolean regions = directRegions(allocator);
+        // The first segment went back: a region slot stays committed, a segment of its own is freed.
+        assertEquals(regions ? 2 * unit : unit, metric.usedDirectMemory());
+        assertEquals(0x0123456789ABCDEFL, buffer.getLong(0));
+        assertEquals(0xFEDCBA9876543210L, buffer.getLong(size - 8));
+
+        assertTrue(buffer.release());
+        assertEquals(regions ? 2 * unit : 0, metric.usedDirectMemory());
     }
 
     @Test
