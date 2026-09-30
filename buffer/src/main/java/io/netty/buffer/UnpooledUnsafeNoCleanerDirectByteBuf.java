@@ -25,6 +25,14 @@ class UnpooledUnsafeNoCleanerDirectByteBuf extends UnpooledUnsafeDirectByteBuf {
         super(alloc, initialCapacity, maxCapacity);
     }
 
+    /**
+     * A view of {@code span}, a slice of another buffer of this class, that never frees it: see
+     * {@code AdaptivePoolingAllocator.SegmentSource#span}.
+     */
+    UnpooledUnsafeNoCleanerDirectByteBuf(ByteBufAllocator alloc, ByteBuffer span, int capacity) {
+        super(alloc, span, capacity, false);
+    }
+
     @Override
     protected ByteBuffer allocateDirect(int initialCapacity) {
         throw new UnsupportedOperationException();

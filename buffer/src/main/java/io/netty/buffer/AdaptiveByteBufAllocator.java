@@ -20,6 +20,8 @@ import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.nio.ByteBuffer;
+
 /**
  * An auto-tuning pooling {@link ByteBufAllocator}, that follows an anti-generational hypothesis.
  * <p>
@@ -102,7 +104,13 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
     }
 
-    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    /**
+     * Direct chunk buffers, and the segments the size classes carve their chunks out of: both are libc {@code malloc}
+     * behind {@link UnsafeByteBufUtil#newDirectByteBuf} (or {@link java.nio.ByteBuffer#allocateDirect} without
+     * {@code Unsafe}, which touches every page at once).
+     */
+    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator,
+                                                               AdaptivePoolingAllocator.SegmentSource {
         private final ByteBufAllocator allocator;
 
         private DirectChunkAllocator(ByteBufAllocator allocator) {
@@ -113,5 +121,31 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         public AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
             return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity);
         }
+
+        @Override
+        public AbstractByteBuf allocateSegment(int size) {
+            return UnsafeByteBufUtil.newDirectByteBuf(allocator, size, size);
+        }
+
+        @Override
+        public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
+            return directSpan(allocator, segment, offset, length);
+        }
+    }
+
+    /**
+     * A buffer over {@code length} bytes of {@code segment}, a buffer of {@link UnsafeByteBufUtil#newDirectByteBuf},
+     * from {@code offset}: of the class of {@code segment}, so that the buffers reading a chunk see one class whatever
+     * the chunk, and never freeing the memory.
+     */
+    static AbstractByteBuf directSpan(ByteBufAllocator allocator, AbstractByteBuf segment, int offset, int length) {
+        ByteBuffer span = segment.nioBuffer(offset, length);
+        if (segment instanceof UnpooledUnsafeNoCleanerDirectByteBuf) {
+            return new UnpooledUnsafeNoCleanerDirectByteBuf(allocator, span, length);
+        }
+        if (segment instanceof UnpooledUnsafeDirectByteBuf) {
+            return new UnpooledUnsafeDirectByteBuf(allocator, span, length, false);
+        }
+        return new UnpooledDirectByteBuf(allocator, span, length, false, false);
     }
 }

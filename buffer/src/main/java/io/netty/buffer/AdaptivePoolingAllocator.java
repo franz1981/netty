@@ -48,6 +48,7 @@ import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
@@ -174,6 +175,44 @@ final class AdaptivePoolingAllocator {
     private static final int MAGAZINE_BUFFER_QUEUE_CAPACITY = SystemPropertyUtil.getInt(
             "io.netty.allocator.magazineBufferQueueCapacity", 1024);
 
+    /**
+     * {@code io.netty.allocator.directSegments}: whether the size classes of a direct allocator carve their chunks out
+     * of {@link Segment}s (see {@link HeapSegments}) instead of allocating each chunk on its own. Default: true. A heap
+     * allocator never does.
+     */
+    private static final boolean DIRECT_SEGMENTS =
+            SystemPropertyUtil.getBoolean("io.netty.allocator.directSegments", true);
+    /** A {@link Segment} is handed out in slices of 64 KiB: a chunk carved from it is a span of whole slices. */
+    static final int SLICE_SHIFT = 16;
+    static final int SLICE_SIZE = 1 << SLICE_SHIFT;
+    /** One bit per slice in one {@code long}: 4 MiB. */
+    static final int MAX_SEGMENT_SIZE = Long.SIZE * SLICE_SIZE;
+    /** Room for the largest size-class chunk (9 slices) with some to spare. */
+    static final int MIN_SEGMENT_SIZE = 1024 * 1024;
+    /**
+     * {@code io.netty.allocator.segmentSize}: the size of every {@link Segment}, a multiple of {@link #SLICE_SIZE}
+     * from {@link #MIN_SEGMENT_SIZE} to {@link #MAX_SEGMENT_SIZE}. Default: 4 MiB, 2 MiB in low-memory mode (where
+     * nothing else the allocator holds is above 2 MiB either).
+     */
+    static final int SEGMENT_SIZE = segmentSizeOf(SystemPropertyUtil.getInt(
+            "io.netty.allocator.segmentSize", IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE));
+    /**
+     * {@code io.netty.allocator.segmentCacheBytes}: how many bytes of wholly free {@link Segment}s the allocator keeps
+     * for any of its heaps, at most; see {@link SegmentCache}. Default: 64 MiB, 8 MiB in low-memory mode.
+     */
+    static final int SEGMENT_CACHE_BYTES = Math.max(0, SystemPropertyUtil.getInt(
+            "io.netty.allocator.segmentCacheBytes", IS_LOW_MEM ? 8 * 1024 * 1024 : 64 * 1024 * 1024));
+
+    private static int segmentSizeOf(int size) {
+        if (size % SLICE_SIZE != 0 || size < MIN_SEGMENT_SIZE || size > MAX_SEGMENT_SIZE) {
+            int fallback = IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE;
+            logger.warn("-Dio.netty.allocator.segmentSize={}: not a multiple of {} from {} to {}, using {}",
+                    size, SLICE_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE, fallback);
+            return fallback;
+        }
+        return size;
+    }
+
     static {
         warnIfSet("io.netty.allocator.chunkPurgePollsThreadLocal",
                 "is deprecated, use -Dio.netty.allocator.chunkPurgeInterval instead");
@@ -281,7 +320,36 @@ final class AdaptivePoolingAllocator {
     private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
+    /** Where {@link Segment}s come from, or {@code null} when this allocator carves no chunk out of segments. */
+    final SegmentSource segmentSource;
+    /** The size of every {@link Segment}; meaningless without a {@link #segmentSource}. */
+    final int segmentSize;
+    /** The wholly free segments any heap takes first; {@code null} without a {@link #segmentSource}. */
+    final SegmentCache segmentCache;
+
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
+        this(chunkAllocator, useCacheForNonEventLoopThreads,
+                DIRECT_SEGMENTS && chunkAllocator instanceof SegmentSource ? (SegmentSource) chunkAllocator : null,
+                SEGMENT_SIZE, SEGMENT_CACHE_BYTES);
+    }
+
+    /**
+     * @param segmentSource     where the segments come from, or {@code null} for chunks allocated one by one
+     * @param segmentSize       the size of every segment, see {@link #SEGMENT_SIZE}
+     * @param segmentCacheBytes the bound of the {@link SegmentCache}, see {@link #SEGMENT_CACHE_BYTES}
+     */
+    AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
+                             SegmentSource segmentSource, int segmentSize, int segmentCacheBytes) {
+        this.segmentSource = segmentSource;
+        this.segmentSize = segmentSize;
+        if (segmentSource != null) {
+            if (segmentSize % SLICE_SIZE != 0 || segmentSize < MIN_SEGMENT_SIZE || segmentSize > MAX_SEGMENT_SIZE) {
+                throw new IllegalArgumentException("segmentSize: " + segmentSize);
+            }
+            segmentCache = new SegmentCache(this, segmentCacheBytes / segmentSize);
+        } else {
+            segmentCache = null;
+        }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
         sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
@@ -499,6 +567,11 @@ final class AdaptivePoolingAllocator {
      * {@link #chunkBufferAllocated} to {@link #chunkBufferFreed} or {@link #recycledChunkBufferFreed}, which are also
      * the only places that fire the {@link AllocateChunkEvent} and the {@link FreeChunkEvent}, so the bytes allocated
      * minus the bytes freed in a JFR recording equal this number.
+     * <p>
+     * A {@link Segment} is one such buffer, whole, from the moment it is taken from the {@link #segmentSource} to the
+     * moment it is freed, wherever it is in between (a heap, the {@link #segmentCache}, or a heap that was freed
+     * while spans were still out): the events are per segment, and the size-class chunks carved out of a segment as
+     * spans fire none, since their memory never leaves the allocator.
      */
     long usedMemory() {
         return chunkRegistry.totalCapacity();
@@ -519,9 +592,32 @@ final class AdaptivePoolingAllocator {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
                 event.threadLocal = threadLocal;
+                event.segment = chunk instanceof Segment;
                 event.commit();
             }
         }
+    }
+
+    /**
+     * A segment for {@code heap}: the newest one of the {@link #segmentCache}, else a new one from the
+     * {@link #segmentSource}, which is announced like any chunk buffer taken from the memory the allocator is built
+     * on. Slow path: once per segment a heap takes.
+     */
+    Segment takeSegment(HeapSegments heap) {
+        Segment segment = segmentCache.poll();
+        if (segment == null) {
+            segment = new Segment(segmentSource.allocateSegment(segmentSize), segmentSize >> SLICE_SHIFT);
+            chunkBufferAllocated(segment, true, heap.isThreadLocal());
+        }
+        segment.owner = heap;
+        return segment;
+    }
+
+    /** Give {@code segment}, wholly free and owned by no heap, back to the {@link #segmentSource}. */
+    void freeSegment(Segment segment) {
+        assert segment.isWhollyFree() && segment.owner == null;
+        chunkBufferFreed(segment, true);
+        segment.buffer.release();
     }
 
     /**
@@ -536,6 +632,7 @@ final class AdaptivePoolingAllocator {
             if (event.shouldCommit()) {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
+                event.segment = chunk instanceof Segment;
                 event.commit();
             }
         }
@@ -573,6 +670,432 @@ final class AdaptivePoolingAllocator {
     private void free() {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
+        }
+        if (segmentCache != null) {
+            segmentCache.close();
+        }
+    }
+
+    /**
+     * Where the {@link Segment}s of a direct allocator come from: the memory the allocator is built on, as for any
+     * chunk buffer (libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}). A segment goes back by
+     * {@link AbstractByteBuf#release()}.
+     */
+    interface SegmentSource {
+        /** A new segment buffer of {@code size} bytes. */
+        AbstractByteBuf allocateSegment(int size);
+
+        /**
+         * A buffer over {@code length} bytes of {@code segment} from {@code offset}, of the same class as
+         * {@code segment} (the chunks of a size class and every other chunk then look alike to the buffers that read
+         * them) and never freeing any memory: releasing it, or not, changes nothing to the segment.
+         */
+        AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
+    }
+
+    /**
+     * A uniform piece of memory from the {@link SegmentSource}, handed out in {@link #SLICE_SIZE} slices: a span is a
+     * run of contiguous slices. The free slices are one bit each in {@link #free}, so claiming a span, freeing it and
+     * merging it with its free neighbours are bit operations (a freed span is simply free bits next to other free
+     * bits), and no metadata lives in the segment's memory. Spans are claimed first fit from the lowest slice, so live
+     * spans pack towards the start of a segment.
+     * <p>
+     * A segment belongs to one {@link HeapSegments} at a time ({@link #owner}), which alone claims spans from it; it
+     * leaves its heap once wholly free, for the allocator's {@link SegmentCache}. Nothing here runs per buffer: a span
+     * is claimed when a chunk is created and freed when it is deallocated.
+     */
+    static final class Segment implements ChunkInfo {
+        private static final AtomicLongFieldUpdater<Segment> FREE =
+                AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
+        static final AtomicReferenceFieldUpdater<Segment, HeapSegments> OWNER =
+                AtomicReferenceFieldUpdater.newUpdater(Segment.class, HeapSegments.class, "owner");
+
+        final AbstractByteBuf buffer;
+        final int slices;
+        /** {@link #free} of a wholly free segment: one bit per slice. */
+        final long allFree;
+        /**
+         * Bit {@code i} set when slice {@code i} is free. Changed by compare-and-set: the owner claims and frees
+         * spans, and once its heap was freed, the last releases of its chunks free theirs from any thread.
+         */
+        volatile long free;
+        /** The heap whose chunks it holds, or {@code null} in the {@link SegmentCache} or on its way to it. */
+        volatile HeapSegments owner;
+        /**
+         * The span buffers made so far, by first slice: a span claimed again at the same place with the same length
+         * reuses its buffer, so that re-creating a chunk allocates no buffer object. At most one per slice.
+         */
+        private final AbstractByteBuf[] spans;
+
+        Segment(AbstractByteBuf buffer, int slices) {
+            assert slices > 0 && slices <= Long.SIZE && buffer.capacity() == slices << SLICE_SHIFT;
+            this.buffer = buffer;
+            this.slices = slices;
+            allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
+            free = allFree;
+            spans = new AbstractByteBuf[slices];
+        }
+
+        /**
+         * The first slice of the lowest run of {@code n} free slices in {@code free}, or -1. After {@code k} rounds of
+         * {@code m &= m >>> 1}, bit {@code i} of {@code m} is set when slices {@code i} to {@code i + k} are all free.
+         */
+        static int firstFit(long free, int n) {
+            long m = free;
+            for (int i = 1; i < n; i++) {
+                m &= m >>> 1;
+            }
+            return m == 0 ? -1 : Long.numberOfTrailingZeros(m);
+        }
+
+        private static long mask(int start, int n) {
+            assert n > 0 && n < Long.SIZE && start >= 0 && start + n <= Long.SIZE;
+            return (1L << n) - 1 << start;
+        }
+
+        /** Claim the lowest run of {@code n} free slices and return its first slice, or -1 when there is none. */
+        int claim(int n) {
+            for (;;) {
+                long current = free;
+                int start = firstFit(current, n);
+                if (start < 0) {
+                    return -1;
+                }
+                if (FREE.compareAndSet(this, current, current & ~mask(start, n))) {
+                    return start;
+                }
+            }
+        }
+
+        /** Free the {@code n} slices from {@code start}, claimed before; return the free bits after. Any thread. */
+        long release(int start, int n) {
+            long bits = mask(start, n);
+            for (;;) {
+                long current = free;
+                if ((current & bits) != 0) {
+                    throw new IllegalStateException("slices " + start + ".." + (start + n - 1) + " are not claimed: "
+                            + Long.toHexString(current));
+                }
+                long next = current | bits;
+                if (FREE.compareAndSet(this, current, next)) {
+                    return next;
+                }
+            }
+        }
+
+        boolean isWhollyFree() {
+            return free == allFree;
+        }
+
+        int freeSlices() {
+            return Long.bitCount(free);
+        }
+
+        int usedSlices() {
+            return slices - freeSlices();
+        }
+
+        /**
+         * The buffer over the {@code n} slices from {@code start}: the one made last time for that exact span, else a
+         * new one from {@code source}. Owner only, when a chunk is created.
+         */
+        AbstractByteBuf span(SegmentSource source, int start, int n) {
+            int length = n << SLICE_SHIFT;
+            AbstractByteBuf span = spans[start];
+            if (span == null || span.capacity() != length) {
+                span = source.span(buffer, start << SLICE_SHIFT, length);
+                spans[start] = span;
+            }
+            return span;
+        }
+
+        @Override
+        public int capacity() {
+            return buffer.capacity();
+        }
+
+        @Override
+        public boolean isDirect() {
+            return buffer.isDirect();
+        }
+
+        @Override
+        public long memoryAddress() {
+            return buffer._memoryAddress();
+        }
+
+        @Override
+        public String toString() {
+            return "Segment[slices: " + slices + ", used: " + usedSlices() + ']';
+        }
+    }
+
+    /**
+     * The segments of one heap (a stripe, or a thread-local heap), in the order the heap took them, and the rules that
+     * pack its spans: a span is claimed from the fullest segment that has room for it (the oldest of equally full
+     * ones), first fit from the lowest slice in it, and a new segment is taken only when none has room. Filling the
+     * fullest segments first leaves the emptiest ones to empty, as tcmalloc's filler and mimalloc's page queues do;
+     * a segment that becomes wholly free leaves the heap at once, for the allocator's {@link SegmentCache}.
+     * <p>
+     * Guarded like the heap: by the stripe lock, or by the owner thread of a thread-local heap. Nothing here runs per
+     * buffer: only chunk creation (a claim) and chunk deallocation (a release) come here, and both run in the heap's
+     * own slow paths. Once the heap is freed ({@link #markFreed}), the chunks still holding spans are deallocated by
+     * whichever thread releases their last buffer: from then on a segment is disposed of by the release that empties
+     * it, whatever the thread, and the list is not touched again.
+     */
+    static final class HeapSegments {
+        private final AdaptivePoolingAllocator allocator;
+        /** The stripe's lock, or {@code null} on a thread-local heap. For the assertions only. */
+        private final StampedLock stripeLock;
+        /** The thread of a thread-local heap, or {@code null} on a stripe. */
+        private final Thread ownerThread;
+        // Visible for testing (and read by dumps): the segments with a span out, oldest first.
+        Segment[] segments = new Segment[4];
+        int count;
+        /** Set once by {@link #markFreed}: the heap is gone, its segments are disposed of by their last release. */
+        private volatile boolean freed;
+        /** The first slice of the span the last {@link #claim} returned the segment of. */
+        private int claimedStart = -1;
+
+        HeapSegments(AdaptivePoolingAllocator allocator, StampedLock stripeLock, Thread ownerThread) {
+            assert allocator.segmentSource != null;
+            assert (stripeLock == null) != (ownerThread == null);
+            this.allocator = allocator;
+            this.stripeLock = stripeLock;
+            this.ownerThread = ownerThread;
+        }
+
+        boolean isThreadLocal() {
+            return ownerThread != null;
+        }
+
+        private boolean inOwnerContext() {
+            return ownerThread != null ? Thread.currentThread() == ownerThread : stripeLock.isWriteLocked();
+        }
+
+        /**
+         * Claim a span of {@code slices} for a new chunk and return its segment; {@link #claimedStart()} tells where in
+         * it. The fullest segment with a free run long enough wins, the oldest on a tie; with none, the heap takes a
+         * segment (see {@link AdaptivePoolingAllocator#takeSegment}). Scans the heap's segments once.
+         */
+        Segment claim(int slices) {
+            assert inOwnerContext() && !freed;
+            Segment best = null;
+            int bestFree = Integer.MAX_VALUE;
+            Segment[] segments = this.segments;
+            for (int i = 0, n = count; i < n; i++) {
+                Segment segment = segments[i];
+                long free = segment.free;
+                int freeSlices = Long.bitCount(free);
+                if (freeSlices >= slices && freeSlices < bestFree && Segment.firstFit(free, slices) >= 0) {
+                    best = segment;
+                    bestFree = freeSlices;
+                    if (freeSlices == slices) {
+                        break;
+                    }
+                }
+            }
+            if (best == null) {
+                best = allocator.takeSegment(this);
+                add(best);
+            }
+            int start = best.claim(slices);
+            assert start >= 0 : best;
+            claimedStart = start;
+            return best;
+        }
+
+        int claimedStart() {
+            return claimedStart;
+        }
+
+        /**
+         * Free the span of {@code slices} from {@code start} in {@code segment}, one of this heap's, when the chunk it
+         * served is deallocated. A segment that becomes wholly free leaves the heap for the {@link SegmentCache}. On a
+         * live heap this runs in the owner's context only: a chunk is deallocated there unless its heap was freed.
+         */
+        void release(Segment segment, int start, int slices) {
+            long free = segment.release(start, slices);
+            if (free != segment.allFree) {
+                return;
+            }
+            // The chunk's deallocation follows the free() that marked it, so a release on a freed heap sees the flag.
+            if (!freed) {
+                assert inOwnerContext();
+                remove(segment);
+            }
+            dispose(segment);
+        }
+
+        /**
+         * Hand {@code segment} to the cache, if it is still this heap's: of the release that emptied it and the sweep
+         * of {@link #afterFree}, which may both see it wholly free once the heap was freed, only one gets it.
+         */
+        private void dispose(Segment segment) {
+            if (Segment.OWNER.compareAndSet(segment, this, null)) {
+                allocator.segmentCache.offer(segment);
+            }
+        }
+
+        private void add(Segment segment) {
+            if (count == segments.length) {
+                segments = Arrays.copyOf(segments, count << 1);
+            }
+            segments[count++] = segment;
+        }
+
+        private void remove(Segment segment) {
+            Segment[] segments = this.segments;
+            for (int i = 0; i < count; i++) {
+                if (segments[i] == segment) {
+                    System.arraycopy(segments, i + 1, segments, i, count - i - 1);
+                    segments[--count] = null;
+                    return;
+                }
+            }
+            throw new IllegalStateException(segment + " is not a segment of this heap");
+        }
+
+        /**
+         * The heap is being freed: from now on the release that empties a segment disposes of it, from any thread.
+         * Call before the heap frees its chunks, then {@link #afterFree}.
+         */
+        void markFreed() {
+            assert inOwnerContext();
+            freed = true;
+        }
+
+        /**
+         * After the heap freed its chunks: dispose of the segments they emptied, then forget them all; the others go
+         * when their last span does (see {@link #release}).
+         */
+        void afterFree() {
+            assert freed;
+            for (int i = 0; i < count; i++) {
+                Segment segment = segments[i];
+                // A volatile read after the volatile write of freed: a release that emptied it and read freed as
+                // false is seen here (it could not have, see release), one that read it as true disposes of it too.
+                if (segment.isWhollyFree()) {
+                    dispose(segment);
+                }
+                segments[i] = null;
+            }
+            count = 0;
+        }
+
+        /** Called by the heap's {@link IdleDecay}: the {@link SegmentCache} ages at most once per interval. */
+        void decay(long now) {
+            allocator.segmentCache.decayIfDue(now);
+        }
+    }
+
+    /**
+     * The wholly free segments of an allocator, which any of its heaps takes before a new one from the
+     * {@link SegmentSource}: a stack, newest on top, bounded by {@link #SEGMENT_CACHE_BYTES}; a segment beyond the
+     * bound is freed at once. Taken from and given to only when a heap takes a segment or one leaves its heap, never
+     * per buffer.
+     * <p>
+     * It ages like the recycler of a heap: at most once per {@link IdleDecay#DECAY_INTERVAL_NANOS}, run by the decay of
+     * whichever heap comes first after the interval, it frees half, rounded up, of the segments that stayed in it
+     * through the whole interval, oldest first. Taking from the top leaves the bottom untouched, so the fewest segments
+     * it held since the last decay are exactly those.
+     * <p>
+     * Guarded by its monitor: the operations are a few field writes, one per segment taken or given up, and the aging
+     * has to take the oldest segments from the bottom, which a lock-free stack cannot.
+     */
+    static final class SegmentCache {
+        private static final AtomicLongFieldUpdater<SegmentCache> LAST_DECAY_NANOS =
+                AtomicLongFieldUpdater.newUpdater(SegmentCache.class, "lastDecayNanos");
+
+        private final AdaptivePoolingAllocator allocator;
+        private final Segment[] stack;
+        private int size;
+        /** The fewest segments held since the last decay: the bottom ones up to it were not taken since. */
+        private int coldCount;
+        private boolean closed;
+        private volatile long lastDecayNanos = System.nanoTime();
+        // Counters, for dumps and tests: segments taken from here, given to here and kept, freed by the bound, the
+        // aging or the close.
+        long taken;
+        long returned;
+        long freed;
+
+        SegmentCache(AdaptivePoolingAllocator allocator, int capacity) {
+            this.allocator = allocator;
+            stack = new Segment[Math.max(0, capacity)];
+        }
+
+        /** The newest segment, or {@code null}. */
+        synchronized Segment poll() {
+            if (size == 0) {
+                return null;
+            }
+            Segment segment = stack[--size];
+            stack[size] = null;
+            if (size < coldCount) {
+                coldCount = size;
+            }
+            taken++;
+            return segment;
+        }
+
+        /** Keep {@code segment}, wholly free and owned by no heap, or free it when the cache is full. */
+        void offer(Segment segment) {
+            assert segment.isWhollyFree() && segment.owner == null;
+            synchronized (this) {
+                if (!closed && size < stack.length) {
+                    stack[size++] = segment;
+                    returned++;
+                    return;
+                }
+                freed++;
+            }
+            allocator.freeSegment(segment);
+        }
+
+        /** Age the cache if no decay did during the last interval: any heap's decay calls this. */
+        void decayIfDue(long now) {
+            long last = lastDecayNanos;
+            if (now - last >= IdleDecay.DECAY_INTERVAL_NANOS && LAST_DECAY_NANOS.compareAndSet(this, last, now)) {
+                decay();
+            }
+        }
+
+        // Visible for testing.
+        synchronized void decay() {
+            int free = (coldCount + 1) >>> 1;
+            for (int i = 0; i < free; i++) {
+                Segment segment = stack[i];
+                freed++;
+                allocator.freeSegment(segment);
+            }
+            if (free > 0) {
+                int kept = size - free;
+                System.arraycopy(stack, free, stack, 0, kept);
+                Arrays.fill(stack, kept, size, null);
+                size = kept;
+            }
+            coldCount = size;
+        }
+
+        /** Free every segment, and every one offered from now on; for an allocator being freed. */
+        synchronized void close() {
+            closed = true;
+            for (int i = 0; i < size; i++) {
+                freed++;
+                allocator.freeSegment(stack[i]);
+                stack[i] = null;
+            }
+            size = 0;
+            coldCount = 0;
+        }
+
+        synchronized int size() {
+            return size;
+        }
+
+        int capacity() {
+            return stack.length;
         }
     }
 
@@ -848,6 +1371,8 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine[] magazines;
         /** Set once the heap has one: a stripe's, or a thread-local heap's for its buffers above the size classes. */
         BuddyMagazine buddyMagazine;
+        /** The heap's segments, when its size classes carve their chunks out of segments; see {@link #decay}. */
+        HeapSegments heapSegments;
         // Visible for testing.
         long allocationsSinceCheck;
         // Visible for testing.
@@ -889,6 +1414,11 @@ final class AdaptivePoolingAllocator {
             }
             if (buddyMagazine != null) {
                 buddyMagazine.decay();
+            }
+            // Last: what the size classes gave up above may have emptied a segment, which then waits in the cache for
+            // a whole interval before its first chance to be freed, like a buffer offered to the recycler.
+            if (heapSegments != null) {
+                heapSegments.decay(now);
             }
         }
     }
