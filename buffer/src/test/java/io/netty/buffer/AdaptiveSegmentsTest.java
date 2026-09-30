@@ -300,6 +300,62 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
+     * A decay frees the chunks that hold no buffer and alone keep a sparse segment in use, when the fullest segment
+     * has room for them: their classes make their next chunk there, and the emptied segment goes to the reserve. A
+     * chunk with a buffer out stays, and so does everything when the other segments have no room.
+     */
+    @Test
+    void decaysMoveEmptyChunksOutOfSparseSegments() throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
+        int perChunk = 8 * SLICE_SIZE_BYTES / size;
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        for (int i = 0; i < 8 * perChunk; i++) {
+            bufs.add(allocator.allocate(size, size));
+        }
+        ByteBuf small = allocator.allocate(1024, 1024); // a 2-slice chunk: the first segment is full
+        Object stripe = usedStripe(allocator);
+        HeapSegments heapSegments = idleDecay(stripe).heapSegments;
+        assertEquals(2, heapSegments.count);
+        Segment sparse = chunkOf(small).segment;
+        assertSame(heapSegments.segments[1], sparse);
+        long now = System.nanoTime();
+
+        // The full segment has no room for the small chunk: it stays, emptied or not.
+        small.release();
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(2, heapSegments.count);
+        assertEquals(2, sparse.usedSlices());
+
+        // Two chunks of the full segment empty and go (above the class's floor): now there is room.
+        for (int i = 0; i < 2 * perChunk; i++) {
+            bufs.remove(0).release();
+        }
+        assertEquals(48, heapSegments.segments[0].usedSlices());
+        small = allocator.allocate(1024, 1024);
+        assertSame(sparse, chunkOf(small).segment, "the class keeps its chunk");
+        // A buffer out pins the chunk.
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(2, heapSegments.count);
+        small.release();
+        allocator.allocate(1024, 1024).release(); // the class stays in use: its decay does not give the chunk up
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(1, heapSegments.count, "the sparse segment emptied");
+        assertEquals(1, heapSegments.reserved);
+        assertTrue(sparse.isWhollyFree());
+        small = allocator.allocate(1024, 1024);
+        assertSame(heapSegments.segments[0], chunkOf(small).segment, "the next chunk is made in the fullest");
+        assertEquals(50, heapSegments.segments[0].usedSlices());
+        assertEquals(2, source.segmentsAllocated(), "no segment allocated to move it");
+        small.release();
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        assertAccounted(source, allocator);
+    }
+
+    /**
      * A thread-local heap freed (its thread ended) while buffers are still out: its segments stay accounted, and the
      * release of the last buffer of a segment, on another thread, gives the segment back.
      */

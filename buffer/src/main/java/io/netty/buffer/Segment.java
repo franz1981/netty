@@ -46,6 +46,11 @@ final class Segment implements ChunkInfo {
     final int slot;
     /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
     private final AbstractByteBuf[] spans;
+    // Owner only, within one HeapSegments#markEvacuees round.
+    /** Slices of the owner's chunks in this segment that hold no buffer. */
+    int movableSlices;
+    /** Whether the owner frees its chunks here that hold no buffer, which empties this segment. */
+    boolean evacuate;
 
     Segment(AbstractByteBuf buffer, int sliceSize) {
         this(buffer, sliceSize, null, -1);

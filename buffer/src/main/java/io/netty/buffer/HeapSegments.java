@@ -48,6 +48,9 @@ final class HeapSegments {
     private int cold;
     private volatile boolean freed;
     private int claimedStart = -1;
+    /** The segments {@link #markEvacuees} marked, until {@link #clearEvacuees}. */
+    private Segment[] evacuees = new Segment[4];
+    private int evacueeCount;
 
     HeapSegments(PageStore store, StampedLock stripeLock, Thread ownerThread) {
         assert (stripeLock == null) != (ownerThread == null);
@@ -164,6 +167,62 @@ final class HeapSegments {
             }
         }
         throw new IllegalStateException(segment + " is not a segment of this heap");
+    }
+
+    /**
+     * Owner only, from a decay, once the heap's chunks that hold no buffer added their slices to their segments'
+     * {@link Segment#movableSlices}. Marks {@link Segment#evacuate}, sparsest first and never the fullest, each segment
+     * whose every used slice is such a chunk, while the segments left keep as many free slices as all the marked ones
+     * use: freeing those chunks empties the marked segments, and {@link #claim} packs the chunks their size classes
+     * make next into the fullest segments with room. Returns whether it marked any; clears every movable count.
+     */
+    boolean markEvacuees() {
+        assert inOwnerContext() && !freed && evacueeCount == 0;
+        Segment[] segments = this.segments;
+        int n = count;
+        int fullest = 0;
+        int room = 0;
+        for (int i = 0; i < n; i++) {
+            room += segments[i].freeSlices();
+            if (segments[i].usedSlices() > segments[fullest].usedSlices()) {
+                fullest = i;
+            }
+        }
+        int moved = 0;
+        for (;;) {
+            Segment sparsest = null;
+            for (int i = 0; i < n; i++) {
+                Segment segment = segments[i];
+                if (i != fullest && !segment.evacuate && segment.movableSlices == segment.usedSlices()
+                        && (sparsest == null || segment.usedSlices() < sparsest.usedSlices())) {
+                    sparsest = segment;
+                }
+            }
+            // The room left must hold what moves: room - free >= moved + used, that is room >= moved + slices.
+            if (sparsest == null || room < moved + sparsest.slices) {
+                break;
+            }
+            room -= sparsest.freeSlices();
+            moved += sparsest.usedSlices();
+            sparsest.evacuate = true;
+            if (evacueeCount == evacuees.length) {
+                evacuees = Arrays.copyOf(evacuees, evacueeCount << 1);
+            }
+            evacuees[evacueeCount++] = sparsest;
+        }
+        for (int i = 0; i < n; i++) {
+            segments[i].movableSlices = 0;
+        }
+        return evacueeCount != 0;
+    }
+
+    /** Owner only: unmarks what {@link #markEvacuees} marked. */
+    void clearEvacuees() {
+        for (int i = 0; i < evacueeCount; i++) {
+            evacuees[i].evacuate = false;
+            evacuees[i] = null;
+        }
+        evacueeCount = 0;
     }
 
     /** Call before the heap frees its chunks, then {@link #afterFree}. */

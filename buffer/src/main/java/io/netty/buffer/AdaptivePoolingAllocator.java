@@ -1035,7 +1035,31 @@ final class AdaptivePoolingAllocator {
             // Last: what the size classes gave up above may have emptied a segment, which then stays reserved for a
             // whole interval before its first chance to be given back, like a buffer offered to the recycler.
             if (heapSegments != null) {
+                if (mags != null && heapSegments.count > 1) {
+                    compact(mags, heapSegments);
+                }
                 heapSegments.decay(now);
+            }
+        }
+
+        /**
+         * Frees the chunks that hold no buffer and alone keep a segment of the heap in use (see
+         * {@link HeapSegments#markEvacuees}): the size classes in use make their next chunk in the fullest segments,
+         * and the emptied segments go to the reserve. A chunk that moves costs one chunk creation, no memory.
+         */
+        private static void compact(SizeClassMagazine[] mags, HeapSegments heapSegments) {
+            for (SizeClassMagazine mag : mags) {
+                if (mag != null) {
+                    mag.countMovableSlices();
+                }
+            }
+            if (heapSegments.markEvacuees()) {
+                for (SizeClassMagazine mag : mags) {
+                    if (mag != null) {
+                        mag.freeMovableChunks();
+                    }
+                }
+                heapSegments.clearEvacuees();
             }
         }
     }
@@ -1761,6 +1785,40 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        /** Adds the slices of the active and reusable chunks that hold no buffer to their segments' movable count. */
+        void countMovableSlices() {
+            countIfMovable(active);
+            for (Chunk cur = reusable.head; cur != null; cur = cur.nextInQueue) {
+                countIfMovable((SizeClassedChunk) cur);
+            }
+        }
+
+        private static void countIfMovable(SizeClassedChunk chunk) {
+            if (chunk != null && chunk.hasFullCapacity()) {
+                chunk.segment.movableSlices += chunk.spanSlices();
+            }
+        }
+
+        /** The magazine drops its active chunk, which holds no buffer: its span goes back to its segment. */
+        void freeActive(SizeClassedChunk chunk) {
+            assert chunk == active && chunk.hasFullCapacity();
+            active = null;
+            chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+        }
+
+        /** Frees the reusable chunks that hold no buffer in a segment to evacuate. */
+        void freeMovable() {
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
+            while (cur != null) {
+                SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
+                if (cur.segment.evacuate && cur.hasFullCapacity()) {
+                    reusable.remove(cur);
+                    cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
+                }
+                cur = next;
+            }
+        }
+
         void offerChunk(SizeClassedChunk chunk) {
             if (chunk.hasRemainingCapacity()) {
                 reusable.pushFront(chunk);
@@ -2132,6 +2190,21 @@ final class AdaptivePoolingAllocator {
                 curr.releaseFromMagazine();
             }
             chunkCache.evictWhollyFree();
+        }
+
+        /** See {@link IdleDecay#compact}. Its heap's decay only. */
+        void countMovableSlices() {
+            chunkCache.countMovableSlices();
+        }
+
+        /** See {@link IdleDecay#compact}. Its heap's decay only: the next allocation makes a chunk where it packs. */
+        void freeMovableChunks() {
+            SizeClassedChunk curr = current;
+            if (curr != null && curr.segment.evacuate && curr.hasFullCapacity()) {
+                current = null;
+                chunkCache.freeActive(curr);
+            }
+            chunkCache.freeMovable();
         }
 
         /**
@@ -3073,6 +3146,11 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        /** The slices of the span this chunk is; only for a chunk that is one. */
+        int spanSlices() {
+            return capacity / segment.sliceSize;
+        }
+
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
             if (segment != null) {
                 // Only the free lists are pooled: the span goes back to its segment at the deallocation below.
@@ -3096,7 +3174,7 @@ final class AdaptivePoolingAllocator {
         protected void deallocate() {
             Segment segment = this.segment;
             if (segment != null) {
-                heapSegments.release(segment, spanStart, capacity / segment.sliceSize);
+                heapSegments.release(segment, spanStart, spanSlices());
             } else {
                 super.deallocate();
             }
