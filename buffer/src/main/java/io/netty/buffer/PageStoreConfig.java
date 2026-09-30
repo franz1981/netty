@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -28,7 +27,7 @@ final class PageStoreConfig {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStoreConfig.class);
 
     /** A slice is whole pages, so that no span starts or ends inside a page. */
-    static final int PAGE_SIZE_BYTES = PlatformDependent.pageSize();
+    static final int PAGE_SIZE_BYTES = PageSize.PAGE_SIZE;
     /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */

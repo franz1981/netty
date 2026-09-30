@@ -1193,10 +1193,6 @@ final class PlatformDependent0 {
         return UNSAFE.addressSize();
     }
 
-    static int pageSize() {
-        return UNSAFE.pageSize();
-    }
-
     static long allocateMemory(long size) {
         return UNSAFE.allocateMemory(size);
     }
