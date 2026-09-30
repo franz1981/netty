@@ -157,9 +157,10 @@ public class JfrEventsTest {
                 // release.
                 releaseAll(allocateMany(alloc, 512 * 1024, 8));
                 // A decay retires the chunk the heap allocates from, at most half used, and the release of its last
-                // buffer frees it.
+                // buffer frees it: the third one, since the first follows the burst's chunks made for more room and a
+                // decay shrinks only after two in a row without such a chunk.
                 ByteBuf held = alloc.heapBuffer(512 * 1024, 512 * 1024);
-                retiredChunks.set(decayThreadLocalHeap(alloc));
+                retiredChunks.set(decayThreadLocalHeap(alloc, 3));
                 held.release();
                 // The thread-local heap is freed when this thread ends, with what its recycler holds.
             }, threadName);
@@ -181,10 +182,10 @@ public class JfrEventsTest {
     }
 
     /**
-     * Run the calling thread's thread-local heap's decay now, and return how many chunks its large-buffer magazine
-     * retired so far.
+     * Run the calling thread's thread-local heap's decay {@code decays} times now, and return how many chunks its
+     * large-buffer magazine retired so far.
      */
-    private static int decayThreadLocalHeap(AdaptiveByteBufAllocator alloc) {
+    private static int decayThreadLocalHeap(AdaptiveByteBufAllocator alloc, int decays) {
         try {
             Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
             heapField.setAccessible(true);
@@ -195,7 +196,9 @@ public class JfrEventsTest {
             Field decayField = heap.getClass().getDeclaredField("idleDecay");
             decayField.setAccessible(true);
             AdaptivePoolingAllocator.IdleDecay idleDecay = (AdaptivePoolingAllocator.IdleDecay) decayField.get(heap);
-            idleDecay.decay(System.nanoTime());
+            for (int i = 0; i < decays; i++) {
+                idleDecay.decay(System.nanoTime());
+            }
             Object magazine = idleDecay.buddyMagazine;
             Field retiredField = magazine.getClass().getDeclaredField("retired");
             retiredField.setAccessible(true);

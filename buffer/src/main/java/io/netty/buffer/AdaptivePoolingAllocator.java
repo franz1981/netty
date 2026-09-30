@@ -1768,9 +1768,10 @@ final class AdaptivePoolingAllocator {
         private final ChunkAllocator chunkAllocator;
         /**
          * The size new chunks of this magazine are made at when it needs no more room at once than before: the
-         * largest chunk it made, until a decay finds the chunk it allocates from at most half used and halves it (see
-         * {@link #halveTarget}). One per magazine, guarded like it: a heap that only sees small large-buffers keeps
-         * small chunks whatever other heaps allocate.
+         * largest chunk it made, until a decay finds the chunk it allocates from at most half used, after the
+         * magazine made no chunk for more room through {@link BuddyMagazine#QUIET_DECAYS_BEFORE_SHRINK} intervals,
+         * and halves it (see {@link #halveTarget}). One per magazine, guarded like it: a heap that only sees small
+         * large-buffers keeps small chunks whatever other heaps allocate.
          */
         private int chunkSizeTarget;
         /**
@@ -1795,18 +1796,19 @@ final class AdaptivePoolingAllocator {
         /**
          * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}, sized by the demand the magazine
          * shows: the first one has room for {@link #INITIAL_BUFS_PER_CHUNK} buffers of {@code promptingSize}; a new
-         * one while every chunk the magazine holds lacks room is twice the {@link #chunkSizeTarget}, since the
-         * magazine needs more at once; one while it holds none (they were given back or retired) is the target.
+         * one while every chunk the magazine holds lacks room ({@code grows}) is twice the {@link #chunkSizeTarget},
+         * since the magazine needs more at once; one while it holds none (they were given back or retired) is the
+         * target.
          * Never above the chunk for {@link #BUFS_PER_CHUNK} buffers of this size, unless the target is larger, nor
          * above {@link #MAX_CHUNK_SIZE}, nor below {@link #MIN_CHUNK_SIZE}. A heap that keeps one large buffer at a
          * time so keeps a small chunk, where a chunk for {@link #BUFS_PER_CHUNK} of them would mostly stay empty; one
          * that keeps more grows to it. The target becomes the new chunk's size when that is larger.
          */
-        BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
+        BuddyChunk newChunkAllocation(int promptingSize, boolean grows, BuddyMagazine magazine) {
             int target = chunkSizeTarget;
             int initial = MathUtil.safeFindNextPositivePowerOfTwo(INITIAL_BUFS_PER_CHUNK * promptingSize);
             int upTo = Math.max(target, MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize));
-            int grown = magazine.holdsChunks() ? target << 1 : target;
+            int grown = grows ? target << 1 : target;
             int chunkSize = Math.max(MIN_CHUNK_SIZE,
                     Math.min(MAX_CHUNK_SIZE, Math.min(upTo, Math.max(initial, grown))));
             if (chunkSize > target) {
@@ -1819,9 +1821,10 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * A decay found a free block of half of {@code capacity} in the chunk the magazine allocates from: the
-         * magazine's demand fits in half of it, so the {@link #chunkSizeTarget} goes down to half of it, never below
-         * the {@link #smallestUsefulChunk} and never up. Returns the new target.
+         * A decay found a free block of half of {@code capacity} in the chunk the magazine allocates from, and the
+         * magazine made no chunk for more room through the last {@link BuddyMagazine#QUIET_DECAYS_BEFORE_SHRINK}
+         * intervals: its demand fits in half of that chunk, so the {@link #chunkSizeTarget} goes down to half of it,
+         * never below the {@link #smallestUsefulChunk} and never up. Returns the new target.
          */
         int halveTarget(int capacity) {
             int target = Math.min(chunkSizeTarget, Math.max(smallestUsefulChunk, capacity >>> 1));
@@ -2118,7 +2121,10 @@ final class AdaptivePoolingAllocator {
      * release is a note.
      * <p>
      * A chunk larger than the magazine needs is <em>retired</em> by a {@link #decay}: it is never allocated from
-     * again, and it is freed once its last block is released (see {@link #retire}). Only slow paths look at it.
+     * again, and it is freed once its last block is released (see {@link #retire}). Only slow paths look at it. A
+     * decay retires a chunk only after the magazine made no chunk for more room through
+     * {@link #QUIET_DECAYS_BEFORE_SHRINK} intervals in a row, so a demand that comes back within that time finds its
+     * chunk still there.
      */
     private static final class BuddyMagazine {
         /** One queue per order of largest free block: {@link BuddyTree#MIN_BLOCK_SIZE} up to the largest chunk. */
@@ -2132,6 +2138,11 @@ final class AdaptivePoolingAllocator {
         private static final int COUNT_SHIFT = 5;
         /** What {@link #tryLockForRelease} returns to the owner thread of a thread-local heap: any non-zero value. */
         private static final long OWNER_STAMP = 1;
+        /**
+         * Decays in a row whose interval saw no chunk made for more room (see {@link #grewSinceDecay}) before a decay
+         * may shrink the magazine's chunks; see {@link #decay}. Visible for testing.
+         */
+        static final int QUIET_DECAYS_BEFORE_SHRINK = 2;
 
         final AdaptivePoolingAllocator allocator;
         private final BuddyChunkController chunkController;
@@ -2168,6 +2179,20 @@ final class AdaptivePoolingAllocator {
         private final IdleDecay idleDecay;
         /** How many decays ran; a chunk filed wholly free records it in {@link BuddyChunk#whollyFreeSince}. */
         private int decays;
+        /**
+         * Whether the magazine made a chunk for more room since the last decay: a new chunk while it held one it may
+         * allocate from, none of which had a free block large enough. Only such a chunk says that the demand grew
+         * past what the magazine holds. A new chunk made while it holds none replaces chunks that were given back
+         * or retired: it does not count, or the chunk made right after a decay retired the one the magazine
+         * allocated from would hold off the next shrink by an interval. Set by {@link #allocateSlow}, read and
+         * cleared by {@link #decay}; nothing on the allocation or release fast paths touches it.
+         */
+        private boolean grewSinceDecay;
+        /**
+         * Decays in a row that found {@link #grewSinceDecay} clear, since the last one that shrank the magazine's
+         * chunks; see {@link #decay}.
+         */
+        private int quietDecays;
 
         /**
          * @param bufRecycler the stripe's buffer pool, or {@code null} on a thread-local heap for the event-loop pool
@@ -2211,7 +2236,9 @@ final class AdaptivePoolingAllocator {
             drainPending();
             chunk = poll(blockSize);
             if (chunk == null) {
-                chunk = chunkController.newChunkAllocation(size, this);
+                boolean grows = holdsChunks();
+                grewSinceDecay |= grows;
+                chunk = chunkController.newChunkAllocation(size, grows, this);
             }
             active = chunk;
             boolean success = chunk.readInitInto(buf, size, blockSize, maxCapacity);
@@ -2339,20 +2366,36 @@ final class AdaptivePoolingAllocator {
          * the cold ones are exactly those stamped before the previous decay.
          * <p>
          * First, the chunk the magazine allocates from tells how much it needs: when it has a free block of half its
-         * capacity, the magazine's next chunks are made at half of it at most (see
-         * {@link BuddyChunkController#halveTarget}), and when it is larger than that it is retired. A magazine whose
-         * demand dropped so goes down to chunks of its size by halves, one per interval, instead of keeping the
-         * largest chunk it ever made; a magazine that needs more again grows its chunks as before.
+         * capacity, and the magazine made no chunk for more room through the last {@link #QUIET_DECAYS_BEFORE_SHRINK}
+         * intervals (see {@link #grewSinceDecay}), the magazine's next chunks are made at half of it at most (see
+         * {@link BuddyChunkController#halveTarget}), and when it is larger than that it is retired. Such a shrink
+         * starts a new count of quiet intervals. A magazine whose demand dropped so goes down to chunks of its size by
+         * halves, one per {@link #QUIET_DECAYS_BEFORE_SHRINK} intervals, instead of keeping the largest chunk it ever
+         * made; a magazine that needs more again grows its chunks as before. A demand that makes a chunk for more room
+         * at least once every {@link #QUIET_DECAYS_BEFORE_SHRINK} intervals, such as bursts between which a trickle
+         * leaves the chunk at most half used, keeps the chunk it allocates from. A steady demand that the halved
+         * chunks do not hold makes a chunk for more room right after each shrink, so its chunk is retired and made
+         * again once per {@link #QUIET_DECAYS_BEFORE_SHRINK} + 1 intervals, rather than after each decay.
          */
         void decay() {
             // Chunks other threads' releases made wholly free are filed as such first, so they start aging now.
             drainPending();
+            if (grewSinceDecay) {
+                grewSinceDecay = false;
+                quietDecays = 0;
+            } else {
+                quietDecays++;
+            }
             BuddyChunk current = active;
             if (current != null) {
                 current.processFreelistEntries();
-                // At most half of it in use: the next chunks need be no larger than half of it, and it is retired
-                // when it is larger than that.
-                if (current.hasFreeHalf() && current.capacity > chunkController.halveTarget(current.capacity)) {
+                boolean shrink = quietDecays >= QUIET_DECAYS_BEFORE_SHRINK && current.hasFreeHalf();
+                if (shrink) {
+                    quietDecays = 0;
+                }
+                // At most half of it in use, and no chunk made for more room for a while: the next chunks need be no
+                // larger than half of it, and it is retired when it is larger than that.
+                if (shrink && current.capacity > chunkController.halveTarget(current.capacity)) {
                     active = null;
                     retire(current);
                 } else if (current.isWhollyFree() && whollyFree.size < CHUNK_REUSE_QUEUE &&
