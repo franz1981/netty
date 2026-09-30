@@ -41,6 +41,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
+import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -55,12 +56,18 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 final class AdaptiveLargeSpansTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     @BeforeEach
     void pooledAboveTheSizeClasses() {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
+    }
+
+    /** Without regions, on heap segments: one {@code byte[]} each. */
+    private AdaptivePoolingAllocator heapAllocator() {
+        segments = new CountingSegmentSource(true);
+        return newAllocator(segments, SEGMENT_SIZE);
     }
 
     private AdaptivePoolingAllocator allocator(boolean withRegions) {
@@ -101,9 +108,12 @@ final class AdaptiveLargeSpansTest {
         assertAccounted(segments, allocator);
     }
 
+    private static Segment segmentOf(ByteBuf buf) {
+        return ((AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk).segment;
+    }
+
     private static long colourOf(ByteBuf buf) {
-        AdaptivePoolingAllocator.SpanChunk chunk = (AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk;
-        return (buf.memoryAddress() - chunk.segment.memoryAddress()) % SLICE;
+        return offsetIn(buf, segmentOf(buf)) % SLICE;
     }
 
     /**
@@ -111,9 +121,10 @@ final class AdaptiveLargeSpansTest {
      * unused tail allows, 64 at most: none for an exact fit, four for a 200-byte tail. Released, they give back
      * exactly the slices they claimed.
      */
-    @Test
-    void largeSpansRotateTheirColourThroughTheirTail() {
-        AdaptivePoolingAllocator allocator = allocator(false);
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void largeSpansRotateTheirColourThroughTheirTail(boolean heap) {
+        AdaptivePoolingAllocator allocator = heap ? heapAllocator() : allocator(false);
         int[][] cases = {{256 * 1024 - 8192, 64}, {256 * 1024, 1}, {256 * 1024 - 200, 4}};
         Set<Segment> seen = new HashSet<Segment>();
         for (int[] c : cases) {
@@ -130,13 +141,11 @@ final class AdaptiveLargeSpansTest {
                 if (colours > 1 && i > 0) {
                     assertEquals((colourOf(bufs.get(i - 1)) + 64) % (colours * 64L), colour, "round robin");
                 }
-                AdaptivePoolingAllocator.SpanChunk chunk = (AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk;
-                long spanEnd = chunk.segment.memoryAddress() + (buf.memoryAddress() - chunk.segment.memoryAddress())
-                        / SLICE * SLICE + 4L * SLICE;
-                assertTrue(buf.memoryAddress() + buf.maxFastWritableBytes() + buf.writerIndex() <= spanEnd,
-                        "inside its span");
+                long offset = offsetIn(buf, segmentOf(buf));
+                long spanEnd = offset / SLICE * SLICE + 4L * SLICE;
+                assertTrue(offset + buf.maxFastWritableBytes() + buf.writerIndex() <= spanEnd, "inside its span");
                 buf.setByte(size - 1, 42);
-                seen.add(chunk.segment);
+                seen.add(segmentOf(buf));
             }
             for (ByteBuf buf : bufs) {
                 buf.release();
@@ -149,24 +158,27 @@ final class AdaptiveLargeSpansTest {
     }
 
     /** A coloured buffer grows in place up to the end of its span, and away from it beyond, freeing the span. */
-    @Test
-    void aColouredBufferGrowsWithinItsSpan() {
-        AdaptivePoolingAllocator allocator = allocator(false);
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aColouredBufferGrowsWithinItsSpan(boolean heap) {
+        AdaptivePoolingAllocator allocator = heap ? heapAllocator() : allocator(false);
         int size = 256 * 1024 - 8192;
         allocator.allocate(size, Integer.MAX_VALUE).release(); // colour 0 taken: the next is coloured
         ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
         long colour = colourOf(buf);
         assertEquals(64, colour);
-        long address = buf.memoryAddress();
+        Segment segment = segmentOf(buf);
+        long offset = offsetIn(buf, segment);
         int fast = buf.maxFastWritableBytes();
         assertEquals(4 * SLICE - colour, fast);
         buf.writerIndex(0).writeZero(fast);
-        assertEquals(address, buf.memoryAddress(), "grown in place");
+        assertEquals(offset, offsetIn(buf, segmentOf(buf)), "grown in place");
+        assertSame(segment, segmentOf(buf));
         assertEquals(fast, buf.capacity());
-        Segment segment = ((AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk).segment;
         assertEquals(4, segment.usedSlices());
         buf.writeByte(1);
-        assertTrue(buf.memoryAddress() != address, "beyond its span: moved");
+        assertTrue(!(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SpanChunk)
+                || segmentOf(buf) != segment || offsetIn(buf, segment) != offset, "beyond its span: moved");
         buf.release();
         assertEquals(0, segment.usedSlices(), "the old span went back whole");
         assertAccounted(segments, allocator);

@@ -23,6 +23,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Isolated;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -44,9 +45,10 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Buffers above the size classes in a direct allocator with a page store: up to half a segment each is a span of its
- * heap's segments; above, a whole segment or, with regions, a run of slots. Nothing comes from the chunk allocator
- * but buffers larger than what the store hands out. Both modes: segments allocated one by one, and regions.
+ * Buffers above the size classes in an allocator with a page store: up to half a segment each is a span of its heap's
+ * segments; above, a whole segment or, with regions, a run of slots. Nothing comes from the chunk allocator but
+ * buffers larger than what the store hands out. Three modes: direct segments allocated one by one, direct regions,
+ * and heap segments (one {@code byte[]} each, no regions).
  */
 @Isolated("Reads PlatformDependent's direct memory counter, which concurrent tests move")
 final class AdaptiveLargeSegmentsTest {
@@ -54,7 +56,7 @@ final class AdaptiveLargeSegmentsTest {
     private static final int POOLED = 512 * 1024;
     private static final int PER_CHUNK = SEGMENT_SIZE / POOLED;
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     @BeforeEach
@@ -70,8 +72,15 @@ final class AdaptiveLargeSegmentsTest {
         return newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
     }
 
-    private AdaptivePoolingAllocator allocator(boolean withRegions) {
-        return withRegions ? withRegions() : withoutRegions();
+    private AdaptivePoolingAllocator withoutRegions(boolean heap) {
+        segments = new CountingSegmentSource(heap);
+        return withoutRegions();
+    }
+
+    enum Mode { DIRECT, DIRECT_REGIONS, HEAP }
+
+    private AdaptivePoolingAllocator allocator(Mode mode) {
+        return mode == Mode.DIRECT_REGIONS ? withRegions() : withoutRegions(mode == Mode.HEAP);
     }
 
     private void assertAccountedIn(AdaptivePoolingAllocator allocator) {
@@ -127,9 +136,10 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     /** Without regions spans fill segments of their own; one wholly free waits in the heap's reserve for reuse. */
-    @Test
-    void spansFillSegmentsKeptInTheHeapReserveWithoutRegions() {
-        AdaptivePoolingAllocator allocator = withoutRegions();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void spansFillSegmentsKeptInTheHeapReserveWithoutRegions(boolean heap) {
+        AdaptivePoolingAllocator allocator = withoutRegions(heap);
         for (int round = 0; round < 3; round++) {
             List<ByteBuf> bufs = allocate(allocator, POOLED, 2 * PER_CHUNK + 1);
             assertEquals(3, segments.segmentsAllocated(), "three segments, whatever the round");
@@ -167,9 +177,10 @@ final class AdaptiveLargeSegmentsTest {
      * empties their segment and takes it again from the heap's reserve.
      */
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void spansReleasedByAnotherThreadAreReusedByTheOwner(boolean withRegions) throws Exception {
-        final AdaptivePoolingAllocator allocator = allocator(withRegions);
+    @EnumSource(Mode.class)
+    void spansReleasedByAnotherThreadAreReusedByTheOwner(Mode mode) throws Exception {
+        final boolean withRegions = mode == Mode.DIRECT_REGIONS;
+        final AdaptivePoolingAllocator allocator = allocator(mode);
         final List<ByteBuf> first = new ArrayList<ByteBuf>();
         int taken = onThreadLocalHeap(() -> {
             first.addAll(allocate(allocator, POOLED, PER_CHUNK));
@@ -194,9 +205,10 @@ final class AdaptiveLargeSegmentsTest {
      * straight back to the store.
      */
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void lastReleaseOnAnotherThreadGivesTheSegmentToTheStore(boolean withRegions) throws Exception {
-        final AdaptivePoolingAllocator allocator = allocator(withRegions);
+    @EnumSource(Mode.class)
+    void lastReleaseOnAnotherThreadGivesTheSegmentToTheStore(Mode mode) throws Exception {
+        final boolean withRegions = mode == Mode.DIRECT_REGIONS;
+        final AdaptivePoolingAllocator allocator = allocator(mode);
         ByteBuf survivor = onThreadLocalHeap(() -> allocator.allocate(POOLED, POOLED));
         assertEquals(1, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive());
         survivor.release();
@@ -205,9 +217,10 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     /** Above the pooled sizes and up to a segment: a whole segment, from any thread, given back on release. */
-    @Test
-    void oneShotsUpToASegmentTakeASegment() {
-        AdaptivePoolingAllocator allocator = withoutRegions();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void oneShotsUpToASegmentTakeASegment(boolean heap) {
+        AdaptivePoolingAllocator allocator = withoutRegions(heap);
         ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
         assertEquals(1, segments.segmentsAllocated());
         assertEquals(0, segments.chunks.size());
@@ -245,9 +258,10 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     /** Without regions a buffer above a segment is its own allocation, as before the page store. */
-    @Test
-    void buffersAboveASegmentAreTheirOwnAllocationWithoutRegions() {
-        AdaptivePoolingAllocator allocator = withoutRegions();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void buffersAboveASegmentAreTheirOwnAllocationWithoutRegions(boolean heap) {
+        AdaptivePoolingAllocator allocator = withoutRegions(heap);
         ByteBuf buf = allocate(allocator, SEGMENT_SIZE + 1, 1).get(0);
         assertEquals(0, segments.segmentsAllocated());
         assertEquals(1, segments.chunks.size());

@@ -20,13 +20,13 @@ import io.netty.util.internal.SystemPropertyUtil;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The immutable parameters of one allocator's page store, and the direct defaults, read once from the
+ * The immutable parameters of one allocator's page store, and the direct and heap defaults, read once from the
  * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
  */
 final class PageStoreConfig {
     /** With regions, a slice is whole pages, so that no span starts or ends inside a page. */
     static final int PAGE_SIZE_BYTES = PageSize.PAGE_SIZE;
-    /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
+    /** The slice of an allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
     static final int MAX_SEGMENT_SIZE_BYTES = Long.SIZE * SLICE_SIZE_BYTES;
@@ -157,6 +157,12 @@ final class PageStoreConfig {
         }
         this.regionSize = regionSize;
         this.regionAlignment = regionAlignment;
+    }
+
+    /** The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. */
+    static PageStoreConfig heapDefaults() {
+        return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
+                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS));
     }
 
     static PageStoreConfig directDefaults() {
