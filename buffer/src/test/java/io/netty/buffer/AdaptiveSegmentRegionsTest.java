@@ -17,6 +17,7 @@ package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -27,8 +28,11 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
  * Regions inside a direct {@link AdaptivePoolingAllocator}: size-class buffers land in region memory, and the
@@ -76,5 +80,27 @@ public class AdaptiveSegmentRegionsTest {
         assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.directRegions(allocator));
+    }
+
+    /**
+     * Below Java 22, or without native access: no regions, each segment is its own allocation, given back to its
+     * source when its heap gives it back.
+     */
+    @Test
+    void withoutMmapEachSegmentIsItsOwnAllocation() {
+        if (PlatformDependent.javaVersion() < 22) {
+            assertFalse(MmapRegionSource.isAvailable());
+        }
+        assumeFalse(MmapRegionSource.isAvailable(), "mmap regions are available here");
+        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
+        assertFalse(AdaptiveByteBufAllocatorTest.directRegions(allocator));
+        ByteBuf buf = allocator.directBuffer(1024, 1024);
+        ByteBuf adaptive = buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap();
+        Segment segment = ((AdaptivePoolingAllocator.SizeClassedChunk)
+                ((AdaptivePoolingAllocator.AdaptiveByteBuf) adaptive).chunk).segment;
+        assertNull(segment.region);
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, segment.buffer.capacity());
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
+        buf.release();
     }
 }
