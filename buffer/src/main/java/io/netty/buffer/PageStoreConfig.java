@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -26,6 +27,8 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 final class PageStoreConfig {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStoreConfig.class);
 
+    /** A slice is whole pages, so that no span starts or ends inside a page. */
+    static final int PAGE_SIZE_BYTES = PlatformDependent.pageSize();
     /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
@@ -73,8 +76,16 @@ final class PageStoreConfig {
         return (MALLOC_MMAP_THRESHOLD_MAX_BYTES / segmentSize + 1) * segmentSize;
     }
 
-    /** {@code size} if it is 0 or a valid region size for {@code segmentSize}; else, with a warning, the default. */
+    /**
+     * {@code size} if it is 0 or a valid region size for {@code segmentSize}; else, with a warning, the default. No
+     * regions when segments of {@code segmentSize} would not start on {@link #REGION_ALIGNMENT_BYTES} boundaries.
+     */
     static int regionSizeOf(int size, int segmentSize) {
+        if (size != 0 && segmentSize % REGION_ALIGNMENT_BYTES != 0) {
+            logger.warn("-Dio.netty.allocator.segmentSize={}: not a multiple of the region alignment {}, no regions",
+                    segmentSize, REGION_ALIGNMENT_BYTES);
+            return 0;
+        }
         if (size == 0 || size > MALLOC_MMAP_THRESHOLD_MAX_BYTES && size % segmentSize == 0
                 && size / segmentSize <= Long.SIZE) {
             return size;
@@ -121,8 +132,10 @@ final class PageStoreConfig {
 
     PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
                     double decayFraction, int regionSize, int regionAlignment) {
-        if (sliceSize <= 0 || segmentSize <= 0 || segmentSize % sliceSize != 0
-                || segmentSize / sliceSize > Long.SIZE) {
+        if (sliceSize <= 0 || sliceSize % PAGE_SIZE_BYTES != 0) {
+            throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES);
+        }
+        if (segmentSize <= 0 || segmentSize % sliceSize != 0 || segmentSize / sliceSize > Long.SIZE) {
             throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
                     + " slices of " + sliceSize);
         }
@@ -146,6 +159,10 @@ final class PageStoreConfig {
         }
         if (regionAlignment < 0 || (regionAlignment & regionAlignment - 1) != 0) {
             throw new IllegalArgumentException("regionAlignment: " + regionAlignment);
+        }
+        if (regionSize != 0 && regionAlignment != 0 && segmentSize % regionAlignment != 0) {
+            throw new IllegalArgumentException("segments of " + segmentSize + " would not start on "
+                    + regionAlignment + " boundaries of their region");
         }
         this.decayFraction = decayFraction;
         this.regionSize = regionSize;

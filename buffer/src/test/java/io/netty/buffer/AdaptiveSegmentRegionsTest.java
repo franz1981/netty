@@ -357,6 +357,12 @@ public class AdaptiveSegmentRegionsTest {
                 () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, REGION, 3 * MIB));
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, -REGION, ALIGNMENT));
+        // Segments of 3 MiB in a 2 MiB-aligned region would not start on 2 MiB boundaries.
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, ALIGNMENT));
+        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, MIB);
+        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, 0);
+        assertEquals(0, PageStoreConfig.regionSizeOf(36 * MIB, 3 * MIB), "no regions for misaligned segments");
     }
 
     /**

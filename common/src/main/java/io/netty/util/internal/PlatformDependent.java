@@ -121,6 +121,7 @@ public final class PlatformDependent {
     private static final boolean IS_OSX = isOsx0();
 
     private static final int ADDRESS_SIZE = addressSize0();
+    private static final int PAGE_SIZE = pageSize0();
     private static final AtomicLong DIRECT_MEMORY_COUNTER;
     private static final long DIRECT_MEMORY_LIMIT;
     private static final Cleaner CLEANER;
@@ -535,6 +536,14 @@ public final class PlatformDependent {
      */
     public static int addressSize() {
         return ADDRESS_SIZE;
+    }
+
+    /**
+     * The size of a page of the OS in bytes, or 4096, the smallest page size of the supported platforms, when it
+     * cannot be read.
+     */
+    public static int pageSize() {
+        return PAGE_SIZE;
     }
 
     public static long allocateMemory(long size) {
@@ -1698,6 +1707,13 @@ public final class PlatformDependent {
             return -1;
         }
         return PlatformDependent0.addressSize();
+    }
+
+    private static int pageSize0() {
+        if (!hasUnsafe()) {
+            return 4096;
+        }
+        return PlatformDependent0.pageSize();
     }
 
     private static long byteArrayBaseOffset0() {

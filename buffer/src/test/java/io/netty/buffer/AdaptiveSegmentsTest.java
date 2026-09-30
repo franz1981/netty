@@ -752,6 +752,8 @@ public class AdaptiveSegmentsTest {
                 new PageStoreConfig(512 * 1024, 8 * 1024, 0, INTERVAL, 0.5)), "576 KiB chunks do not fit");
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE, 0, 0, INTERVAL, 0.5), "no slice");
+        assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(SEGMENT_SIZE,
+                PageStoreConfig.PAGE_SIZE_BYTES / 2, 0, INTERVAL, 0.5), "a slice is whole pages");
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, -1, INTERVAL, 0.5), "negative cache");
         assertThrows(IllegalArgumentException.class,
