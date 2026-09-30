@@ -17,6 +17,7 @@ package io.netty.buffer;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -35,6 +36,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * Java 24+ native-access test run): aligned exact mappings, purges that zero the range and drop the process's
  * resident memory, and the unmap on release.
  */
+@Isolated("Reads the process's resident memory, which concurrent tests would move")
 final class MmapRegionSourceTest {
     private static final int MIB = 1024 * 1024;
     private static final int REGION_SIZE = 64 * MIB;
