@@ -30,16 +30,18 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * <p>
  * Regions: a slot is taken and given back by a CAS on its region's bitmap, without a lock; a new region is mapped
  * under this store's monitor, the only lock, when no region has a free slot. Regions are only added, never removed,
- * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}. Once a region cannot be
- * mapped, none is mapped again, and a take that finds no free slot allocates its segment on its own.
+ * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}; and so is the memory of
+ * the idle free slices of the segments heaps hold, by their own decays: see {@link #purgeSlices}. Once a region cannot
+ * be mapped, none is mapped again, and a take that finds no free slot allocates its segment on its own.
  * <p>
  * Used memory, reported to {@link AdaptivePoolingAllocator#chunkBufferAllocated} and
  * {@link AdaptivePoolingAllocator#chunkBufferFreed} per segment: without regions, a segment from its allocation to
  * its free. With regions, the committed segments: a slot counts from the time it is taken with no memory behind it to
  * the time it is purged (or the close), whether a heap holds it or it is free meanwhile. A slot never taken, or
  * purged and not taken since, does not count: this follows what the process has resident, except for the pages of a
- * committed segment nobody touched yet. The same slots are charged to {@link PlatformDependent}'s direct memory
- * limit, never whole regions; a segment allocated on its own is charged by its allocation.
+ * committed segment nobody touched yet, or whose idle slices its heap purged. The same slots are charged to
+ * {@link PlatformDependent}'s direct memory limit, never whole regions; a segment allocated on its own is charged by
+ * its allocation.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -47,6 +49,14 @@ final class PageStore {
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "segmentsCommitted");
     private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
+    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_CALLS =
+            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeCalls");
+    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_BYTES =
+            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeBytes");
+    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_HUGE_BLOCKS =
+            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeHugeBlocks");
+    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_FAILURES =
+            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeFailures");
     private static final Region[] NO_REGIONS = new Region[0];
     /** mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments. */
     private static final int RESERVE_BYTES = 32 * 1024 * 1024;
@@ -79,6 +89,12 @@ final class PageStore {
     long segmentsPurged;
     long bytesPurged;
     long purgeFailures;
+    // Written by any heap's decay: the purges of idle slices of the segments heaps hold (see purgeSlices).
+    volatile long slicePurgeCalls;
+    volatile long slicePurgeBytes;
+    /** Whole {@link PageStoreConfig#regionAlignment} blocks inside the purged runs: huge pages a THP kernel keeps. */
+    volatile long slicePurgeHugeBlocks;
+    volatile long slicePurgeFailures;
 
     /** Without {@code regionSource}, or without regions in {@code config}, every segment is allocated on its own. */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
@@ -141,6 +157,7 @@ final class PageStore {
                 Segment segment = fullest.segment(slot, segmentSource, config);
                 if (fullest.freedEpoch[slot] == Region.UNCOMMITTED) {
                     PlatformDependent.incrementMemoryCounter(config.segmentSize);
+                    segment.resident = 0;
                     fullest.freedEpoch[slot] = 0;
                     SEGMENTS_COMMITTED.incrementAndGet(this);
                     allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
@@ -314,6 +331,50 @@ final class PageStore {
                 segmentsPurged++;
                 allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
             }
+        }
+    }
+
+    /**
+     * Any heap, from its decay, for a region segment it holds: gives the memory of each run of contiguous slices of
+     * {@code slices}, all free in the segment and owned by the heap, back to the OS with one call. Returns the slices
+     * purged: a run whose call fails keeps its memory, and the failure never reaches the heap. The segment stays in
+     * the used memory, whole, as long as a heap holds it.
+     */
+    long purgeSlices(Segment segment, long slices) {
+        int sliceSize = segment.sliceSize;
+        int base = segment.slot * config.segmentSize;
+        int hugeSlices = config.regionAlignment / sliceSize;
+        long purged = 0;
+        while (slices != 0) {
+            long run = lowestRun(slices);
+            slices &= ~run;
+            int start = Long.numberOfTrailingZeros(run);
+            int n = Long.bitCount(run);
+            try {
+                regionSource.purge(segment.region.buffer, base + start * sliceSize, n * sliceSize);
+            } catch (Throwable t) {
+                slicePurgeFailed(t);
+                continue;
+            }
+            purged |= run;
+            SLICE_PURGE_CALLS.incrementAndGet(this);
+            SLICE_PURGE_BYTES.addAndGet(this, (long) n * sliceSize);
+            if (hugeSlices > 1) {
+                int blocks = (start + n) / hugeSlices - (start + hugeSlices - 1) / hugeSlices;
+                if (blocks > 0) {
+                    SLICE_PURGE_HUGE_BLOCKS.addAndGet(this, blocks);
+                }
+            }
+        }
+        return purged;
+    }
+
+    private void slicePurgeFailed(Throwable cause) {
+        if (SLICE_PURGE_FAILURES.getAndIncrement(this) == 0) {
+            logger.warn("Cannot purge idle slices of a segment: their memory stays committed. Further failures are "
+                    + "logged at debug level.", cause);
+        } else {
+            logger.debug("Cannot purge idle slices of a segment ({} failures).", slicePurgeFailures, cause);
         }
     }
 

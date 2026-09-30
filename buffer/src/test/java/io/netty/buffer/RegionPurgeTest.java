@@ -216,6 +216,48 @@ final class RegionPurgeTest {
         assertEquals(0, allocator.usedMemory());
     }
 
+    /**
+     * A heap's decays purge the free slices of its region segments that stayed free and unclaimed through a whole
+     * interval, one call per run, once until they are claimed again; the slices in use keep their memory, and the
+     * segment stays in the used memory.
+     */
+    @Test
+    void heapDecaysPurgeTheIdleSlicesOfTheirSegments() {
+        int slice = PageStoreConfig.SLICE_SIZE_BYTES;
+        Segment segment = heap.claim(8);
+        assertSame(segment, heap.claim(8));
+        assertEquals(8, heap.claimedStart());
+        heap.claim(4); // 16 to 19
+        int base = segment.slot * SEGMENT_SIZE;
+        segment.buffer.setLong(0, 0x0123456789ABCDEFL);
+        segment.buffer.setLong(8 * slice, 0x0123456789ABCDEFL);
+        heap.release(segment, 8, 8);
+        long now = System.nanoTime();
+        heap.decay(now += INTERVAL); // free since this interval only
+        assertEquals(0, store.slicePurgeCalls);
+        heap.decay(now += INTERVAL);
+        assertEquals(1, store.slicePurgeCalls, "8 to 15; 20 to 63 were never claimed: no memory behind them");
+        assertArrayEquals(new int[] {base + 8 * slice, 8 * slice}, regions.purges.get(regions.purgeCalls() - 1));
+        assertEquals(8L * slice, store.slicePurgeBytes);
+        assertEquals(0, segment.buffer.getLong(8 * slice), "purged memory reads zero");
+        assertEquals(0x0123456789ABCDEFL, segment.buffer.getLong(0), "slices in use keep theirs");
+        heap.decay(now += INTERVAL);
+        assertEquals(1, store.slicePurgeCalls, "purged once");
+        assertEquals((long) SEGMENT_SIZE, allocator.usedMemory(), "the heap still holds the segment");
+
+        // Claimed and released again: a whole interval unclaimed before the next purge.
+        assertSame(segment, heap.claim(8));
+        assertEquals(8, heap.claimedStart());
+        heap.release(segment, 8, 8);
+        heap.decay(now += INTERVAL);
+        assertEquals(1, store.slicePurgeCalls, "claimed since the previous decay");
+        heap.decay(now += INTERVAL);
+        assertEquals(2, store.slicePurgeCalls);
+        heap.release(segment, 0, 8);
+        heap.release(segment, 16, 4);
+        assertAccounted(segments, regions, allocator);
+    }
+
     /** A purge that finds another one running returns at once, without purging nor counting a purge. */
     @Test
     void onePurgerAtATime() throws Exception {

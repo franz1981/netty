@@ -154,6 +154,8 @@ final class HeapSegments {
         if (count == segments.length) {
             segments = Arrays.copyOf(segments, count << 1);
         }
+        segment.freeAtDecay = 0;
+        segment.claimedSinceDecay = 0;
         segments[count++] = segment;
     }
 
@@ -253,13 +255,38 @@ final class HeapSegments {
 
     /**
      * Owner only. Gives back half, rounded up, of the reserved segments unused since the previous decay, oldest
-     * first: a reserve of one goes back once it stayed unused a whole interval. Then lets the store purge its idle
-     * free slots, if due and no other heap's decay is purging.
+     * first: a reserve of one goes back once it stayed unused a whole interval. Then purges the idle slices of its
+     * region segments, and lets the store purge its idle free slots, if due and no other heap's decay is purging.
      */
     void decay(long now) {
         assert inOwnerContext();
         disposeOldestReserved(cold + 1 >>> 1);
         cold = reserved;
+        if (store.regionSource != null) {
+            purgeIdleSlices();
+        }
         store.purgeIfDue(now);
+    }
+
+    /**
+     * The memory of the free slices of the heap's region segments that stayed free, unclaimed, since the previous
+     * decay goes back to the OS, one call per run (see {@link PageStore#purgeSlices}): the heap keeps the segments,
+     * and a purged slice claimed again costs page faults only. A slice is purged once until it is claimed again.
+     */
+    private void purgeIdleSlices() {
+        Segment[] segments = this.segments;
+        for (int i = 0, n = count; i < n; i++) {
+            Segment segment = segments[i];
+            if (segment.region == null) {
+                continue; // allocated on its own: nothing to purge in place
+            }
+            long free = segment.free;
+            long idle = free & segment.freeAtDecay & ~segment.claimedSinceDecay & segment.resident;
+            segment.freeAtDecay = free;
+            segment.claimedSinceDecay = 0;
+            if (idle != 0) {
+                segment.resident &= ~store.purgeSlices(segment, idle);
+            }
+        }
     }
 }
