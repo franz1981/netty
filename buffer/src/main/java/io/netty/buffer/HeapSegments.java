@@ -67,6 +67,16 @@ final class HeapSegments {
         this.ownerThread = ownerThread;
         reserve = new Segment[store.maxReserveLimit()];
         purgesSlices = store.regionSource != null;
+        store.registerHeap(this);
+    }
+
+    /** {@link PageStore#STRIPE} or {@link PageStore#THREAD_LOCAL}. */
+    String kind() {
+        return ownerThread != null ? PageStore.THREAD_LOCAL : PageStore.STRIPE;
+    }
+
+    boolean isFreed() {
+        return freed;
     }
 
     boolean isThreadLocal() {
@@ -97,7 +107,7 @@ final class HeapSegments {
             }
         }
         if (best == null) {
-            best = reserved != 0 ? takeNewestReserved() : store.take(this);
+            best = reserved != 0 ? takeReservedFor(kind()) : store.take(this);
             add(best);
         }
         int start = best.claim(slices);
@@ -142,6 +152,8 @@ final class HeapSegments {
             }
         }
         reserve[reserved++] = segment;
+        PageStore.givenBack(segment.memoryAddress(), segment.capacity(), 1, regionIndex(segment),
+                PageStore.HEAP_RESERVE, kind());
     }
 
     /**
@@ -165,9 +177,20 @@ final class HeapSegments {
         if (reserved == 0) {
             return null;
         }
-        Segment segment = takeNewestReserved();
+        Segment segment = takeReservedFor(kind());
         segment.owner = null;
         return segment;
+    }
+
+    private Segment takeReservedFor(String heap) {
+        Segment segment = takeNewestReserved();
+        PageStore.taken(segment.memoryAddress(), segment.capacity(), 1, regionIndex(segment), PageStore.HEAP_RESERVE,
+                heap);
+        return segment;
+    }
+
+    private static int regionIndex(Segment segment) {
+        return segment.region != null ? segment.region.index : -1;
     }
 
     private Segment takeNewestReserved() {
@@ -193,7 +216,8 @@ final class HeapSegments {
      */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
-            store.free(segment);
+            // After the heap was freed, any thread: on behalf of no heap.
+            store.free(segment, freed ? PageStore.NO_HEAP : kind());
         }
     }
 
@@ -305,6 +329,7 @@ final class HeapSegments {
      */
     void afterFree() {
         assert freed;
+        store.unregisterHeap(this);
         renewed = null;
         disposeOldestReserved(reserved);
         cold = 0;

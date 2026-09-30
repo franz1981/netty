@@ -43,6 +43,10 @@ final class Region {
      * given back, the {@link System#nanoTime()} it was given back at.
      */
     final long[] freedAt;
+    /** Per slot, slot owner only: whether memory was ever behind it, so that a slot with none now was purged. */
+    final boolean[] everCommitted;
+    /** Its index in {@link PageStore#regions}, set before it is published there. */
+    int index = -1;
 
     Region(AbstractByteBuf buffer, int slots) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -52,6 +56,7 @@ final class Region {
         free = allSlots;
         segments = new Segment[slots];
         freedAt = new long[slots];
+        everCommitted = new boolean[slots];
         Arrays.fill(freedAt, UNCOMMITTED);
     }
 

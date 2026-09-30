@@ -19,7 +19,13 @@ import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
+import java.util.Iterator;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -65,6 +71,19 @@ final class PageStore {
     /** mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments. */
     private static final int RESERVE_BYTES = 32 * 1024 * 1024;
     private static final int MAX_RESERVED_SEGMENTS = 8;
+    // The heap a segment is taken or given back for, in the JFR events.
+    static final String STRIPE = "stripe";
+    static final String THREAD_LOCAL = "thread-local";
+    static final String NO_HEAP = "none";
+    // Where a segment comes from, or goes to, in the JFR events.
+    static final String FRESH_SLOT = "fresh-slot";
+    static final String COMMITTED_SLOT = "committed-slot";
+    static final String PURGED_SLOT = "purged-slot";
+    static final String HEAP_RESERVE = "heap-reserve";
+    static final String OWN_ALLOCATION = "own-allocation";
+    static final String SLOT_RUN = "slot-run";
+    static final String FREE_SLOT = "free-slot";
+    static final String OWN_FREED = "own-freed";
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -100,6 +119,12 @@ final class PageStore {
     // Written by any heap's decay or release: the renewals of heaps' last segments (see HeapSegments#markEvacuees).
     volatile long renewalsStarted;
     volatile long renewalsDone;
+    /**
+     * With JFR available, for {@link PageStoreStateEvent} only, else {@code null}: the segments allocated on their own
+     * that are out, and the heaps, weakly.
+     */
+    final Set<Segment> ownSegments;
+    final Queue<WeakReference<HeapSegments>> heaps;
 
     /** Without {@code regionSource}, or without regions in {@code config}, every segment is allocated on its own. */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
@@ -109,6 +134,47 @@ final class PageStore {
         this.segmentSource = segmentSource;
         this.regionSource = config.regionSize > 0 ? regionSource : null;
         mapsRegions = this.regionSource != null;
+        if (PlatformDependent.isJfrEnabled()) {
+            ownSegments = ConcurrentHashMap.newKeySet();
+            heaps = new ConcurrentLinkedQueue<WeakReference<HeapSegments>>();
+            PageStoreStateEvent.register(this);
+        } else {
+            ownSegments = null;
+            heaps = null;
+        }
+    }
+
+    /** For {@link PageStoreStateEvent}: once per heap. */
+    void registerHeap(HeapSegments heap) {
+        Queue<WeakReference<HeapSegments>> heaps = this.heaps;
+        if (heaps != null) {
+            heaps.add(new WeakReference<HeapSegments>(heap));
+        }
+    }
+
+    /** When {@code heap} is freed: it and the heaps collected meanwhile leave {@link #heaps}. */
+    void unregisterHeap(HeapSegments heap) {
+        Queue<WeakReference<HeapSegments>> heaps = this.heaps;
+        if (heaps != null) {
+            for (Iterator<WeakReference<HeapSegments>> it = heaps.iterator(); it.hasNext();) {
+                HeapSegments registered = it.next().get();
+                if (registered == null || registered == heap) {
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    static void taken(long address, long length, int segments, int region, String source, String heap) {
+        if (PlatformDependent.isJfrEnabled() && SegmentTakeEvent.isEventEnabled()) {
+            SegmentTakeEvent.commit(address, length, segments, region, source, heap);
+        }
+    }
+
+    static void givenBack(long address, long length, int segments, int region, String destination, String heap) {
+        if (PlatformDependent.isJfrEnabled() && SegmentGiveBackEvent.isEventEnabled()) {
+            SegmentGiveBackEvent.commit(address, length, segments, region, destination, heap);
+        }
     }
 
     /**
@@ -117,31 +183,37 @@ final class PageStore {
      * free, a new allocation.
      */
     Segment take(HeapSegments heap) {
-        Segment segment = takeSegment(heap.regionOffset, heap.isThreadLocal());
+        Segment segment = takeSegment(heap.regionOffset, heap.kind());
         segment.owner = heap;
         return segment;
     }
 
     /**
      * Any thread. A segment for a chunk that uses it whole, outside any heap's segments: owned by no heap, and given
-     * back with {@link #free} from any thread once it is wholly free, which it stays: see {@link Segment#releasedWhole}.
+     * back with {@link #free} from any thread once it is wholly free, which it stays: see
+     * {@link Segment#releasedWhole}.
      *
      * @param regionOffset where to start looking among the regions, as {@link HeapSegments#regionOffset}
+     * @param heap         the heap the chunk is for, or {@code null} for a buffer of its own
      */
-    Segment takeWhole(int regionOffset, boolean threadLocal) {
-        return takeSegment(regionOffset, threadLocal);
+    Segment takeWhole(int regionOffset, HeapSegments heap) {
+        return takeSegment(regionOffset, heap != null ? heap.kind() : NO_HEAP);
     }
 
-    private Segment takeSegment(int regionOffset, boolean threadLocal) {
-        Segment segment = regionSource != null ? takeFromRegions(regionOffset, threadLocal) : null;
+    private Segment takeSegment(int regionOffset, String heap) {
+        Segment segment = regionSource != null ? takeFromRegions(regionOffset, heap) : null;
         if (segment == null) {
             segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
-            allocator.chunkBufferAllocated(segment, true, threadLocal);
+            allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
+            if (ownSegments != null) {
+                ownSegments.add(segment);
+            }
+            taken(segment.memoryAddress(), config.segmentSize, 1, -1, OWN_ALLOCATION, heap);
         }
         return segment;
     }
 
-    private Segment takeFromRegions(int regionOffset, boolean threadLocal) {
+    private Segment takeFromRegions(int regionOffset, String heap) {
         for (;;) {
             Region[] regions = this.regions;
             int n = regions.length;
@@ -175,14 +247,18 @@ final class PageStore {
             boolean taken = false;
             try {
                 Segment segment = fullest.segment(slot, segmentSource, config);
+                String source = COMMITTED_SLOT;
                 if (fullest.freedAt[slot] == Region.UNCOMMITTED) {
                     PlatformDependent.incrementMemoryCounter(config.segmentSize);
                     segment.resident = 0;
                     fullest.freedAt[slot] = 0;
+                    source = fullest.everCommitted[slot] ? PURGED_SLOT : FRESH_SLOT;
+                    fullest.everCommitted[slot] = true;
                     SEGMENTS_COMMITTED.incrementAndGet(this);
-                    allocator.chunkBufferAllocated(segment, true, threadLocal);
+                    allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
                 }
                 taken = true;
+                taken(segment.memoryAddress(), config.segmentSize, 1, fullest.index, source, heap);
                 return segment;
             } finally {
                 if (!taken) {
@@ -207,17 +283,27 @@ final class PageStore {
             return false;
         }
         AbstractByteBuf buffer;
+        Object event = PlatformDependent.isJfrEnabled() && PageStoreMapEvent.isEventEnabled() ?
+                PageStoreMapEvent.start() : null;
         try {
             buffer = regionSource.allocateRegion(config.regionSize, config.regionAlignment);
         } catch (OutOfMemoryError | RuntimeException e) {
+            if (event != null) {
+                AbstractPageStoreCallEvent.end(event, 0, config.regionSize, seen.length, e);
+            }
             mapsRegions = false;
             logger.warn("Cannot map a region of {} bytes: segments are allocated one by one from now on.",
                     config.regionSize, e);
             return false;
         }
         assert buffer.capacity() == config.regionSize;
+        if (event != null) {
+            AbstractPageStoreCallEvent.end(event, buffer._memoryAddress(), config.regionSize, seen.length, null);
+        }
         Region[] grown = Arrays.copyOf(seen, seen.length + 1);
-        grown[seen.length] = new Region(buffer, config.segmentsPerRegion());
+        Region region = new Region(buffer, config.segmentsPerRegion());
+        region.index = seen.length;
+        grown[seen.length] = region;
         regions = grown;
         return true;
     }
@@ -228,7 +314,7 @@ final class PageStore {
      * or when {@code slots} is more than a region holds. Maps a new region when none has such a run. Each slot is
      * committed and counted as {@link #take} does; give the run back with {@link #freeRun}, from any thread.
      */
-    long takeRun(int slots, int regionOffset, boolean threadLocal) {
+    long takeRun(int slots, int regionOffset) {
         if (regionSource == null || slots > config.segmentsPerRegion()) {
             return -1;
         }
@@ -239,7 +325,9 @@ final class PageStore {
                 Region region = regions[i];
                 int start = region.takeRun(slots);
                 if (start >= 0) {
-                    commitRun(region, start, slots, threadLocal);
+                    commitRun(region, start, slots);
+                    taken(region.buffer._memoryAddress() + (long) start * config.segmentSize,
+                            (long) slots * config.segmentSize, slots, i, SLOT_RUN, NO_HEAP);
                     return (long) i << 32 | start;
                 }
             }
@@ -250,7 +338,7 @@ final class PageStore {
     }
 
     /** The run's slots with no memory behind them are charged and counted; on failure the whole run goes back. */
-    private void commitRun(Region region, int start, int slots, boolean threadLocal) {
+    private void commitRun(Region region, int start, int slots) {
         boolean committed = false;
         try {
             for (int slot = start; slot < start + slots; slot++) {
@@ -258,8 +346,9 @@ final class PageStore {
                 if (region.freedAt[slot] == Region.UNCOMMITTED) {
                     PlatformDependent.incrementMemoryCounter(config.segmentSize);
                     region.freedAt[slot] = 0;
+                    region.everCommitted[slot] = true;
                     SEGMENTS_COMMITTED.incrementAndGet(this);
-                    allocator.chunkBufferAllocated(segment, true, threadLocal);
+                    allocator.chunkBufferAllocated(segment, true, false);
                 }
             }
             committed = true;
@@ -277,6 +366,8 @@ final class PageStore {
             region.segmentOrNull(slot).releasedWhole(now);
         }
         region.giveBackRun(start, slots, now);
+        givenBack(region.buffer._memoryAddress() + (long) start * config.segmentSize,
+                (long) slots * config.segmentSize, slots, region.index, SLOT_RUN, NO_HEAP);
     }
 
     Region region(int index) {
@@ -288,13 +379,25 @@ final class PageStore {
      * which may return memory to the OS.
      */
     void free(Segment segment) {
+        free(segment, NO_HEAP);
+    }
+
+    /** As {@link #free(Segment)}, on behalf of {@code heap}: {@link #STRIPE}, {@link #THREAD_LOCAL} or none. */
+    void free(Segment segment, String heap) {
         assert segment.isWhollyFree() && segment.owner == null;
-        if (segment.region != null) {
-            segment.region.giveBack(segment.slot, System.nanoTime());
+        long address = segment.memoryAddress();
+        Region region = segment.region;
+        if (region != null) {
+            region.giveBack(segment.slot, System.nanoTime());
+            givenBack(address, config.segmentSize, 1, region.index, FREE_SLOT, heap);
             return;
+        }
+        if (ownSegments != null) {
+            ownSegments.remove(segment);
         }
         allocator.chunkBufferFreed(segment, true);
         segment.buffer.release();
+        givenBack(address, config.segmentSize, 1, -1, OWN_FREED, heap);
     }
 
     /**
@@ -313,7 +416,20 @@ final class PageStore {
                     allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
                 }
             }
-            region.buffer.release();
+            long address = region.buffer._memoryAddress();
+            Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
+                    PageStoreUnmapEvent.start() : null;
+            Throwable failure = null;
+            try {
+                region.buffer.release();
+            } catch (RuntimeException | Error e) {
+                failure = e;
+                throw e;
+            } finally {
+                if (event != null) {
+                    AbstractPageStoreCallEvent.end(event, address, config.regionSize, region.index, failure);
+                }
+            }
         }
     }
 
@@ -398,12 +514,16 @@ final class PageStore {
             slots &= ~bits;
             int start = Long.numberOfTrailingZeros(bits);
             int run = Long.bitCount(bits);
+            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
+                    PageStorePurgeEvent.start() : null;
             try {
                 regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
             } catch (Throwable t) {
+                purged(event, SLOTS, region, start * segmentSize, run * segmentSize, t);
                 purgeFailed(t);
                 continue;
             }
+            purged(event, SLOTS, region, start * segmentSize, run * segmentSize, null);
             purgeCalls++;
             bytesPurged += (long) run * segmentSize;
             PlatformDependent.decrementMemoryCounter(run * segmentSize);
@@ -431,12 +551,16 @@ final class PageStore {
             slices &= ~run;
             int start = Long.numberOfTrailingZeros(run);
             int n = Long.bitCount(run);
+            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
+                    PageStorePurgeEvent.start() : null;
             try {
                 regionSource.purge(segment.region.buffer, base + start * sliceSize, n * sliceSize);
             } catch (Throwable t) {
+                purged(event, SLICES, segment.region, base + start * sliceSize, n * sliceSize, t);
                 slicePurgeFailed(t);
                 continue;
             }
+            purged(event, SLICES, segment.region, base + start * sliceSize, n * sliceSize, null);
             purged |= run;
             SLICE_PURGE_CALLS.incrementAndGet(this);
             SLICE_PURGE_BYTES.addAndGet(this, (long) n * sliceSize);
@@ -448,6 +572,16 @@ final class PageStore {
             }
         }
         return purged;
+    }
+
+    private static final String SLOTS = "slots";
+    private static final String SLICES = "slices";
+
+    private static void purged(Object event, String unit, Region region, int offset, int length, Throwable failure) {
+        if (event != null) {
+            PageStorePurgeEvent.end(event, unit, region.buffer._memoryAddress() + offset, length, region.index,
+                    failure);
+        }
     }
 
     /** A heap started renewing its last segment. */

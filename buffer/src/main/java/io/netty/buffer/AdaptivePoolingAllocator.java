@@ -589,7 +589,7 @@ final class AdaptivePoolingAllocator {
         int segmentSize = store.config.segmentSize;
         int hint = threadIndex(Thread.currentThread()) & Integer.MAX_VALUE;
         if (size <= segmentSize) {
-            Segment segment = store.takeWhole(hint, false);
+            Segment segment = store.takeWhole(hint, null);
             boolean made = false;
             try {
                 BuddyChunk chunk = new BuddyChunk(segment, this);
@@ -602,7 +602,7 @@ final class AdaptivePoolingAllocator {
             }
         }
         int slots = (int) ((size + (long) segmentSize - 1) / segmentSize);
-        long run = store.takeRun(slots, hint, false);
+        long run = store.takeRun(slots, hint);
         if (run < 0) {
             return null;
         }
@@ -2134,7 +2134,7 @@ final class AdaptivePoolingAllocator {
             HeapSegments heap = magazine.heapSegments;
             Segment segment = heap.takeReservedWhole();
             if (segment == null) {
-                segment = store.takeWhole(heap.regionOffset, magazine.isThreadLocal());
+                segment = store.takeWhole(heap.regionOffset, heap);
             }
             boolean made = false;
             try {
@@ -3488,14 +3488,19 @@ final class AdaptivePoolingAllocator {
          */
         void release(HeapSegments heap) {
             if (RefCnt.release(refCnt)) {
-                Segment segment = this.segment;
-                if (segment != null && segment.region == null && heap != null) {
-                    segment.releasedWhole(System.nanoTime());
-                    if (heap.reserveWhole(segment)) {
-                        return;
-                    }
-                }
+                lastReleasedByOwner(heap);
+            }
+        }
+
+        private void lastReleasedByOwner(HeapSegments heap) {
+            Segment segment = this.segment;
+            if (segment == null || heap == null) {
                 deallocate();
+                return;
+            }
+            segment.releasedWhole(System.nanoTime());
+            if (segment.region != null || !heap.reserveWhole(segment)) {
+                allocator.pageStore.free(segment, heap.kind());
             }
         }
 

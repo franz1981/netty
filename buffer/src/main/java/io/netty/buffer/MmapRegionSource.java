@@ -378,7 +378,8 @@ final class MmapRegionSource implements RegionSource {
                 throw new Error(t);
             }
             if (address == MAP_FAILED) {
-                throw new OutOfMemoryError("mmap(2) failed to map " + length + " bytes: errno " + errno(state));
+                int errno = errno(state);
+                throw new MapFailedError("mmap(2) failed to map " + length + " bytes: errno " + errno, errno);
             }
             return address;
         } finally {
@@ -409,8 +410,9 @@ final class MmapRegionSource implements RegionSource {
                 throw new Error(t);
             }
             if (result != 0) {
-                throw new IllegalStateException("munmap(2) failed for " + length + " bytes at 0x"
-                        + Long.toHexString(address) + ": errno " + errno(state));
+                int errno = errno(state);
+                throw new CallFailedException("munmap(2) failed for " + length + " bytes at 0x"
+                        + Long.toHexString(address) + ": errno " + errno, errno);
             }
         } finally {
             closeArena(arena);
@@ -440,8 +442,9 @@ final class MmapRegionSource implements RegionSource {
                 throw new Error(t);
             }
             if (result != 0) {
-                throw new IllegalStateException("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
-                        + Long.toHexString(address) + ": errno " + errno(state));
+                int errno = errno(state);
+                throw new CallFailedException("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
+                        + Long.toHexString(address) + ": errno " + errno, errno);
             }
         } finally {
             closeArena(arena);
@@ -508,6 +511,47 @@ final class MmapRegionSource implements RegionSource {
         @Override
         public long memoryAddress() {
             return address;
+        }
+    }
+
+    /** The errno of the failed call behind {@code failure}, or of one it suppressed or was caused by; else -1. */
+    static int errnoOf(Throwable failure) {
+        for (Throwable t = failure; t != null; t = t.getCause()) {
+            if (t instanceof CallFailedException) {
+                return ((CallFailedException) t).errno;
+            }
+            if (t instanceof MapFailedError) {
+                return ((MapFailedError) t).errno;
+            }
+            for (Throwable suppressed : t.getSuppressed()) {
+                int errno = errnoOf(suppressed);
+                if (errno != -1) {
+                    return errno;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /** {@code munmap} or {@code madvise} failed with {@link #errno}. */
+    static final class CallFailedException extends IllegalStateException {
+        private static final long serialVersionUID = -4196453183478391284L;
+        final int errno;
+
+        CallFailedException(String message, int errno) {
+            super(message);
+            this.errno = errno;
+        }
+    }
+
+    /** {@code mmap} failed with {@link #errno}. */
+    static final class MapFailedError extends OutOfMemoryError {
+        private static final long serialVersionUID = 2894373093851276041L;
+        final int errno;
+
+        MapFailedError(String message, int errno) {
+            super(message);
+            this.errno = errno;
         }
     }
 }
