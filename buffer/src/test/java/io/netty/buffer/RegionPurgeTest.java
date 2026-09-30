@@ -169,6 +169,36 @@ final class RegionPurgeTest {
         assertAccounted(segments, regions, allocator);
     }
 
+    /**
+     * A purge call that fails leaves its slots committed, free and purgeable: nothing is thrown to the caller, which
+     * may be an allocation, and the next purge tries them again.
+     */
+    @Test
+    void aFailedPurgeCallIsSwallowedAndRetried() {
+        List<Segment> taken = takeAll(3);
+        giveBack(taken.get(1));
+        final AtomicBoolean fail = new AtomicBoolean(true);
+        regions.onPurge = () -> {
+            if (fail.get()) {
+                throw new IllegalStateException("madvise(MADV_DONTNEED) failed: errno 22");
+            }
+        };
+        long now = System.nanoTime();
+        store.purgeIfDue(now += INTERVAL);
+        store.purgeIfDue(now += INTERVAL);
+        assertEquals(1, store.purgeFailures);
+        assertEquals(0, store.segmentsPurged);
+        assertEquals(3L * SEGMENT_SIZE, allocator.usedMemory(), "still committed");
+        assertArrayEquals(new int[] {2, 1, SLOTS - 3}, store.slotCounts());
+        store.purgeIfDue(now += INTERVAL);
+        assertEquals(2, store.purgeFailures);
+        fail.set(false);
+        store.purgeIfDue(now += INTERVAL);
+        assertEquals(1, store.segmentsPurged);
+        assertEquals(2L * SEGMENT_SIZE, allocator.usedMemory());
+        assertAccounted(segments, regions, allocator);
+    }
+
     /** A heap's decay is what drives the purge. */
     @Test
     void heapDecaysDriveThePurge() {

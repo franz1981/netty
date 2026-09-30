@@ -78,6 +78,7 @@ final class PageStore {
     long purgeCalls;
     long segmentsPurged;
     long bytesPurged;
+    long purgeFailures;
 
     /** Without {@code regionSource}, or without regions in {@code config}, every segment is allocated on its own. */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
@@ -288,14 +289,23 @@ final class PageStore {
         return purgeable;
     }
 
-    /** Purges each run of contiguous slots of {@code slots}, which the caller claimed, with one call. */
+    /**
+     * Purges each run of contiguous slots of {@code slots}, which the caller claimed, with one call. A run whose call
+     * fails keeps its memory, and stays purgeable: the failure never reaches the allocation that drove the decay.
+     */
     private void purgeRuns(Region region, long slots) {
         int segmentSize = config.segmentSize;
         while (slots != 0) {
             long bits = lowestRun(slots);
+            slots &= ~bits;
             int start = Long.numberOfTrailingZeros(bits);
             int run = Long.bitCount(bits);
-            regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
+            try {
+                regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
+            } catch (Throwable t) {
+                purgeFailed(t);
+                continue;
+            }
             purgeCalls++;
             bytesPurged += (long) run * segmentSize;
             PlatformDependent.decrementMemoryCounter(run * segmentSize);
@@ -304,7 +314,15 @@ final class PageStore {
                 segmentsPurged++;
                 allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
             }
-            slots &= ~bits;
+        }
+    }
+
+    private void purgeFailed(Throwable cause) {
+        if (purgeFailures++ == 0) {
+            logger.warn("Cannot purge free region slots: their memory stays committed. Further failures are logged "
+                    + "at debug level.", cause);
+        } else {
+            logger.debug("Cannot purge free region slots ({} failures).", purgeFailures, cause);
         }
     }
 
