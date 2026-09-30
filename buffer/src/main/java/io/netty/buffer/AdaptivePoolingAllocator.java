@@ -46,7 +46,6 @@ import java.nio.channels.ScatteringByteChannel;
 import java.nio.charset.Charset;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -293,7 +292,6 @@ final class AdaptivePoolingAllocator {
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
 
-    private final BuddyChunkManagementStrategy buddyStrategy;
     private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
@@ -351,7 +349,6 @@ final class AdaptivePoolingAllocator {
             stripedHeaps[i] = new StripedHeap();
         }
         stripeScanLength = INITIAL_MAGAZINES;
-        buddyStrategy = new BuddyChunkManagementStrategy();
         fallbackRecycler = AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
 
         boolean disableThreadLocalGroups = IS_LOW_MEM && DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM;
@@ -1136,7 +1133,7 @@ final class AdaptivePoolingAllocator {
             if (recycler == null) {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
-            BuddyMagazine mag = new BuddyMagazine(allocator, allocator.buddyStrategy, recycler, lock, null, idleDecay);
+            BuddyMagazine mag = new BuddyMagazine(allocator, recycler, lock, null, idleDecay);
             buddyMagazine = mag;
             idleDecay.buddyMagazine = mag;
             return mag;
@@ -1254,8 +1251,7 @@ final class AdaptivePoolingAllocator {
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf) {
             BuddyMagazine mag = buddyMagazine;
             if (mag == null) {
-                mag = new BuddyMagazine(allocator, allocator.buddyStrategy, null, null, Thread.currentThread(),
-                                        idleDecay);
+                mag = new BuddyMagazine(allocator, null, null, Thread.currentThread(), idleDecay);
                 buddyMagazine = mag;
                 idleDecay.buddyMagazine = mag;
             }
@@ -2028,21 +2024,17 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static final class BuddyChunkManagementStrategy {
-        private final AtomicInteger maxChunkSize = new AtomicInteger();
-
-        BuddyChunkController createController(AdaptivePoolingAllocator allocator) {
-            return new BuddyChunkController(allocator.chunkAllocator, maxChunkSize);
-        }
-    }
-
     private static final class BuddyChunkController {
         private final ChunkAllocator chunkAllocator;
-        private final AtomicInteger maxChunkSize;
+        /**
+         * The largest chunk this magazine made so far; its chunks never shrink below it, so a magazine serving mixed
+         * sizes does not go back and forth between chunk sizes. One per magazine, guarded like it: a heap that only
+         * sees small large-buffers keeps small chunks whatever other heaps allocate.
+         */
+        private int maxChunkSize;
 
-        BuddyChunkController(ChunkAllocator chunkAllocator, AtomicInteger maxChunkSize) {
+        BuddyChunkController(ChunkAllocator chunkAllocator) {
             this.chunkAllocator = chunkAllocator;
-            this.maxChunkSize = maxChunkSize;
         }
 
         /**
@@ -2056,12 +2048,11 @@ final class AdaptivePoolingAllocator {
          * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}.
          */
         BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
-            int maxChunkSize = this.maxChunkSize.get();
+            int maxChunkSize = this.maxChunkSize;
             int proposedChunkSize = MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize);
             int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(maxChunkSize, proposedChunkSize));
             if (chunkSize > maxChunkSize) {
-                // Update our stored max chunk size. It's fine that this is racy.
-                this.maxChunkSize.set(chunkSize);
+                this.maxChunkSize = chunkSize;
             }
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.isThreadLocal());
@@ -2421,15 +2412,15 @@ final class AdaptivePoolingAllocator {
          * @param stripeLock  the stripe's lock, or {@code null} on a thread-local heap
          * @param ownerThread the thread-local heap's thread, or {@code null} on a stripe
          */
-        BuddyMagazine(AdaptivePoolingAllocator allocator, BuddyChunkManagementStrategy strategy,
-                      AdaptiveRecycler bufRecycler, StampedLock stripeLock, Thread ownerThread, IdleDecay idleDecay) {
+        BuddyMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
+                      Thread ownerThread, IdleDecay idleDecay) {
             assert (stripeLock == null) != (ownerThread == null);
             this.allocator = allocator;
             this.idleDecay = idleDecay;
             this.bufRecycler = bufRecycler;
             this.stripeLock = stripeLock;
             this.ownerThread = ownerThread;
-            this.chunkController = strategy.createController(allocator);
+            this.chunkController = new BuddyChunkController(allocator.chunkAllocator);
             for (int order = 0; order < ORDERS; order++) {
                 byLargestFreeOrder[order] = new ChunkQueue();
             }

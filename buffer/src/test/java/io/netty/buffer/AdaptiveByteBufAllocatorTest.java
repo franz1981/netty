@@ -1867,6 +1867,29 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
+    /**
+     * A heap's large-buffer chunks are sized by what that heap allocates: another heap's 1 MiB buffers do not make
+     * them 8 MiB.
+     */
+    @Test
+    void largeBufferChunkSizeIsPerHeap() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            ByteBuf big = allocator.heapBuffer(1024 * 1024, 1024 * 1024);
+            assertEquals(8 * 1024 * 1024, allocator.usedHeapMemory(), "8 x 1 MiB");
+            big.release();
+        });
+        onThreadLocalHeap(() -> {
+            ByteBuf small = allocator.heapBuffer(192 * 1024, 192 * 1024);
+            try {
+                assertEquals(2 * 1024 * 1024, allocator.usedHeapMemory(), "8 x 192 KiB, rounded up to 2 MiB");
+            } finally {
+                small.release();
+            }
+        });
+    }
+
     private static boolean isLowMemory() throws Exception {
         Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         f.setAccessible(true);
