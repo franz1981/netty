@@ -356,6 +356,50 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
+     * Without regions, a heap's last segment whose free slices were claimed once more than it uses now is given back
+     * once nothing in it holds a buffer: the next chunk is made in a new segment. Not while the reserve holds one,
+     * and not again while the new segment's free slices were never claimed.
+     */
+    @Test
+    void aLastSegmentTouchedMoreThanItUsesIsRenewed() throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
+        int perChunk = 8 * SLICE_SIZE_BYTES / size;
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        for (int i = 0; i < 6 * perChunk; i++) {
+            bufs.add(allocator.allocate(size, size));
+        }
+        ByteBuf small = allocator.allocate(1024, 1024);
+        Object stripe = usedStripe(allocator);
+        HeapSegments heapSegments = idleDecay(stripe).heapSegments;
+        Segment first = heapSegments.segments[0];
+        assertEquals(50, first.usedSlices());
+        long now = System.nanoTime();
+        decayStripe(stripe, now += INTERVAL);
+        assertSame(first, heapSegments.segments[0], "all of it in use");
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        small.release();
+        assertEquals(10, first.usedSlices(), "the big class keeps its floor chunk, the small one its current");
+        allocator.allocate(size, size).release(); // both classes stay in use: their decays keep their chunks
+        allocator.allocate(1024, 1024).release();
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(0, heapSegments.count, "40 free slices claimed once, 10 used: given back");
+        assertEquals(0, heapSegments.reserved);
+        assertEquals(0, source.segmentsLive());
+        small = allocator.allocate(1024, 1024);
+        Segment second = heapSegments.segments[0];
+        assertNotSame(first, second);
+        assertEquals(2, source.segmentsAllocated());
+        decayStripe(stripe, now += INTERVAL);
+        assertSame(second, heapSegments.segments[0], "nothing claimed there but what it uses");
+        small.release();
+        assertAccounted(source, allocator);
+    }
+
+    /**
      * A thread-local heap freed (its thread ended) while buffers are still out: its segments stay accounted, and the
      * release of the last buffer of a segment, on another thread, gives the segment back.
      */

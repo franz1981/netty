@@ -46,8 +46,11 @@ final class Segment implements ChunkInfo {
     final int slot;
     /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
     private final AbstractByteBuf[] spans;
-    // Owner only, for the purge of idle slices in its decays (see HeapSegments#decay). Region segments only.
-    /** Slices that may have memory behind them: claimed since the last purge of their memory. */
+    // Owner only, for the purge of idle slices in its decays (see HeapSegments#decay).
+    /**
+     * Slices that may have memory behind them: claimed since the last purge of their memory, or, for a segment
+     * allocated on its own, since its allocation.
+     */
     long resident;
     /** Slices free at the owner's previous decay. */
     long freeAtDecay;

@@ -51,6 +51,8 @@ final class HeapSegments {
     /** The segments {@link #markEvacuees} marked, until {@link #clearEvacuees}. */
     private Segment[] evacuees = new Segment[4];
     private int evacueeCount;
+    /** The evacuee given back at once when it empties, instead of reserved; see {@link #markEvacuees}. */
+    private Segment renewed;
 
     HeapSegments(PageStore store, StampedLock stripeLock, Thread ownerThread) {
         assert (stripeLock == null) != (ownerThread == null);
@@ -113,6 +115,11 @@ final class HeapSegments {
         }
         assert inOwnerContext();
         remove(segment);
+        if (segment == renewed) {
+            renewed = null;
+            dispose(segment);
+            return;
+        }
         if (reserved >= Math.min(store.reserveLimit(), reserve.length)) {
             // The oldest, cold if any is, makes room: at a limit of one, the newest wholly free segment is kept.
             disposeOldestReserved(1);
@@ -177,6 +184,11 @@ final class HeapSegments {
      * whose every used slice is such a chunk, while the segments left keep as many free slices as all the marked ones
      * use: freeing those chunks empties the marked segments, and {@link #claim} packs the chunks their size classes
      * make next into the fullest segments with room. Returns whether it marked any; clears every movable count.
+     * <p>
+     * Without regions no free slice is purged in place (see {@link #purgeIdleSlices}): a heap's last segment keeps
+     * every page a burst touched in it. When the reserve is empty, nothing in that segment holds a buffer, and more of
+     * its free slices were claimed once than it uses, it is marked too, and given back at once when it empties: the
+     * heap's next chunk is made in a new segment, whose pages cost nothing until touched.
      */
     boolean markEvacuees() {
         assert inOwnerContext() && !freed && evacueeCount == 0;
@@ -212,6 +224,15 @@ final class HeapSegments {
             }
             evacuees[evacueeCount++] = sparsest;
         }
+        if (n == 1 && reserved == 0) {
+            Segment last = segments[0];
+            int used = last.usedSlices();
+            if (last.region == null && last.movableSlices == used && Long.bitCount(last.resident & last.free) > used) {
+                renewed = last;
+                last.evacuate = true;
+                evacuees[evacueeCount++] = last;
+            }
+        }
         for (int i = 0; i < n; i++) {
             segments[i].movableSlices = 0;
         }
@@ -220,6 +241,7 @@ final class HeapSegments {
 
     /** Owner only: unmarks what {@link #markEvacuees} marked. */
     void clearEvacuees() {
+        renewed = null;
         for (int i = 0; i < evacueeCount; i++) {
             evacuees[i].evacuate = false;
             evacuees[i] = null;
