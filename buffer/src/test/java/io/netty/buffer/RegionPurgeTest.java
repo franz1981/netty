@@ -105,6 +105,27 @@ final class RegionPurgeTest {
         assertArrayEquals(new int[] {0, 0, SLOTS}, store.slotCounts());
     }
 
+    /** A purge claims one run at a time: while one run is purged, the free slots of the others can be taken. */
+    @Test
+    void aPurgeHoldsOneRunAtATime() {
+        List<Segment> taken = takeAll(SLOTS);
+        for (int slot : new int[] {1, 2, 3, 5, 6}) {
+            giveBack(taken.get(slot));
+        }
+        final Region region = taken.get(0).region;
+        final List<Long> freeDuringPurge = new ArrayList<Long>();
+        regions.onPurge = () -> freeDuringPurge.add(region.free);
+        long now = System.nanoTime();
+        store.purgeIfDue(now += INTERVAL);
+        store.purgeIfDue(now += INTERVAL);
+        assertEquals(2, freeDuringPurge.size());
+        assertEquals(0b1100000L, (long) freeDuringPurge.get(0), "1-3 held, 5-6 free");
+        assertEquals(0b0001110L, (long) freeDuringPurge.get(1), "5-6 held, 1-3 free again");
+        assertEquals(0b1101110L, region.free);
+        assertEquals(5, store.segmentsPurged);
+        assertAccounted(segments, regions, allocator);
+    }
+
     @Test
     void aWholeRegionFreeIsOneCall() {
         List<Segment> taken = takeAll(SLOTS);

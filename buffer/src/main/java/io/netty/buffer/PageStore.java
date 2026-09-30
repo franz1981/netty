@@ -239,25 +239,37 @@ final class PageStore {
     }
 
     /**
-     * Claims the purgeable free slots of each region by CAS, purges each run of contiguous ones with one
-     * {@link RegionSource#purge} call, then frees them again. A slot purged keeps its free bit's place in the order of
-     * takes: taking it again only costs the page faults of touching it.
+     * Purges each run of contiguous purgeable free slots with one {@link RegionSource#purge} call, holding only that
+     * run's slots, claimed by CAS, for the call: a take meanwhile still finds every other free slot. A slot purged
+     * keeps its free bit's place in the order of takes: taking it again only costs the page faults of touching it.
      */
     private void purge() {
         int epoch = purgeEpoch + 1;
         purgeEpoch = epoch;
         purges++;
         for (Region region : regions) {
-            long claimed = region.claim(purgeable(region, region.free, epoch));
-            if (claimed == 0) {
-                continue;
-            }
-            try {
-                purgeRuns(region, purgeable(region, claimed, epoch));
-            } finally {
-                region.giveBackAll(claimed);
+            long candidates = purgeable(region, region.free, epoch);
+            while (candidates != 0) {
+                long run = lowestRun(candidates);
+                candidates &= ~run;
+                long claimed = region.claim(run);
+                if (claimed == 0) {
+                    continue;
+                }
+                try {
+                    purgeRuns(region, purgeable(region, claimed, epoch));
+                } finally {
+                    region.giveBackAll(claimed);
+                }
             }
         }
+    }
+
+    /** The lowest run of contiguous set bits of {@code bits}, which is not 0. */
+    private static long lowestRun(long bits) {
+        int start = Long.numberOfTrailingZeros(bits);
+        int length = Long.numberOfTrailingZeros(~(bits >>> start));
+        return length == Long.SIZE ? -1L : (1L << length) - 1 << start;
     }
 
     /**
@@ -280,9 +292,9 @@ final class PageStore {
     private void purgeRuns(Region region, long slots) {
         int segmentSize = config.segmentSize;
         while (slots != 0) {
-            int start = Long.numberOfTrailingZeros(slots);
-            int run = Long.numberOfTrailingZeros(~(slots >>> start));
-            long bits = run == Long.SIZE ? -1L : (1L << run) - 1 << start;
+            long bits = lowestRun(slots);
+            int start = Long.numberOfTrailingZeros(bits);
+            int run = Long.bitCount(bits);
             regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
             purgeCalls++;
             bytesPurged += (long) run * segmentSize;
