@@ -31,6 +31,25 @@ interface Cleaner {
     CleanableDirectBuffer allocate(int capacity);
 
     /**
+     * Create a direct {@link ByteBuffer} of exactly {@code capacity} bytes whose first byte is at an address that is a
+     * multiple of {@code alignment}, and return it alongside its cleaning mechanism, which frees the whole allocation.
+     * <p>
+     * The default implementation allocates {@code capacity + alignment} bytes with {@link #allocate(int)} (rounded up
+     * to the alignment when the allocation's address cannot be read) and returns the aligned part of them:
+     * {@link CleanableDirectBuffer#allocatedCapacity()} then reports the bytes actually allocated, which is also what
+     * the direct memory counter was charged. Implementations with an aligned allocation primitive may override it.
+     *
+     * @param capacity  the capacity of the returned buffer
+     * @param alignment a power of two
+     * @throws UnsupportedOperationException when this platform cannot tell where an aligned address is in a buffer
+     *                                       (no memory address and no {@code ByteBuffer.alignedSlice}); nothing is
+     *                                       left allocated then
+     */
+    default CleanableDirectBuffer allocateAligned(int capacity, int alignment) {
+        return AlignedCleanableDirectBuffer.allocate(this, capacity, alignment);
+    }
+
+    /**
      * Reallocate a direct buffer with a new capacity. The old buffer is consumed and
      * must not be used after this call.
      * <p>

@@ -31,6 +31,8 @@ public class CleanerJava24Linker implements Cleaner {
     private static final MethodHandle INVOKE_MALLOC;
     private static final MethodHandle INVOKE_CREATE_BYTEBUFFER;
     private static final MethodHandle INVOKE_FREE;
+    /** {@code aligned_alloc}, or {@code null} when it could not be linked: then aligned allocations over-allocate. */
+    private static final MethodHandle INVOKE_ALIGNED_ALLOC;
 
     static {
         boolean suitableJavaVersion;
@@ -59,6 +61,7 @@ public class CleanerJava24Linker implements Cleaner {
         MethodHandle mallocMethod;
         MethodHandle wrapMethod;
         MethodHandle freeMethod;
+        MethodHandle alignedAllocMethod = null;
         Throwable error;
 
         if (suitableJavaVersion) {
@@ -154,6 +157,29 @@ public class CleanerJava24Linker implements Cleaner {
                         freeFuncDesc);
                 freeMethod = (MethodHandle) freeLinker.invoke(Array.newInstance(linkerOptionCls, 0));
 
+                // Constructing the aligned_alloc (long, long)long handle: aligned_alloc(alignment, size), freed by
+                // free() like malloc's memory. Optional: without it, aligned allocations over-allocate with malloc.
+                try {
+                    Object twoLongs = Array.newInstance(memoryLayoutCls, 2);
+                    Array.set(twoLongs, 0, longLayout);
+                    Array.set(twoLongs, 1, longLayout);
+                    MethodHandle alignedAllocFuncDesc = MethodHandles.insertArguments(
+                            lookup.findStatic(funcDescCls, "of",
+                                    methodType(funcDescCls, memoryLayoutCls, memoryLayoutArrayCls)),
+                            0, longLayout, twoLongs);
+                    MethodHandle alignedAllocLinker = MethodHandles.foldArguments(
+                            MethodHandles.foldArguments(downcallHandleStatic,
+                                    MethodHandles.foldArguments(findSymbol,
+                                            MethodHandles.constant(String.class, "aligned_alloc"))),
+                            alignedAllocFuncDesc);
+                    alignedAllocMethod = (MethodHandle) alignedAllocLinker.invoke(
+                            Array.newInstance(linkerOptionCls, 0));
+                } catch (Throwable t) {
+                    if (logger != null) {
+                        logger.debug("aligned_alloc(3): unavailable", t);
+                    }
+                }
+
                 // Constructing the wrapper (long, long)ByteBuffer handle
                 MethodHandle ofAddress = lookup.findStatic(memSegCls, "ofAddress", methodType(memSegCls, long.class));
                 MethodHandle reinterpret = lookup.findVirtual(memSegCls, "reinterpret",
@@ -168,6 +194,7 @@ public class CleanerJava24Linker implements Cleaner {
                 mallocMethod = null;
                 wrapMethod = null;
                 freeMethod = null;
+                alignedAllocMethod = null;
                 error = throwable;
             }
         } else {
@@ -187,6 +214,7 @@ public class CleanerJava24Linker implements Cleaner {
         INVOKE_MALLOC = mallocMethod;
         INVOKE_CREATE_BYTEBUFFER = wrapMethod;
         INVOKE_FREE = freeMethod;
+        INVOKE_ALIGNED_ALLOC = alignedAllocMethod;
     }
 
     static boolean isSupported() {
@@ -196,6 +224,24 @@ public class CleanerJava24Linker implements Cleaner {
     @Override
     public CleanableDirectBuffer allocate(int capacity) {
         return new CleanableDirectBufferImpl(capacity);
+    }
+
+    /** Whether {@link #allocateAligned} can use {@code aligned_alloc}; for tests. */
+    static boolean hasAlignedAlloc() {
+        return INVOKE_ALIGNED_ALLOC != null;
+    }
+
+    /**
+     * {@code aligned_alloc(alignment, capacity)} when {@code capacity} is a positive multiple of {@code alignment} (as
+     * C11 asks), exactly {@code capacity} bytes charged and freed; otherwise the over-allocating default.
+     */
+    @Override
+    public CleanableDirectBuffer allocateAligned(int capacity, int alignment) {
+        AlignedCleanableDirectBuffer.checkAlignment(capacity, alignment);
+        if (INVOKE_ALIGNED_ALLOC != null && capacity > 0 && capacity % alignment == 0) {
+            return new CleanableDirectBufferImpl(capacity, alignment);
+        }
+        return AlignedCleanableDirectBuffer.allocate(this, capacity, alignment);
     }
 
     @Override
@@ -223,6 +269,20 @@ public class CleanerJava24Linker implements Cleaner {
         return addr;
     }
 
+    static long alignedAlloc(int capacity, int alignment) {
+        final long addr;
+        try {
+            addr = (long) INVOKE_ALIGNED_ALLOC.invokeExact((long) alignment, (long) capacity);
+        } catch (Throwable e) {
+            throw new Error(e); // Should not happen.
+        }
+        if (addr == 0) {
+            throw new OutOfMemoryError("aligned_alloc(3) failed to allocate " + capacity + " bytes aligned to " +
+                    alignment);
+        }
+        return addr;
+    }
+
     static void free(long memoryAddress) {
         try {
             INVOKE_FREE.invokeExact(memoryAddress);
@@ -236,10 +296,15 @@ public class CleanerJava24Linker implements Cleaner {
         private final long memoryAddress;
 
         private CleanableDirectBufferImpl(int capacity) {
+            this(capacity, 0);
+        }
+
+        /** With {@code alignment} 0, {@code malloc}; else {@code aligned_alloc}. */
+        private CleanableDirectBufferImpl(int capacity, int alignment) {
             PlatformDependent.incrementMemoryCounter(capacity);
             long addr;
             try {
-                addr = malloc(capacity);
+                addr = alignment == 0 ? malloc(capacity) : alignedAlloc(capacity, alignment);
             } catch (Throwable e) {
                 PlatformDependent.decrementMemoryCounter(capacity);
                 throw e;

@@ -637,6 +637,22 @@ public final class PlatformDependent {
     }
 
     /**
+     * Allocate a direct {@link ByteBuffer} of exactly {@code capacity} bytes starting at an address that is a multiple
+     * of {@code alignment}, for a pooling allocator (an expensive clean is permitted), and return it alongside its
+     * deallocation mechanism, which frees the whole allocation. On Java 24+ with native access (the libc linker
+     * cleaner) this is {@code aligned_alloc} when {@code capacity} is a multiple of {@code alignment}; otherwise
+     * {@code capacity + alignment} bytes are allocated and the aligned part returned. Either way
+     * {@link CleanableDirectBuffer#allocatedCapacity()} is what was allocated, and charged to the direct memory
+     * counter.
+     *
+     * @param alignment a power of two
+     * @throws UnsupportedOperationException when this platform cannot align a direct buffer; nothing stays allocated
+     */
+    public static CleanableDirectBuffer allocateDirectAligned(int capacity, int alignment) {
+        return CLEANER.allocateAligned(capacity, alignment);
+    }
+
+    /**
      * Reallocate a direct buffer with the given new capacity.
      * The old buffer is invalidated and must not be used after this call.
      *
