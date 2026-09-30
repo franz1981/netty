@@ -23,6 +23,7 @@ import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
@@ -37,6 +38,7 @@ import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
+import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -45,10 +47,11 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * The page store inside a direct {@link AdaptivePoolingAllocator}: size-class chunks as spans of the heaps' segments,
- * reused across size classes, given back by the heaps' decays, and the defaults per memory mode.
+ * The page store inside an {@link AdaptivePoolingAllocator}, of direct or heap memory: size-class chunks as spans of
+ * the heaps' segments, reused across size classes, given back by the heaps' decays, and the defaults per memory mode.
  */
 public class AdaptiveSegmentsTest {
     private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
@@ -146,10 +149,10 @@ public class AdaptiveSegmentsTest {
      * buffer is allocated on its own, and the used memory is the segments, whole.
      */
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void directSizeClassChunksAreSpansOfSegments(final boolean threadLocal) throws Exception {
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void sizeClassChunksAreSpansOfSegments(boolean heap, final boolean threadLocal) throws Exception {
         assumeFalse(isLowMemory() && threadLocal, "low-memory mode has no thread-local heaps");
-        final CountingSegmentSource source = new CountingSegmentSource();
+        final CountingSegmentSource source = new CountingSegmentSource(heap);
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         final int pooled = pooledSizeClassesCount();
         Callable<List<ByteBuf>> work = () -> {
@@ -162,10 +165,9 @@ public class AdaptiveSegmentsTest {
                 assertNotNull(chunk.segment, "size " + size);
                 assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity(), "chunk of size " + size);
                 assertEquals(chunk.capacity() / size, field(chunk, "segments"), "segments of size " + size);
-                long base = chunk.segment.memoryAddress();
-                long address = buf.memoryAddress();
-                assertTrue(address >= base + (long) chunk.spanStart * SLICE_SIZE_BYTES
-                        && address + size <= base + ((long) chunk.spanStart + expectedSlices(size)) * SLICE_SIZE_BYTES,
+                long offset = offsetIn(buf, chunk.segment);
+                assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES
+                        && offset + size <= ((long) chunk.spanStart + expectedSlices(size)) * SLICE_SIZE_BYTES,
                         "size " + size + " outside its span");
                 buf.setLong(0, 0x0123456789ABCDEFL);
                 assertEquals(0x0123456789ABCDEFL, buf.getLong(0));
@@ -181,20 +183,71 @@ public class AdaptiveSegmentsTest {
         }
     }
 
-    /** Heap buffers are untouched: their chunks are allocated one by one, at the sizes of old. */
-    @Test
-    void heapBuffersKeepTheirChunks() throws Exception {
-        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
-        AdaptivePoolingAllocator heap = (AdaptivePoolingAllocator) field(allocator, "heap");
-        assertNull(heap.pageStore);
-        ByteBuf small = allocator.heapBuffer(1024, 1024);
-        assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocator.metric().usedHeapMemory());
-        ByteBuf headered = allocator.heapBuffer(4352, 4352);
-        assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE + 136 * 1024, allocator.metric().usedHeapMemory());
-        assertNull(chunkOf(headered).segment);
-        assertEquals(0, allocator.metric().usedDirectMemory());
-        small.release();
-        headered.release();
+    /**
+     * Buffers of different chunks of one heap segment, each written whole with its own pattern, then read back: no two
+     * overlap. The second round's chunks are re-created with the free lists of the first round's (see
+     * {@link AdaptivePoolingAllocator.SizeClassChunkRecycler}), at other spans.
+     */
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    void buffersOfRecreatedChunksStayInTheirSpans(boolean heap, boolean threadLocal) throws Exception {
+        assumeFalse(isLowMemory() && threadLocal, "low-memory mode has no thread-local heaps");
+        final CountingSegmentSource source = new CountingSegmentSource(heap);
+        final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        final int small = 1024; // 2-slice chunks
+        final int large = isLowMemory() ? 16384 : 65536; // 8-slice chunks
+        Callable<Void> work = () -> {
+            List<Object> firstLists = new ArrayList<Object>();
+            List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+            for (int i = 0; i < 3 * (8 * SLICE_SIZE_BYTES / large); i++) {
+                bufs.add(allocator.allocate(large, large));
+            }
+            for (ByteBuf buf : bufs) {
+                firstLists.add(field(chunkOf(buf), "externalFreeList"));
+                buf.release();
+            }
+            bufs.clear();
+            // The large class keeps one chunk: another class's chunks take the freed spans, at other offsets.
+            for (int i = 0; i < 3 * (2 * SLICE_SIZE_BYTES / small); i++) {
+                bufs.add(allocator.allocate(small, small));
+            }
+            for (int i = 0; i < 3 * (8 * SLICE_SIZE_BYTES / large); i++) {
+                bufs.add(allocator.allocate(large, large));
+            }
+            int recreated = 0;
+            List<SizeClassedChunk> seen = new ArrayList<SizeClassedChunk>();
+            for (int i = 0; i < bufs.size(); i++) {
+                ByteBuf buf = bufs.get(i);
+                SizeClassedChunk chunk = chunkOf(buf);
+                if (!seen.contains(chunk)) {
+                    seen.add(chunk);
+                    recreated += firstLists.contains(field(chunk, "externalFreeList")) && chunk.spanStart != 0 ? 1 : 0;
+                }
+                long offset = offsetIn(buf, chunk.segment);
+                assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES && offset + buf.capacity()
+                        <= (long) chunk.spanStart * SLICE_SIZE_BYTES + chunk.capacity(), "outside its span");
+                for (int j = 0; j < buf.capacity(); j += 8) {
+                    buf.setLong(j, (long) i << 32 | j);
+                }
+            }
+            assertTrue(recreated > 0, "a chunk re-created from recycled lists, not at the segment's start");
+            for (int i = 0; i < bufs.size(); i++) {
+                ByteBuf buf = bufs.get(i);
+                for (int j = 0; j < buf.capacity(); j += 8) {
+                    assertEquals((long) i << 32 | j, buf.getLong(j));
+                }
+                buf.release();
+            }
+            assertAccounted(source, allocator);
+            return null;
+        };
+        if (threadLocal) {
+            onFastThreadLocalThread(work);
+        } else {
+            work.call();
+        }
+        assertEquals(1, source.segmentsAllocated());
+        assertTrue(source.chunks.isEmpty(), "no chunk buffer of its own");
     }
 
     /**
@@ -202,9 +255,10 @@ public class AdaptiveSegmentsTest {
      * size: no new segment. Then decays give everything back: an idle class gives up its chunks, an emptied segment
      * goes to the heap's reserve, and the decays give the reserve back by halves.
      */
-    @Test
-    void spansAreReusedAcrossClassesAndDecaysGiveSegmentsBack() throws Exception {
-        CountingSegmentSource source = new CountingSegmentSource();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void spansAreReusedAcrossClassesAndDecaysGiveSegmentsBack(boolean heap) throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource(heap);
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
         int perChunk = 8 * SLICE_SIZE_BYTES / size;
@@ -261,10 +315,11 @@ public class AdaptiveSegmentsTest {
      * On a thread-local heap every other thread's release is a note. The chunks such releases empty are applied by
      * the owner's decays: an idle class gives them up, and the segment they emptied goes to the heap's reserve.
      */
-    @Test
-    void foreignReleasesEmptyASegmentThroughTheNotes() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void foreignReleasesEmptyASegmentThroughTheNotes(boolean heapMemory) throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final CountingSegmentSource source = new CountingSegmentSource();
+        final CountingSegmentSource source = new CountingSegmentSource(heapMemory);
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         final int size = 65536;
         final int perChunk = 8 * SLICE_SIZE_BYTES / size;
@@ -359,10 +414,11 @@ public class AdaptiveSegmentsTest {
      * A thread-local heap freed (its thread ended) while buffers are still out: its segments stay accounted, and the
      * release of the last buffer of a segment, on another thread, gives the segment back.
      */
-    @Test
-    void segmentsOfAnEndedThreadGoBackWithTheirLastBuffer() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void segmentsOfAnEndedThreadGoBackWithTheirLastBuffer(boolean heap) throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final CountingSegmentSource source = new CountingSegmentSource();
+        final CountingSegmentSource source = new CountingSegmentSource(heap);
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         List<ByteBuf> bufs = onFastThreadLocalThread(() -> {
             List<ByteBuf> out = new ArrayList<ByteBuf>();
@@ -412,8 +468,9 @@ public class AdaptiveSegmentsTest {
 
     /**
      * The defaults: 4 MiB segments in 64-segment regions; 2 MiB segments in low-memory mode, where the single stripe
-     * carves its direct chunks out of segments too; heap buffers never. Regions wherever they can be mapped. The
-     * memory accounted is a segment, with regions or not.
+     * carves its chunks out of segments too. Regions wherever they can be mapped, for direct memory only. The memory
+     * accounted is a segment, with regions or not, direct or heap. A heap reserves up to 8 heap segments, as a direct
+     * heap does without regions.
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
@@ -430,9 +487,16 @@ public class AdaptiveSegmentsTest {
         assertNotNull(chunkOf(buf).segment);
         assertEquals(regions, chunkOf(buf).segment.region != null);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
+        assumeTrue(AdaptivePoolingAllocator.HEAP_SEGMENTS, "heap segments turned off");
+        PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, heapStore.config.segmentSize);
+        assertNull(heapStore.regionSource);
+        assertEquals(8, heapStore.reserveLimit());
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
-        assertNull(chunkOf(heap).segment);
-        assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocator.metric().usedHeapMemory());
+        assertNotNull(chunkOf(heap).segment);
+        assertNull(chunkOf(heap).segment.region);
+        assertSame(chunkOf(heap).segment.buffer.array(), heap.array());
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedHeapMemory());
         buf.release();
         heap.release();
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory(),

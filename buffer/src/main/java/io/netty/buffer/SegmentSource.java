@@ -17,7 +17,8 @@ package io.netty.buffer;
 
 /**
  * Memory for segments: libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf} for the direct
- * allocator. Implementations: the direct chunk allocator and test sources. Called once per segment allocated.
+ * allocator, a {@code byte[]} for the heap allocator. Implementations: the chunk allocators and test sources. Called
+ * once per segment allocated.
  */
 interface SegmentSource {
     /** Freed by {@link AbstractByteBuf#release()}, which may return memory to the OS. */
@@ -25,7 +26,9 @@ interface SegmentSource {
 
     /**
      * A view of {@code segment} (or of a region) that never frees memory, of the class of {@code segment}, so that
-     * the buffers reading a chunk see one class whatever the chunk.
+     * the buffers reading a chunk see one class whatever the chunk. Or {@code segment} itself, never released by its
+     * spans, where a view cannot start at an offset (a heap buffer): a size-class chunk then hands out offsets from
+     * its span's.
      */
     AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
 

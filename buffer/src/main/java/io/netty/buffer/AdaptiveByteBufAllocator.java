@@ -54,9 +54,16 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     }
 
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
+        this(preferDirect, useCacheForNonEventLoopThreads, AdaptivePoolingAllocator.HEAP_SEGMENTS);
+    }
+
+    /** @param heapSegments whether heap chunks are carved out of segments, else allocated one by one */
+    AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads, boolean heapSegments) {
         super(preferDirect);
         direct = new AdaptivePoolingAllocator(new DirectChunkAllocator(this), useCacheForNonEventLoopThreads);
-        heap = new AdaptivePoolingAllocator(new HeapChunkAllocator(this), useCacheForNonEventLoopThreads);
+        HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
+        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads,
+                heapSegments ? heapChunks : null, PageStoreConfig.heapDefaults());
     }
 
     @Override
@@ -89,7 +96,8 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
-    private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    /** Heap chunk buffers, and the segments the size classes carve their chunks out of: one {@code byte[]} each. */
+    private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
         private final ByteBufAllocator allocator;
 
         private HeapChunkAllocator(ByteBufAllocator allocator) {
@@ -101,6 +109,16 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
             return PlatformDependent.hasUnsafe() ?
                     new UnpooledUnsafeHeapByteBuf(allocator, initialCapacity, maxCapacity) :
                     new UnpooledHeapByteBuf(allocator, initialCapacity, maxCapacity);
+        }
+
+        @Override
+        public AbstractByteBuf allocateSegment(int size) {
+            return allocate(size, size);
+        }
+
+        @Override
+        public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
+            return segment;
         }
     }
 

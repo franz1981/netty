@@ -24,6 +24,8 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledForJreRange;
 import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -49,8 +51,9 @@ public class JfrEventsTest {
         return new PooledByteBufAllocator(preferDirect);
     }
 
+    /** Heap chunks allocated one by one, no segments: the tests count the events of those chunks. */
     AdaptiveByteBufAllocator newAdaptiveAllocator(boolean preferDirect) {
-        return new AdaptiveByteBufAllocator(preferDirect);
+        return new AdaptiveByteBufAllocator(preferDirect, false, false);
     }
 
     /**
@@ -69,7 +72,7 @@ public class JfrEventsTest {
             stream.startAsync();
 
             // useCacheForNonEventLoopThreads=false -> shared path, so chunkRecycler is non-null
-            AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, false);
+            AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, false, false);
             int buffersPerChunk = 512;
             List<ByteBuf> bufs = new ArrayList<ByteBuf>();
 
@@ -109,12 +112,13 @@ public class JfrEventsTest {
         Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
-        // useCacheForNonEventLoopThreads: the workload thread gets a thread-local heap, which its end frees.
-        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, true);
+        // useCacheForNonEventLoopThreads: the workload thread gets a thread-local heap, which its end frees. Heap
+        // chunks allocated one by one: no segments.
+        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, true, false);
         final String threadName = "adaptive-chunk-events";
-        // A one-shot chunk of a size nothing else allocates, committed after the workload: events arrive in the
-        // order they were committed, so once it is seen every event of the workload has been.
-        final int sentinel = 3 * 1024 * 1024 + 4099;
+        // A one-shot chunk of a size nothing else allocates, above a segment, committed after the workload: events
+        // arrive in the order they were committed, so once it is seen every event of the workload has been.
+        final int sentinel = 5 * 1024 * 1024 + 4099;
         final CountDownLatch sentinelSeen = new CountDownLatch(1);
         final long[] allocatedFreed = new long[2];
         final int[] oneShots = new int[2];
@@ -175,22 +179,24 @@ public class JfrEventsTest {
     }
 
     /**
-     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment
-     * (a span fires none; a segment of a region fires them when first taken and when purged or unmapped), and
+     * The same balance for memory whose size-class chunks are spans of segments, direct or heap: the events are per
+     * segment (a span fires none; a segment of a region fires them when first taken and when purged or unmapped), and
      * a segment still holding a buffer when its thread-local heap dies goes back when another thread releases that
      * buffer, with its events on that thread.
      */
     @SuppressWarnings("Since15")
-    @Test
-    public void adaptiveDirectChunkEventsAddUpToUsedMemory() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void adaptiveSegmentChunkEventsAddUpToUsedMemory(final boolean direct) throws Exception {
         Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
         final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
-        final int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
-        assumeTrue(segmentSize > 0, "direct chunks are not carved out of segments");
-        final String threadName = "adaptive-direct-chunk-events";
-        final int sentinel = 3 * 1024 * 1024 + 4099;
+        final int segmentSize = direct ? AdaptiveByteBufAllocatorTest.directSegmentSize(alloc) :
+                AdaptiveByteBufAllocatorTest.heapSegmentSize(alloc);
+        assumeTrue(segmentSize > 0, "chunks are not carved out of segments");
+        final String threadName = "adaptive-segment-chunk-events";
+        final int sentinel = 5 * 1024 * 1024 + 4099;
         final CountDownLatch sentinelSeen = new CountDownLatch(1);
         final long[] allocatedFreed = new long[2];
         final int[] oneShots = new int[2];
@@ -228,13 +234,13 @@ public class JfrEventsTest {
 
             Thread thread = new FastThreadLocalThread(() -> {
                 // Spans of 8 slices: the 16 KiB burst fills a segment, the 64 KiB one reuses its spans.
-                releaseAll(allocateManyDirect(alloc, 16 * 1024, 32 * 8));
-                releaseAll(allocateManyDirect(alloc, 64 * 1024, 8 * 8));
-                alloc.directBuffer(4 * 1024 * 1024).release();
-                releaseAll(allocateManyDirect(alloc, 512 * 1024, 8));
+                releaseAll(allocateMany(alloc, direct, 16 * 1024, 32 * 8));
+                releaseAll(allocateMany(alloc, direct, 64 * 1024, 8 * 8));
+                allocateMany(alloc, direct, 4 * 1024 * 1024, 1).get(0).release();
+                releaseAll(allocateMany(alloc, direct, 512 * 1024, 8));
                 // The size classes go idle and give their spans back: the emptied segment waits in the cache.
-                decayThreadLocalHeap(alloc, "direct", 3);
-                heldPastTheEnd[0] = alloc.directBuffer(1024, 1024);
+                decayThreadLocalHeap(alloc, direct ? "direct" : "heap", 3);
+                heldPastTheEnd[0] = allocateMany(alloc, direct, 1024, 1).get(0);
             }, threadName);
             thread.start();
             thread.join();
@@ -247,14 +253,15 @@ public class JfrEventsTest {
         }
         assertTrue(segments[0] > 0, "segments are announced");
         assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload threads");
-        long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc);
+        long unit = segmentSize;
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment");
         }
         // The 4 MiB buffer and the 512 KiB ones take whole segments of the page store: segment events, no one-shot.
         assertEquals(0, oneShots[0], "no chunk is allocated outside the page store");
         assertEquals(0, oneShots[1]);
-        assertEquals(alloc.metric().usedDirectMemory(), allocatedFreed[0] - allocatedFreed[1],
+        assertEquals(direct ? alloc.metric().usedDirectMemory() : alloc.metric().usedHeapMemory(),
+                allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
     }
 
@@ -263,10 +270,10 @@ public class JfrEventsTest {
         return event.getBoolean("segment");
     }
 
-    private static List<ByteBuf> allocateManyDirect(ByteBufAllocator alloc, int size, int count) {
+    private static List<ByteBuf> allocateMany(ByteBufAllocator alloc, boolean direct, int size, int count) {
         List<ByteBuf> bufs = new ArrayList<ByteBuf>(count);
         for (int i = 0; i < count; i++) {
-            bufs.add(alloc.directBuffer(size, size));
+            bufs.add(direct ? alloc.directBuffer(size, size) : alloc.heapBuffer(size, size));
         }
         return bufs;
     }

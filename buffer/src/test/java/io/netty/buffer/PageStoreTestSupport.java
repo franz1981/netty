@@ -18,6 +18,7 @@ package io.netty.buffer;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.util.internal.PlatformDependent;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,6 +33,7 @@ import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 /**
  * Real memory sources that count what they hand out, and allocators built on them: the page store's accounting goes
@@ -48,30 +50,49 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Direct segments counted as they are allocated and freed; also the chunk allocator of the allocator under test,
-     * for the chunks that are not carved from segments.
+     * Direct or heap segments counted as they are allocated and freed; also the chunk allocator of the allocator under
+     * test, for the chunks that are not carved from segments. The heap one does what the heap allocator's does: a
+     * {@code byte[]} per segment or chunk, and a span is the segment itself.
      */
     static final class CountingSegmentSource
             implements SegmentSource, AdaptivePoolingAllocator.ChunkAllocator {
+        final boolean heap;
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
 
+        CountingSegmentSource() {
+            this(false);
+        }
+
+        CountingSegmentSource(boolean heap) {
+            this.heap = heap;
+        }
+
+        private AbstractByteBuf newBuffer(int initialCapacity, int maxCapacity) {
+            ByteBufAllocator alloc = UnpooledByteBufAllocator.DEFAULT;
+            if (!heap) {
+                return UnsafeByteBufUtil.newDirectByteBuf(alloc, initialCapacity, maxCapacity);
+            }
+            return PlatformDependent.hasUnsafe() ? new UnpooledUnsafeHeapByteBuf(alloc, initialCapacity, maxCapacity) :
+                    new UnpooledHeapByteBuf(alloc, initialCapacity, maxCapacity);
+        }
+
         @Override
         public synchronized AbstractByteBuf allocateSegment(int size) {
-            AbstractByteBuf buf = UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size);
+            AbstractByteBuf buf = newBuffer(size, size);
             segments.add(buf);
             return buf;
         }
 
         @Override
         public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
-            return AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, segment, offset, length);
+            return heap ? segment :
+                    AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, segment, offset, length);
         }
 
         @Override
         public synchronized AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
-            AbstractByteBuf buf = UnsafeByteBufUtil.newDirectByteBuf(
-                    UnpooledByteBufAllocator.DEFAULT, initialCapacity, maxCapacity);
+            AbstractByteBuf buf = newBuffer(initialCapacity, maxCapacity);
             chunks.add(buf);
             return buf;
         }
@@ -152,6 +173,18 @@ final class PageStoreTestSupport {
             }
             return live;
         }
+    }
+
+    /**
+     * Where {@code buf}'s memory starts in {@code segment}, which holds it: by address for direct memory, by array
+     * offset for heap memory, which must be the segment's own array.
+     */
+    static long offsetIn(ByteBuf buf, Segment segment) {
+        if (segment.buffer.hasArray()) {
+            assertSame(segment.buffer.array(), buf.array(), "not the segment's array");
+            return buf.arrayOffset() - segment.buffer.arrayOffset();
+        }
+        return buf.memoryAddress() - segment.memoryAddress();
     }
 
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {

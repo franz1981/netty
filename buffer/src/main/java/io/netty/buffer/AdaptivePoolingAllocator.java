@@ -81,13 +81,12 @@ import java.util.function.IntConsumer;
  * Chunks that are given up are kept for reuse, bounded per heap, and freed beyond that. Their buffers go to a
  * {@link SizeClassChunkRecycler} so a chunk of another size class can be built from the same memory.
  * <p>
- * For direct memory the size classes do not allocate their chunks one by one: each heap takes uniform
- * {@link Segment}s (4 MiB) and carves every size-class chunk out of one as a span of 64 KiB slices (see
- * {@link HeapSegments}); a chunk given up frees its span at once, for any chunk size of the heap, and a segment that
- * empties is kept whole in its heap's reserve, or given back to the allocator's {@link PageStore}; the heap's decays
- * give idle reserved segments back by halves. Where they can be mapped, segments are slots of {@code mmap} regions,
- * whose idle slots the decays purge. The buffers above the size classes keep their own chunks. Heap memory keeps
- * chunks allocated one by one.
+ * The size classes do not allocate their chunks one by one: each heap takes uniform {@link Segment}s (4 MiB) and
+ * carves every size-class chunk out of one as a span of 64 KiB slices (see {@link HeapSegments}); a chunk given up
+ * frees its span at once, for any chunk size of the heap, and a segment that empties is kept whole in its heap's
+ * reserve, or given back to the allocator's {@link PageStore}; the heap's decays give idle reserved segments back by
+ * halves. For direct memory, where they can be mapped, segments are slots of {@code mmap} regions, whose idle slots
+ * the decays purge. For heap memory a segment is one {@code byte[]}, given back to the GC.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -150,8 +149,8 @@ final class AdaptivePoolingAllocator {
      * emptied by releases the heap could not apply at once (another thread's, on a thread-local heap or a busy
      * stripe) counts from the heap's next slow path or decay, which applies them.
      * <p>
-     * No effect with a {@link PageStore} (direct memory, by default): there buffers above the size classes are spans
-     * of their heap's segments, see {@link SpanMagazine}.
+     * No effect with a {@link PageStore} (the default): there buffers above the size classes are spans of their
+     * heap's segments, see {@link SpanMagazine}.
      */
     static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
@@ -188,11 +187,13 @@ final class AdaptivePoolingAllocator {
 
     /**
      * {@code io.netty.allocator.directSegments}: whether the size classes of a direct allocator carve their chunks out
-     * of {@link Segment}s (see {@link HeapSegments}) instead of allocating each chunk on its own. Default: true. A heap
-     * allocator never does.
+     * of {@link Segment}s (see {@link HeapSegments}) instead of allocating each chunk on its own. Default: true.
      */
     private static final boolean DIRECT_SEGMENTS =
             SystemPropertyUtil.getBoolean("io.netty.allocator.directSegments", true);
+
+    /** {@code io.netty.allocator.heapSegments}: as {@link #DIRECT_SEGMENTS}, for a heap allocator. Default: true. */
+    static final boolean HEAP_SEGMENTS = SystemPropertyUtil.getBoolean("io.netty.allocator.heapSegments", true);
 
     static {
         warnIfSet("io.netty.allocator.chunkPurgePollsThreadLocal",
@@ -1034,7 +1035,7 @@ final class AdaptivePoolingAllocator {
      * A heap that keeps allocating keeps what it reuses and gives back by halves what it stopped needing; a heap that
      * stops allocating keeps its memory until it is freed.
      * <p>
-     * With segments (direct memory), a size class that gives up its chunks frees their spans at once, and a segment
+     * With segments (the default), a size class that gives up its chunks frees their spans at once, and a segment
      * they empty goes to the heap's reserve, whose decays give back half, rounded up, of what stayed unused through the
      * whole interval (see {@link HeapSegments#decay}). With regions, the heap's decay ticks also purge the memory of
      * its segments' free slices and of the store's free slots that stayed free for the page store's own delay,
@@ -2104,10 +2105,11 @@ final class AdaptivePoolingAllocator {
             return MpscIntQueue.create(chunkSize / segmentSize, SizeClassedChunk.FREE_LIST_EMPTY);
         }
 
-        private MpscIntQueue createFreeList() {
+        /** @param base where the chunk's buffers start in its buffer: see {@link SizeClassedChunk} */
+        private MpscIntQueue createFreeList(int base) {
             final int segmentsCount = chunkSize / segmentSize;
             final MpscIntQueue freeList = MpscIntQueue.create(segmentsCount, SizeClassedChunk.FREE_LIST_EMPTY);
-            int segmentOffset = 0;
+            int segmentOffset = base;
             for (int i = 0; i < segmentsCount; i++) {
                 freeList.offer(segmentOffset);
                 segmentOffset += segmentSize;
@@ -2115,9 +2117,9 @@ final class AdaptivePoolingAllocator {
             return freeList;
         }
 
-        private IntStack createLocalFreeList() {
+        private IntStack createLocalFreeList(int base) {
             final int segmentsCount = chunkSize / segmentSize;
-            int segmentOffset = chunkSize;
+            int segmentOffset = base + chunkSize;
             int[] offsets = new int[segmentsCount];
             for (int i = 0; i < segmentsCount; i++) {
                 segmentOffset -= segmentSize;
@@ -2155,11 +2157,11 @@ final class AdaptivePoolingAllocator {
                 MpscIntQueue recycledFL = recycler.takeFreeList();
                 IntStack recycledLocal = recycler.takeLocalFreeList();
                 // Still counted in usedMemory() since the recycler took it: nothing to announce.
-                return new SizeClassedChunk(recycledBuf, recycledFL, recycledLocal, magazine, this, null, 0);
+                return new SizeClassedChunk(recycledBuf, recycledFL, recycledLocal, magazine, this, null, 0, 0);
             }
             AbstractByteBuf chunkBuffer = chunkAllocator.allocate(chunkSize, chunkSize);
             assert chunkBuffer.capacity() == chunkSize;
-            SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this, null, 0);
+            SizeClassedChunk chunk = new SizeClassedChunk(chunkBuffer, magazine, this, null, 0, 0);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.ownerThread != null);
             return chunk;
         }
@@ -2176,14 +2178,16 @@ final class AdaptivePoolingAllocator {
             int start = heapSegments.claimedStart();
             try {
                 AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices);
+                // A heap segment is its own span: the chunk's buffers start at the span's offset in it.
+                int base = span == segment.buffer ? start * segment.sliceSize : 0;
                 if (recycler.poll(magazine.sizeClassIndex)) {
                     AbstractByteBuf none = recycler.takeBuffer();
                     assert none == null;
                     MpscIntQueue recycledFL = recycler.takeFreeList();
                     IntStack recycledLocal = recycler.takeLocalFreeList();
-                    return new SizeClassedChunk(span, recycledFL, recycledLocal, magazine, this, segment, start);
+                    return new SizeClassedChunk(span, recycledFL, recycledLocal, magazine, this, segment, start, base);
                 }
-                return new SizeClassedChunk(span, magazine, this, segment, start);
+                return new SizeClassedChunk(span, magazine, this, segment, start, base);
             } catch (Throwable t) {
                 heapSegments.release(segment, start, slices);
                 throw t;
@@ -3144,9 +3148,14 @@ final class AdaptivePoolingAllocator {
          *               {@link SizeClassChunkRecycler}, or is a one-shot chunk for a single buffer
          */
         Chunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, boolean pooled) {
+            this(delegate, allocator, pooled, delegate.capacity());
+        }
+
+        /** @param capacity the bytes of {@code delegate} this chunk hands out: all of them, unless it is a span */
+        Chunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, boolean pooled, int capacity) {
             this.delegate = delegate;
             this.pooled = pooled;
-            capacity = delegate.capacity();
+            this.capacity = capacity;
             this.allocator = allocator;
         }
 
@@ -3226,8 +3235,8 @@ final class AdaptivePoolingAllocator {
             return stack.length;
         }
 
-        void refill(int count, int segmentSize) {
-            int offset = count * segmentSize;
+        void refill(int count, int segmentSize, int base) {
+            int offset = base + count * segmentSize;
             for (int i = 0; i < count; i++) {
                 offset -= segmentSize;
                 stack[i] = offset;
@@ -3302,10 +3311,12 @@ final class AdaptivePoolingAllocator {
 
         /**
          * @param segment   the segment {@code delegate} is a span of, from slice {@code spanStart}, or {@code null}
+         * @param base      where the chunk's buffers start in {@code delegate}: 0, or the span's offset when
+         *                  {@code delegate} is the whole segment's buffer (see {@link SegmentSource#span})
          */
         SizeClassedChunk(AbstractByteBuf delegate, SizeClassMagazine magazine,
-                         SizeClassChunkController controller, Segment segment, int spanStart) {
-            super(delegate, magazine.allocator, true);
+                         SizeClassChunkController controller, Segment segment, int spanStart, int base) {
+            super(delegate, magazine.allocator, true, controller.chunkSize);
             this.segment = segment;
             this.spanStart = spanStart;
             heapSegments = magazine.heapSegments;
@@ -3315,11 +3326,11 @@ final class AdaptivePoolingAllocator {
             ownerThread = magazine.ownerThread;
             owningCache = magazine.chunkCache;
             if (ownerThread == null) {
-                externalFreeList = controller.createFreeList();
+                externalFreeList = controller.createFreeList(base);
                 localFreeList = controller.createEmptyLocalFreeList();
             } else {
                 externalFreeList = controller.createEmptyFreeList();
-                localFreeList = controller.createLocalFreeList();
+                localFreeList = controller.createLocalFreeList(base);
             }
         }
 
@@ -3331,8 +3342,8 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk(AbstractByteBuf recycledDelegate, MpscIntQueue recycledFreeList,
                          IntStack recycledLocalFreeList,
                          SizeClassMagazine magazine, SizeClassChunkController controller,
-                         Segment segment, int spanStart) {
-            super(recycledDelegate, magazine.allocator, true);
+                         Segment segment, int spanStart, int base) {
+            super(recycledDelegate, magazine.allocator, true, controller.chunkSize);
             this.segment = segment;
             this.spanStart = spanStart;
             heapSegments = magazine.heapSegments;
@@ -3348,19 +3359,32 @@ final class AdaptivePoolingAllocator {
             if (ownerThread != null) {
                 if (reuseLocal) {
                     localFreeList = recycledLocalFreeList;
-                    localFreeList.refill(segments, segmentSize);
+                    localFreeList.refill(segments, segmentSize, base);
                 } else {
-                    localFreeList = controller.createLocalFreeList();
+                    localFreeList = controller.createLocalFreeList(base);
                 }
                 externalFreeList.resetAndFill(0, segmentSize);
             } else {
                 if (reuseLocal) {
                     localFreeList = recycledLocalFreeList;
-                    localFreeList.refill(0, segmentSize);
+                    localFreeList.refill(0, segmentSize, 0);
                 } else {
                     localFreeList = controller.createEmptyLocalFreeList();
                 }
-                externalFreeList.resetAndFill(segments, segmentSize);
+                fill(externalFreeList, segments, segmentSize, base);
+            }
+        }
+
+        /** {@link MpscIntQueue#resetAndFill}, from {@code base}. */
+        private static void fill(MpscIntQueue freeList, int count, int stride, int base) {
+            if (base == 0) {
+                freeList.resetAndFill(count, stride);
+                return;
+            }
+            freeList.resetAndFill(0, stride);
+            for (int i = 0, offset = base; i < count; i++, offset += stride) {
+                boolean offered = freeList.offer(offset);
+                assert offered;
             }
         }
 
