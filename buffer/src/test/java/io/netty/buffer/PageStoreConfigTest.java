@@ -61,26 +61,24 @@ final class PageStoreConfigTest {
 
     /**
      * The property: 0 stays off; any other value is rounded to the nearest multiple of the segment size, clamped
-     * from {@link PageStoreConfig#defaultRegionSize} up to 64 segments, rather than rejected.
+     * from 2 up to 64 segments, rather than rejected. The default is the largest.
      */
     @Test
     void badRegionSizesAreClampedToTheNearestValid() {
-        int fallback = PageStoreConfig.defaultRegionSize(SEGMENT_SIZE);
-        assertEquals(36 * MIB, fallback);
-        assertEquals(34 * MIB, PageStoreConfig.defaultRegionSize(2 * MIB));
+        assertEquals(256 * MIB, PageStoreConfig.defaultRegionSize(SEGMENT_SIZE));
+        assertEquals(128 * MIB, PageStoreConfig.defaultRegionSize(2 * MIB));
         assertEquals(0, PageStoreConfig.regionSizeOf(0, SEGMENT_SIZE));
         assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(36 * MIB, SEGMENT_SIZE));
-        assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(40 * MIB, SEGMENT_SIZE));
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(256 * MIB, SEGMENT_SIZE));
         // Below the floor: clamped up to it.
-        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(-1, SEGMENT_SIZE));
-        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(4 * MIB, SEGMENT_SIZE));
-        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(32 * MIB, SEGMENT_SIZE));
+        assertEquals(8 * MIB, PageStoreConfig.regionSizeOf(-1, SEGMENT_SIZE));
+        assertEquals(8 * MIB, PageStoreConfig.regionSizeOf(4 * MIB, SEGMENT_SIZE));
         // Not a multiple of the segment size: rounded to the nearest one.
         assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(34 * MIB, SEGMENT_SIZE));
         assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(38 * MIB, SEGMENT_SIZE));
         // Above the ceiling: clamped down to it.
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(260 * MIB, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(Integer.MAX_VALUE, SEGMENT_SIZE));
         // The config itself: 2 to 64 whole segments, a power-of-two alignment.
         assertRejected(SEGMENT_SIZE, SEGMENT_SIZE, REGION_ALIGNMENT);
         assertRejected(SEGMENT_SIZE, 65 * SEGMENT_SIZE, REGION_ALIGNMENT);

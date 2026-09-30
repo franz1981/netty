@@ -103,24 +103,21 @@ final class PageStoreTestSupport {
         }
     }
 
-    /** Regions from the direct allocator's malloc source, counted. */
+    /**
+     * Regions counted as they are mapped: {@code mmap} where {@link MmapRegionSource} is available, else plain direct
+     * buffers (untouched {@code malloc} memory, unaligned).
+     */
     static final class CountingRegionSource implements RegionSource {
-        private final RegionSource delegate =
-                new AdaptiveByteBufAllocator.MallocRegionSource(UnpooledByteBufAllocator.DEFAULT);
+        final MmapRegionSource mmap = MmapRegionSource.isAvailable() ?
+                new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) : null;
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
-        final List<Integer> allocatedBytes = new ArrayList<Integer>();
 
         @Override
         public synchronized AbstractByteBuf allocateRegion(int size, int alignment) {
-            AbstractByteBuf region = delegate.allocateRegion(size, alignment);
+            AbstractByteBuf region = mmap != null ? mmap.allocateRegion(size, alignment) :
+                    UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size);
             regions.add(region);
-            allocatedBytes.add(delegate.allocatedBytes(region));
             return region;
-        }
-
-        @Override
-        public int allocatedBytes(AbstractByteBuf region) {
-            return delegate.allocatedBytes(region);
         }
 
         synchronized int live() {
@@ -129,14 +126,6 @@ final class PageStoreTestSupport {
                 live += region.refCnt() > 0 ? 1 : 0;
             }
             return live;
-        }
-
-        synchronized long unreleasedBytes() {
-            long bytes = 0;
-            for (int i = 0; i < regions.size(); i++) {
-                bytes += regions.get(i).refCnt() > 0 ? allocatedBytes.get(i) : 0;
-            }
-            return bytes;
         }
     }
 
@@ -164,9 +153,23 @@ final class PageStoreTestSupport {
         assertEquals(source.unreleasedBytes(), allocator.usedMemory(), "usedMemory() and the segment source disagree");
     }
 
+    /**
+     * The used memory is the segments allocated on their own and not freed, plus the committed slots of the regions:
+     * see {@link PageStore}.
+     */
     static void assertAccounted(CountingSegmentSource segments, CountingRegionSource regions,
                                 AdaptivePoolingAllocator allocator) {
-        assertEquals(segments.unreleasedBytes() + regions.unreleasedBytes(), allocator.usedMemory(),
-                "usedMemory() and what the sources handed out disagree");
+        assertEquals(segments.unreleasedBytes() + committedSlots(allocator.pageStore) * (long) SEGMENT_SIZE,
+                allocator.usedMemory(), "usedMemory() and what the sources handed out disagree");
+    }
+
+    static int committedSlots(PageStore store) {
+        int committed = 0;
+        for (Region region : store.regions) {
+            for (boolean slot : region.committed) {
+                committed += slot ? 1 : 0;
+            }
+        }
+        return committed;
     }
 }

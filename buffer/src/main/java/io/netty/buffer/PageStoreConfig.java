@@ -38,42 +38,33 @@ final class PageStoreConfig {
      */
     static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
-    /**
-     * glibc's dynamic mmap threshold never rises above {@code DEFAULT_MMAP_THRESHOLD_MAX}, 32 MiB on 64-bit, and a
-     * chunk above it never moves the threshold: a {@code malloc} above 32 MiB is always an {@code mmap}, its
-     * {@code free} always a {@code munmap}, so it leaves no hole in an arena (glibc {@code malloc.c}: the max at 901,
-     * the mmap test {@code nb >= mp_.mmap_threshold} at 2351, the ratchet on free, bounded by the max, at 4404-4409).
-     */
-    static final int MALLOC_MMAP_THRESHOLD_MAX_BYTES = 32 * 1024 * 1024;
     /** A direct allocator's regions start at a multiple of 2 MiB, so that a THP-enabled kernel can back them whole. */
     static final int REGION_ALIGNMENT_BYTES = 2 * 1024 * 1024;
     /**
      * {@code io.netty.allocator.segmentRegionSize}: the size of the regions a direct allocator carves its
-     * {@link Segment}s out of (see {@link RegionPool}), rounded to the nearest multiple of the segment size from
-     * {@link #defaultRegionSize} up to {@link Long#SIZE} segments; 0: no regions, one allocation per segment.
-     * Default: the smallest valid size (36 MiB with 4 MiB segments), 0 in low-memory mode. Used only where
-     * allocating direct memory leaves it untouched ({@code PlatformDependent#directAllocationLeavesMemoryUntouched}):
-     * where it is zeroed at allocation, a region would cost its whole size at once.
+     * {@link Segment}s out of (see {@link PageStore}), rounded to the nearest multiple of the segment size from 2 up to
+     * {@link Long#SIZE} segments; 0: no regions, one allocation per segment. Default: {@link Long#SIZE} segments
+     * (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a segment's pages are committed
+     * as they are touched. Regions need a {@link RegionSource}, {@link MmapRegionSource} for the direct allocator.
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
-            "io.netty.allocator.segmentRegionSize",
-            AdaptivePoolingAllocator.IS_LOW_MEM ? 0 : defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
+            "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
 
-    /** The smallest multiple of {@code segmentSize} above {@link #MALLOC_MMAP_THRESHOLD_MAX_BYTES}. */
+    /** The largest: one bit per segment in one {@code long}. */
     static int defaultRegionSize(int segmentSize) {
-        return (MALLOC_MMAP_THRESHOLD_MAX_BYTES / segmentSize + 1) * segmentSize;
+        return Long.SIZE * segmentSize;
     }
 
     /**
-     * 0, or {@code size} rounded to the nearest multiple of {@code segmentSize} from {@link #defaultRegionSize} up
-     * to {@link Long#SIZE} segments: {@link #SEGMENT_SIZE_BYTES} is always a multiple of
-     * {@link #REGION_ALIGNMENT_BYTES}, so the regions this yields always keep it.
+     * 0, or {@code size} rounded to the nearest multiple of {@code segmentSize} from 2 up to {@link Long#SIZE}
+     * segments: {@link #SEGMENT_SIZE_BYTES} is always a multiple of {@link #REGION_ALIGNMENT_BYTES}, so the regions
+     * this yields always keep it.
      */
     static int regionSizeOf(int size, int segmentSize) {
         if (size == 0) {
             return 0;
         }
-        long min = defaultRegionSize(segmentSize);
+        long min = 2L * segmentSize;
         long max = (long) Long.SIZE * segmentSize;
         long rounded = Math.round((double) size / segmentSize) * (long) segmentSize;
         return (int) Math.max(min, Math.min(max, rounded));

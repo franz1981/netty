@@ -57,7 +57,6 @@ final class MmapRegionSourceTest {
             long address = MmapRegionSource.addressOf(region);
             assertEquals(0, address & ALIGNMENT - 1);
             assertEquals(REGION_SIZE, region.capacity());
-            assertEquals(REGION_SIZE, source.allocatedBytes(region));
             assertTrue(region.isDirect());
             assertEquals(0, region.getLong(0));
             assertEquals(0, region.getLong(REGION_SIZE - 8));

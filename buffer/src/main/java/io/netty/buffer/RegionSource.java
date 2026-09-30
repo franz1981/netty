@@ -16,20 +16,10 @@
 package io.netty.buffer;
 
 /**
- * Memory for regions: aligned {@code malloc} for the direct allocator. Implementations: {@code MallocRegionSource}
- * and test sources. Called once per region allocated; a region is freed whole by {@link AbstractByteBuf#release()}.
+ * Memory for regions: address space whose pages cost nothing until touched. Implementations: {@link MmapRegionSource}
+ * and test sources. Called once per region; a region is given back whole by {@link AbstractByteBuf#release()}.
  */
 interface RegionSource {
-    /**
-     * A new region of exactly {@code size} bytes, starting at a multiple of {@code alignment} if this source can
-     * (0: any address).
-     */
+    /** A new region of exactly {@code size} bytes, untouched, starting at a multiple of {@code alignment} (0: any). */
     AbstractByteBuf allocateRegion(int size, int alignment);
-
-    /**
-     * The bytes allocated for {@code region}, which it holds until released: its capacity, or more when aligning
-     * it took more (an over-allocation). What {@link AdaptivePoolingAllocator#usedMemory()} and the chunk events
-     * account for it.
-     */
-    int allocatedBytes(AbstractByteBuf region);
 }

@@ -212,11 +212,6 @@ final class MmapRegionSource implements RegionSource {
         return UnsafeByteBufUtil.newDirectByteBuf(allocator, new Mapping(buffer, start));
     }
 
-    @Override
-    public int allocatedBytes(AbstractByteBuf region) {
-        return region.capacity();
-    }
-
     /**
      * {@code madvise(MADV_DONTNEED)} on {@code length} bytes of {@code region} from {@code offset}, whole pages: one
      * system call, and one TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.

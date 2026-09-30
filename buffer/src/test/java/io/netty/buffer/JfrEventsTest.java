@@ -175,8 +175,8 @@ public class JfrEventsTest {
     }
 
     /**
-     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment,
-     * or per region when segments are carved out of regions (a span fires none, nor does a segment of a region), and
+     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment
+     * (a span fires none; a segment of a region fires them when first taken and when purged or unmapped), and
      * a segment still holding a buffer when its thread-local heap dies goes back when another thread releases that
      * buffer, with its events on that thread.
      */
@@ -249,7 +249,7 @@ public class JfrEventsTest {
         assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload threads");
         long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc);
         for (int capacity : units) {
-            assertEquals(unit, capacity, "segment events have the size of a segment, or of a region");
+            assertEquals(unit, capacity, "segment events have the size of a segment");
         }
         assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
         assertEquals(1, oneShots[1], "and when it is freed");
@@ -259,7 +259,7 @@ public class JfrEventsTest {
 
     @SuppressWarnings("Since15")
     private static boolean isPageStore(RecordedEvent event) {
-        return event.getBoolean("segment") || event.getBoolean("region");
+        return event.getBoolean("segment");
     }
 
     private static List<ByteBuf> allocateManyDirect(ByteBufAllocator alloc, int size, int count) {
@@ -488,14 +488,12 @@ public class JfrEventsTest {
             alloc.directBuffer(128).release();
 
             RecordedEvent allocate = allocateFuture.get();
-            // A direct size class takes a segment and carves its chunk out of it: the segment, or the region it is
-            // carved out of, is the event.
+            // A direct size class takes a segment and carves its chunk out of it: the segment is the event, a
+            // region's or not.
             int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
-            boolean regions = AdaptiveByteBufAllocatorTest.directRegions(alloc);
-            assertEquals(segmentSize > 0 ? AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc)
-                            : AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocate.getInt("capacity"));
-            assertEquals(segmentSize > 0 && !regions, allocate.getBoolean("segment"));
-            assertEquals(regions, allocate.getBoolean("region"));
+            assertEquals(segmentSize > 0 ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
+                    allocate.getInt("capacity"));
+            assertEquals(segmentSize > 0, allocate.getBoolean("segment"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
             assertTrue(allocate.getBoolean("direct"));

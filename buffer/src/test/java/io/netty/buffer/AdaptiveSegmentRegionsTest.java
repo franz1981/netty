@@ -17,7 +17,6 @@ package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
-import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -32,8 +31,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Regions inside a direct {@link AdaptivePoolingAllocator}: size-class buffers land in region memory, and the defaults
- * per memory mode.
+ * Regions inside a direct {@link AdaptivePoolingAllocator}: size-class buffers land in region memory, and the
+ * defaults.
  */
 public class AdaptiveSegmentRegionsTest {
     private final CountingSegmentSource segments = new CountingSegmentSource();
@@ -66,21 +65,16 @@ public class AdaptiveSegmentRegionsTest {
     }
 
     /**
-     * Low-memory mode has no regions by default; otherwise 36 MiB regions aligned to 2 MiB, used where allocating
-     * leaves the memory untouched.
+     * The defaults, in both memory modes: 64-segment regions aligned to 2 MiB, used wherever they can be mapped.
      */
     @Test
-    void lowMemoryModeHasNoRegions() throws Exception {
+    void regionsWhereverTheyCanBeMapped() {
         org.junit.jupiter.api.Assumptions.assumeTrue(
                 System.getProperty("io.netty.allocator.segmentRegionSize") == null, "set explicitly");
-        java.lang.reflect.Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
-        f.setAccessible(true);
-        boolean lowMemory = f.getBoolean(null);
         PageStoreConfig direct = PageStoreConfig.directDefaults();
-        assertEquals(lowMemory ? 0 : REGION_SIZE, direct.regionSize);
+        assertEquals(Long.SIZE * direct.segmentSize, direct.regionSize);
         assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
-        assertEquals(!lowMemory && PlatformDependent.directAllocationLeavesMemoryUntouched(),
-                AdaptiveByteBufAllocatorTest.directRegions(allocator));
+        assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.directRegions(allocator));
     }
 }

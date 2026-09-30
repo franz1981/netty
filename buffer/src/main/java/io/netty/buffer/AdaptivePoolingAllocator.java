@@ -598,9 +598,8 @@ final class AdaptivePoolingAllocator {
      * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, spare or not, or
      * a heap that was freed while spans were still out): the events are per
      * segment, and the size-class chunks carved out of a segment as spans fire none, since their memory never leaves
-     * the allocator. With a {@link PageStore#regionPool}, the unit is the {@link Region} instead, counted for what was
-     * allocated for it (its alignment included), from its allocation to its free: the segments carved out of it fire
-     * no events, wherever they are.
+     * the allocator. With {@link PageStore#regions}, a segment is a slot of a region, counted from the first time it
+     * is taken to the close: see {@link PageStore}.
      */
     long usedMemory() {
         return chunkRegistry.totalCapacity();
@@ -622,7 +621,6 @@ final class AdaptivePoolingAllocator {
                 event.pooled = pooled;
                 event.threadLocal = threadLocal;
                 event.segment = chunk instanceof Segment;
-                event.region = chunk instanceof Region;
                 event.commit();
             }
         }
@@ -641,7 +639,6 @@ final class AdaptivePoolingAllocator {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
                 event.segment = chunk instanceof Segment;
-                event.region = chunk instanceof Region;
                 event.commit();
             }
         }
@@ -679,6 +676,9 @@ final class AdaptivePoolingAllocator {
     private void free() {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
+        }
+        if (pageStore != null) {
+            pageStore.close();
         }
     }
 

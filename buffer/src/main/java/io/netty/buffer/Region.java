@@ -15,36 +15,68 @@
  */
 package io.netty.buffer;
 
-/**
- * One allocation from a {@link RegionSource}, carved into {@link #slots} segments, one per slot: the unit the
- * allocator accounts ({@link #capacity()} is what was allocated for it, alignment included). A slot is free while its
- * segment is back in the region: in no heap. Guarded by the {@link RegionPool}'s monitor.
- */
-final class Region implements ChunkInfo {
-    final AbstractByteBuf buffer;
-    final int allocatedBytes;
-    final int slots;
-    final long allFree;
-    /** Bit {@code i} set when slot {@code i} is free. */
-    long freeSlots;
-    /** Made when a slot is first taken, and reused. */
-    private final Segment[] segments;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
-    Region(AbstractByteBuf buffer, int allocatedBytes, int slots) {
+/**
+ * One mapping from a {@link RegionSource}, cut into {@link #slots} segments at fixed offsets. Its slots are taken and
+ * given back from any thread by a CAS on the {@link #free} bitmap: a cleared bit is owned by exactly one thread (the
+ * heap that took the slot, or its releaser), which alone touches the slot's {@link #segments} and
+ * {@link #committed} entries; the CAS that gives the bit back publishes them to the next owner. A region lives as
+ * long as its {@link PageStore}.
+ */
+final class Region {
+    private static final AtomicLongFieldUpdater<Region> FREE = AtomicLongFieldUpdater.newUpdater(Region.class, "free");
+
+    final AbstractByteBuf buffer;
+    final int slots;
+    final long allSlots;
+    /** Bit {@code i} set when slot {@code i} is free: in no heap. */
+    volatile long free;
+    /** The segment of each slot, made the first time it is taken, then reused. Slot owner only. */
+    private final Segment[] segments;
+    /** Whether the slot's memory was touched since the region was mapped: counted in the used memory. Slot owner. */
+    final boolean[] committed;
+
+    Region(AbstractByteBuf buffer, int slots) {
         assert slots > 0 && slots <= Long.SIZE;
         this.buffer = buffer;
-        this.allocatedBytes = allocatedBytes;
         this.slots = slots;
-        allFree = slots == Long.SIZE ? -1L : (1L << slots) - 1;
-        freeSlots = allFree;
+        allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
+        free = allSlots;
         segments = new Segment[slots];
+        committed = new boolean[slots];
     }
 
-    /** The lowest free slot's segment. */
-    Segment takeSlot(SegmentSource source, PageStoreConfig config) {
-        assert freeSlots != 0;
-        int slot = Long.numberOfTrailingZeros(freeSlots);
-        freeSlots &= ~(1L << slot);
+    /** Takes the lowest free slot: returns it, or -1 when none is free. Lock-free. */
+    int takeSlot() {
+        for (;;) {
+            long current = free;
+            if (current == 0) {
+                return -1;
+            }
+            int slot = Long.numberOfTrailingZeros(current);
+            if (FREE.compareAndSet(this, current, current & ~(1L << slot))) {
+                return slot;
+            }
+        }
+    }
+
+    /** Frees {@code slot}, which the caller owns. Lock-free. */
+    void giveBack(int slot) {
+        long bit = 1L << slot;
+        for (;;) {
+            long current = free;
+            if ((current & bit) != 0) {
+                throw new IllegalStateException("slot " + slot + " is already free: " + Long.toHexString(current));
+            }
+            if (FREE.compareAndSet(this, current, current | bit)) {
+                return;
+            }
+        }
+    }
+
+    /** Slot owner only. The slot's segment, made on first use as a view of the region. */
+    Segment segment(int slot, SegmentSource source, PageStoreConfig config) {
         Segment segment = segments[slot];
         if (segment == null) {
             int size = config.segmentSize;
@@ -54,27 +86,17 @@ final class Region implements ChunkInfo {
         return segment;
     }
 
+    /** For the close, when no slot has an owner any more. */
+    Segment segmentOrNull(int slot) {
+        return segments[slot];
+    }
+
     int freeSlotCount() {
-        return Long.bitCount(freeSlots);
-    }
-
-    @Override
-    public int capacity() {
-        return allocatedBytes;
-    }
-
-    @Override
-    public boolean isDirect() {
-        return buffer.isDirect();
-    }
-
-    @Override
-    public long memoryAddress() {
-        return buffer._memoryAddress();
+        return Long.bitCount(free);
     }
 
     @Override
     public String toString() {
-        return "Region[slots: " + slots + ", free: " + Long.bitCount(freeSlots) + ']';
+        return "Region[slots: " + slots + ", free: " + freeSlotCount() + ']';
     }
 }

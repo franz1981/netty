@@ -21,7 +21,6 @@ import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
-import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -356,9 +355,9 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * The defaults: 4 MiB segments and 36 MiB regions; 2 MiB and no regions in low-memory mode,
-     * where the single stripe carves its direct chunks out of segments too; heap buffers never. The memory accounted
-     * is a region (with what aligning it took), or a segment without regions.
+     * The defaults: 4 MiB segments in 64-segment regions; 2 MiB segments in low-memory mode, where the single stripe
+     * carves its direct chunks out of segments too; heap buffers never. Regions wherever they can be mapped. The
+     * memory accounted is a segment, with regions or not.
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
@@ -366,29 +365,21 @@ public class AdaptiveSegmentsTest {
         assumeFalse(System.getProperty("io.netty.allocator.segmentSize") != null
                 || System.getProperty("io.netty.allocator.segmentRegionSize") != null, "set explicitly");
         assertEquals(lowMemory ? 2 * 1024 * 1024 : 4 * 1024 * 1024, PageStoreConfig.SEGMENT_SIZE_BYTES);
-        assertEquals(lowMemory ? 0 : 36 * 1024 * 1024, PageStoreConfig.SEGMENT_REGION_SIZE_BYTES);
+        assertEquals(Long.SIZE * PageStoreConfig.SEGMENT_SIZE_BYTES, PageStoreConfig.SEGMENT_REGION_SIZE_BYTES);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
-        boolean regions = !lowMemory && PlatformDependent.directAllocationLeavesMemoryUntouched();
+        boolean regions = MmapRegionSource.isAvailable();
         assertEquals(regions, AdaptiveByteBufAllocatorTest.directRegions(allocator));
         ByteBuf buf = allocator.directBuffer(1024, 1024);
-        long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(allocator);
-        if (!regions) {
-            assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, unit);
-        } else {
-            int region = PageStoreConfig.SEGMENT_REGION_SIZE_BYTES;
-            assertTrue(unit == region || unit == region + PageStoreConfig.REGION_ALIGNMENT_BYTES,
-                    "a region, aligned by aligned_alloc or by over-allocating: " + unit);
-            assertNotNull(chunkOf(buf).segment.region);
-        }
-        assertEquals(unit, allocator.metric().usedDirectMemory());
         assertNotNull(chunkOf(buf).segment);
+        assertEquals(regions, chunkOf(buf).segment.region != null);
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNull(chunkOf(heap).segment);
         assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocator.metric().usedHeapMemory());
         buf.release();
         heap.release();
-        assertEquals(unit, allocator.metric().usedDirectMemory(),
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory(),
                 "the segment stays with the chunk its size class keeps");
     }
 

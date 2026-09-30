@@ -34,6 +34,8 @@ final class HeapSegments {
     /** For assertions only. */
     private final StampedLock stripeLock;
     private final Thread ownerThread;
+    /** Where this heap starts looking among the store's regions: spreads equally full regions over the heaps. */
+    int regionOffset = System.identityHashCode(this) & Integer.MAX_VALUE;
     // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;

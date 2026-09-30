@@ -108,6 +108,33 @@
     ]
   },
   {
+    "name": "io.netty.buffer.PageStore",
+    "fields": [
+      {
+        "name": "segmentsCommitted"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.Region",
+    "fields": [
+      {
+        "name": "free"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.Segment",
+    "fields": [
+      {
+        "name": "free"
+      },
+      {
+        "name": "owner"
+      }
+    ]
+  },
+  {
     "name":"io.netty.util.ReferenceCountUtil",
     "queryAllDeclaredMethods":true
   }
