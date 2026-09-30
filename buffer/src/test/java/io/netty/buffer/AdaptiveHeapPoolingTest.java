@@ -16,6 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.util.concurrent.FastThreadLocalThread;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -26,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.buffer.AdaptiveByteBufAllocatorTest.stripesWithABuddyMagazine;
 import static io.netty.buffer.AdaptiveByteBufAllocatorTest.threadLocalIdleDecay;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -35,13 +37,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
- * Heap buffers: nothing above the size classes is pooled. Direct buffers are pooled as before.
+ * Heap buffers: nothing above the size classes is pooled, and the size-class chunks stay under a cap, by default
+ * the largest byte array G1 does not allocate as a humongous object. Direct buffers are pooled as before.
  */
 public class AdaptiveHeapPoolingTest {
     private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
     private static final int LARGEST_SIZE_CLASS = SIZE_CLASSES[SIZE_CLASSES.length - 1];
     private static final int KIB = 1024;
     private static final int MIB = 1024 * KIB;
+
+    /** The cap the allocator computes for G1 regions of {@code regionSize} bytes. */
+    private static int capFor(int regionSize) {
+        return regionSize / 2 - AdaptivePoolingAllocator.BYTE_ARRAY_HEADER_ALLOWANCE - 1;
+    }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -143,6 +151,91 @@ public class AdaptiveHeapPoolingTest {
         });
     }
 
+    /** With 1 MiB regions the 512 and 528 KiB chunks become 256 and 272 KiB; larger regions change nothing. */
+    @Test
+    void heapChunkSizesForG1Regions() {
+        int[] uncapped = AdaptivePoolingAllocator.sizeClassChunkSizes(0);
+        for (int i = 0; i < SIZE_CLASSES.length; i++) {
+            assertEquals(AdaptivePoolingAllocator.chunkSizeOf(SIZE_CLASSES[i]), uncapped[i]);
+        }
+        for (int region : new int[] {2 * MIB, 4 * MIB, 8 * MIB, 32 * MIB}) {
+            assertArrayEquals(uncapped, AdaptivePoolingAllocator.sizeClassChunkSizes(capFor(region)),
+                    region + " bytes regions");
+        }
+        int[] capped = AdaptivePoolingAllocator.sizeClassChunkSizes(capFor(MIB));
+        for (int i = 0; i < SIZE_CLASSES.length; i++) {
+            int expected = uncapped[i];
+            if (expected == 512 * KIB) {
+                expected = 256 * KIB;
+            } else if (expected == 528 * KIB) {
+                expected = 272 * KIB;
+            }
+            assertEquals(expected, capped[i], SIZE_CLASSES[i] + " bytes");
+            assertTrue(capped[i] / SIZE_CLASSES[i] >= AdaptivePoolingAllocator.MIN_SEGMENTS_UNDER_CAP);
+        }
+    }
+
+    /**
+     * Every chunk buffer a capped heap allocator takes for its size classes is within the cap, whatever the size class,
+     * and the used memory is what it holds from its chunk allocator.
+     */
+    @Test
+    void heapChunksRespectTheCap() throws Exception {
+        RecordingChunkAllocator chunks = new RecordingChunkAllocator();
+        int cap = capFor(MIB);
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(chunks, false, false, cap);
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        for (int i = 0; i < SIZE_CLASSES.length; i++) {
+            int size = SIZE_CLASSES[i];
+            int chunkSize = allocator.chunkSizeOfClass(i);
+            if (chunkSize == 0) {
+                assertTrue(isLowMemory(), size + " bytes is pooled but in low-memory mode");
+                continue;
+            }
+            assertTrue(chunkSize <= cap, size + " bytes: chunk " + chunkSize);
+            // Two chunks' worth, so that the second chunk is the one a full first one leads to.
+            for (int n = 0; n < 2 * (chunkSize / size); n++) {
+                ByteBuf buf = allocator.allocate(size, size);
+                assertTrue(isPooled(buf));
+                assertEquals(chunkSize, chunkOf(buf).capacity, size + " bytes");
+                bufs.add(buf);
+            }
+        }
+        assertTrue(chunks.largest > 0);
+        assertTrue(chunks.largest <= cap, "largest chunk buffer: " + chunks.largest);
+        assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
+    }
+
+    /**
+     * A size class with no chunk size under the cap that holds two of its buffers is not pooled, nor any above it;
+     * the classes below it still are, in smaller chunks.
+     */
+    @Test
+    void sizeClassesThatDoNotFitUnderTheCapAreNotPooled() throws Exception {
+        RecordingChunkAllocator chunks = new RecordingChunkAllocator();
+        int cap = 200000;
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(chunks, false, false, cap);
+        assertEquals(128 * KIB, allocator.chunkSizeOfClass(AdaptivePoolingAllocator.sizeClassIndexOf(16 * KIB)));
+        for (int size : new int[] {128 * KIB, LARGEST_SIZE_CLASS}) {
+            assertEquals(0, allocator.chunkSizeOfClass(AdaptivePoolingAllocator.sizeClassIndexOf(size)));
+            ByteBuf buf = allocator.allocate(size, size);
+            assertFalse(isPooled(buf), size + " bytes");
+            assertEquals(size, chunkOf(buf).capacity);
+            assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
+            buf.release();
+        }
+        ByteBuf small = allocator.allocate(16 * KIB, 16 * KIB);
+        assertTrue(isPooled(small));
+        assertEquals(128 * KIB, chunkOf(small).capacity);
+        small.release();
+        assertEquals(chunks.unreleasedBytes(), allocator.usedMemory());
+        assertFalse(hasBuddyMagazine(allocator), "not pooled above the size classes either");
+    }
+
     private static void assertContent(ByteBuf buf, int length) {
         for (int i = 0; i < length; i++) {
             assertEquals((byte) i, buf.getByte(i), "index " + i);
@@ -160,6 +253,19 @@ public class AdaptiveHeapPoolingTest {
         Field pooled = AdaptivePoolingAllocator.Chunk.class.getDeclaredField("pooled");
         pooled.setAccessible(true);
         return pooled.getBoolean(chunkOf(buf));
+    }
+
+    private static boolean hasBuddyMagazine(AdaptivePoolingAllocator allocator) throws Exception {
+        Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
+        stripesField.setAccessible(true);
+        for (Object stripe : (Object[]) stripesField.get(allocator)) {
+            Field magField = stripe.getClass().getDeclaredField("buddyMagazine");
+            magField.setAccessible(true);
+            if (magField.get(stripe) != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isLowMemory() throws Exception {
@@ -187,6 +293,31 @@ public class AdaptiveHeapPoolingTest {
         thread.join();
         if (failure.get() != null) {
             throw failure.get();
+        }
+    }
+
+    private static final class RecordingChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+        private final List<AbstractByteBuf> allocated = new ArrayList<AbstractByteBuf>();
+        /** The largest chunk buffer allocated. */
+        int largest;
+
+        @Override
+        public AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
+            AbstractByteBuf buf =
+                    new UnpooledHeapByteBuf(UnpooledByteBufAllocator.DEFAULT, initialCapacity, maxCapacity);
+            allocated.add(buf);
+            largest = Math.max(largest, initialCapacity);
+            return buf;
+        }
+
+        long unreleasedBytes() {
+            long bytes = 0;
+            for (AbstractByteBuf buf : allocated) {
+                if (buf.refCnt() > 0) {
+                    bytes += buf.capacity();
+                }
+            }
+            return bytes;
         }
     }
 }

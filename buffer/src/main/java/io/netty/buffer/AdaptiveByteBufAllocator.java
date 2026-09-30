@@ -54,8 +54,9 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
         direct = new AdaptivePoolingAllocator(new DirectChunkAllocator(this), useCacheForNonEventLoopThreads);
-        // Heap buffers above the size classes are not pooled.
-        heap = new AdaptivePoolingAllocator(new HeapChunkAllocator(this), useCacheForNonEventLoopThreads, false);
+        // Heap buffers above the size classes are not pooled, and the size-class chunks stay below the cap.
+        heap = new AdaptivePoolingAllocator(new HeapChunkAllocator(this), useCacheForNonEventLoopThreads, false,
+                AdaptivePoolingAllocator.HEAP_CHUNK_MAX_BYTES);
     }
 
     @Override

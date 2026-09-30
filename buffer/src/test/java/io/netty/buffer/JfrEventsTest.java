@@ -109,6 +109,9 @@ public class JfrEventsTest {
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
         // useCacheForNonEventLoopThreads: the workload thread gets a thread-local heap, which its end frees.
         final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, true);
+        // 512 KiB, or less under G1 with small regions: see AdaptivePoolingAllocator.HEAP_CHUNK_MAX_BYTES.
+        final int chunkSize = AdaptiveByteBufAllocatorTest.heapChunkSizeOf(alloc, 16 * 1024);
+        assertEquals(chunkSize, AdaptiveByteBufAllocatorTest.heapChunkSizeOf(alloc, 64 * 1024));
         final String threadName = "adaptive-chunk-events";
         // A one-shot chunk of a size nothing else allocates, committed after the workload: events arrive in the
         // order they were committed, so once it is seen every event of the workload has been.
@@ -126,7 +129,7 @@ public class JfrEventsTest {
                     sentinelSeen.countDown();
                 } else if (onWorkloadThread(event, threadName)) {
                     allocatedFreed[0] += event.getInt("capacity");
-                    if (event.getBoolean("pooled") && event.getInt("capacity") == 512 * 1024) {
+                    if (event.getBoolean("pooled") && event.getInt("capacity") == chunkSize) {
                         sizeClassChunksAllocated.incrementAndGet();
                     }
                     oneShots[0] += event.getBoolean("pooled") ? 0 : 1;
@@ -137,7 +140,7 @@ public class JfrEventsTest {
                     int capacity = event.getInt("capacity");
                     allocatedFreed[1] += capacity;
                     oneShots[1] += event.getBoolean("pooled") ? 0 : 1;
-                    if (event.getBoolean("pooled") && capacity == 512 * 1024) {
+                    if (event.getBoolean("pooled") && capacity == chunkSize) {
                         sizeClassChunksFreed.incrementAndGet();
                     }
                 }
@@ -145,10 +148,10 @@ public class JfrEventsTest {
             stream.startAsync();
 
             Thread thread = new FastThreadLocalThread(() -> {
-                // 16 KiB and 64 KiB buffers use 512 KiB chunks and share a recycler pool: a burst of one, fully
-                // released, leaves chunk buffers in the recycler that the other then builds its chunks from.
-                releaseAll(allocateMany(alloc, 16 * 1024, 32 * 8));
-                releaseAll(allocateMany(alloc, 64 * 1024, 8 * 8));
+                // 16 KiB and 64 KiB buffers use the same chunk size and share a recycler pool: a burst of one,
+                // fully released, leaves chunk buffers in the recycler that the other then builds its chunks from.
+                releaseAll(allocateMany(alloc, 16 * 1024, chunkSize / (16 * 1024) * 8));
+                releaseAll(allocateMany(alloc, 64 * 1024, chunkSize / (64 * 1024) * 8));
                 // One-shot: above the largest pooled buffer.
                 alloc.heapBuffer(4 * 1024 * 1024).release();
                 // Above the size classes: heap buffers are not pooled there, each gets a one-shot chunk too.
@@ -384,10 +387,11 @@ public class JfrEventsTest {
                         eventsFlushed.countDown();
                     });
             stream.startAsync();
-            ByteBufAllocator allocator = newAdaptiveAllocator(false);
+            AdaptiveByteBufAllocator allocator = newAdaptiveAllocator(false);
             int bufSize = 16896;
-            int minSegmentsPerChunk = 32; // See AdaptivePoolingAllocator.SizeClassChunkController.
-            int bufsToAllocate = 1 + minSegmentsPerChunk;
+            // 32, or fewer when the heap chunks are capped: see AdaptivePoolingAllocator.HEAP_CHUNK_MAX_BYTES.
+            int segmentsPerChunk = AdaptiveByteBufAllocatorTest.heapChunkSizeOf(allocator, bufSize) / bufSize;
+            int bufsToAllocate = 1 + segmentsPerChunk;
             List<ByteBuf> buffers = new ArrayList<>(bufsToAllocate);
             for (int i = 0; i < bufsToAllocate; ++i) {
                 buffers.add(allocator.heapBuffer(bufSize, bufSize));
@@ -416,9 +420,10 @@ public class JfrEventsTest {
                     });
             stream.startAsync();
             int bufSize = 16896;
-            ByteBufAllocator allocator = newAdaptiveAllocator(false);
-            List<ByteBuf> buffers = new ArrayList<>(32);
-            for (int i = 0; i < 30; ++i) {
+            AdaptiveByteBufAllocator allocator = newAdaptiveAllocator(false);
+            int segmentsPerChunk = AdaptiveByteBufAllocatorTest.heapChunkSizeOf(allocator, bufSize) / bufSize;
+            List<ByteBuf> buffers = new ArrayList<>(segmentsPerChunk);
+            for (int i = 0; i < segmentsPerChunk - 2; ++i) {
                 buffers.add(allocator.heapBuffer(bufSize, bufSize));
             }
             // we still have 2 available segments in the chunk, so we should not allocate a new one

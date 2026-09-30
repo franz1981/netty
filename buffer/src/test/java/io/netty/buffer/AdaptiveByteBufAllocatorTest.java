@@ -979,6 +979,16 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return (AdaptivePoolingAllocator) field.get(allocator);
     }
 
+    /**
+     * The chunk size of the size class of {@code size} for heap buffers: under G1 it may be smaller than
+     * {@link AdaptivePoolingAllocator#chunkSizeOf}, see {@link AdaptivePoolingAllocator#HEAP_CHUNK_MAX_BYTES}.
+     */
+    static int heapChunkSizeOf(AdaptiveByteBufAllocator allocator, int size) throws Exception {
+        int chunkSize = pooling(allocator, false).chunkSizeOfClass(AdaptivePoolingAllocator.sizeClassIndexOf(size));
+        assertTrue(chunkSize > 0, size + " is not pooled on the heap");
+        return chunkSize;
+    }
+
     /** The {@link IdleDecay} of the calling thread's thread-local heap for heap buffers. */
     private static IdleDecay threadLocalIdleDecay(AdaptiveByteBufAllocator allocator) throws Exception {
         return threadLocalIdleDecay(allocator, false);
@@ -1486,7 +1496,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             IdleDecay idleDecay = threadLocalIdleDecay(allocator);
             idleDecay.decay(System.nanoTime());
             int threshold = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
-                    * (AdaptivePoolingAllocator.chunkSizeOf(size) / size);
+                    * (heapChunkSizeOf(allocator, size) / size);
             for (int i = 0; i < threshold; i++) {
                 allocator.heapBuffer(size, size).release();
             }

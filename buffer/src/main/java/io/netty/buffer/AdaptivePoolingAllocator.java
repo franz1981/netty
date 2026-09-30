@@ -37,6 +37,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
@@ -70,8 +71,10 @@ import java.util.function.IntConsumer;
  * </ul>
  * <p>
  * The allocator of heap buffers is built without the second tier (the {@code poolAboveSizeClasses} argument of its
- * constructor): a buffer above the largest size class gets a one-shot chunk. This is fixed at construction: the
- * routing reads it from a final field, not from the buffer or its size.
+ * constructor): a buffer above the largest size class gets a one-shot chunk. Its size-class chunks are at most
+ * {@link #HEAP_CHUNK_MAX_BYTES}, which keeps their arrays out of G1's humongous regions, and a size class with no
+ * chunk size under that cap gets one-shot chunks too. Both are fixed at construction: the routing reads them from
+ * two final fields, not from the buffer or its size.
  * <p>
  * The magazines are grouped into {@link StripedHeap}s, each guarded by one lock, and a thread picks a stripe by its
  * id; more stripes are used when threads collide on the lock. A {@link FastThreadLocalThread} instead gets a
@@ -178,6 +181,71 @@ final class AdaptivePoolingAllocator {
     private static final int MAGAZINE_BUFFER_QUEUE_CAPACITY = SystemPropertyUtil.getInt(
             "io.netty.allocator.magazineBufferQueueCapacity", 1024);
 
+    /**
+     * What a heap chunk of {@link #HEAP_CHUNK_MAX_BYTES} leaves for the header of its byte array under half a G1
+     * region: 64 bytes. A byte array's header is 16 bytes with compressed class pointers and 24 without; the rest is
+     * margin, so that the cap does not depend on the header layout of the VM.
+     */
+    static final int BYTE_ARRAY_HEADER_ALLOWANCE = 64;
+
+    /**
+     * {@code io.netty.allocator.heapChunkMaxBytes}: the largest chunk, in bytes, that an allocator of heap buffers
+     * carves size classes from; see {@link #sizeClassChunkSizes}. Default: under G1, half a region less
+     * {@link #BYTE_ARRAY_HEADER_ALLOWANCE} and one byte. G1 allocates an object of half a region or more as a
+     * humongous object, in regions of its own, and with the 1 MiB regions it picks for a heap of up to 2 GiB (JDK 21)
+     * that was every chunk of the size classes from 16 KiB up. Read once, from the
+     * {@code UseG1GC} and {@code G1HeapRegionSize} VM options, whose values are the ones in effect after the VM's
+     * ergonomics. Without G1, or when the options cannot be read ({@code java.management} absent, on Android, or
+     * denied by a security manager), there is no cap: the chunks keep the sizes of {@link #chunkSizeOf}. 0 or less:
+     * no cap.
+     */
+    static final int HEAP_CHUNK_MAX_BYTES;
+
+    static {
+        if (SystemPropertyUtil.contains("io.netty.allocator.heapChunkMaxBytes")) {
+            HEAP_CHUNK_MAX_BYTES = Math.max(0, SystemPropertyUtil.getInt("io.netty.allocator.heapChunkMaxBytes", 0));
+            logger.debug("-Dio.netty.allocator.heapChunkMaxBytes: {} (set)", HEAP_CHUNK_MAX_BYTES);
+        } else {
+            long regionSize = g1HeapRegionSize();
+            if (regionSize > 0) {
+                // Strictly below half a region, header allowance included.
+                HEAP_CHUNK_MAX_BYTES = (int) Math.min(Integer.MAX_VALUE,
+                        regionSize / 2 - BYTE_ARRAY_HEADER_ALLOWANCE - 1);
+                logger.debug("-Dio.netty.allocator.heapChunkMaxBytes: {} (G1 region size: {} bytes)",
+                        HEAP_CHUNK_MAX_BYTES, regionSize);
+            } else {
+                HEAP_CHUNK_MAX_BYTES = 0;
+                logger.debug("-Dio.netty.allocator.heapChunkMaxBytes: 0 ({})",
+                        regionSize == 0 ? "not G1" : "the GC options could not be read");
+            }
+        }
+    }
+
+    /**
+     * The G1 region size in bytes, 0 when the VM does not use G1, or -1 when that cannot be told. Reflective, so that
+     * this class loads where {@code java.management} or {@code com.sun.management} does not exist.
+     */
+    private static long g1HeapRegionSize() {
+        try {
+            Class<?> factory = Class.forName("java.lang.management.ManagementFactory");
+            Class<?> beanType = Class.forName("com.sun.management.HotSpotDiagnosticMXBean");
+            Class<?> optionType = Class.forName("com.sun.management.VMOption");
+            Object bean = factory.getMethod("getPlatformMXBean", Class.class).invoke(null, beanType);
+            if (bean == null) {
+                return -1;
+            }
+            Method getVMOption = beanType.getMethod("getVMOption", String.class);
+            Method getValue = optionType.getMethod("getValue");
+            if (!Boolean.parseBoolean((String) getValue.invoke(getVMOption.invoke(bean, "UseG1GC")))) {
+                return 0;
+            }
+            return Long.parseLong((String) getValue.invoke(getVMOption.invoke(bean, "G1HeapRegionSize")));
+        } catch (Throwable t) {
+            logger.debug("Could not read the G1 VM options", t);
+            return -1;
+        }
+    }
+
     static {
         warnIfSet("io.netty.allocator.chunkPurgePollsThreadLocal",
                 "is deprecated, use -Dio.netty.allocator.chunkPurgeInterval instead");
@@ -275,11 +343,40 @@ final class AdaptivePoolingAllocator {
     private static final int POOLED_SIZE_CLASSES_COUNT =
             IS_LOW_MEM ? sizeClassIndexOf(LOW_MEM_MAX_SIZE_CLASS) + 1 : SIZE_CLASSES_COUNT;
 
+    /** Under a cap, the fewest segments a size-classed chunk holds; see {@link #sizeClassChunkSizes}. */
+    static final int MIN_SEGMENTS_UNDER_CAP = 2;
+
+    static {
+        if (HEAP_CHUNK_MAX_BYTES > 0 && logger.isDebugEnabled()) {
+            int[] capped = sizeClassChunkSizes(HEAP_CHUNK_MAX_BYTES);
+            StringBuilder changes = new StringBuilder();
+            for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
+                int chunkSize = chunkSizeOf(SIZE_CLASSES[i]);
+                if (capped[i] != chunkSize) {
+                    changes.append(' ').append(SIZE_CLASSES[i]).append(':').append(chunkSize).append("->")
+                           .append(capped[i] == 0 ? "unpooled" : String.valueOf(capped[i]));
+                }
+            }
+            logger.debug("Heap size-class chunk sizes under {} bytes (size class:chunk size):{}",
+                    HEAP_CHUNK_MAX_BYTES, changes.length() == 0 ? " unchanged" : changes);
+        }
+    }
+
     private final ChunkAllocator chunkAllocator;
     private final ChunkRegistry chunkRegistry;
     private final SizeClassChunkManagementStrategy[] sizeClassStrategies;
+    /**
+     * The size classes below this index are pooled: {@link #POOLED_SIZE_CLASSES_COUNT}, or fewer when a cap leaves
+     * some without a chunk size (see {@link #sizeClassChunkSizes}).
+     */
+    private final int pooledSizeClassCount;
     /** Whether buffers above the size classes, up to {@link #MAX_POOLED_BUF_SIZE}, come from buddy chunks. */
     private final boolean poolsAboveSizeClasses;
+    /**
+     * Size class index to the index of its chunk size in {@link #CHUNK_SIZES}, for this allocator's chunk sizes:
+     * {@link #SIZE_CLASS_TO_CHUNK_POOL} unless a cap changed them.
+     */
+    final byte[] sizeClassToChunkPool;
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
 
@@ -288,23 +385,35 @@ final class AdaptivePoolingAllocator {
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
-        this(chunkAllocator, useCacheForNonEventLoopThreads, true);
+        this(chunkAllocator, useCacheForNonEventLoopThreads, true, 0);
     }
 
     /**
-     * @param poolAboveSizeClasses whether buffers above the size classes, up to {@link #MAX_POOLED_BUF_SIZE}, are
-     *                             pooled in buddy chunks; when {@code false} each gets a one-shot chunk and no
-     *                             {@link BuddyMagazine} is ever created. Low-memory mode never pools them.
+     * @param poolAboveSizeClasses whether buffers above the size classes, up to {@link #MAX_POOLED_BUF_SIZE}, and
+     *                             those of a size class the cap leaves without a chunk size, are pooled in buddy
+     *                             chunks; when {@code false} each gets a one-shot chunk and no {@link BuddyMagazine}
+     *                             is ever created. Low-memory mode never pools them.
+     * @param maxChunkBytes        the largest size-classed chunk, in bytes; 0 or less for no cap. See
+     *                             {@link #sizeClassChunkSizes}.
      */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             boolean poolAboveSizeClasses) {
+                             boolean poolAboveSizeClasses, int maxChunkBytes) {
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
+        int[] chunkSizes = sizeClassChunkSizes(maxChunkBytes);
         sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
+        int pooled = 0;
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
-            sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(SIZE_CLASSES[i]);
+            if (chunkSizes[i] != 0) {
+                sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(SIZE_CLASSES[i], chunkSizes[i]);
+                if (pooled == i && i < POOLED_SIZE_CLASSES_COUNT) {
+                    pooled++;
+                }
+            }
         }
+        pooledSizeClassCount = pooled;
         poolsAboveSizeClasses = poolAboveSizeClasses && !IS_LOW_MEM;
+        sizeClassToChunkPool = chunkPoolsOf(chunkSizes, CHUNK_SIZES);
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new StripedHeap();
@@ -344,18 +453,19 @@ final class AdaptivePoolingAllocator {
             if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
                 heap = threadLocalSizeClassHeap.get();
             }
-            if (index < POOLED_SIZE_CLASSES_COUNT) {
+            if (index < pooledSizeClassCount) {
                 if (heap != null) {
                     allocated = heap.allocate(index, size, maxCapacity, buf);
                 } else {
                     allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
                 }
             } else if (poolsAboveSizeClasses) {
-                // Above the size classes: a thread with its own heap never takes a stripe lock for these either.
+                // Above the size classes, or a size class a cap left unpooled: a thread with its own heap never takes
+                // a stripe lock for these either.
                 if (heap != null) {
                     allocated = heap.allocateLarge(size, maxCapacity, buf);
                 } else {
-                    allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
+                    allocated = allocateShared(SIZE_CLASSES_COUNT, size, maxCapacity, currentThread, buf);
                 }
             }
         }
@@ -440,14 +550,69 @@ final class AdaptivePoolingAllocator {
      */
     // Visible for testing.
     static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes) {
+        int[] classChunkSizes = new int[sizeClasses.length];
+        for (int i = 0; i < sizeClasses.length; i++) {
+            classChunkSizes[i] = chunkSizeOf(sizeClasses[i]);
+        }
+        return chunkPoolsOf(classChunkSizes, chunkSizes);
+    }
+
+    /**
+     * For each of {@code classChunkSizes}, the index of that chunk size in {@code chunkSizes}; 0 for a size class
+     * without one, which never reaches a {@link SizeClassChunkRecycler}.
+     */
+    private static byte[] chunkPoolsOf(int[] classChunkSizes, int[] chunkSizes) {
         assert chunkSizes.length <= Byte.MAX_VALUE;
-        byte[] pools = new byte[sizeClasses.length];
+        byte[] pools = new byte[classChunkSizes.length];
         for (int i = 0; i < pools.length; i++) {
-            int pool = indexOf(chunkSizes, chunkSizes.length, chunkSizeOf(sizeClasses[i]));
-            assert pool >= 0;
-            pools[i] = (byte) pool;
+            if (classChunkSizes[i] != 0) {
+                int pool = indexOf(chunkSizes, chunkSizes.length, classChunkSizes[i]);
+                assert pool >= 0;
+                pools[i] = (byte) pool;
+            }
         }
         return pools;
+    }
+
+    /**
+     * The chunk size of every size class when no chunk may be larger than {@code maxChunkBytes}, or 0 for a size
+     * class that is then not pooled. With no cap ({@code maxChunkBytes} of 0 or less), or where it fits, a class
+     * keeps {@link #chunkSizeOf}. Otherwise it takes the largest of {@link #CHUNK_SIZES} under the cap that is of
+     * the same kind, a power of two or not, and holds at least {@link #MIN_SEGMENTS_UNDER_CAP} segments: the classes
+     * that shared a chunk size still share one, so a {@link SizeClassChunkRecycler} keeps one pool per entry of the
+     * same table, and a class of a power of two plus a bit keeps the chunks sized for its family. With 1 MiB G1
+     * regions, for instance, the 512 KiB chunks of 16 to 128 KiB become 256 KiB, holding 16 down to 2 segments, and
+     * the 528 KiB ones of 16.5 to 132 KiB become 272 KiB, holding 16 down to 2 segments and 8 KiB unused. The first
+     * class with no such chunk size, and every class above it, is not pooled.
+     */
+    // Visible for testing.
+    static int[] sizeClassChunkSizes(int maxChunkBytes) {
+        int[] sizes = new int[SIZE_CLASSES_COUNT];
+        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
+            int segmentSize = SIZE_CLASSES[i];
+            int chunkSize = chunkSizeOf(segmentSize);
+            if (maxChunkBytes > 0 && chunkSize > maxChunkBytes) {
+                boolean powerOfTwo = isPowerOfTwo(chunkSize);
+                chunkSize = 0;
+                for (int candidate : CHUNK_SIZES) {
+                    if (candidate <= maxChunkBytes && candidate > chunkSize
+                            && isPowerOfTwo(candidate) == powerOfTwo
+                            && candidate / segmentSize >= MIN_SEGMENTS_UNDER_CAP) {
+                        chunkSize = candidate;
+                    }
+                }
+                if (chunkSize == 0) {
+                    // This class and every larger one are not pooled.
+                    break;
+                }
+            }
+            sizes[i] = chunkSize;
+        }
+        return sizes;
+    }
+
+    private static boolean isPowerOfTwo(int value) {
+        return value > 0 && (value & value - 1) == 0;
     }
 
     private static int indexOf(int[] values, int count, int value) {
@@ -462,6 +627,13 @@ final class AdaptivePoolingAllocator {
     // Visible for testing.
     static int chunkPoolOf(int sizeClassIndex) {
         return SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+    }
+
+    /** The chunk size of a size class on this allocator, or 0 when the class is not pooled here. */
+    // Visible for testing.
+    int chunkSizeOfClass(int sizeClassIndex) {
+        SizeClassChunkManagementStrategy strategy = sizeClassStrategies[sizeClassIndex];
+        return sizeClassIndex < pooledSizeClassCount && strategy != null ? strategy.chunkSize : 0;
     }
 
     static int sizeClassIndexOf(int size) {
@@ -634,6 +806,8 @@ final class AdaptivePoolingAllocator {
         private int retainedBytes;
         /** Where the buffers came from, and are accounted: still in its {@link #usedMemory()} while pooled here. */
         private final AdaptivePoolingAllocator allocator;
+        /** The allocator's {@link AdaptivePoolingAllocator#sizeClassToChunkPool}. */
+        private final byte[] chunkPools;
         /**
          * Per pool, the fewest buffers it held since the last decay: the bottom of the stack up to that count was not
          * touched for the whole interval, so those buffers are the cold ones.
@@ -647,6 +821,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassChunkRecycler(AdaptivePoolingAllocator allocator) {
             this.allocator = allocator;
+            chunkPools = allocator.sizeClassToChunkPool;
             for (int i = 0; i < CHUNK_POOL_COUNT; i++) {
                 int capacity = capacityOf(i);
                 buffers[i] = new AbstractByteBuf[capacity];
@@ -672,7 +847,7 @@ final class AdaptivePoolingAllocator {
         boolean poll(int sizeClassIndex) {
             assert polledBuffer == null && polledFreeList == null && polledLocalFreeList == null :
                     "the previous poll was not fully taken";
-            int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+            int pool = chunkPools[sizeClassIndex];
             int size = sizes[pool];
             if (size == 0) {
                 return false;
@@ -712,7 +887,7 @@ final class AdaptivePoolingAllocator {
 
         /** Whether {@link #offer} would keep a buffer of {@code sizeClassIndex}'s chunk size now. */
         boolean hasRoomFor(int sizeClassIndex) {
-            int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+            int pool = chunkPools[sizeClassIndex];
             return sizes[pool] < buffers[pool].length
                     && (long) retainedBytes + CHUNK_SIZES[pool] <= RECYCLED_BYTES_BUDGET;
         }
@@ -726,7 +901,7 @@ final class AdaptivePoolingAllocator {
             if (!hasRoomFor(sizeClassIndex)) {
                 return false;
             }
-            int pool = SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex];
+            int pool = chunkPools[sizeClassIndex];
             int size = sizes[pool];
             int chunkSize = CHUNK_SIZES[pool];
             retainedBytes += chunkSize;
@@ -739,7 +914,7 @@ final class AdaptivePoolingAllocator {
 
         // Visible for testing.
         int size(int sizeClassIndex) {
-            return sizes[SIZE_CLASS_TO_CHUNK_POOL[sizeClassIndex]];
+            return sizes[chunkPools[sizeClassIndex]];
         }
 
         // Visible for testing.
@@ -1680,9 +1855,9 @@ final class AdaptivePoolingAllocator {
         private final int segmentSize;
         private final int chunkSize;
 
-        private SizeClassChunkManagementStrategy(int segmentSize) {
+        private SizeClassChunkManagementStrategy(int segmentSize, int chunkSize) {
             this.segmentSize = ObjectUtil.checkPositive(segmentSize, "segmentSize");
-            chunkSize = chunkSizeOf(segmentSize);
+            this.chunkSize = chunkSize;
         }
 
         SizeClassChunkController createController(AdaptivePoolingAllocator allocator) {
