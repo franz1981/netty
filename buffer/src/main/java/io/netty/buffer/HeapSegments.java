@@ -20,10 +20,12 @@ import java.util.concurrent.locks.StampedLock;
 
 /**
  * The segments one heap has spans in, oldest first, and the rule that packs its spans: the fullest segment with a
- * long enough free run wins (the oldest on a tie), then the {@link #spare}, and a segment is taken from the
- * {@link PageStore} only when none fits. A segment that becomes wholly free leaves the list: it becomes the spare,
- * and the previous spare goes back to the store. The spare goes back too once it stayed unused from one
- * {@link #decay} to the next.
+ * long enough free run wins (the oldest on a tie), then the newest segment of the {@link #reserve}, and a segment is
+ * taken from the {@link PageStore} only when none fits. A segment that becomes wholly free leaves the list for the
+ * reserve, whole: taken again, it costs no allocation. The reserve holds {@link PageStore#reserveLimit} segments at
+ * most: when full, its oldest goes back to the store. Each {@link #decay} gives back, oldest first, half (rounded up)
+ * of the segments that stayed in the reserve since the previous one, as mimalloc does with its per-heap segment
+ * reserve.
  * <p>
  * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim}),
  * chunk deallocation ({@link #release}) and decays only. After {@link #markFreed}, releases may come from any thread:
@@ -39,10 +41,11 @@ final class HeapSegments {
     // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;
-    /** The heap's one wholly free segment, not in {@link #segments}; {@code null} when none. */
-    Segment spare;
-    /** Whether a decay saw the {@link #spare} already: the next one gives it back. */
-    private boolean spareSeenByDecay;
+    /** Wholly free segments, not in {@link #segments}, oldest first. */
+    final Segment[] reserve;
+    int reserved;
+    /** How many of the oldest reserved segments stayed unused since the previous decay. */
+    private int cold;
     private volatile boolean freed;
     private int claimedStart = -1;
 
@@ -51,6 +54,7 @@ final class HeapSegments {
         this.store = store;
         this.stripeLock = stripeLock;
         this.ownerThread = ownerThread;
+        reserve = new Segment[store.maxReserveLimit()];
     }
 
     boolean isThreadLocal() {
@@ -80,12 +84,7 @@ final class HeapSegments {
             }
         }
         if (best == null) {
-            best = spare;
-            if (best != null) {
-                spare = null;
-            } else {
-                best = store.take(this);
-            }
+            best = reserved != 0 ? takeNewestReserved() : store.take(this);
             add(best);
         }
         int start = best.claim(slices);
@@ -111,12 +110,32 @@ final class HeapSegments {
         }
         assert inOwnerContext();
         remove(segment);
-        Segment previous = spare;
-        spare = segment;
-        spareSeenByDecay = false;
-        if (previous != null) {
-            dispose(previous);
+        if (reserved >= Math.min(store.reserveLimit(), reserve.length)) {
+            // The oldest, cold if any is, makes room: at a limit of one, the newest wholly free segment is kept.
+            disposeOldestReserved(1);
+            if (cold > 0) {
+                cold--;
+            }
         }
+        reserve[reserved++] = segment;
+    }
+
+    private Segment takeNewestReserved() {
+        Segment segment = reserve[--reserved];
+        reserve[reserved] = null;
+        cold = Math.min(cold, reserved);
+        return segment;
+    }
+
+    private void disposeOldestReserved(int n) {
+        Segment[] reserve = this.reserve;
+        for (int i = 0; i < n; i++) {
+            dispose(reserve[i]);
+        }
+        int left = reserved - n;
+        System.arraycopy(reserve, n, reserve, 0, left);
+        Arrays.fill(reserve, left, reserved, null);
+        reserved = left;
     }
 
     /**
@@ -154,14 +173,13 @@ final class HeapSegments {
     }
 
     /**
-     * Gives back the spare and the segments the heap's frees emptied, forgets all; the others go with their last span.
+     * Gives back the reserve and the segments the heap's frees emptied, forgets all; the others go with their last
+     * span.
      */
     void afterFree() {
         assert freed;
-        if (spare != null) {
-            dispose(spare);
-            spare = null;
-        }
+        disposeOldestReserved(reserved);
+        cold = 0;
         for (int i = 0; i < count; i++) {
             Segment segment = segments[i];
             // A volatile read after the volatile write of freed: a release that emptied it and read freed as
@@ -175,20 +193,14 @@ final class HeapSegments {
     }
 
     /**
-     * Owner only. Gives back the spare if the previous decay saw it already: it stayed unused a whole interval. Then
-     * lets the store purge its idle free slots, if due and no other heap's decay is purging.
+     * Owner only. Gives back half, rounded up, of the reserved segments unused since the previous decay, oldest
+     * first: a reserve of one goes back once it stayed unused a whole interval. Then lets the store purge its idle
+     * free slots, if due and no other heap's decay is purging.
      */
     void decay(long now) {
         assert inOwnerContext();
-        Segment spare = this.spare;
-        if (spare != null) {
-            if (spareSeenByDecay) {
-                this.spare = null;
-                dispose(spare);
-            } else {
-                spareSeenByDecay = true;
-            }
-        }
+        disposeOldestReserved(cold + 1 >>> 1);
+        cold = reserved;
         store.purgeIfDue(now);
     }
 }

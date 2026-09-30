@@ -200,7 +200,7 @@ public class AdaptiveSegmentsTest {
     /**
      * Chunks given up by one size class free their spans, which other classes of the same heap reuse, of any chunk
      * size: no new segment. Then decays give everything back: an idle class gives up its chunks, an emptied segment
-     * becomes the heap's spare (the previous spare goes back), and a spare unused a whole interval goes back too.
+     * goes to the heap's reserve, and the decays give the reserve back by halves.
      */
     @Test
     void spansAreReusedAcrossClassesAndDecaysGiveSegmentsBack() throws Exception {
@@ -225,18 +225,18 @@ public class AdaptiveSegmentsTest {
         bufs.clear();
         assertAccounted(source, allocator);
         // Every chunk ran out of segments, so none is active; the class keeps the last one to empty (its floor), in
-        // the second segment. The first segment emptied and became the heap's spare.
+        // the second segment. The first segment emptied and went to the heap's reserve.
         assertEquals(1, heapSegments.count);
         assertEquals(8, heapSegments.segments[0].usedSlices());
-        assertNotNull(heapSegments.spare);
+        assertEquals(1, heapSegments.reserved);
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 2-slice chunks
         for (int i = 0; i < 20 * (2 * SLICE_SIZE_BYTES / other); i++) {
             bufs.add(allocator.allocate(other, other));
         }
         assertEquals(2, source.segmentsAllocated(), "40 slices fit in the free ones");
-        assertEquals(1, heapSegments.count, "the fullest segment with room, not the spare");
-        assertNotNull(heapSegments.spare);
+        assertEquals(1, heapSegments.count, "the fullest segment with room, not the reserved one");
+        assertEquals(1, heapSegments.reserved);
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -248,10 +248,10 @@ public class AdaptiveSegmentsTest {
             now += INTERVAL;
             decayStripe(stripe, now);
             assertAccounted(source, allocator);
-            assertTrue(source.segmentsLive() <= heapSegments.count + 1, "one wholly free segment at most");
+            assertEquals(heapSegments.count + heapSegments.reserved, source.segmentsLive());
         }
         assertEquals(0, heapSegments.count, "every segment left the heap");
-        assertNull(heapSegments.spare, "and the spare went back");
+        assertEquals(0, heapSegments.reserved, "and the reserve went back");
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
         assertEquals(2, source.segmentsAllocated());
@@ -259,7 +259,7 @@ public class AdaptiveSegmentsTest {
 
     /**
      * On a thread-local heap every other thread's release is a note. The chunks such releases empty are applied by
-     * the owner's decays: an idle class gives them up, and the segment they emptied becomes the heap's spare.
+     * the owner's decays: an idle class gives them up, and the segment they emptied goes to the heap's reserve.
      */
     @Test
     void foreignReleasesEmptyASegmentThroughTheNotes() throws Exception {
@@ -285,13 +285,13 @@ public class AdaptiveSegmentsTest {
             releaser.join();
             // Nothing applied yet: the segment still holds its three spans.
             assertEquals(24, heapSegments.segments[0].usedSlices());
-            assertNull(heapSegments.spare);
+            assertEquals(0, heapSegments.reserved);
             long now = System.nanoTime();
             idleDecay(heap).decay(now + INTERVAL); // the class allocated since the last decay: not idle yet
             assertEquals(1, heapSegments.count);
             idleDecay(heap).decay(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
             assertEquals(0, heapSegments.count);
-            assertNotNull(heapSegments.spare);
+            assertEquals(1, heapSegments.reserved);
             assertAccounted(source, allocator);
             return null;
         });

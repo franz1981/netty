@@ -153,11 +153,11 @@ final class RegionPurgeTest {
     void heapDecaysDriveThePurge() {
         Segment segment = heap.claim(63);
         heap.release(segment, 0, 63);
-        assertSame(segment, heap.spare);
+        assertSame(segment, heap.reserve[0]);
         long now = System.nanoTime();
-        heap.decay(now += INTERVAL); // the spare is seen; a purge runs, with nothing to purge
-        heap.decay(now += INTERVAL); // the spare goes back to its region; a purge runs, too early for it
-        assertNull(heap.spare);
+        heap.decay(now += INTERVAL); // the reserved one is seen; a purge runs, with nothing to purge
+        heap.decay(now += INTERVAL); // it goes back to its region; a purge runs, too early for it
+        assertEquals(0, heap.reserved);
         assertEquals(0, regions.purgeCalls());
         heap.decay(now += INTERVAL);
         assertEquals(1, regions.purgeCalls());

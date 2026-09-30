@@ -165,12 +165,12 @@ final class PageStoreTestSupport {
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 
-    /** Gives {@code segment}'s one span back, then its heap's spare with two decays: it goes back to the store. */
+    /** Gives {@code segment}'s one span back, then its heap's only reserved one with two decays: back to the store. */
     static void giveBack(HeapSegments heap, Segment segment, int start, int slices) {
         heap.release(segment, start, slices);
         heap.decay(0);
         heap.decay(0);
-        assertNull(heap.spare);
+        assertEquals(0, heap.reserved);
         assertNull(segment.owner);
     }
 

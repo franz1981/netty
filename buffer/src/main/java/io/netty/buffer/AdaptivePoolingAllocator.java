@@ -85,10 +85,10 @@ import java.util.function.IntConsumer;
  * For direct memory the size classes do not allocate their chunks one by one: each heap takes uniform
  * {@link Segment}s (4 MiB) and carves every size-class chunk out of one as a span of 64 KiB slices (see
  * {@link HeapSegments}); a chunk given up frees its span at once, for any chunk size of the heap, and a segment that
- * empties is kept by its heap as its one spare, or given back to the allocator's {@link PageStore}; an idle spare is
- * given back by the heap's decay. Where they can be mapped, segments are slots of {@code mmap} regions, whose idle
- * slots the decays purge. The buffers above the size classes keep their own chunks. Heap memory keeps chunks
- * allocated one by one.
+ * empties is kept whole in its heap's reserve, or given back to the allocator's {@link PageStore}; the heap's decays
+ * give idle reserved segments back by halves. Where they can be mapped, segments are slots of {@code mmap} regions,
+ * whose idle slots the decays purge. The buffers above the size classes keep their own chunks. Heap memory keeps
+ * chunks allocated one by one.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -596,7 +596,7 @@ final class AdaptivePoolingAllocator {
      * minus the bytes freed in a JFR recording equal this number.
      * <p>
      * A {@link Segment} is one such buffer, whole, from the moment it is taken from the
-     * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, spare or not, or
+     * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, reserved or not, or
      * a heap that was freed while spans were still out): the events are per
      * segment, and the size-class chunks carved out of a segment as spans fire none, since their memory never leaves
      * the allocator. With {@link PageStore#regions}, a segment is a slot of a region, counted from the first time it
@@ -960,14 +960,16 @@ final class AdaptivePoolingAllocator {
      * stops allocating keeps its memory until it is freed.
      * <p>
      * With segments (direct memory), a size class that gives up its chunks frees their spans at once, and a segment
-     * they empty becomes the heap's spare, which its decay gives back once it stayed unused a whole interval (see
-     * {@link HeapSegments#decay}). The same decay lets the {@link PageStore} purge the region slots that stayed free a
-     * whole interval, at most once per interval for all heaps (see {@link PageStore#purgeIfDue}).
+     * they empty goes to the heap's reserve, whose decays give back half, rounded up, of what stayed unused through the
+     * whole interval (see {@link HeapSegments#decay}). The same decay lets the {@link PageStore} purge the region
+     * slots that stayed free a whole interval, at most once per interval for all heaps (see
+     * {@link PageStore#purgeIfDue}).
      * <p>
      * What a heap keeps idle is bounded: up to {@link SizeClassChunkRecycler#RECYCLED_BYTES_BUDGET} in its recycler,
      * up to {@link #CHUNK_REUSE_QUEUE_BYTES} of wholly free large-buffer chunks, the large-buffer chunk it allocates
      * from (up to {@link #MAX_CHUNK_SIZE}), and the chunk each size class in use allocates from plus the one it
-     * keeps. With the defaults that is about 84 MiB per heap at most, for every event loop that allocates and every
+     * keeps, plus, with segments, the reserve of wholly free segments ({@link PageStore#reserveLimit}). With the
+     * defaults that is about 84 MiB per heap at most without the reserve, for every event loop that allocates and every
      * stripe in use. On a thread-local heap every other thread's release is a note: the chunks those releases empty
      * come under these bounds when the owner applies the notes, on its next slow path or decay, so an owner that
      * stopped allocating keeps them until it allocates again. Nothing is
@@ -1030,7 +1032,7 @@ final class AdaptivePoolingAllocator {
             if (buddyMagazine != null) {
                 buddyMagazine.decay();
             }
-            // Last: what the size classes gave up above may have emptied a segment, which then stays the spare for a
+            // Last: what the size classes gave up above may have emptied a segment, which then stays reserved for a
             // whole interval before its first chance to be given back, like a buffer offered to the recycler.
             if (heapSegments != null) {
                 heapSegments.decay(now);
@@ -1747,7 +1749,7 @@ final class AdaptivePoolingAllocator {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     // A recycler that keeps no memory (chunks are spans of segments) never holds a chunk back: its
-                    // span goes back to the segment, and the heap's spare ageing is what gives memory back.
+                    // span goes back to the segment, and the heap's reserve ageing is what gives memory back.
                     if (chunkRecycler != null && chunkRecycler.holdsBuffers
                             && !chunkRecycler.hasRoomFor(sizeClassIndex)) {
                         return;

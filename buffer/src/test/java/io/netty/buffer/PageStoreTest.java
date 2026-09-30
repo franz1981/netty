@@ -231,7 +231,7 @@ final class PageStoreTest {
     }
 
     /**
-     * Several heaps claiming and releasing at random, with their spares ageing and idle slots purged: at every step
+     * Several heaps claiming and releasing at random, with their reserves ageing and idle slots purged: at every step
      * the allocator's used memory is exactly the segments allocated on their own and not freed plus the committed
      * slots; once the heaps are freed and the store closed, nothing is left.
      */
@@ -282,7 +282,7 @@ final class PageStoreTest {
             owners[live].release(spans[live], starts[live], lengths[live]);
         }
         for (HeapSegments heap : heaps) {
-            assertEquals(0, heap.count, "no span out: a spare at most");
+            assertEquals(0, heap.count, "no span out: reserved segments at most");
             heap.markFreed();
             heap.afterFree();
         }

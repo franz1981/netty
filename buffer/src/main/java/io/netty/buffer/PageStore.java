@@ -41,6 +41,9 @@ final class PageStore {
     private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
     private static final Region[] NO_REGIONS = new Region[0];
+    /** mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments. */
+    private static final int RESERVE_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_RESERVED_SEGMENTS = 8;
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -251,6 +254,20 @@ final class PageStore {
             }
             slots &= ~bits;
         }
+    }
+
+    /**
+     * The most wholly free segments a heap keeps (see {@link HeapSegments}). Without regions, a segment given back is
+     * freed, and taking one allocates a buffer, a {@link Segment} and later its span views: mimalloc's reserve of
+     * 32 MiB, from 1 to 8 segments, avoids that. With regions, one: a free slot is taken again by a CAS, its
+     * {@link Segment} reused, while a reserved slot is not free to the other heaps nor to the purge.
+     */
+    int reserveLimit() {
+        return regionSource != null ? 1 : maxReserveLimit();
+    }
+
+    int maxReserveLimit() {
+        return Math.min(Math.max(1, RESERVE_BYTES / config.segmentSize), MAX_RESERVED_SEGMENTS);
     }
 
     int regionCount() {
