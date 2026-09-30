@@ -1774,13 +1774,6 @@ final class AdaptivePoolingAllocator {
          * large-buffers keeps small chunks whatever other heaps allocate.
          */
         private int chunkSizeTarget;
-        /**
-         * The first chunk for the size that prompted this magazine's latest chunk: room for
-         * {@link #INITIAL_BUFS_PER_CHUNK} of those buffers. The {@link #chunkSizeTarget} is never halved below it,
-         * since the next chunk for that size would be this large again: a magazine keeping one 1 MiB buffer at a time
-         * so keeps its 2 MiB chunk, instead of retiring it and making the same one at every decay.
-         */
-        private int smallestUsefulChunk = MIN_CHUNK_SIZE;
 
         BuddyChunkController(ChunkAllocator chunkAllocator) {
             this.chunkAllocator = chunkAllocator;
@@ -1814,7 +1807,6 @@ final class AdaptivePoolingAllocator {
             if (chunkSize > target) {
                 chunkSizeTarget = chunkSize;
             }
-            smallestUsefulChunk = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, initial));
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.isThreadLocal());
             return chunk;
@@ -1824,10 +1816,16 @@ final class AdaptivePoolingAllocator {
          * A decay found a free block of half of {@code capacity} in the chunk the magazine allocates from, and the
          * magazine made no chunk for more room through the last {@link BuddyMagazine#QUIET_DECAYS_BEFORE_SHRINK}
          * intervals: its demand fits in half of that chunk, so the {@link #chunkSizeTarget} goes down to half of it,
-         * never below the {@link #smallestUsefulChunk} and never up. Returns the new target.
+         * never up, and never below the first chunk for the largest block still in use in it ({@code largestInUse},
+         * 0 when none): room for {@link #INITIAL_BUFS_PER_CHUNK} of those, which the next allocation of that size
+         * would make again. A magazine keeping one 1 MiB buffer at a time so keeps its 2 MiB chunk, instead of
+         * retiring it and making the same one; one whose 1 MiB buffers are gone goes down to the size of the ones it
+         * keeps now. Returns the new target.
          */
-        int halveTarget(int capacity) {
-            int target = Math.min(chunkSizeTarget, Math.max(smallestUsefulChunk, capacity >>> 1));
+        int halveTarget(int capacity, int largestInUse) {
+            int floor = largestInUse == 0 ? MIN_CHUNK_SIZE : Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE,
+                    MathUtil.safeFindNextPositivePowerOfTwo(INITIAL_BUFS_PER_CHUNK * largestInUse)));
+            int target = Math.min(chunkSizeTarget, Math.max(floor, capacity >>> 1));
             chunkSizeTarget = target;
             return target;
         }
@@ -2395,7 +2393,8 @@ final class AdaptivePoolingAllocator {
                 }
                 // At most half of it in use, and no chunk made for more room for a while: the next chunks need be no
                 // larger than half of it, and it is retired when it is larger than that.
-                if (shrink && current.capacity > chunkController.halveTarget(current.capacity)) {
+                if (shrink && current.capacity >
+                        chunkController.halveTarget(current.capacity, current.largestBlockInUse())) {
                     active = null;
                     retire(current);
                 } else if (current.isWhollyFree() && whollyFree.size < CHUNK_REUSE_QUEUE &&
@@ -3201,6 +3200,11 @@ final class AdaptivePoolingAllocator {
             return tree.largestFreeOrder() >= tree.maxOrder - 1;
         }
 
+        /** The size of the largest block in use, 0 when none; walks the tree, for decays only. */
+        int largestBlockInUse() {
+            return tree.largestClaimedSize();
+        }
+
         @Override
         public String toString() {
             int capacity = delegate.capacity();
@@ -3255,6 +3259,24 @@ final class AdaptivePoolingAllocator {
          */
         boolean isWhollyFree() {
             return nodes[1] == maxOrder + 1;
+        }
+
+        /**
+         * The size of the largest claimed block, 0 when none. A claimed block is a node at 0 whose children are not
+         * (a claim only takes a wholly free block, and leaves its subtree as it was), or a leaf at 0; the first depth
+         * that has one holds the largest. Walks up to every node: for slow paths only.
+         */
+        int largestClaimedSize() {
+            byte[] nodes = this.nodes;
+            for (int depth = 0; depth <= maxOrder; depth++) {
+                boolean leaves = depth == maxOrder;
+                for (int index = 1 << depth, end = 2 << depth; index < end; index++) {
+                    if (nodes[index] == 0 && (leaves || nodes[index << 1] != 0)) {
+                        return MIN_BLOCK_SIZE << maxOrder - depth;
+                    }
+                }
+            }
+            return 0;
         }
 
         /**

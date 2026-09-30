@@ -401,4 +401,29 @@ class AdaptivePoolingAllocatorTest {
         f.setAccessible(true);
         return f.getBoolean(null);
     }
+
+    @Test
+    void buddyTreeFindsTheLargestClaimedBlock() {
+        AdaptivePoolingAllocator.BuddyTree tree = new AdaptivePoolingAllocator.BuddyTree(1024 * 1024);
+        int min = AdaptivePoolingAllocator.BuddyTree.MIN_BLOCK_SIZE;
+        assertEquals(0, tree.largestClaimedSize(), "nothing claimed");
+        int small = tree.claim(min);
+        assertEquals(min, tree.largestClaimedSize());
+        int big = tree.claim(256 * 1024);
+        assertEquals(256 * 1024, tree.largestClaimedSize(), "the larger of the two");
+        tree.release(big, 256 * 1024);
+        assertEquals(min, tree.largestClaimedSize(), "back to the small one");
+        int half = tree.claim(512 * 1024);
+        tree.release(small, min);
+        assertEquals(512 * 1024, tree.largestClaimedSize(), "the 512 KiB block, the small one gone");
+        tree.release(half, 512 * 1024);
+        assertEquals(0, tree.largestClaimedSize(), "all released");
+        int whole = tree.claim(1024 * 1024);
+        assertEquals(1024 * 1024, tree.largestClaimedSize(), "the whole chunk");
+        tree.release(whole, 1024 * 1024);
+        for (int i = 0; i < 1024 * 1024 / min; i++) {
+            tree.claim(min);
+        }
+        assertEquals(min, tree.largestClaimedSize(), "every leaf claimed: the internal nodes at 0 are not blocks");
+    }
 }

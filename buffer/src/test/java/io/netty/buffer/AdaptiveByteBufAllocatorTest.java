@@ -2377,6 +2377,34 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
+    /**
+     * The floor of a shrink is the largest buffer still in use, not the one that made the chunk: a chunk made for a
+     * 1 MiB buffer (2 MiB, room for two) shrinks by halves to the smallest chunk once only 256 KiB buffers are kept,
+     * one at a time, even though no new chunk is made in between to tell the magazine its buffers got smaller.
+     */
+    @Test
+    void chunkMadeForALargerBufferShrinksToTheBuffersKeptNow() throws Throwable {
+        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above the size classes");
+        final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, true);
+        onThreadLocalHeap(() -> {
+            final int size = 256 * 1024;
+            allocator.heapBuffer(1024 * 1024, 1024 * 1024).release();
+            long chunk = allocator.usedHeapMemory();
+            assertEquals(2 * 1024 * 1024, chunk, "made for a 1 MiB buffer");
+            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            while (chunk > SMALLEST_LARGE_CHUNK) {
+                setQuietDecays(idleDecay, QUIET_DECAYS_BEFORE_SHRINK - 1);
+                ByteBuf buf = allocator.heapBuffer(size, size);
+                assertEquals(chunk, allocator.usedHeapMemory(), "from a chunk of " + chunk);
+                idleDecay.decay(System.nanoTime());
+                assertEquals(chunk / 2, largeChunkSizeTarget(idleDecay), "halved below the 1 MiB floor");
+                buf.release();
+                assertEquals(0, allocator.usedHeapMemory(), "retired, freed at the release of its buffer");
+                chunk /= 2;
+            }
+        });
+    }
+
     /** A decay that finds the chunk the magazine allocates from more than half used leaves it and its size be. */
     @Test
     void activeLargeChunkMoreThanHalfUsedIsNotRetired() throws Throwable {
