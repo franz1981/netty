@@ -410,6 +410,7 @@ final class AdaptivePoolingAllocator {
         this.segmentSource = segmentSource;
         if (segmentSource != null) {
             this.pageStore = ObjectUtil.checkNotNull(pageStore, "pageStore");
+            checkSizeClassSpansFit(pageStore);
             segmentSize = pageStore.segmentSize;
             segmentCache = new SegmentCache(this, pageStore.segmentCacheBytes / segmentSize);
             regionPool = regionSource != null && pageStore.regionSize > 0 ?
@@ -457,6 +458,17 @@ final class AdaptivePoolingAllocator {
                 }
             }
         };
+    }
+
+    private static void checkSizeClassSpansFit(PageStoreConfig config) {
+        int largestChunk = 0;
+        for (int sizeClass : SIZE_CLASSES) {
+            largestChunk = Math.max(largestChunk, spanChunkSizeOf(sizeClass, config.sliceSize));
+        }
+        if (largestChunk > config.segmentSize) {
+            throw new IllegalArgumentException("segmentSize " + config.segmentSize
+                    + " cannot hold a size-class chunk of " + largestChunk + " (slices of " + config.sliceSize + ')');
+        }
     }
 
     ByteBuf allocate(int size, int maxCapacity) {
@@ -838,14 +850,6 @@ final class AdaptivePoolingAllocator {
                     || segmentSize / sliceSize > Long.SIZE) {
                 throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
                         + " slices of " + sliceSize);
-            }
-            int largestChunk = 0;
-            for (int sizeClass : SIZE_CLASSES) {
-                largestChunk = Math.max(largestChunk, spanChunkSizeOf(sizeClass, sliceSize));
-            }
-            if (largestChunk > segmentSize) {
-                throw new IllegalArgumentException("segmentSize " + segmentSize + " cannot hold a size-class chunk of "
-                        + largestChunk + " (slices of " + sliceSize + ')');
             }
             if (segmentCacheBytes < 0) {
                 throw new IllegalArgumentException("segmentCacheBytes: " + segmentCacheBytes);

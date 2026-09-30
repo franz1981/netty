@@ -752,8 +752,9 @@ public class AdaptiveSegmentsTest {
                 () -> new PageStoreConfig(65 * SLICE_SIZE, SLICE_SIZE, 0, INTERVAL, 0.5), "65 slices");
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE, 0, INTERVAL, 0.5), "partial slice");
-        assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(512 * 1024, 8 * 1024, 0, INTERVAL, 0.5), "576 KiB chunks do not fit");
+        final CountingSegmentSource source = new CountingSegmentSource();
+        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(512 * 1024, 8 * 1024, 0, INTERVAL, 0.5)), "576 KiB chunks do not fit");
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE, 0, 0, INTERVAL, 0.5), "no slice");
         assertThrows(IllegalArgumentException.class,
