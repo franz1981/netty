@@ -16,16 +16,12 @@
 package io.netty.buffer;
 
 import io.netty.util.internal.SystemPropertyUtil;
-import io.netty.util.internal.logging.InternalLogger;
-import io.netty.util.internal.logging.InternalLoggerFactory;
 
 /**
  * The immutable parameters of one allocator's page store, and the direct defaults, read once from the
  * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
  */
 final class PageStoreConfig {
-    private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStoreConfig.class);
-
     /** A slice is whole pages, so that no span starts or ends inside a page. */
     static final int PAGE_SIZE_BYTES = PageSize.PAGE_SIZE;
     /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
@@ -36,8 +32,9 @@ final class PageStoreConfig {
     static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
     /**
      * {@code io.netty.allocator.segmentSize}: a multiple of {@link #SLICE_SIZE_BYTES} from
-     * {@link #MIN_SEGMENT_SIZE_BYTES} to {@link #MAX_SEGMENT_SIZE_BYTES}. Default: 4 MiB, 2 MiB in low-memory mode
-     * (where nothing else the allocator holds is above 2 MiB either).
+     * {@link #MIN_SEGMENT_SIZE_BYTES} to {@link #MAX_SEGMENT_SIZE_BYTES}, rounded to the nearest multiple of
+     * {@link #REGION_ALIGNMENT_BYTES} so that the segments of a default region always keep its alignment. Default:
+     * 4 MiB, 2 MiB in low-memory mode (where nothing else the allocator holds is above 2 MiB either).
      */
     static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
@@ -60,9 +57,9 @@ final class PageStoreConfig {
     static final int REGION_ALIGNMENT_BYTES = 2 * 1024 * 1024;
     /**
      * {@code io.netty.allocator.segmentRegionSize}: the size of the regions a direct allocator carves its
-     * {@link Segment}s out of (see {@link RegionPool}), a multiple of the segment size above
-     * {@link #MALLOC_MMAP_THRESHOLD_MAX_BYTES} and at most {@link Long#SIZE} segments; 0: no regions, one allocation
-     * per segment. Default: the smallest valid size (36 MiB with 4 MiB segments), 0 in low-memory mode. Used only where
+     * {@link Segment}s out of (see {@link RegionPool}), rounded to the nearest multiple of the segment size from
+     * {@link #defaultRegionSize} up to {@link Long#SIZE} segments; 0: no regions, one allocation per segment.
+     * Default: the smallest valid size (36 MiB with 4 MiB segments), 0 in low-memory mode. Used only where
      * allocating direct memory leaves it untouched ({@code PlatformDependent#directAllocationLeavesMemoryUntouched}):
      * where it is zeroed at allocation, a region would cost its whole size at once.
      */
@@ -76,34 +73,31 @@ final class PageStoreConfig {
     }
 
     /**
-     * {@code size} if it is 0 or a valid region size for {@code segmentSize}; else, with a warning, the default. No
-     * regions when segments of {@code segmentSize} would not start on {@link #REGION_ALIGNMENT_BYTES} boundaries.
+     * 0, or {@code size} rounded to the nearest multiple of {@code segmentSize} from {@link #defaultRegionSize} up
+     * to {@link Long#SIZE} segments: {@link #SEGMENT_SIZE_BYTES} is always a multiple of
+     * {@link #REGION_ALIGNMENT_BYTES}, so the regions this yields always keep it.
      */
     static int regionSizeOf(int size, int segmentSize) {
-        if (size != 0 && segmentSize % REGION_ALIGNMENT_BYTES != 0) {
-            logger.warn("-Dio.netty.allocator.segmentSize={}: not a multiple of the region alignment {}, no regions",
-                    segmentSize, REGION_ALIGNMENT_BYTES);
+        if (size == 0) {
             return 0;
         }
-        if (size == 0 || size > MALLOC_MMAP_THRESHOLD_MAX_BYTES && size % segmentSize == 0
-                && size / segmentSize <= Long.SIZE) {
-            return size;
-        }
-        int fallback = AdaptivePoolingAllocator.IS_LOW_MEM ? 0 : defaultRegionSize(segmentSize);
-        logger.warn("-Dio.netty.allocator.segmentRegionSize={}: not 0 nor a multiple of the segment size {} above {} " +
-                "and at most {} segments, using {}",
-                size, segmentSize, MALLOC_MMAP_THRESHOLD_MAX_BYTES, Long.SIZE, fallback);
-        return fallback;
+        long min = defaultRegionSize(segmentSize);
+        long max = (long) Long.SIZE * segmentSize;
+        long rounded = Math.round((double) size / segmentSize) * (long) segmentSize;
+        return (int) Math.max(min, Math.min(max, rounded));
     }
 
-    private static int segmentSizeOf(int size) {
-        if (size % SLICE_SIZE_BYTES != 0 || size < MIN_SEGMENT_SIZE_BYTES || size > MAX_SEGMENT_SIZE_BYTES) {
-            int fallback = AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES;
-            logger.warn("-Dio.netty.allocator.segmentSize={}: not a multiple of {} from {} to {}, using {}",
-                    size, SLICE_SIZE_BYTES, MIN_SEGMENT_SIZE_BYTES, MAX_SEGMENT_SIZE_BYTES, fallback);
-            return fallback;
-        }
-        return size;
+    /**
+     * {@code size} rounded to the nearest multiple of {@link #REGION_ALIGNMENT_BYTES} from
+     * {@link #MIN_SEGMENT_SIZE_BYTES} to {@link #MAX_SEGMENT_SIZE_BYTES}. {@link #REGION_ALIGNMENT_BYTES} is itself a
+     * multiple of {@link #SLICE_SIZE_BYTES}, so the result is always a valid slice count too.
+     */
+    static int segmentSizeOf(int size) {
+        long rounded = Math.round((double) size / REGION_ALIGNMENT_BYTES) * (long) REGION_ALIGNMENT_BYTES;
+        long min = (MIN_SEGMENT_SIZE_BYTES + REGION_ALIGNMENT_BYTES - 1) / REGION_ALIGNMENT_BYTES
+                * (long) REGION_ALIGNMENT_BYTES;
+        long max = MAX_SEGMENT_SIZE_BYTES / REGION_ALIGNMENT_BYTES * (long) REGION_ALIGNMENT_BYTES;
+        return (int) Math.max(min, Math.min(max, rounded));
     }
 
     /** 1 to {@link Long#SIZE} whole slices. */

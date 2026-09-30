@@ -73,9 +73,12 @@ final class PageStoreConfigTest {
         assertEquals(0.5, direct.decayFraction);
     }
 
-    /** The property: 0, or a multiple of the segment size above 32 MiB and at most 64 segments; else the default. */
+    /**
+     * The property: 0 stays off; any other value is rounded to the nearest multiple of the segment size, clamped
+     * from {@link PageStoreConfig#defaultRegionSize} up to 64 segments, rather than rejected.
+     */
     @Test
-    void badRegionSizesFallBackToTheDefault() {
+    void badRegionSizesAreClampedToTheNearestValid() {
         int fallback = PageStoreConfig.defaultRegionSize(SEGMENT_SIZE);
         assertEquals(36 * MIB, fallback);
         assertEquals(34 * MIB, PageStoreConfig.defaultRegionSize(2 * MIB));
@@ -83,23 +86,48 @@ final class PageStoreConfigTest {
         assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(36 * MIB, SEGMENT_SIZE));
         assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(40 * MIB, SEGMENT_SIZE));
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(256 * MIB, SEGMENT_SIZE));
-        boolean lowMemory = PageStoreConfig.SEGMENT_REGION_SIZE_BYTES == 0
-                && System.getProperty("io.netty.allocator.segmentRegionSize") == null;
-        int expected = lowMemory ? 0 : fallback;
-        for (int bad : new int[] {-1, 4 * MIB, 32 * MIB, 34 * MIB, 260 * MIB}) {
-            assertEquals(expected, PageStoreConfig.regionSizeOf(bad, SEGMENT_SIZE), "" + bad);
-        }
+        // Below the floor: clamped up to it.
+        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(-1, SEGMENT_SIZE));
+        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(4 * MIB, SEGMENT_SIZE));
+        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(32 * MIB, SEGMENT_SIZE));
+        // Not a multiple of the segment size: rounded to the nearest one.
+        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(34 * MIB, SEGMENT_SIZE));
+        assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(38 * MIB, SEGMENT_SIZE));
+        // Above the ceiling: clamped down to it.
+        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(260 * MIB, SEGMENT_SIZE));
         // The config itself: 2 to 64 whole segments, a power-of-two alignment.
         assertRejected(SEGMENT_SIZE, SEGMENT_SIZE, REGION_ALIGNMENT);
         assertRejected(SEGMENT_SIZE, 65 * SEGMENT_SIZE, REGION_ALIGNMENT);
         assertRejected(SEGMENT_SIZE, REGION_SIZE + MIB, REGION_ALIGNMENT);
         assertRejected(SEGMENT_SIZE, REGION_SIZE, 3 * MIB);
         assertRejected(SEGMENT_SIZE, -REGION_SIZE, REGION_ALIGNMENT);
-        // Segments of 3 MiB in a 2 MiB-aligned region would not start on 2 MiB boundaries.
+        // Segments of 3 MiB in a 2 MiB-aligned region would not start on 2 MiB boundaries: the constructor still
+        // rejects this combination when it is built directly, for programmatic misuse.
         assertRejected(3 * MIB, 36 * MIB, REGION_ALIGNMENT);
         new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, MIB);
         new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, 0);
-        assertEquals(0, PageStoreConfig.regionSizeOf(36 * MIB, 3 * MIB), "no regions for misaligned segments");
+    }
+
+    /**
+     * The property: rounded to the nearest multiple of the region alignment, clamped from 1 to 4 MiB, so that
+     * regions stay on rather than turning off for a segment size that would misalign them.
+     */
+    @Test
+    void badSegmentSizesAreClampedToTheNearestValid() {
+        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(0));
+        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(-1));
+        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(MIB));
+        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(2 * MIB));
+        // Exactly halfway between 2 and 4 MiB: rounds up.
+        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(3 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(4 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(5 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(Integer.MAX_VALUE));
+        for (int size = MIB; size <= 4 * MIB; size += 64 * 1024) {
+            int rounded = PageStoreConfig.segmentSizeOf(size);
+            assertEquals(0, rounded % PageStoreConfig.REGION_ALIGNMENT_BYTES, "" + size);
+            assertEquals(0, rounded % SLICE_SIZE_BYTES, "" + size);
+        }
     }
 
     private static void assertRejected(final int segmentSize, final int regionSize, final int alignment) {
