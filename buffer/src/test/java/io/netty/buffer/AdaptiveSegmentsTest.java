@@ -58,7 +58,7 @@ public class AdaptiveSegmentsTest {
      * for the chunks that are not carved from segments.
      */
     static final class CountingSegmentSource
-            implements AdaptivePoolingAllocator.SegmentSource, AdaptivePoolingAllocator.ChunkAllocator {
+            implements SegmentSource, AdaptivePoolingAllocator.ChunkAllocator {
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
 

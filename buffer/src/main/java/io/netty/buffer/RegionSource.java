@@ -1,0 +1,35 @@
+/*
+ * Copyright 2026 The Netty Project
+ *
+ * The Netty Project licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+package io.netty.buffer;
+
+/**
+ * Where the regions of a {@link RegionPool} come from. A region is one buffer that segments are carved out of by
+ * {@link SegmentSource#span}; it goes back by {@link AbstractByteBuf#release()}, whole.
+ */
+interface RegionSource {
+    /**
+     * A new region of exactly {@code size} bytes, starting at a multiple of {@code alignment} if this source can
+     * (0: any address).
+     */
+    AbstractByteBuf allocateRegion(int size, int alignment);
+
+    /**
+     * The bytes allocated for {@code region}, which it holds until released: its capacity, or more when aligning
+     * it took more (an over-allocation). What {@link AdaptivePoolingAllocator#usedMemory()} and the chunk events
+     * account for it.
+     */
+    int allocatedBytes(AbstractByteBuf region);
+}

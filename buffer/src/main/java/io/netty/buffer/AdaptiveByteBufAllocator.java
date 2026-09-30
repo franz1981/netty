@@ -110,8 +110,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
      * behind {@link UnsafeByteBufUtil#newDirectByteBuf} (or {@link java.nio.ByteBuffer#allocateDirect} without
      * {@code Unsafe}, which touches every page at once).
      */
-    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator,
-                                                               AdaptivePoolingAllocator.SegmentSource {
+    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
         private final ByteBufAllocator allocator;
 
         private DirectChunkAllocator(ByteBufAllocator allocator) {
@@ -139,7 +138,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
          * allocated one by one.
          */
         @Override
-        public AdaptivePoolingAllocator.RegionSource regionSource() {
+        public RegionSource regionSource() {
             return PlatformDependent.directAllocationLeavesMemoryUntouched() ? new MallocRegionSource(allocator) : null;
         }
     }
@@ -149,7 +148,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
      * through {@link PlatformDependent#allocateDirectAligned} when the platform can ({@code aligned_alloc} on the libc
      * linker cleaner, an over-allocation otherwise), unaligned when it cannot. Freed whole when released.
      */
-    static final class MallocRegionSource implements AdaptivePoolingAllocator.RegionSource {
+    static final class MallocRegionSource implements RegionSource {
         private final ByteBufAllocator allocator;
         /** Set once an aligned allocation was refused: every later region is unaligned. */
         private volatile boolean cannotAlign;

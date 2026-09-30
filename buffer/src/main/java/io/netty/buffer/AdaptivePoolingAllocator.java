@@ -737,46 +737,6 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * Where the {@link Segment}s of a direct allocator come from: the memory the allocator is built on, as for any
-     * chunk buffer (libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}). A segment goes back by
-     * {@link AbstractByteBuf#release()}.
-     */
-    interface SegmentSource {
-        /** A new segment buffer of {@code size} bytes. */
-        AbstractByteBuf allocateSegment(int size);
-
-        /**
-         * A buffer over {@code length} bytes of {@code segment} from {@code offset}, of the same class as
-         * {@code segment} (the chunks of a size class and every other chunk then look alike to the buffers that read
-         * them) and never freeing any memory: releasing it, or not, changes nothing to the segment.
-         */
-        AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
-
-        /** Where regions of segments come from, or {@code null} when this source has none. */
-        default RegionSource regionSource() {
-            return null;
-        }
-    }
-
-    /**
-     * Where the regions of a {@link RegionPool} come from. A region is one buffer that segments are carved out of by
-     * {@link SegmentSource#span}; it goes back by {@link AbstractByteBuf#release()}, whole.
-     */
-    interface RegionSource {
-        /**
-         * A new region of exactly {@code size} bytes, starting at a multiple of {@code alignment} if this source can
-         * (0: any address).
-         */
-        AbstractByteBuf allocateRegion(int size, int alignment);
-
-        /**
-         * The bytes allocated for {@code region}, which it holds until released: its capacity, or more when aligning
-         * it took more (an over-allocation). What {@link #usedMemory()} and the chunk events account for it.
-         */
-        int allocatedBytes(AbstractByteBuf region);
-    }
-
-    /**
      * A uniform piece of memory from the {@link SegmentSource}, handed out in slices of its allocator's
      * {@link PageStoreConfig#sliceSize} (at most {@link Long#SIZE} of them): a span is a
      * run of contiguous slices. The free slices are one bit each in {@link #free}, so claiming a span, freeing it and
