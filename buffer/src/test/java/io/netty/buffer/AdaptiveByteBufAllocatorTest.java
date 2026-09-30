@@ -165,7 +165,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         if (direct.segmentSource == null) {
             return 0;
         }
-        AdaptivePoolingAllocator.RegionPool pool = direct.regionPool;
+        RegionPool pool = direct.regionPool;
         if (pool == null) {
             return direct.segmentSize;
         }
