@@ -111,6 +111,22 @@ final class MmapRegionSourceTest {
         }
     }
 
+    /**
+     * A failed call says why with its errno: ENOMEM (12) for a mapping larger than the address space, EINVAL (22) for
+     * an address that is not on a page.
+     */
+    @Test
+    void failuresCarryTheErrno() {
+        OutOfMemoryError tooLarge = assertThrows(OutOfMemoryError.class, () -> MmapRegionSource.mmap(1L << 62));
+        assertTrue(tooLarge.getMessage().endsWith(": errno 12"), tooLarge.getMessage());
+        IllegalStateException unmap = assertThrows(IllegalStateException.class,
+                () -> MmapRegionSource.munmap(1, PageStoreConfig.PAGE_SIZE_BYTES));
+        assertTrue(unmap.getMessage().endsWith(": errno 22"), unmap.getMessage());
+        IllegalStateException advise = assertThrows(IllegalStateException.class,
+                () -> MmapRegionSource.madviseDontNeed(1, PageStoreConfig.PAGE_SIZE_BYTES));
+        assertTrue(advise.getMessage().endsWith(": errno 22"), advise.getMessage());
+    }
+
     /** The region is mapped while it lives, and unmapped once released. */
     @Test
     void releaseUnmaps() throws IOException {

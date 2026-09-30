@@ -53,9 +53,18 @@ final class MmapRegionSource implements RegionSource {
     private static final int MADV_DONTNEED = 4;
     private static final long MAP_FAILED = -1L;
 
+    // The downcalls take a leading capture-state segment, typed Object, that holds errno after the call.
     private static final MethodHandle MMAP;
     private static final MethodHandle MUNMAP;
     private static final MethodHandle MADVISE;
+    /** {@code () -> Arena}, confined: holds one call's capture state. */
+    private static final MethodHandle OPEN_ARENA;
+    /** {@code (Arena) -> MemorySegment}: a capture state. */
+    private static final MethodHandle NEW_CALL_STATE;
+    /** {@code (Arena) -> void}. */
+    private static final MethodHandle CLOSE_ARENA;
+    /** {@code (MemorySegment) -> int}: the errno of a capture state. */
+    private static final MethodHandle ERRNO;
     /** {@code (long address, long size) -> ByteBuffer}. */
     private static final MethodHandle WRAP;
 
@@ -63,6 +72,10 @@ final class MmapRegionSource implements RegionSource {
         MethodHandle mmap = null;
         MethodHandle munmap = null;
         MethodHandle madvise = null;
+        MethodHandle openArena = null;
+        MethodHandle newCallState = null;
+        MethodHandle closeArena = null;
+        MethodHandle errno = null;
         MethodHandle wrap = null;
         Throwable error = null;
         try {
@@ -94,6 +107,10 @@ final class MmapRegionSource implements RegionSource {
             Class<?> symbolLookupCls = Class.forName("java.lang.foreign.SymbolLookup");
             Class<?> memSegCls = Class.forName("java.lang.foreign.MemorySegment");
             Class<?> funcDescCls = Class.forName("java.lang.foreign.FunctionDescriptor");
+            Class<?> arenaCls = Class.forName("java.lang.foreign.Arena");
+            Class<?> segmentAllocatorCls = Class.forName("java.lang.foreign.SegmentAllocator");
+            Class<?> pathElementCls = Class.forName("java.lang.foreign.MemoryLayout$PathElement");
+            Class<?> ofIntCls = Class.forName("java.lang.foreign.ValueLayout$OfInt");
 
             // Pointers, size_t and off_t are passed as Java longs.
             Object addressLayout = lookup.findStaticGetter(valueLayoutCls, "ADDRESS", addressLayoutCls).invoke();
@@ -113,21 +130,42 @@ final class MmapRegionSource implements RegionSource {
                     .asFixedArity();
             MethodHandle descriptorOf = lookup.findStatic(funcDescCls, "of", methodType(funcDescCls,
                     memoryLayoutCls, Array.newInstance(memoryLayoutCls, 0).getClass())).asFixedArity();
-            Object noOptions = Array.newInstance(linkerOptionCls, 0);
+            Object captureErrno = Array.newInstance(linkerOptionCls, 1);
+            Array.set(captureErrno, 0, lookup.findStatic(linkerOptionCls, "captureCallState",
+                    methodType(linkerOptionCls, String[].class)).asFixedArity().invoke(new String[] {"errno"}));
             Object j = lookup.findStaticGetter(valueLayoutCls, "JAVA_LONG",
                     Class.forName("java.lang.foreign.ValueLayout$OfLong")).invoke();
-            Object i = lookup.findStaticGetter(valueLayoutCls, "JAVA_INT",
-                    Class.forName("java.lang.foreign.ValueLayout$OfInt")).invoke();
+            Object i = lookup.findStaticGetter(valueLayoutCls, "JAVA_INT", ofIntCls).invoke();
 
             // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-            mmap = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, noOptions,
+            mmap = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, captureErrno,
                     "mmap", j, j, j, i, i, i, j);
             // int munmap(void *addr, size_t length)
-            munmap = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, noOptions,
+            munmap = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, captureErrno,
                     "munmap", i, j, j);
             // int madvise(void *addr, size_t length, int advice)
-            madvise = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, noOptions,
+            madvise = link(linker, symbols, find, downcallHandle, descriptorOf, memoryLayoutCls, captureErrno,
                     "madvise", i, j, j, i);
+
+            // Arena.ofConfined(), arena.allocate(Linker.Option.captureStateLayout()), arena.close(), and
+            // state.get(JAVA_INT, <offset of errno>).
+            Object stateLayout = lookup.findStatic(linkerOptionCls, "captureStateLayout",
+                    methodType(Class.forName("java.lang.foreign.StructLayout"))).invoke();
+            Object errnoPath = Array.newInstance(pathElementCls, 1);
+            Array.set(errnoPath, 0, lookup.findStatic(pathElementCls, "groupElement",
+                    methodType(pathElementCls, String.class)).invoke("errno"));
+            long errnoOffset = (Long) lookup.findVirtual(memoryLayoutCls, "byteOffset",
+                    methodType(long.class, errnoPath.getClass())).asFixedArity().invoke(stateLayout, errnoPath);
+            openArena = lookup.findStatic(arenaCls, "ofConfined", methodType(arenaCls))
+                    .asType(methodType(Object.class));
+            newCallState = MethodHandles.insertArguments(lookup.findVirtual(segmentAllocatorCls, "allocate",
+                    methodType(memSegCls, memoryLayoutCls)), 1, stateLayout)
+                    .asType(methodType(Object.class, Object.class));
+            closeArena = lookup.findVirtual(arenaCls, "close", methodType(void.class))
+                    .asType(methodType(void.class, Object.class));
+            errno = MethodHandles.insertArguments(lookup.findVirtual(memSegCls, "get",
+                    methodType(int.class, ofIntCls, long.class)), 1, i, errnoOffset)
+                    .asType(methodType(int.class, Object.class));
 
             // MemorySegment.ofAddress(address).reinterpret(size).asByteBuffer(), as CleanerJava24Linker wraps memory.
             MethodHandle ofAddress = lookup.findStatic(memSegCls, "ofAddress", methodType(memSegCls, long.class));
@@ -140,12 +178,20 @@ final class MmapRegionSource implements RegionSource {
             mmap = null;
             munmap = null;
             madvise = null;
+            openArena = null;
+            newCallState = null;
+            closeArena = null;
+            errno = null;
             wrap = null;
             error = t;
         }
         MMAP = mmap;
         MUNMAP = munmap;
         MADVISE = madvise;
+        OPEN_ARENA = openArena;
+        NEW_CALL_STATE = newCallState;
+        CLOSE_ARENA = closeArena;
+        ERRNO = errno;
         WRAP = wrap;
         if (error == null) {
             logger.debug("mmap(2) regions: available");
@@ -154,8 +200,9 @@ final class MmapRegionSource implements RegionSource {
         }
     }
 
+    /** The downcall of {@code name}, with its leading capture-state segment typed {@code Object}. */
     private static MethodHandle link(Object linker, Object symbols, MethodHandle find, MethodHandle downcallHandle,
-                                     MethodHandle descriptorOf, Class<?> memoryLayoutCls, Object noOptions,
+                                     MethodHandle descriptorOf, Class<?> memoryLayoutCls, Object options,
                                      String name, Object returnLayout, Object... argumentLayouts) throws Throwable {
         Object arguments = Array.newInstance(memoryLayoutCls, argumentLayouts.length);
         for (int k = 0; k < argumentLayouts.length; k++) {
@@ -166,7 +213,8 @@ final class MmapRegionSource implements RegionSource {
         if (!symbol.isPresent()) {
             throw new UnsupportedOperationException(name + " is not in the default lookup");
         }
-        return (MethodHandle) downcallHandle.invoke(linker, symbol.get(), descriptor, noOptions);
+        MethodHandle handle = (MethodHandle) downcallHandle.invoke(linker, symbol.get(), descriptor, options);
+        return handle.asType(handle.type().changeParameterType(0, Object.class));
     }
 
     static boolean isAvailable() {
@@ -198,19 +246,37 @@ final class MmapRegionSource implements RegionSource {
         long head = start - address;
         long tail = mapped - head - size;
         if (head > 0) {
-            munmap(address, head);
+            try {
+                munmap(address, head);
+            } catch (IllegalStateException e) {
+                throw unmapAfter(e, address, mapped);
+            }
         }
         if (tail > 0) {
-            munmap(start + size, tail);
+            try {
+                munmap(start + size, tail);
+            } catch (IllegalStateException e) {
+                throw unmapAfter(e, start, size + tail);
+            }
         }
         ByteBuffer buffer;
         try {
             buffer = (ByteBuffer) WRAP.invokeExact(start, (long) size);
         } catch (Throwable t) {
-            munmap(start, size);
-            throw new IllegalStateException("cannot wrap a mapping of " + size + " bytes", t);
+            throw unmapAfter(new IllegalStateException("cannot wrap a mapping of " + size + " bytes", t), start, size);
         }
         return UnsafeByteBufUtil.newDirectByteBuf(allocator, new Mapping(buffer, start));
+    }
+
+    /** After {@code failure}, unmaps what is left of a new mapping, or records in {@code failure} that it leaked. */
+    private static IllegalStateException unmapAfter(IllegalStateException failure, long address, long length) {
+        try {
+            munmap(address, length);
+        } catch (IllegalStateException e) {
+            failure.addSuppressed(new IllegalStateException(length + " bytes at 0x" + Long.toHexString(address)
+                    + " stay mapped, leaked", e));
+        }
+        return failure;
     }
 
     /**
@@ -224,17 +290,7 @@ final class MmapRegionSource implements RegionSource {
             throw new IllegalArgumentException("offset: " + offset + ", length: " + length + " of "
                     + region.capacity() + " bytes, pages of " + PageStoreConfig.PAGE_SIZE_BYTES);
         }
-        long address = mappingOf(region).address + offset;
-        int result;
-        try {
-            result = (int) MADVISE.invokeExact(address, (long) length, MADV_DONTNEED);
-        } catch (Throwable t) {
-            throw new Error(t);
-        }
-        if (result != 0) {
-            throw new IllegalStateException("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
-                    + Long.toHexString(address));
-        }
+        madviseDontNeed(mappingOf(region).address + offset, length);
     }
 
     /** The start of {@code region}'s mapping. */
@@ -246,31 +302,96 @@ final class MmapRegionSource implements RegionSource {
         return (Mapping) ((UnpooledDirectByteBuf) region).cleanable;
     }
 
-    private static long mmap(long length) {
-        long address;
+    // Each call gets a capture state of its own, allocated and freed around it: the calls are rare, and may come
+    // from any thread.
+
+    static long mmap(long length) {
+        Object arena = openArena();
         try {
-            address = (long) MMAP.invokeExact(0L, length, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0L);
-        } catch (Throwable t) {
-            throw new Error(t);
+            Object state = newCallState(arena);
+            long address;
+            try {
+                address = (long) MMAP.invokeExact(state, 0L, length, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0L);
+            } catch (Throwable t) {
+                throw new Error(t);
+            }
+            if (address == MAP_FAILED) {
+                throw new OutOfMemoryError("mmap(2) failed to map " + length + " bytes: errno " + errno(state));
+            }
+            return address;
+        } finally {
+            closeArena(arena);
         }
-        if (address == MAP_FAILED) {
-            throw new OutOfMemoryError("mmap(2) failed to map " + length + " bytes");
-        }
-        return address;
     }
 
-    private static void munmap(long address, long length) {
-        int result;
+    static void munmap(long address, long length) {
+        Object arena = openArena();
         try {
-            result = (int) MUNMAP.invokeExact(address, length);
+            Object state = newCallState(arena);
+            int result;
+            try {
+                result = (int) MUNMAP.invokeExact(state, address, length);
+            } catch (Throwable t) {
+                throw new Error(t);
+            }
+            if (result != 0) {
+                throw new IllegalStateException("munmap(2) failed for " + length + " bytes at 0x"
+                        + Long.toHexString(address) + ": errno " + errno(state));
+            }
+        } finally {
+            closeArena(arena);
+        }
+    }
+
+    static void madviseDontNeed(long address, long length) {
+        Object arena = openArena();
+        try {
+            Object state = newCallState(arena);
+            int result;
+            try {
+                result = (int) MADVISE.invokeExact(state, address, length, MADV_DONTNEED);
+            } catch (Throwable t) {
+                throw new Error(t);
+            }
+            if (result != 0) {
+                throw new IllegalStateException("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
+                        + Long.toHexString(address) + ": errno " + errno(state));
+            }
+        } finally {
+            closeArena(arena);
+        }
+    }
+
+    private static Object openArena() {
+        try {
+            return (Object) OPEN_ARENA.invokeExact();
         } catch (Throwable t) {
             throw new Error(t);
         }
-        if (result != 0) {
-            // Only EINVAL is possible for a range of our own mapping: a bug.
-            throw new IllegalStateException("munmap(2) failed for " + length + " bytes at 0x"
-                    + Long.toHexString(address));
+    }
+
+    private static Object newCallState(Object arena) {
+        try {
+            return (Object) NEW_CALL_STATE.invokeExact(arena);
+        } catch (Throwable t) {
+            throw new Error(t);
+        }
+    }
+
+    private static void closeArena(Object arena) {
+        try {
+            CLOSE_ARENA.invokeExact(arena);
+        } catch (Throwable t) {
+            throw new Error(t);
+        }
+    }
+
+    private static int errno(Object state) {
+        try {
+            return (int) ERRNO.invokeExact(state);
+        } catch (Throwable t) {
+            throw new Error(t);
         }
     }
 
