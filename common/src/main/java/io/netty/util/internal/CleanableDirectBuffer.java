@@ -38,15 +38,6 @@ public interface CleanableDirectBuffer {
     void clean();
 
     /**
-     * The bytes of memory behind this buffer, as charged to the direct memory counter and freed by {@link #clean()}:
-     * the buffer's capacity, unless the buffer is a part of a larger allocation (see
-     * {@code PlatformDependent#allocateDirectAligned(int, int)}).
-     */
-    default int allocatedCapacity() {
-        return buffer().capacity();
-    }
-
-    /**
      * @return {@code true} if the {@linkplain #memoryAddress() native memory address} is available,
      * otherwise {@code false}.
      */

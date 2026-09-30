@@ -637,22 +637,6 @@ public final class PlatformDependent {
     }
 
     /**
-     * Allocate a direct {@link ByteBuffer} of exactly {@code capacity} bytes starting at an address that is a multiple
-     * of {@code alignment}, for a pooling allocator (an expensive clean is permitted), and return it alongside its
-     * deallocation mechanism, which frees the whole allocation. On Java 24+ with native access (the libc linker
-     * cleaner) this is {@code aligned_alloc} when {@code capacity} is a multiple of {@code alignment}; otherwise
-     * {@code capacity + alignment} bytes are allocated and the aligned part returned. Either way
-     * {@link CleanableDirectBuffer#allocatedCapacity()} is what was allocated, and charged to the direct memory
-     * counter.
-     *
-     * @param alignment a power of two
-     * @throws UnsupportedOperationException when this platform cannot align a direct buffer; nothing stays allocated
-     */
-    public static CleanableDirectBuffer allocateDirectAligned(int capacity, int alignment) {
-        return CLEANER.allocateAligned(capacity, alignment);
-    }
-
-    /**
      * Reallocate a direct buffer with the given new capacity.
      * The old buffer is invalidated and must not be used after this call.
      *
@@ -1138,16 +1122,6 @@ public final class PlatformDependent {
 
     public static boolean useDirectBufferNoCleaner() {
         return CLEANER instanceof DirectCleaner;
-    }
-
-    /**
-     * Whether {@link #allocateDirect(int, boolean)} and {@link #allocateDirectAligned(int, int)} leave the new memory
-     * untouched, so that its pages cost nothing until used: {@code malloc} without zeroing ({@code Unsafe} without a
-     * cleaner, or the libc linker cleaner). {@code ByteBuffer.allocateDirect} zeroes what it allocates; the memory
-     * segment cleaner is counted as touching too.
-     */
-    public static boolean directAllocationLeavesMemoryUntouched() {
-        return CLEANER instanceof DirectCleaner || CLEANER instanceof CleanerJava24Linker;
     }
 
     /**
