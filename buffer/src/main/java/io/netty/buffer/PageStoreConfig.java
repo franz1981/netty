@@ -22,7 +22,7 @@ import io.netty.util.internal.SystemPropertyUtil;
  * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
  */
 final class PageStoreConfig {
-    /** A slice is whole pages, so that no span starts or ends inside a page. */
+    /** With regions, a slice is whole pages, so that no span starts or ends inside a page. */
     static final int PAGE_SIZE_BYTES = PageSize.PAGE_SIZE;
     /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE_BYTES = 64 * 1024;
@@ -45,9 +45,10 @@ final class PageStoreConfig {
      * {@link Segment}s out of (see {@link PageStore}), rounded to the nearest multiple of the segment size from 2 up to
      * {@link Long#SIZE} segments; 0: no regions, one allocation per segment. Default: {@link Long#SIZE} segments
      * (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a segment's pages are committed
-     * as they are touched. Regions need a {@link RegionSource}, {@link MmapRegionSource} for the direct allocator.
+     * as they are touched. Regions need a {@link RegionSource}, {@link MmapRegionSource} for the direct allocator,
+     * and pages no larger than {@link #SLICE_SIZE_BYTES}: 0 otherwise.
      */
-    static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
+    static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(PAGE_SIZE_BYTES, SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
 
     /** The largest: one bit per segment in one {@code long}. */
@@ -68,6 +69,11 @@ final class PageStoreConfig {
         long max = (long) Long.SIZE * segmentSize;
         long rounded = Math.round((double) size / segmentSize) * (long) segmentSize;
         return (int) Math.max(min, Math.min(max, rounded));
+    }
+
+    /** 0 where a page is larger than a slice, else {@link #regionSizeOf(int, int)}. */
+    static int regionSizeOf(int pageSize, int size, int segmentSize) {
+        return pageSize > SLICE_SIZE_BYTES ? 0 : regionSizeOf(size, segmentSize);
     }
 
     /**
@@ -102,8 +108,8 @@ final class PageStoreConfig {
     }
 
     PageStoreConfig(int segmentSize, int sliceSize, long decayIntervalNanos, int regionSize, int regionAlignment) {
-        if (sliceSize <= 0 || sliceSize % PAGE_SIZE_BYTES != 0) {
-            throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES);
+        if (sliceSize <= 0) {
+            throw new IllegalArgumentException("sliceSize: " + sliceSize);
         }
         if (segmentSize <= 0 || segmentSize % sliceSize != 0 || segmentSize / sliceSize > Long.SIZE) {
             throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
@@ -119,6 +125,10 @@ final class PageStoreConfig {
                 || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
             throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor 2 to " + Long.SIZE
                     + " segments of " + segmentSize);
+        }
+        if (regionSize != 0 && sliceSize % PAGE_SIZE_BYTES != 0) {
+            throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES
+                    + ", as regions need");
         }
         if (regionAlignment < 0 || (regionAlignment & regionAlignment - 1) != 0) {
             throw new IllegalArgumentException("regionAlignment: " + regionAlignment);

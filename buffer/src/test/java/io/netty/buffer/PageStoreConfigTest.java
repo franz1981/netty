@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * the direct defaults with their property fallbacks.
  */
 final class PageStoreConfigTest {
-    /** Bad parameters are rejected: too many slices, a partial slice or page, no interval. */
+    /** Bad parameters are rejected: too many slices, a partial slice, a partial page with regions, no interval. */
     @Test
     void pageStoreConfigRejectsBadParameters() {
         assertThrows(IllegalArgumentException.class,
@@ -41,8 +41,10 @@ final class PageStoreConfigTest {
                 () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE_BYTES, INTERVAL), "partial slice");
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE, 0, INTERVAL), "no slice");
-        assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(SEGMENT_SIZE,
-                PageStoreConfig.PAGE_SIZE_BYTES / 2, INTERVAL), "a slice is whole pages");
+        final int halfPage = PageStoreConfig.PAGE_SIZE_BYTES / 2;
+        assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(64 * halfPage, halfPage, INTERVAL,
+                128 * halfPage, 0), "with regions, a slice is whole pages");
+        new PageStoreConfig(64 * halfPage, halfPage, INTERVAL); // without regions, pages do not matter
         assertThrows(IllegalArgumentException.class,
                 () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0), "no interval");
         PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL);
@@ -76,6 +78,10 @@ final class PageStoreConfigTest {
         // Not a multiple of the segment size: rounded to the nearest one.
         assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(34 * MIB, SEGMENT_SIZE));
         assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(38 * MIB, SEGMENT_SIZE));
+        // Pages larger than a slice: no regions, rather than a config that cannot be built.
+        assertEquals(0, PageStoreConfig.regionSizeOf(128 * 1024, 256 * MIB, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(64 * 1024, 256 * MIB, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(4096, 256 * MIB, SEGMENT_SIZE));
         // Above the ceiling: clamped down to it.
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(260 * MIB, SEGMENT_SIZE));
         assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(Integer.MAX_VALUE, SEGMENT_SIZE));
