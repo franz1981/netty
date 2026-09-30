@@ -48,6 +48,9 @@ final class HeapSegments {
     private int cold;
     private volatile boolean freed;
     private int claimedStart = -1;
+    /** Whether its segments' free slices are purged in place: region segments only. */
+    final boolean purgesSlices;
+    private long lastPurgeTick = System.nanoTime();
     /** The segments {@link #markEvacuees} marked, until {@link #clearEvacuees}. */
     private Segment[] evacuees = new Segment[4];
     private int evacueeCount;
@@ -63,6 +66,7 @@ final class HeapSegments {
         this.stripeLock = stripeLock;
         this.ownerThread = ownerThread;
         reserve = new Segment[store.maxReserveLimit()];
+        purgesSlices = store.regionSource != null;
     }
 
     boolean isThreadLocal() {
@@ -167,8 +171,6 @@ final class HeapSegments {
         if (count == segments.length) {
             segments = Arrays.copyOf(segments, count << 1);
         }
-        segment.freeAtDecay = 0;
-        segment.claimedSinceDecay = 0;
         segments[count++] = segment;
     }
 
@@ -290,35 +292,53 @@ final class HeapSegments {
 
     /**
      * Owner only. Gives back half, rounded up, of the reserved segments unused since the previous decay, oldest
-     * first: a reserve of one goes back once it stayed unused a whole interval. Then purges the idle slices of its
-     * region segments, and lets the store purge its idle free slots, if due and no other heap's decay is purging.
+     * first: a reserve of one goes back once it stayed unused a whole interval. Then a {@link #purgeTick}.
      */
     void decay(long now) {
         assert inOwnerContext();
         disposeOldestReserved(cold + 1 >>> 1);
         cold = reserved;
-        if (store.regionSource != null) {
-            purgeIdleSlices();
+        purgeTick(now);
+    }
+
+    /**
+     * Owner only, from the heap's decay ticks (see {@code IdleDecay#count}) and decays. At most once per
+     * {@link PageStoreConfig#purgeCheckNanos}: purges the idle slices of its region segments, and lets the store
+     * purge its idle free slots, if due and no other heap is purging them.
+     */
+    void purgeTick(long now) {
+        assert inOwnerContext();
+        if (now - lastPurgeTick < store.config.purgeCheckNanos) {
+            return;
+        }
+        lastPurgeTick = now;
+        if (purgesSlices) {
+            purgeIdleSlices(now);
         }
         store.purgeIfDue(now);
     }
 
     /**
-     * The memory of the free slices of the heap's region segments that stayed free, unclaimed, since the previous
-     * decay goes back to the OS, one call per run (see {@link PageStore#purgeSlices}): the heap keeps the segments,
-     * and a purged slice claimed again costs page faults only. A slice is purged once until it is claimed again.
+     * The memory of the free slices of the heap's region segments released {@link PageStoreConfig#purgeDelayNanos}
+     * ago or earlier goes back to the OS, one call per run (see {@link PageStore#purgeSlices}): the heap keeps the
+     * segments, and a purged slice claimed again costs page faults only. A slice is purged once until it is claimed
+     * again.
      */
-    private void purgeIdleSlices() {
+    private void purgeIdleSlices(long now) {
+        long delay = store.config.purgeDelayNanos;
         Segment[] segments = this.segments;
         for (int i = 0, n = count; i < n; i++) {
             Segment segment = segments[i];
             if (segment.region == null) {
                 continue; // allocated on its own: nothing to purge in place
             }
-            long free = segment.free;
-            long idle = free & segment.freeAtDecay & ~segment.claimedSinceDecay & segment.resident;
-            segment.freeAtDecay = free;
-            segment.claimedSinceDecay = 0;
+            long idle = 0;
+            for (long bits = segment.free & segment.resident; bits != 0; bits &= bits - 1) {
+                int slice = Long.numberOfTrailingZeros(bits);
+                if (now - segment.freedAt[slice] >= delay) {
+                    idle |= 1L << slice;
+                }
+            }
             if (idle != 0) {
                 segment.resident &= ~store.purgeSlices(segment, idle);
             }

@@ -961,9 +961,9 @@ final class AdaptivePoolingAllocator {
      * <p>
      * With segments (direct memory), a size class that gives up its chunks frees their spans at once, and a segment
      * they empty goes to the heap's reserve, whose decays give back half, rounded up, of what stayed unused through the
-     * whole interval (see {@link HeapSegments#decay}). The same decay lets the {@link PageStore} purge the region
-     * slots that stayed free a whole interval, at most once per interval for all heaps (see
-     * {@link PageStore#purgeIfDue}).
+     * whole interval (see {@link HeapSegments#decay}). With regions, the heap's decay ticks also purge the memory of
+     * its segments' free slices and of the store's free slots that stayed free for the page store's own delay,
+     * shorter than a decay interval (see {@link HeapSegments#purgeTick}).
      * <p>
      * What a heap keeps idle is bounded: up to {@link SizeClassChunkRecycler#RECYCLED_BYTES_BUDGET} in its recycler,
      * up to {@link #CHUNK_REUSE_QUEUE_BYTES} of wholly free large-buffer chunks, the large-buffer chunk it allocates
@@ -995,10 +995,20 @@ final class AdaptivePoolingAllocator {
         // Visible for testing.
         long lastDecayNanos = System.nanoTime();
 
-        /** The heap made {@code allocations} more allocations. */
+        /**
+         * The heap made {@code allocations} more allocations: a size class's purge tick. With segments whose memory
+         * is purged in place (regions), every tick also reads the clock for the heap's purge tick (see
+         * {@link HeapSegments#purgeTick}), whose delay is shorter than a decay interval: a tick comes once per four
+         * chunks' worth of a class's allocations, at least 128.
+         */
         void count(long allocations) {
             allocationsSinceCheck += allocations;
+            HeapSegments segments = heapSegments;
+            boolean purges = segments != null && segments.purgesSlices;
             if (allocationsSinceCheck < DECAY_MIN_ALLOCATIONS) {
+                if (purges) {
+                    segments.purgeTick(System.nanoTime());
+                }
                 return;
             }
             // A new count starts whether or not the interval passed: one look at the clock per count, no more. Every
@@ -1008,6 +1018,8 @@ final class AdaptivePoolingAllocator {
             long now = System.nanoTime();
             if (now - lastDecayNanos >= DECAY_INTERVAL_NANOS) {
                 decay(now);
+            } else if (purges) {
+                segments.purgeTick(now);
             }
         }
 

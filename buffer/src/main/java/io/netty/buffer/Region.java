@@ -22,14 +22,14 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * One mapping from a {@link RegionSource}, cut into {@link #slots} segments at fixed offsets. Its slots are taken and
  * given back from any thread by a CAS on the {@link #free} bitmap: a cleared bit is owned by exactly one thread (the
  * heap that took the slot, its releaser, or the purger that claimed it), which alone touches the slot's
- * {@link #segments} and {@link #freedEpoch} entries; the CAS that gives the bit back publishes them to the next owner.
+ * {@link #segments} and {@link #freedAt} entries; the CAS that gives the bit back publishes them to the next owner.
  * A region lives as long as its {@link PageStore}.
  */
 final class Region {
     private static final AtomicLongFieldUpdater<Region> FREE = AtomicLongFieldUpdater.newUpdater(Region.class, "free");
 
     /** No memory behind the slot: never taken since the region was mapped, or purged since. */
-    static final int UNCOMMITTED = Integer.MIN_VALUE;
+    static final long UNCOMMITTED = Long.MIN_VALUE;
 
     final AbstractByteBuf buffer;
     final int slots;
@@ -40,9 +40,9 @@ final class Region {
     private final Segment[] segments;
     /**
      * Per slot, slot owner only: {@link #UNCOMMITTED}, else memory is behind it (counted in the used memory) and, once
-     * given back, the {@link PageStore#purgeEpoch} it was given back in.
+     * given back, the {@link System#nanoTime()} it was given back at.
      */
-    final int[] freedEpoch;
+    final long[] freedAt;
 
     Region(AbstractByteBuf buffer, int slots) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -51,8 +51,8 @@ final class Region {
         allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
         free = allSlots;
         segments = new Segment[slots];
-        freedEpoch = new int[slots];
-        Arrays.fill(freedEpoch, UNCOMMITTED);
+        freedAt = new long[slots];
+        Arrays.fill(freedAt, UNCOMMITTED);
     }
 
     /**
@@ -75,17 +75,17 @@ final class Region {
     private int lowestCommitted(long slots) {
         for (long bits = slots; bits != 0; bits &= bits - 1) {
             int slot = Long.numberOfTrailingZeros(bits);
-            if (freedEpoch[slot] != UNCOMMITTED) {
+            if (freedAt[slot] != UNCOMMITTED) {
                 return slot;
             }
         }
         return Long.numberOfTrailingZeros(slots);
     }
 
-    /** Frees {@code slot}, which the caller owns, stamped with {@code epoch}. Lock-free. */
-    void giveBack(int slot, int epoch) {
-        if (freedEpoch[slot] != UNCOMMITTED) {
-            freedEpoch[slot] = epoch;
+    /** Frees {@code slot}, which the caller owns, stamped with {@code now}. Lock-free. */
+    void giveBack(int slot, long now) {
+        if (freedAt[slot] != UNCOMMITTED) {
+            freedAt[slot] = now;
         }
         giveBackAll(1L << slot);
     }

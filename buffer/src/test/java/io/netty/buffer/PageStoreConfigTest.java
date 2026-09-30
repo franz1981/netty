@@ -15,8 +15,9 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.TimeUnit;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -58,7 +59,20 @@ final class PageStoreConfigTest {
         assertEquals(SLICE_SIZE_BYTES, direct.sliceSize);
         assertEquals(64 * 1024, direct.sliceSize);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, direct.segmentSize);
-        assertEquals(IdleDecay.DECAY_INTERVAL_NANOS, direct.decayIntervalNanos);
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(PageStoreConfig.PURGE_DELAY_MILLIS), direct.purgeDelayNanos);
+        assertEquals(direct.purgeDelayNanos / 4, direct.purgeCheckNanos);
+        if (System.getProperty("io.netty.allocator.segmentPurgeDelay") == null) {
+            assertEquals(4000, PageStoreConfig.PURGE_DELAY_MILLIS, "mimalloc's 1000 ms purge delay x 4");
+        }
+    }
+
+    /** The purge delay property is clamped to 10 ms .. 10 minutes. */
+    @Test
+    void purgeDelayIsClamped() {
+        assertEquals(10, PageStoreConfig.purgeDelayMillisOf(0));
+        assertEquals(10, PageStoreConfig.purgeDelayMillisOf(-5));
+        assertEquals(4000, PageStoreConfig.purgeDelayMillisOf(4000));
+        assertEquals(600000, PageStoreConfig.purgeDelayMillisOf(Long.MAX_VALUE));
     }
 
     /**

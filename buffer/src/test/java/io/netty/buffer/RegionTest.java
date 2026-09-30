@@ -64,8 +64,8 @@ final class RegionTest {
         for (int slot = 0; slot < 9; slot++) {
             assertEquals(slot, region.takeSlot());
         }
-        region.freedEpoch[5] = 0; // committed when taken, as the page store does
-        region.freedEpoch[7] = 0;
+        region.freedAt[5] = 0; // committed when taken, as the page store does
+        region.freedAt[7] = 0;
         region.giveBack(2, 0);
         region.giveBack(7, 3);
         region.giveBack(5, 3);

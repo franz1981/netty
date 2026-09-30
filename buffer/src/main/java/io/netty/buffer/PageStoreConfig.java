@@ -17,6 +17,8 @@ package io.netty.buffer;
 
 import io.netty.util.internal.SystemPropertyUtil;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  * The immutable parameters of one allocator's page store, and the direct defaults, read once from the
  * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
@@ -50,6 +52,18 @@ final class PageStoreConfig {
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(PAGE_SIZE_BYTES, SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
+
+    /**
+     * {@code io.netty.allocator.segmentPurgeDelay}: milliseconds a free region slot, or a free slice of a segment a
+     * heap holds, stays free before its memory goes back to the OS, as mimalloc's purge delay times its arena
+     * multiplier (1000 ms x 4). From 10 ms to 10 minutes. Default: 4000.
+     */
+    static final long PURGE_DELAY_MILLIS = purgeDelayMillisOf(
+            SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
+
+    static long purgeDelayMillisOf(long millis) {
+        return Math.max(10, Math.min(600000, millis));
+    }
 
     /** The largest: one bit per segment in one {@code long}. */
     static int defaultRegionSize(int segmentSize) {
@@ -92,22 +106,25 @@ final class PageStoreConfig {
     /** 1 to {@link Long#SIZE} whole slices. */
     final int segmentSize;
     final int sliceSize;
+    /** How long free memory stays before it is purged: see {@link #PURGE_DELAY_MILLIS}. */
+    final long purgeDelayNanos;
     /**
-     * What is aged runs at most once per interval, driven by the heaps' decays: an interval shorter than theirs ages
-     * no more often than they run.
+     * How often, at most, a heap looks for memory to purge, and the store runs a purge pass: a quarter of the delay,
+     * so that free memory goes back between one delay and a delay and a quarter after it was freed, while the heaps
+     * allocate (see {@link HeapSegments#purgeTick}).
      */
-    final long decayIntervalNanos;
+    final long purgeCheckNanos;
     /** 2 to {@link Long#SIZE} whole segments, or 0: one allocation per segment. */
     final int regionSize;
     /** A power of two, honoured if the region source can; 0: any address. */
     final int regionAlignment;
 
     /** Without regions: one allocation per segment. */
-    PageStoreConfig(int segmentSize, int sliceSize, long decayIntervalNanos) {
-        this(segmentSize, sliceSize, decayIntervalNanos, 0, 0);
+    PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos) {
+        this(segmentSize, sliceSize, purgeDelayNanos, 0, 0);
     }
 
-    PageStoreConfig(int segmentSize, int sliceSize, long decayIntervalNanos, int regionSize, int regionAlignment) {
+    PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment) {
         if (sliceSize <= 0) {
             throw new IllegalArgumentException("sliceSize: " + sliceSize);
         }
@@ -115,12 +132,13 @@ final class PageStoreConfig {
             throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
                     + " slices of " + sliceSize);
         }
-        if (decayIntervalNanos <= 0) {
-            throw new IllegalArgumentException("decayIntervalNanos: " + decayIntervalNanos);
+        if (purgeDelayNanos <= 0) {
+            throw new IllegalArgumentException("purgeDelayNanos: " + purgeDelayNanos);
         }
         this.segmentSize = segmentSize;
         this.sliceSize = sliceSize;
-        this.decayIntervalNanos = decayIntervalNanos;
+        this.purgeDelayNanos = purgeDelayNanos;
+        purgeCheckNanos = Math.max(1, purgeDelayNanos >>> 2);
         if (regionSize != 0 && (regionSize < 0 || regionSize % segmentSize != 0
                 || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
             throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor 2 to " + Long.SIZE
@@ -141,11 +159,9 @@ final class PageStoreConfig {
         this.regionAlignment = regionAlignment;
     }
 
-    /** Ages with the heaps' decay interval. */
     static PageStoreConfig directDefaults() {
         return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
-                AdaptivePoolingAllocator.IdleDecay.DECAY_INTERVAL_NANOS, SEGMENT_REGION_SIZE_BYTES,
-                REGION_ALIGNMENT_BYTES);
+                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), SEGMENT_REGION_SIZE_BYTES, REGION_ALIGNMENT_BYTES);
     }
 
     int segmentsPerRegion() {

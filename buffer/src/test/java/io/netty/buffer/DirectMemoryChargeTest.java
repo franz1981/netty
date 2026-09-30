@@ -106,7 +106,7 @@ final class DirectMemoryChargeTest {
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.take(heap));
             assertEquals(SLOTS - 1, region.freeSlotCount(), "the slot went back");
-            assertEquals(Region.UNCOMMITTED, region.freedEpoch[1]);
+            assertEquals(Region.UNCOMMITTED, region.freedAt[1]);
             assertEquals(1, store.segmentsCommitted);
             assertEquals(SEGMENT_SIZE, allocator.usedMemory());
             store.free(releaseOwnership(first));

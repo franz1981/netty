@@ -57,6 +57,16 @@ final class RegionPurgeTest {
             newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
     private final PageStore store = allocator.pageStore;
     private final HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
+    private static final long DELAY = INTERVAL; // the allocator's purge delay, see newAllocator
+    private static final long CHECK = DELAY / 4;
+    /** The made-up time of the last {@link #purgeAt}; no earlier than the store's creation. */
+    private long lastPurgeAt = System.nanoTime();
+
+    /** A pass of the store's purge at {@code at}, or a check interval after the previous one when that is later. */
+    private void purgeAt(long at) {
+        lastPurgeAt = Math.max(at, lastPurgeAt + CHECK);
+        store.purgeIfDue(lastPurgeAt);
+    }
 
     private List<Segment> takeAll(int n) {
         List<Segment> taken = new ArrayList<Segment>();
@@ -76,13 +86,14 @@ final class RegionPurgeTest {
     @Test
     void oneCallPerRunOfContiguousSlots() {
         List<Segment> taken = takeAll(SLOTS);
+        long before = System.nanoTime();
         for (int slot : new int[] {1, 2, 3, 5, 6, 8}) {
             giveBack(taken.get(slot));
         }
-        long now = System.nanoTime();
-        store.purgeIfDue(now += INTERVAL);
-        assertEquals(0, regions.purgeCalls(), "given back in this interval");
-        store.purgeIfDue(now += INTERVAL);
+        long after = System.nanoTime();
+        purgeAt(before + DELAY - CHECK);
+        assertEquals(0, regions.purgeCalls(), "free for less than the delay");
+        purgeAt(after + DELAY);
         assertEquals(3, regions.purgeCalls());
         assertArrayEquals(new int[] {SEGMENT_SIZE, 3 * SEGMENT_SIZE}, regions.purges.get(0));
         assertArrayEquals(new int[] {5 * SEGMENT_SIZE, 2 * SEGMENT_SIZE}, regions.purges.get(1));
@@ -98,8 +109,7 @@ final class RegionPurgeTest {
         for (int slot : new int[] {0, 4, 7}) {
             giveBack(taken.get(slot));
         }
-        store.purgeIfDue(now += INTERVAL);
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(System.nanoTime() + DELAY);
         assertEquals(6, regions.purgeCalls(), "0, 4 and 7 are not contiguous");
         assertEquals(0, allocator.usedMemory());
         assertArrayEquals(new int[] {0, 0, SLOTS}, store.slotCounts());
@@ -142,27 +152,28 @@ final class RegionPurgeTest {
     }
 
     /**
-     * A slot is purged by the first purge that finds it given back before the previous one: free through a whole
-     * interval. A purge runs at most once per interval, however often it is asked; one given back meanwhile waits.
+     * A slot is purged by the first pass that finds it free for the delay at least. A pass runs at most once per
+     * check interval, however often it is asked.
      */
     @Test
-    void onlySlotsFreeThroughAWholeInterval() {
+    void onlySlotsFreeForTheDelay() {
         List<Segment> taken = takeAll(3);
-        long now = System.nanoTime();
         giveBack(taken.get(0));
-        store.purgeIfDue(now + INTERVAL / 2);
-        assertEquals(0, store.purges, "not due: less than an interval since the store began");
-        store.purgeIfDue(now += INTERVAL);
+        long freed0 = System.nanoTime();
+        store.purgeIfDue(lastPurgeAt + CHECK / 2);
+        assertEquals(0, store.purges, "not due: less than a check interval since the store began");
+        purgeAt(freed0 + DELAY - CHECK);
         assertEquals(1, store.purges);
-        assertEquals(0, regions.purgeCalls(), "slot 0 was given back during this interval");
+        assertEquals(0, regions.purgeCalls(), "slot 0 is free for less than the delay");
         giveBack(taken.get(1));
-        store.purgeIfDue(now + INTERVAL / 2);
-        assertEquals(1, store.purges, "at most one purge per interval");
-        store.purgeIfDue(now += INTERVAL);
+        long freed1 = System.nanoTime();
+        store.purgeIfDue(lastPurgeAt + CHECK / 2);
+        assertEquals(1, store.purges, "at most one pass per check interval");
+        purgeAt(freed0 + DELAY);
         assertEquals(2, store.purges);
-        assertEquals(1, regions.purgeCalls(), "slot 0 only: slot 1 was given back during the last interval");
+        assertEquals(1, regions.purgeCalls(), "slot 0 only: slot 1 is free for less than the delay");
         assertArrayEquals(new int[] {0, SEGMENT_SIZE}, regions.purges.get(0));
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(freed1 + DELAY);
         assertEquals(2, regions.purgeCalls());
         assertArrayEquals(new int[] {SEGMENT_SIZE, SEGMENT_SIZE}, regions.purges.get(1));
         assertEquals((long) SEGMENT_SIZE, allocator.usedMemory(), "slot 2 is still in the heap");
@@ -171,58 +182,64 @@ final class RegionPurgeTest {
 
     /**
      * A purge call that fails leaves its slots committed, free and purgeable: nothing is thrown to the caller, which
-     * may be an allocation, and the next purge tries them again.
+     * may be an allocation, and the next pass tries them again.
      */
     @Test
     void aFailedPurgeCallIsSwallowedAndRetried() {
         List<Segment> taken = takeAll(3);
         giveBack(taken.get(1));
+        long freed = System.nanoTime();
         final AtomicBoolean fail = new AtomicBoolean(true);
         regions.onPurge = () -> {
             if (fail.get()) {
                 throw new IllegalStateException("madvise(MADV_DONTNEED) failed: errno 22");
             }
         };
-        long now = System.nanoTime();
-        store.purgeIfDue(now += INTERVAL);
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(freed + DELAY);
         assertEquals(1, store.purgeFailures);
         assertEquals(0, store.segmentsPurged);
         assertEquals(3L * SEGMENT_SIZE, allocator.usedMemory(), "still committed");
         assertArrayEquals(new int[] {2, 1, SLOTS - 3}, store.slotCounts());
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(0);
         assertEquals(2, store.purgeFailures);
         fail.set(false);
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(0);
         assertEquals(1, store.segmentsPurged);
         assertEquals(2L * SEGMENT_SIZE, allocator.usedMemory());
         assertAccounted(segments, regions, allocator);
     }
 
-    /** A heap's decay is what drives the purge. */
+    /**
+     * A heap's decay drives the purge too: the reserved segment goes back to its region, stamped with the clock, and
+     * a pass in the same decay purges it once the decay's time is a delay past that.
+     */
     @Test
     void heapDecaysDriveThePurge() {
         Segment segment = heap.claim(63);
         heap.release(segment, 0, 63);
         assertSame(segment, heap.reserve[0]);
         long now = System.nanoTime();
-        heap.decay(now += INTERVAL); // the reserved one is seen; a purge runs, with nothing to purge
-        heap.decay(now += INTERVAL); // it goes back to its region; a purge runs, too early for it
-        assertEquals(0, heap.reserved);
+        heap.decay(now + CHECK); // the reserved one is seen; a pass runs, with nothing to purge
+        assertEquals(1, store.purges);
         assertEquals(0, regions.purgeCalls());
-        heap.decay(now += INTERVAL);
+        heap.decay(now + 2 * CHECK); // it goes back to its region, stamped now; a pass runs, too early for it
+        long freed = System.nanoTime();
+        assertEquals(0, heap.reserved);
+        assertEquals(2, store.purges);
+        assertEquals(0, regions.purgeCalls());
+        heap.decay(freed + DELAY);
         assertEquals(1, regions.purgeCalls());
         assertEquals(3, store.purges);
         assertEquals(0, allocator.usedMemory());
     }
 
     /**
-     * A heap's decays purge the free slices of its region segments that stayed free and unclaimed through a whole
-     * interval, one call per run, once until they are claimed again; the slices in use keep their memory, and the
-     * segment stays in the used memory.
+     * A heap's purge ticks purge the free slices of its region segments released a delay ago or earlier, one call
+     * per run, once until they are claimed again; the slices in use keep their memory, and the segment stays in the
+     * used memory.
      */
     @Test
-    void heapDecaysPurgeTheIdleSlicesOfTheirSegments() {
+    void heapPurgeTicksPurgeTheIdleSlicesOfTheirSegments() {
         int slice = PageStoreConfig.SLICE_SIZE_BYTES;
         Segment segment = heap.claim(8);
         assertSame(segment, heap.claim(8));
@@ -231,41 +248,68 @@ final class RegionPurgeTest {
         int base = segment.slot * SEGMENT_SIZE;
         segment.buffer.setLong(0, 0x0123456789ABCDEFL);
         segment.buffer.setLong(8 * slice, 0x0123456789ABCDEFL);
+        long before = System.nanoTime();
         heap.release(segment, 8, 8);
-        long now = System.nanoTime();
-        heap.decay(now += INTERVAL); // free since this interval only
-        assertEquals(0, store.slicePurgeCalls);
-        heap.decay(now += INTERVAL);
+        long released = System.nanoTime();
+        heap.purgeTick(before + DELAY - CHECK);
+        assertEquals(0, store.slicePurgeCalls, "released less than a delay ago");
+        heap.purgeTick(before + DELAY - CHECK / 2);
+        assertEquals(0, store.slicePurgeCalls, "less than a check interval since the previous tick");
+        heap.purgeTick(released + DELAY);
         assertEquals(1, store.slicePurgeCalls, "8 to 15; 20 to 63 were never claimed: no memory behind them");
         assertArrayEquals(new int[] {base + 8 * slice, 8 * slice}, regions.purges.get(regions.purgeCalls() - 1));
         assertEquals(8L * slice, store.slicePurgeBytes);
         assertEquals(0, segment.buffer.getLong(8 * slice), "purged memory reads zero");
         assertEquals(0x0123456789ABCDEFL, segment.buffer.getLong(0), "slices in use keep theirs");
-        heap.decay(now += INTERVAL);
+        heap.purgeTick(released + DELAY + CHECK);
         assertEquals(1, store.slicePurgeCalls, "purged once");
         assertEquals((long) SEGMENT_SIZE, allocator.usedMemory(), "the heap still holds the segment");
 
-        // Claimed and released again: a whole interval unclaimed before the next purge.
+        // Claimed and released again: a delay after the new release.
         assertSame(segment, heap.claim(8));
         assertEquals(8, heap.claimedStart());
         heap.release(segment, 8, 8);
-        heap.decay(now += INTERVAL);
-        assertEquals(1, store.slicePurgeCalls, "claimed since the previous decay");
-        heap.decay(now += INTERVAL);
+        released = System.nanoTime();
+        heap.purgeTick(released + DELAY + 2 * CHECK);
         assertEquals(2, store.slicePurgeCalls);
         heap.release(segment, 0, 8);
         heap.release(segment, 16, 4);
         assertAccounted(segments, regions, allocator);
     }
 
-    /** A purge that finds another one running returns at once, without purging nor counting a purge. */
+    /**
+     * With a delay of 50 ms, allocations alone, without any decay, purge the slices a chunk freed: the ticks of the
+     * size classes read the clock for the heap's purge tick.
+     */
+    @Test
+    void allocationTicksHonourTheDelay() throws Exception {
+        long delay = TimeUnit.MILLISECONDS.toNanos(50);
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(segments, true, segments, regions,
+                new PageStoreConfig(SEGMENT_SIZE, PageStoreConfig.SLICE_SIZE_BYTES, delay, REGION_SIZE,
+                        REGION_ALIGNMENT));
+        PageStore store = allocator.pageStore;
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        for (int i = 0; i < 3 * 32; i++) { // three 8-slice chunks of 16 KiB buffers
+            bufs.add(allocator.allocate(16384, 16384));
+        }
+        for (ByteBuf buf : bufs) {
+            buf.release(); // two of the chunks empty above the class's floor: their spans go back to the segment
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5); // half a decay interval
+        while (store.slicePurgeCalls == 0 && System.nanoTime() < deadline) {
+            allocator.allocate(1024, 1024).release();
+        }
+        assertTrue(store.slicePurgeCalls > 0, "purged within 5 s of allocations");
+        assertEquals(0, store.purgeFailures + store.slicePurgeFailures);
+    }
+
+    /** A pass that finds another one running returns at once, without purging nor counting a pass. */
     @Test
     void onePurgerAtATime() throws Exception {
-        List<Segment> taken = takeAll(2);
+        List<Segment> taken = takeAll(3);
         giveBack(taken.get(0));
-        final long now = System.nanoTime();
-        store.purgeIfDue(now + INTERVAL);
-        giveBack(taken.get(1));
+        giveBack(taken.get(2));
+        final long freed = System.nanoTime();
         final CountDownLatch inPurge = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicBoolean blocked = new AtomicBoolean();
@@ -279,16 +323,14 @@ final class RegionPurgeTest {
                 }
             }
         };
-        Thread first = new Thread(() -> store.purgeIfDue(now + 2 * INTERVAL));
+        Thread first = new Thread(() -> store.purgeIfDue(freed + DELAY));
         first.start();
         assertTrue(inPurge.await(10, TimeUnit.SECONDS));
-        store.purgeIfDue(now + 10 * INTERVAL);
-        assertEquals(2, store.purges, "the second caller did not purge");
+        store.purgeIfDue(freed + 10 * DELAY);
+        assertEquals(1, store.purges, "the second caller did not purge");
         release.countDown();
         first.join();
-        assertEquals(1, regions.purgeCalls(), "slot 0 only, by the first caller");
-        store.purgeIfDue(now + 11 * INTERVAL);
-        assertEquals(2, regions.purgeCalls(), "slot 1, once the guard is free");
+        assertEquals(2, regions.purgeCalls(), "slots 0 and 2, by the first caller");
         assertAccounted(segments, regions, allocator);
     }
 
@@ -330,10 +372,9 @@ final class RegionPurgeTest {
             }
             giveBack(segment);
         }
-        long now = System.nanoTime();
-        store.purgeIfDue(now += INTERVAL);
+        long freed = System.nanoTime();
         long touched = MmapRegionSourceTest.residentKiB();
-        store.purgeIfDue(now += INTERVAL);
+        purgeAt(freed + DELAY);
         long purged = MmapRegionSourceTest.residentKiB();
         assertEquals(1, regions.purgeCalls());
         assertTrue(touched - purged >= REGION_SIZE / 1024 * 3 / 4,

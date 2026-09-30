@@ -46,16 +46,14 @@ final class Segment implements ChunkInfo {
     final int slot;
     /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
     private final AbstractByteBuf[] spans;
-    // Owner only, for the purge of idle slices in its decays (see HeapSegments#decay).
+    // Owner only, for the purge of idle slices (see HeapSegments#purgeTick).
     /**
      * Slices that may have memory behind them: claimed since the last purge of their memory, or, for a segment
      * allocated on its own, since its allocation.
      */
     long resident;
-    /** Slices free at the owner's previous decay. */
-    long freeAtDecay;
-    /** Slices claimed since the owner's previous decay. */
-    long claimedSinceDecay;
+    /** Per slice, the {@link System#nanoTime()} of its last release. */
+    final long[] freedAt;
     // Owner only, within one HeapSegments#markEvacuees round.
     /** Slices of the owner's chunks in this segment that hold no buffer. */
     int movableSlices;
@@ -77,6 +75,7 @@ final class Segment implements ChunkInfo {
         allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
         free = allFree;
         spans = new AbstractByteBuf[slices];
+        freedAt = new long[slices];
     }
 
     /**
@@ -106,7 +105,6 @@ final class Segment implements ChunkInfo {
             }
             long bits = mask(start, n);
             if (FREE.compareAndSet(this, current, current & ~bits)) {
-                claimedSinceDecay |= bits;
                 resident |= bits;
                 return start;
             }
@@ -124,6 +122,10 @@ final class Segment implements ChunkInfo {
             }
             long next = current | bits;
             if (FREE.compareAndSet(this, current, next)) {
+                long now = System.nanoTime();
+                for (int i = start; i < start + n; i++) {
+                    freedAt[i] = now;
+                }
                 return next;
             }
         }

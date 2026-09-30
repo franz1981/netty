@@ -191,8 +191,8 @@ final class PageStoreTestSupport {
     static int committedSlots(PageStore store) {
         int committed = 0;
         for (Region region : store.regions) {
-            for (int freedEpoch : region.freedEpoch) {
-                committed += freedEpoch != Region.UNCOMMITTED ? 1 : 0;
+            for (long freedAt : region.freedAt) {
+                committed += freedAt != Region.UNCOMMITTED ? 1 : 0;
             }
         }
         return committed;

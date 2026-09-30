@@ -82,8 +82,6 @@ final class PageStore {
     /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
     private volatile long lastPurgeNanos = System.nanoTime();
-    /** Counts the purges; a slot given back stamps itself with it. Written by the purger. */
-    volatile int purgeEpoch;
     // Read by tests and dumps.
     /** Slots taken while no memory backed them: each such take costs page faults as the segment is touched. */
     volatile long segmentsCommitted;
@@ -162,10 +160,10 @@ final class PageStore {
             boolean taken = false;
             try {
                 Segment segment = fullest.segment(slot, segmentSource, config);
-                if (fullest.freedEpoch[slot] == Region.UNCOMMITTED) {
+                if (fullest.freedAt[slot] == Region.UNCOMMITTED) {
                     PlatformDependent.incrementMemoryCounter(config.segmentSize);
                     segment.resident = 0;
-                    fullest.freedEpoch[slot] = 0;
+                    fullest.freedAt[slot] = 0;
                     SEGMENTS_COMMITTED.incrementAndGet(this);
                     allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
                 }
@@ -173,7 +171,7 @@ final class PageStore {
                 return segment;
             } finally {
                 if (!taken) {
-                    fullest.giveBack(slot, purgeEpoch);
+                    fullest.giveBack(slot, System.nanoTime());
                 }
             }
         }
@@ -216,7 +214,7 @@ final class PageStore {
     void free(Segment segment) {
         assert segment.isWhollyFree() && segment.owner == null;
         if (segment.region != null) {
-            segment.region.giveBack(segment.slot, purgeEpoch);
+            segment.region.giveBack(segment.slot, System.nanoTime());
             return;
         }
         allocator.chunkBufferFreed(segment, true);
@@ -233,8 +231,8 @@ final class PageStore {
         this.regions = NO_REGIONS;
         for (Region region : regions) {
             for (int slot = 0; slot < region.slots; slot++) {
-                if (region.freedEpoch[slot] != Region.UNCOMMITTED) {
-                    region.freedEpoch[slot] = Region.UNCOMMITTED;
+                if (region.freedAt[slot] != Region.UNCOMMITTED) {
+                    region.freedAt[slot] = Region.UNCOMMITTED;
                     PlatformDependent.decrementMemoryCounter(config.segmentSize);
                     allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
                 }
@@ -244,19 +242,20 @@ final class PageStore {
     }
 
     /**
-     * Any thread, from a heap's decay. At most once per {@link PageStoreConfig#decayIntervalNanos}, and by one thread
-     * at a time (a try-guard: a caller that finds a purge running returns at once), gives back to the OS the memory
-     * of the free slots that stayed free through a whole interval: those given back before the previous purge.
+     * Any thread, from a heap's purge tick (see {@link HeapSegments#purgeTick}). At most once per
+     * {@link PageStoreConfig#purgeCheckNanos}, and by one thread at a time (a try-guard: a caller that finds a purge
+     * running returns at once), gives back to the OS the memory of the free slots that stayed free for
+     * {@link PageStoreConfig#purgeDelayNanos} at least.
      */
     void purgeIfDue(long now) {
-        if (regionSource == null || now - lastPurgeNanos < config.decayIntervalNanos
+        if (regionSource == null || now - lastPurgeNanos < config.purgeCheckNanos
                 || !PURGING.compareAndSet(this, 0, 1)) {
             return;
         }
         try {
-            if (now - lastPurgeNanos >= config.decayIntervalNanos) {
+            if (now - lastPurgeNanos >= config.purgeCheckNanos) {
                 lastPurgeNanos = now;
-                purge();
+                purge(now);
             }
         } finally {
             purging = 0;
@@ -268,12 +267,11 @@ final class PageStore {
      * run's slots, claimed by CAS, for the call: a take meanwhile still finds every other free slot. A slot purged
      * keeps its free bit's place in the order of takes: taking it again only costs the page faults of touching it.
      */
-    private void purge() {
-        int epoch = purgeEpoch + 1;
-        purgeEpoch = epoch;
+    private void purge(long now) {
         purges++;
+        long delay = config.purgeDelayNanos;
         for (Region region : regions) {
-            long candidates = purgeable(region, region.free, epoch);
+            long candidates = purgeable(region, region.free, now, delay);
             while (candidates != 0) {
                 long run = lowestRun(candidates);
                 candidates &= ~run;
@@ -282,7 +280,7 @@ final class PageStore {
                     continue;
                 }
                 try {
-                    purgeRuns(region, purgeable(region, claimed, epoch));
+                    purgeRuns(region, purgeable(region, claimed, now, delay));
                 } finally {
                     region.giveBackAll(claimed);
                 }
@@ -298,15 +296,15 @@ final class PageStore {
     }
 
     /**
-     * The slots of {@code slots} with memory behind them, given back before the previous purge: free through a whole
-     * interval. Racy for slots the caller does not own, exact for those it does.
+     * The slots of {@code slots} with memory behind them, given back {@code delay} before {@code now} or earlier.
+     * Racy for slots the caller does not own, exact for those it does.
      */
-    private static long purgeable(Region region, long slots, int epoch) {
+    private static long purgeable(Region region, long slots, long now, long delay) {
         long purgeable = 0;
         for (long bits = slots; bits != 0; bits &= bits - 1) {
             int slot = Long.numberOfTrailingZeros(bits);
-            int freed = region.freedEpoch[slot];
-            if (freed != Region.UNCOMMITTED && epoch - freed >= 2) {
+            long freed = region.freedAt[slot];
+            if (freed != Region.UNCOMMITTED && now - freed >= delay) {
                 purgeable |= 1L << slot;
             }
         }
@@ -334,7 +332,7 @@ final class PageStore {
             bytesPurged += (long) run * segmentSize;
             PlatformDependent.decrementMemoryCounter(run * segmentSize);
             for (int slot = start; slot < start + run; slot++) {
-                region.freedEpoch[slot] = Region.UNCOMMITTED;
+                region.freedAt[slot] = Region.UNCOMMITTED;
                 segmentsPurged++;
                 allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
             }
@@ -433,7 +431,7 @@ final class PageStore {
             for (int slot = 0; slot < region.slots; slot++) {
                 if ((free & 1L << slot) == 0) {
                     counts[0]++;
-                } else if (region.freedEpoch[slot] != Region.UNCOMMITTED) {
+                } else if (region.freedAt[slot] != Region.UNCOMMITTED) {
                     counts[1]++;
                 } else {
                     counts[2]++;
