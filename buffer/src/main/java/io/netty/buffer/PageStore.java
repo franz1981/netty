@@ -15,6 +15,8 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.PlatformDependent;
+
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -33,7 +35,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * its free. With regions, the committed segments: a slot counts from the time it is taken with no memory behind it to
  * the time it is purged (or the close), whether a heap holds it or it is free meanwhile. A slot never taken, or
  * purged and not taken since, does not count: this follows what the process has resident, except for the pages of a
- * committed segment nobody touched yet.
+ * committed segment nobody touched yet. The same slots are charged to {@link PlatformDependent}'s direct memory
+ * limit, never whole regions; a segment allocated on its own is charged by its allocation.
  */
 final class PageStore {
     private static final AtomicLongFieldUpdater<PageStore> SEGMENTS_COMMITTED =
@@ -121,13 +124,22 @@ final class PageStore {
             if (slot < 0) {
                 continue; // taken meanwhile: look again
             }
-            Segment segment = fullest.segment(slot, segmentSource, config);
-            if (fullest.freedEpoch[slot] == Region.UNCOMMITTED) {
-                fullest.freedEpoch[slot] = 0;
-                SEGMENTS_COMMITTED.incrementAndGet(this);
-                allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
+            boolean taken = false;
+            try {
+                Segment segment = fullest.segment(slot, segmentSource, config);
+                if (fullest.freedEpoch[slot] == Region.UNCOMMITTED) {
+                    PlatformDependent.incrementMemoryCounter(config.segmentSize);
+                    fullest.freedEpoch[slot] = 0;
+                    SEGMENTS_COMMITTED.incrementAndGet(this);
+                    allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
+                }
+                taken = true;
+                return segment;
+            } finally {
+                if (!taken) {
+                    fullest.giveBack(slot, purgeEpoch);
+                }
             }
-            return segment;
         }
     }
 
@@ -172,6 +184,7 @@ final class PageStore {
             for (int slot = 0; slot < region.slots; slot++) {
                 if (region.freedEpoch[slot] != Region.UNCOMMITTED) {
                     region.freedEpoch[slot] = Region.UNCOMMITTED;
+                    PlatformDependent.decrementMemoryCounter(config.segmentSize);
                     allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
                 }
             }
@@ -247,6 +260,7 @@ final class PageStore {
             regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
             purgeCalls++;
             bytesPurged += (long) run * segmentSize;
+            PlatformDependent.decrementMemoryCounter(run * segmentSize);
             for (int slot = start; slot < start + run; slot++) {
                 region.freedEpoch[slot] = Region.UNCOMMITTED;
                 segmentsPurged++;

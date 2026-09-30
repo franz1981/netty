@@ -38,7 +38,8 @@ import static java.lang.invoke.MethodType.methodType;
  * Linux x86_64 or aarch64 (the {@code PROT_*}, {@code MAP_*} and {@code MADV_*} values below are those of both), with
  * native access enabled for this class's module, never in a native image.
  * <p>
- * Neither the mapping nor a purge is charged to or credited from {@code PlatformDependent}'s direct memory counter.
+ * Neither the mapping nor a purge is charged to or credited from {@code PlatformDependent}'s direct memory counter:
+ * {@link PageStore} charges the slots it commits.
  */
 final class MmapRegionSource implements RegionSource {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(MmapRegionSource.class);
