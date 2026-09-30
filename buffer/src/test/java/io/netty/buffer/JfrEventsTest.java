@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
@@ -38,6 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @Timeout(10)
 @EnabledForJreRange(min = JRE.JAVA_17) // RecordingStream
@@ -170,6 +172,114 @@ public class JfrEventsTest {
         assertTrue(sizeClassChunksFreed.get() > 0, "the dying thread-local heap must free its chunk buffers");
         assertEquals(alloc.metric().usedHeapMemory(), allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
+    }
+
+    /**
+     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment
+     * (a span fires none), segments that empty wait in the allocator's segment cache without an event, and a segment
+     * still holding a buffer when its thread-local heap dies goes there too, when another thread releases that buffer.
+     */
+    @SuppressWarnings("Since15")
+    @Test
+    public void adaptiveDirectChunkEventsAddUpToUsedMemory() throws Exception {
+        Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
+        lowMem.setAccessible(true);
+        assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
+        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+        final int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
+        assumeTrue(segmentSize > 0, "direct chunks are not carved out of segments");
+        final String threadName = "adaptive-direct-chunk-events";
+        final int sentinel = 3 * 1024 * 1024 + 4099;
+        final CountDownLatch sentinelSeen = new CountDownLatch(1);
+        final long[] allocatedFreed = new long[2];
+        final int[] oneShots = new int[2];
+        final int[] segments = new int[2];
+        final AtomicInteger otherSegmentEvents = new AtomicInteger();
+        final ByteBuf[] heldPastTheEnd = new ByteBuf[1];
+        try (RecordingStream stream = new RecordingStream()) {
+            stream.enable(AllocateChunkEvent.class);
+            stream.enable(FreeChunkEvent.class);
+            stream.onEvent(AllocateChunkEvent.NAME, event -> {
+                if (event.getInt("capacity") == sentinel) {
+                    sentinelSeen.countDown();
+                } else if (onWorkloadThread(event, threadName)) {
+                    allocatedFreed[0] += event.getInt("capacity");
+                    oneShots[0] += event.getBoolean("pooled") ? 0 : 1;
+                    if (event.getBoolean("segment")) {
+                        segments[0]++;
+                        if (event.getInt("capacity") != segmentSize) {
+                            otherSegmentEvents.incrementAndGet();
+                        }
+                    }
+                } else if (event.getBoolean("segment")) {
+                    otherSegmentEvents.incrementAndGet();
+                }
+            });
+            stream.onEvent(FreeChunkEvent.NAME, event -> {
+                if (onWorkloadThread(event, threadName)) {
+                    allocatedFreed[1] += event.getInt("capacity");
+                    oneShots[1] += event.getBoolean("pooled") ? 0 : 1;
+                    segments[1] += event.getBoolean("segment") ? 1 : 0;
+                } else if (event.getBoolean("segment")) {
+                    otherSegmentEvents.incrementAndGet();
+                }
+            });
+            stream.startAsync();
+
+            Thread thread = new FastThreadLocalThread(() -> {
+                // Spans of 8 slices: the 16 KiB burst fills a segment, the 64 KiB one reuses its spans.
+                releaseAll(allocateManyDirect(alloc, 16 * 1024, 32 * 8));
+                releaseAll(allocateManyDirect(alloc, 64 * 1024, 8 * 8));
+                alloc.directBuffer(4 * 1024 * 1024).release();
+                releaseAll(allocateManyDirect(alloc, 512 * 1024, 8));
+                // The size classes go idle and give their spans back: the emptied segment waits in the cache.
+                decayThreadLocalHeap(alloc, "direct", 3);
+                heldPastTheEnd[0] = alloc.directBuffer(1024, 1024);
+            }, threadName);
+            thread.start();
+            thread.join();
+            // The heap is gone; this release empties its last segment, from another thread.
+            heldPastTheEnd[0].release();
+            new AdaptiveByteBufAllocator(false).heapBuffer(sentinel).release();
+            sentinelSeen.await();
+        }
+        assertTrue(segments[0] > 0, "segments are announced");
+        assertEquals(0, segments[1], "no segment is freed: the cache holds them");
+        assertEquals(0, otherSegmentEvents.get(), "segment events have the segment's size, on the workload thread");
+        assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
+        assertEquals(1, oneShots[1], "and when it is freed");
+        assertEquals(alloc.metric().usedDirectMemory(), allocatedFreed[0] - allocatedFreed[1],
+                "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
+    }
+
+    private static List<ByteBuf> allocateManyDirect(ByteBufAllocator alloc, int size, int count) {
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>(count);
+        for (int i = 0; i < count; i++) {
+            bufs.add(alloc.directBuffer(size, size));
+        }
+        return bufs;
+    }
+
+    /**
+     * Run the calling thread's thread-local heap's decay {@code decays} times now.
+     */
+    private static void decayThreadLocalHeap(AdaptiveByteBufAllocator alloc, String which, int decays) {
+        try {
+            Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField(which);
+            heapField.setAccessible(true);
+            Object pooling = heapField.get(alloc);
+            Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
+            tlField.setAccessible(true);
+            Object heap = ((FastThreadLocal<?>) tlField.get(pooling)).get();
+            Field decayField = heap.getClass().getDeclaredField("idleDecay");
+            decayField.setAccessible(true);
+            AdaptivePoolingAllocator.IdleDecay idleDecay = (AdaptivePoolingAllocator.IdleDecay) decayField.get(heap);
+            for (int i = 0; i < decays; i++) {
+                idleDecay.decay(System.nanoTime());
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @SuppressWarnings("Since15")
@@ -367,7 +477,11 @@ public class JfrEventsTest {
             alloc.directBuffer(128).release();
 
             RecordedEvent allocate = allocateFuture.get();
-            assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocate.getInt("capacity"));
+            // A direct size class takes a segment and carves its chunk out of it: the segment is the event.
+            int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
+            assertEquals(segmentSize > 0 ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
+                    allocate.getInt("capacity"));
+            assertEquals(segmentSize > 0, allocate.getBoolean("segment"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
             assertTrue(allocate.getBoolean("direct"));

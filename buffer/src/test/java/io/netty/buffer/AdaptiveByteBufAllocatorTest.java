@@ -104,25 +104,46 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         heapBuffer.release();
     }
 
+    /**
+     * Direct size-class chunks are spans of a segment, which is the memory accounted: the first buffer takes a whole
+     * segment, and the chunk of the next size class is another span of it.
+     */
     @Override
     @Test
     public void testUsedDirectMemory() {
         AdaptiveByteBufAllocator allocator =  newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         assertEquals(0, metric.usedDirectMemory());
+        int segmentSize = directSegmentSize(allocator);
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
-        int capacity = buffer.capacity();
-        assertEquals(expectedUsedMemory(allocator, capacity), metric.usedDirectMemory());
+        try {
+            int capacity = buffer.capacity();
+            long first = segmentSize > 0 ? segmentSize : expectedUsedMemory(allocator, capacity);
+            assertEquals(first, metric.usedDirectMemory());
 
-        // Double the size of the buffer
-        buffer.capacity(capacity << 1);
-        capacity = buffer.capacity();
-        // This is a new size class, and a new magazine with a new chunk
-        assertEquals(2 * expectedUsedMemory(allocator, capacity), metric.usedDirectMemory(), buffer.toString());
-
-        buffer.release();
+            // Double the size of the buffer
+            buffer.capacity(capacity << 1);
+            capacity = buffer.capacity();
+            // This is a new size class, and a new magazine with a new chunk: another span of the same segment.
+            long both = segmentSize > 0 ? segmentSize : 2 * expectedUsedMemory(allocator, capacity);
+            assertEquals(both, metric.usedDirectMemory(), buffer.toString());
+        } finally {
+            buffer.release();
+        }
         // Memory is still held by the magazines
-        assertEquals(2 * expectedUsedMemory(allocator, capacity), metric.usedDirectMemory());
+        assertEquals(segmentSize > 0 ? segmentSize : 2 * 128 * 1024, metric.usedDirectMemory());
+    }
+
+    /** The size of the direct allocator's segments, or 0 when its chunks are not carved out of segments. */
+    static int directSegmentSize(AdaptiveByteBufAllocator allocator) {
+        try {
+            Field directField = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
+            directField.setAccessible(true);
+            AdaptivePoolingAllocator direct = (AdaptivePoolingAllocator) directField.get(allocator);
+            return direct.segmentSource != null ? direct.segmentSize : 0;
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     @Override
