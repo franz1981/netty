@@ -29,6 +29,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
@@ -202,7 +203,7 @@ public class JfrEventsTest {
         final int[] oneShots = new int[2];
         final int[] segments = new int[2];
         final List<Integer> units = new ArrayList<Integer>();
-        final AtomicInteger otherSegmentEvents = new AtomicInteger();
+        final List<String> otherSegmentEvents = new ArrayList<String>();
         final ByteBuf[] heldPastTheEnd = new ByteBuf[1];
         try (RecordingStream stream = new RecordingStream()) {
             stream.enable(AllocateChunkEvent.class);
@@ -218,7 +219,7 @@ public class JfrEventsTest {
                         units.add(event.getInt("capacity"));
                     }
                 } else if (isPageStore(event)) {
-                    otherSegmentEvents.incrementAndGet();
+                    otherSegmentEvents.add(threadOf(event));
                 }
             });
             stream.onEvent(FreeChunkEvent.NAME, event -> {
@@ -227,7 +228,7 @@ public class JfrEventsTest {
                     oneShots[1] += event.getBoolean("pooled") ? 0 : 1;
                     segments[1] += isPageStore(event) ? 1 : 0;
                 } else if (isPageStore(event)) {
-                    otherSegmentEvents.incrementAndGet();
+                    otherSegmentEvents.add(threadOf(event));
                 }
             });
             stream.startAsync();
@@ -252,7 +253,7 @@ public class JfrEventsTest {
             sentinelSeen.await();
         }
         assertTrue(segments[0] > 0, "segments are announced");
-        assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload threads");
+        assertEquals(Collections.emptyList(), otherSegmentEvents, "segment events are on the workload threads");
         long unit = segmentSize;
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment");
@@ -298,6 +299,11 @@ public class JfrEventsTest {
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
+    }
+
+    @SuppressWarnings("Since15")
+    private static String threadOf(RecordedEvent event) {
+        return event.getThread() != null ? event.getThread().getJavaName() : null;
     }
 
     @SuppressWarnings("Since15")

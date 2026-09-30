@@ -78,6 +78,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return new AdaptiveByteBufAllocator(preferDirect);
     }
 
+    /** As {@link #newAllocator}, with heap chunks allocated one by one. */
+    protected AdaptiveByteBufAllocator newAllocatorWithoutHeapSegments(boolean preferDirect) {
+        return new AdaptiveByteBufAllocator(preferDirect, false, false);
+    }
+
     @Override
     protected AdaptiveByteBufAllocator newUnpooledAllocator() {
         return newAllocator(false);
@@ -487,7 +492,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @Test
     void idleBuddyChunksAboveTheReuseLimitAreFreed() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
-        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        // The reuse limit is for chunks allocated one by one: heap segments keep a reserve instead.
+        AdaptiveByteBufAllocator allocator = newAllocatorWithoutHeapSegments(true);
         int size = 256 * 1024; // above the largest size class, so buddy chunks
         // The first buffer creates the first chunk: its size and how many buffers it holds come from the allocator,
         // not from the sizing formula copied here.
@@ -587,7 +593,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @Test
     void buddyAllocationPrefersTheChunkWithTheLargestFreeBlock() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
-        AdaptiveByteBufAllocator allocator = newAllocator(true);
+        // Buddy chunks: heap chunks allocated one by one; with segments these buffers are spans instead.
+        AdaptiveByteBufAllocator allocator = newAllocatorWithoutHeapSegments(true);
         int size = 256 * 1024; // above the largest size class, so buddy chunks
         ByteBuf first = allocator.heapBuffer(size, size);
         long chunkSize = allocator.usedHeapMemory();
