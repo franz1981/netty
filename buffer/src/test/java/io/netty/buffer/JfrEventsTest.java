@@ -16,6 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.util.concurrent.FastThreadLocalThread;
+import io.netty.util.internal.PlatformDependent;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
 import org.junit.jupiter.api.Test;
@@ -23,6 +24,8 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledForJreRange;
 import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -38,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @Timeout(10)
 @EnabledForJreRange(min = JRE.JAVA_17) // RecordingStream
@@ -99,16 +103,24 @@ public class JfrEventsTest {
      * any workload the bytes allocated minus the bytes freed must equal the allocator's used memory: chunk buffers
      * that a heap's recycler takes over and hands to a chunk of another size class are neither freed nor allocated
      * again, a one-shot buffer is announced both ways, and a thread-local heap that dies frees what its recycler
-     * held. The workload runs on one thread, whose events are the only ones counted.
+     * held. The workload runs on one thread, whose events are the only ones counted. The same for heap chunks,
+     * direct chunks, and direct chunks that are each their own {@code mmap(2)}.
      */
     @SuppressWarnings("Since15")
-    @Test
-    public void adaptiveChunkEventsAddUpToUsedMemory() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"heap", "direct", "mmap"})
+    public void adaptiveChunkEventsAddUpToUsedMemory(String chunks) throws Exception {
         Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
+        final boolean direct = !"heap".equals(chunks);
+        boolean mmap = "mmap".equals(chunks);
+        if (mmap) {
+            assumeTrue(PlatformDependent.hasDirectMmap(), "mmap(2) direct buffers are not available");
+        }
         // useCacheForNonEventLoopThreads: the workload thread gets a thread-local heap, which its end frees.
-        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(false, true);
+        final AdaptiveByteBufAllocator alloc = direct ?
+                new AdaptiveByteBufAllocator(true, true, mmap) : new AdaptiveByteBufAllocator(false, true);
         final String threadName = "adaptive-chunk-events";
         // A one-shot chunk of a size nothing else allocates, committed after the workload: events arrive in the
         // order they were committed, so once it is seen every event of the workload has been.
@@ -147,13 +159,13 @@ public class JfrEventsTest {
             Thread thread = new FastThreadLocalThread(() -> {
                 // 16 KiB and 64 KiB buffers use 512 KiB chunks and share a recycler pool: a burst of one, fully
                 // released, leaves chunk buffers in the recycler that the other then builds its chunks from.
-                releaseAll(allocateMany(alloc, 16 * 1024, 32 * 8));
-                releaseAll(allocateMany(alloc, 64 * 1024, 8 * 8));
+                releaseAll(allocateMany(alloc, direct, 16 * 1024, 32 * 8));
+                releaseAll(allocateMany(alloc, direct, 64 * 1024, 8 * 8));
                 // One-shot: above the largest pooled buffer.
-                alloc.heapBuffer(4 * 1024 * 1024).release();
+                (direct ? alloc.directBuffer(4 * 1024 * 1024) : alloc.heapBuffer(4 * 1024 * 1024)).release();
                 // Above the size classes: large-buffer chunks of the thread-local heap, kept idle there after the
                 // release.
-                releaseAll(allocateMany(alloc, 512 * 1024, 8));
+                releaseAll(allocateMany(alloc, direct, 512 * 1024, 8));
                 // The thread-local heap is freed when this thread ends, with what its recycler holds.
             }, threadName);
             thread.start();
@@ -168,7 +180,8 @@ public class JfrEventsTest {
         assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
         assertEquals(1, oneShots[1], "and when it is freed");
         assertTrue(sizeClassChunksFreed.get() > 0, "the dying thread-local heap must free its chunk buffers");
-        assertEquals(alloc.metric().usedHeapMemory(), allocatedFreed[0] - allocatedFreed[1],
+        assertEquals(direct ? alloc.metric().usedDirectMemory() : alloc.metric().usedHeapMemory(),
+                allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
     }
 
@@ -177,10 +190,10 @@ public class JfrEventsTest {
         return event.getThread() != null && threadName.equals(event.getThread().getJavaName());
     }
 
-    private static List<ByteBuf> allocateMany(ByteBufAllocator alloc, int size, int count) {
+    private static List<ByteBuf> allocateMany(ByteBufAllocator alloc, boolean direct, int size, int count) {
         List<ByteBuf> bufs = new ArrayList<ByteBuf>(count);
         for (int i = 0; i < count; i++) {
-            bufs.add(alloc.heapBuffer(size, size));
+            bufs.add(direct ? alloc.directBuffer(size, size) : alloc.heapBuffer(size, size));
         }
         return bufs;
     }

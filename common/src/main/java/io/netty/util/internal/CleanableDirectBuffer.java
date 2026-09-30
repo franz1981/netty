@@ -53,4 +53,18 @@ public interface CleanableDirectBuffer {
     default long memoryAddress() {
         return 0;
     }
+
+    /**
+     * Give the physical memory of the whole pages inside {@code [offset, offset + length)} back to the OS, keeping
+     * the buffer usable: those bytes read as zero afterwards. Optional: only buffers from
+     * {@link PlatformDependent#allocateDirectMmap(int)} support it.
+     *
+     * @param offset The first byte of the range.
+     * @param length The number of bytes in the range.
+     * @return {@code true} if the pages were given back (or the range holds no whole page), {@code false} if this
+     * buffer does not support it or the OS refused.
+     */
+    default boolean purge(int offset, int length) {
+        return false;
+    }
 }

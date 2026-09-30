@@ -637,6 +637,31 @@ public final class PlatformDependent {
     }
 
     /**
+     * Whether {@link #allocateDirectMmap(int)} is available: Java 22+ on Linux x86_64 or aarch64, with native access
+     * enabled for this module.
+     */
+    public static boolean hasDirectMmap() {
+        return MmapCleaner.isSupported();
+    }
+
+    /**
+     * Map a direct {@link ByteBuffer} of the given capacity with its own anonymous {@code mmap(2)}, page-aligned and
+     * rounded up to whole pages, whose {@link CleanableDirectBuffer#clean()} gives it back to the OS with
+     * {@code munmap(2)}. Two system calls per buffer: meant for big, pooled buffers, such as allocator chunks.
+     *
+     * @param capacity The desired capacity of the direct byte buffer.
+     * @return The {@link CleanableDirectBuffer} instance that contain the buffer and its deallocation mechanism.
+     * @throws UnsupportedOperationException if {@link #hasDirectMmap()} is {@code false}.
+     */
+    public static CleanableDirectBuffer allocateDirectMmap(int capacity) {
+        MmapCleaner cleaner = MmapCleaner.INSTANCE;
+        if (cleaner == null) {
+            throw new UnsupportedOperationException("mmap(2) direct buffers are not available");
+        }
+        return cleaner.allocate(capacity);
+    }
+
+    /**
      * Reallocate a direct buffer with the given new capacity.
      * The old buffer is invalidated and must not be used after this call.
      *
