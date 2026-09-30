@@ -63,10 +63,6 @@ final class PageStore {
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeHugeBlocks");
     private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_FAILURES =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeFailures");
-    private static final AtomicLongFieldUpdater<PageStore> RENEWALS_STARTED =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "renewalsStarted");
-    private static final AtomicLongFieldUpdater<PageStore> RENEWALS_DONE =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "renewalsDone");
     private static final Region[] NO_REGIONS = new Region[0];
     /** mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments. */
     private static final int RESERVE_BYTES = 32 * 1024 * 1024;
@@ -116,9 +112,6 @@ final class PageStore {
     /** Whole {@link PageStoreConfig#regionAlignment} blocks inside the purged runs: huge pages a THP kernel keeps. */
     volatile long slicePurgeHugeBlocks;
     volatile long slicePurgeFailures;
-    // Written by any heap's decay or release: the renewals of heaps' last segments (see HeapSegments#markEvacuees).
-    volatile long renewalsStarted;
-    volatile long renewalsDone;
     /**
      * With JFR available, for {@link PageStoreStateEvent} only, else {@code null}: the segments allocated on their own
      * that are out, and the heaps, weakly.
@@ -582,16 +575,6 @@ final class PageStore {
             PageStorePurgeEvent.end(event, unit, region.buffer._memoryAddress() + offset, length, region.index,
                     failure);
         }
-    }
-
-    /** A heap started renewing its last segment. */
-    void renewing() {
-        RENEWALS_STARTED.incrementAndGet(this);
-    }
-
-    /** A heap gave back the segment it renewed. */
-    void renewed() {
-        RENEWALS_DONE.incrementAndGet(this);
     }
 
     private void slicePurgeFailed(Throwable cause) {
