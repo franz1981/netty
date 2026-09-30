@@ -116,33 +116,61 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(0, metric.usedDirectMemory());
         int segmentSize = directSegmentSize(allocator);
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
+        long unit = directPageStoreUnit(allocator);
         try {
             int capacity = buffer.capacity();
-            long first = segmentSize > 0 ? segmentSize : expectedUsedMemory(allocator, capacity);
+            long first = segmentSize > 0 ? unit : expectedUsedMemory(allocator, capacity);
             assertEquals(first, metric.usedDirectMemory());
 
             // Double the size of the buffer
             buffer.capacity(capacity << 1);
             capacity = buffer.capacity();
             // This is a new size class, and a new magazine with a new chunk: another span of the same segment.
-            long both = segmentSize > 0 ? segmentSize : 2 * expectedUsedMemory(allocator, capacity);
+            long both = segmentSize > 0 ? unit : 2 * expectedUsedMemory(allocator, capacity);
             assertEquals(both, metric.usedDirectMemory(), buffer.toString());
         } finally {
             buffer.release();
         }
         // Memory is still held by the magazines
-        assertEquals(segmentSize > 0 ? segmentSize : 2 * 128 * 1024, metric.usedDirectMemory());
+        assertEquals(segmentSize > 0 ? unit : 2 * 128 * 1024, metric.usedDirectMemory());
+    }
+
+    static AdaptivePoolingAllocator direct(AdaptiveByteBufAllocator allocator) {
+        try {
+            Field directField = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
+            directField.setAccessible(true);
+            return (AdaptivePoolingAllocator) directField.get(allocator);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     /** The size of the direct allocator's segments, or 0 when its chunks are not carved out of segments. */
     static int directSegmentSize(AdaptiveByteBufAllocator allocator) {
-        try {
-            Field directField = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
-            directField.setAccessible(true);
-            AdaptivePoolingAllocator direct = (AdaptivePoolingAllocator) directField.get(allocator);
-            return direct.segmentSource != null ? direct.segmentSize : 0;
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
+        AdaptivePoolingAllocator direct = direct(allocator);
+        return direct.segmentSource != null ? direct.segmentSize : 0;
+    }
+
+    /** Whether the direct allocator carves its segments out of regions. */
+    static boolean directRegions(AdaptiveByteBufAllocator allocator) {
+        return direct(allocator).regionPool != null;
+    }
+
+    /**
+     * What the direct allocator's page store accounts per unit: a segment, or with regions what was allocated for its
+     * first region (the region, plus what aligning it took), -1 while it has none; 0 without segments.
+     */
+    static long directPageStoreUnit(AdaptiveByteBufAllocator allocator) {
+        AdaptivePoolingAllocator direct = direct(allocator);
+        if (direct.segmentSource == null) {
+            return 0;
+        }
+        AdaptivePoolingAllocator.RegionPool pool = direct.regionPool;
+        if (pool == null) {
+            return direct.segmentSize;
+        }
+        synchronized (pool) {
+            return pool.count > 0 ? pool.regions[0].allocatedBytes : -1;
         }
     }
 

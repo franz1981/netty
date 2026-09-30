@@ -175,9 +175,10 @@ public class JfrEventsTest {
     }
 
     /**
-     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment
-     * (a span fires none), segments that empty wait in the allocator's segment cache without an event, and a segment
-     * still holding a buffer when its thread-local heap dies goes there too, when another thread releases that buffer.
+     * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment,
+     * or per region when segments are carved out of regions (a span fires none, nor does a segment of a region),
+     * segments that empty wait in the allocator's segment cache without an event, and a segment still holding a buffer
+     * when its thread-local heap dies goes there too, when another thread releases that buffer.
      */
     @SuppressWarnings("Since15")
     @Test
@@ -194,6 +195,7 @@ public class JfrEventsTest {
         final long[] allocatedFreed = new long[2];
         final int[] oneShots = new int[2];
         final int[] segments = new int[2];
+        final List<Integer> units = new ArrayList<Integer>();
         final AtomicInteger otherSegmentEvents = new AtomicInteger();
         final ByteBuf[] heldPastTheEnd = new ByteBuf[1];
         try (RecordingStream stream = new RecordingStream()) {
@@ -205,13 +207,11 @@ public class JfrEventsTest {
                 } else if (onWorkloadThread(event, threadName)) {
                     allocatedFreed[0] += event.getInt("capacity");
                     oneShots[0] += event.getBoolean("pooled") ? 0 : 1;
-                    if (event.getBoolean("segment")) {
+                    if (isPageStore(event)) {
                         segments[0]++;
-                        if (event.getInt("capacity") != segmentSize) {
-                            otherSegmentEvents.incrementAndGet();
-                        }
+                        units.add(event.getInt("capacity"));
                     }
-                } else if (event.getBoolean("segment")) {
+                } else if (isPageStore(event)) {
                     otherSegmentEvents.incrementAndGet();
                 }
             });
@@ -219,8 +219,8 @@ public class JfrEventsTest {
                 if (onWorkloadThread(event, threadName)) {
                     allocatedFreed[1] += event.getInt("capacity");
                     oneShots[1] += event.getBoolean("pooled") ? 0 : 1;
-                    segments[1] += event.getBoolean("segment") ? 1 : 0;
-                } else if (event.getBoolean("segment")) {
+                    segments[1] += isPageStore(event) ? 1 : 0;
+                } else if (isPageStore(event)) {
                     otherSegmentEvents.incrementAndGet();
                 }
             });
@@ -245,11 +245,20 @@ public class JfrEventsTest {
         }
         assertTrue(segments[0] > 0, "segments are announced");
         assertEquals(0, segments[1], "no segment is freed: the cache holds them");
-        assertEquals(0, otherSegmentEvents.get(), "segment events have the segment's size, on the workload thread");
+        assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload thread");
+        long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc);
+        for (int capacity : units) {
+            assertEquals(unit, capacity, "segment events have the size of a segment, or of a region");
+        }
         assertEquals(1, oneShots[0], "the one-shot chunk is announced when it is allocated");
         assertEquals(1, oneShots[1], "and when it is freed");
         assertEquals(alloc.metric().usedDirectMemory(), allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");
+    }
+
+    @SuppressWarnings("Since15")
+    private static boolean isPageStore(RecordedEvent event) {
+        return event.getBoolean("segment") || event.getBoolean("region");
     }
 
     private static List<ByteBuf> allocateManyDirect(ByteBufAllocator alloc, int size, int count) {
@@ -477,11 +486,14 @@ public class JfrEventsTest {
             alloc.directBuffer(128).release();
 
             RecordedEvent allocate = allocateFuture.get();
-            // A direct size class takes a segment and carves its chunk out of it: the segment is the event.
+            // A direct size class takes a segment and carves its chunk out of it: the segment, or the region it is
+            // carved out of, is the event.
             int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
-            assertEquals(segmentSize > 0 ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
-                    allocate.getInt("capacity"));
-            assertEquals(segmentSize > 0, allocate.getBoolean("segment"));
+            boolean regions = AdaptiveByteBufAllocatorTest.directRegions(alloc);
+            assertEquals(segmentSize > 0 ? AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc)
+                            : AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocate.getInt("capacity"));
+            assertEquals(segmentSize > 0 && !regions, allocate.getBoolean("segment"));
+            assertEquals(regions, allocate.getBoolean("region"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
             assertTrue(allocate.getBoolean("direct"));

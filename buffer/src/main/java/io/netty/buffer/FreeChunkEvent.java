@@ -39,4 +39,7 @@ final class FreeChunkEvent extends AbstractChunkEvent {
     @Description("Is this chunk a segment of the adaptive allocator's page store, whose size-class chunks are "
             + "spans of it that fire no chunk events of their own?")
     public boolean segment;
+    @Description("Is this chunk a region of the adaptive allocator's page store, whose segments are carved out of it "
+            + "and fire no chunk events of their own?")
+    public boolean region;
 }

@@ -24,6 +24,7 @@ import io.netty.buffer.AdaptivePoolingAllocator.SegmentCache;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
+import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -704,27 +705,41 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * The defaults: 4 MiB segments and a 64 MiB cache, 2 MiB and 8 MiB in low-memory mode, where the single stripe
-     * carves its direct chunks out of segments too; heap buffers never.
+     * The defaults: 4 MiB segments, a 64 MiB cache and 36 MiB regions; 2 MiB, 8 MiB and no regions in low-memory mode,
+     * where the single stripe carves its direct chunks out of segments too; heap buffers never. The memory accounted
+     * is a region (with what aligning it took), or a segment without regions.
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
         boolean lowMemory = isLowMemory();
         assumeFalse(System.getProperty("io.netty.allocator.segmentSize") != null
-                || System.getProperty("io.netty.allocator.segmentCacheBytes") != null, "set explicitly");
+                || System.getProperty("io.netty.allocator.segmentCacheBytes") != null
+                || System.getProperty("io.netty.allocator.segmentRegionSize") != null, "set explicitly");
         assertEquals(lowMemory ? 2 * 1024 * 1024 : 4 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_SIZE);
         assertEquals(lowMemory ? 8 * 1024 * 1024 : 64 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_CACHE_BYTES);
+        assertEquals(lowMemory ? 0 : 36 * 1024 * 1024, AdaptivePoolingAllocator.SEGMENT_REGION_SIZE);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
+        boolean regions = !lowMemory && PlatformDependent.directAllocationLeavesMemoryUntouched();
+        assertEquals(regions, AdaptiveByteBufAllocatorTest.directRegions(allocator));
         ByteBuf buf = allocator.directBuffer(1024, 1024);
-        assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, allocator.metric().usedDirectMemory());
+        long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(allocator);
+        if (!regions) {
+            assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, unit);
+        } else {
+            int region = AdaptivePoolingAllocator.SEGMENT_REGION_SIZE;
+            assertTrue(unit == region || unit == region + AdaptivePoolingAllocator.REGION_ALIGNMENT,
+                    "a region, aligned by aligned_alloc or by over-allocating: " + unit);
+            assertNotNull(chunkOf(buf).segment.region);
+        }
+        assertEquals(unit, allocator.metric().usedDirectMemory());
         assertNotNull(chunkOf(buf).segment);
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNull(chunkOf(heap).segment);
         assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocator.metric().usedHeapMemory());
         buf.release();
         heap.release();
-        assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, allocator.metric().usedDirectMemory(),
+        assertEquals(unit, allocator.metric().usedDirectMemory(),
                 "the segment stays with the chunk its size class keeps");
     }
 

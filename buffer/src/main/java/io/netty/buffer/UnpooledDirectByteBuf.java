@@ -71,6 +71,16 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
     }
 
     /**
+     * A buffer over {@code memory}, of its capacity, that frees it by {@link CleanableDirectBuffer#clean()} when
+     * released.
+     */
+    UnpooledDirectByteBuf(ByteBufAllocator alloc, CleanableDirectBuffer memory) {
+        super(memory.buffer().capacity());
+        this.alloc = ObjectUtil.checkNotNull(alloc, "alloc");
+        setByteBuffer(memory, false);
+    }
+
+    /**
      * Creates a new direct buffer by wrapping the specified initial buffer.
      *
      * @param maxCapacity the maximum capacity of the underlying direct buffer

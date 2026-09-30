@@ -212,6 +212,42 @@ final class AdaptivePoolingAllocator {
      */
     static final int SEGMENT_CACHE_BYTES = Math.max(0, SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentCacheBytes", IS_LOW_MEM ? 8 * 1024 * 1024 : 64 * 1024 * 1024));
+    /**
+     * glibc's dynamic mmap threshold never rises above {@code DEFAULT_MMAP_THRESHOLD_MAX}, 32 MiB on 64-bit, and a
+     * chunk above it never moves the threshold: a {@code malloc} above 32 MiB is always an {@code mmap}, its
+     * {@code free} always a {@code munmap}, so it leaves no hole in an arena (glibc {@code malloc.c}: the max at 901,
+     * the mmap test {@code nb >= mp_.mmap_threshold} at 2351, the ratchet on free, bounded by the max, at 4404-4409).
+     */
+    static final int MALLOC_MMAP_THRESHOLD_MAX = 32 * 1024 * 1024;
+    /** A direct allocator's regions start at a multiple of 2 MiB, so that a THP-enabled kernel can back them whole. */
+    static final int REGION_ALIGNMENT = 2 * 1024 * 1024;
+    /**
+     * {@code io.netty.allocator.segmentRegionSize}: the size of the regions a direct allocator carves its
+     * {@link Segment}s out of (see {@link RegionPool}), a multiple of the segment size above
+     * {@link #MALLOC_MMAP_THRESHOLD_MAX} and at most {@link Long#SIZE} segments; 0: no regions, one allocation per
+     * segment. Default: the smallest valid size (36 MiB with 4 MiB segments), 0 in low-memory mode. Used only where
+     * allocating direct memory leaves it untouched ({@code PlatformDependent#directAllocationLeavesMemoryUntouched}):
+     * where it is zeroed at allocation, a region would cost its whole size at once.
+     */
+    static final int SEGMENT_REGION_SIZE = regionSizeOf(SystemPropertyUtil.getInt(
+            "io.netty.allocator.segmentRegionSize", IS_LOW_MEM ? 0 : defaultRegionSize(SEGMENT_SIZE)), SEGMENT_SIZE);
+
+    /** The smallest multiple of {@code segmentSize} above {@link #MALLOC_MMAP_THRESHOLD_MAX}. */
+    static int defaultRegionSize(int segmentSize) {
+        return (MALLOC_MMAP_THRESHOLD_MAX / segmentSize + 1) * segmentSize;
+    }
+
+    /** {@code size} if it is 0 or a valid region size for {@code segmentSize}; else, with a warning, the default. */
+    static int regionSizeOf(int size, int segmentSize) {
+        if (size == 0 || size > MALLOC_MMAP_THRESHOLD_MAX && size % segmentSize == 0
+                && size / segmentSize <= Long.SIZE) {
+            return size;
+        }
+        int fallback = IS_LOW_MEM ? 0 : defaultRegionSize(segmentSize);
+        logger.warn("-Dio.netty.allocator.segmentRegionSize={}: not 0 nor a multiple of the segment size {} above {} " +
+                "and at most {} segments, using {}", size, segmentSize, MALLOC_MMAP_THRESHOLD_MAX, Long.SIZE, fallback);
+        return fallback;
+    }
 
     private static int segmentSizeOf(int size) {
         if (size % SLICE_SIZE != 0 || size < MIN_SEGMENT_SIZE || size > MAX_SEGMENT_SIZE) {
@@ -347,6 +383,8 @@ final class AdaptivePoolingAllocator {
     final int segmentSize;
     /** The wholly free segments any heap takes first; {@code null} without a {@link #segmentSource}. */
     final SegmentCache segmentCache;
+    /** The regions segments are carved out of; {@code null} when each segment is an allocation of its own. */
+    final RegionPool regionPool;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
         this(chunkAllocator, useCacheForNonEventLoopThreads,
@@ -354,21 +392,33 @@ final class AdaptivePoolingAllocator {
                 PageStoreConfig.directDefaults());
     }
 
+    /** The regions come from {@code segmentSource}'s {@link SegmentSource#regionSource()}, if the config has them. */
+    AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
+                             SegmentSource segmentSource, PageStoreConfig pageStore) {
+        this(chunkAllocator, useCacheForNonEventLoopThreads, segmentSource,
+                segmentSource != null && pageStore.regionSize > 0 ? segmentSource.regionSource() : null, pageStore);
+    }
+
     /**
      * @param segmentSource where the segments come from, or {@code null} for chunks allocated one by one
+     * @param regionSource  where the regions segments are carved out of come from, or {@code null} for one allocation
+     *                      per segment; ignored when the config has no regions
      * @param pageStore     the page store's parameters; ignored without a {@code segmentSource}
      */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             SegmentSource segmentSource, PageStoreConfig pageStore) {
+                             SegmentSource segmentSource, RegionSource regionSource, PageStoreConfig pageStore) {
         this.segmentSource = segmentSource;
         if (segmentSource != null) {
             this.pageStore = ObjectUtil.checkNotNull(pageStore, "pageStore");
             segmentSize = pageStore.segmentSize;
             segmentCache = new SegmentCache(this, pageStore.segmentCacheBytes / segmentSize);
+            regionPool = regionSource != null && pageStore.regionSize > 0 ?
+                    new RegionPool(this, regionSource, pageStore) : null;
         } else {
             this.pageStore = null;
             segmentSize = 0;
             segmentCache = null;
+            regionPool = null;
         }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
@@ -623,7 +673,9 @@ final class AdaptivePoolingAllocator {
      * A {@link Segment} is one such buffer, whole, from the moment it is taken from the {@link #segmentSource} to the
      * moment it is freed, wherever it is in between (a heap, the {@link #segmentCache}, or a heap that was freed
      * while spans were still out): the events are per segment, and the size-class chunks carved out of a segment as
-     * spans fire none, since their memory never leaves the allocator.
+     * spans fire none, since their memory never leaves the allocator. With a {@link #regionPool}, the unit is the
+     * {@link Region} instead, counted for what was allocated for it (its alignment included), from its allocation to
+     * its free: the segments carved out of it fire no events, wherever they are.
      */
     long usedMemory() {
         return chunkRegistry.totalCapacity();
@@ -645,6 +697,7 @@ final class AdaptivePoolingAllocator {
                 event.pooled = pooled;
                 event.threadLocal = threadLocal;
                 event.segment = chunk instanceof Segment;
+                event.region = chunk instanceof Region;
                 event.commit();
             }
         }
@@ -658,16 +711,28 @@ final class AdaptivePoolingAllocator {
     Segment takeSegment(HeapSegments heap) {
         Segment segment = segmentCache.poll();
         if (segment == null) {
-            segment = new Segment(segmentSource.allocateSegment(segmentSize), pageStore.sliceSize);
-            chunkBufferAllocated(segment, true, heap.isThreadLocal());
+            if (regionPool != null) {
+                // A free slot of a region, or a new region (announced, as the unit the allocator holds).
+                segment = regionPool.take(heap.isThreadLocal());
+            } else {
+                segment = new Segment(segmentSource.allocateSegment(segmentSize), pageStore.sliceSize);
+                chunkBufferAllocated(segment, true, heap.isThreadLocal());
+            }
         }
         segment.owner = heap;
         return segment;
     }
 
-    /** Give {@code segment}, wholly free and owned by no heap, back to the {@link #segmentSource}. */
+    /**
+     * Give {@code segment}, wholly free and owned by no heap, back: to its region, which is freed if that was its
+     * last segment out (see {@link RegionPool#giveBack}), or to the {@link #segmentSource}.
+     */
     void freeSegment(Segment segment) {
         assert segment.isWhollyFree() && segment.owner == null;
+        if (segment.region != null) {
+            regionPool.giveBack(segment);
+            return;
+        }
         chunkBufferFreed(segment, true);
         segment.buffer.release();
     }
@@ -685,6 +750,7 @@ final class AdaptivePoolingAllocator {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
                 event.segment = chunk instanceof Segment;
+                event.region = chunk instanceof Region;
                 event.commit();
             }
         }
@@ -752,9 +818,22 @@ final class AdaptivePoolingAllocator {
          * rounded up, oldest first: in (0, 1], 0.5 by default (the recycler's halving).
          */
         final double decayFraction;
+        /**
+         * The size of the regions segments are carved out of, a whole number of segments (2 to {@link Long#SIZE}), or 0
+         * for one allocation per segment. See {@link RegionPool}.
+         */
+        final int regionSize;
+        /** Where a region starts: a power of two it is a multiple of, if its source can; 0 for no requirement. */
+        final int regionAlignment;
 
+        /** Without regions: one allocation per segment. */
         PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
                         double decayFraction) {
+            this(segmentSize, sliceSize, segmentCacheBytes, decayIntervalNanos, decayFraction, 0, 0);
+        }
+
+        PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
+                        double decayFraction, int regionSize, int regionAlignment) {
             if (sliceSize <= 0 || segmentSize <= 0 || segmentSize % sliceSize != 0
                     || segmentSize / sliceSize > Long.SIZE) {
                 throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
@@ -781,13 +860,30 @@ final class AdaptivePoolingAllocator {
             this.sliceSize = sliceSize;
             this.segmentCacheBytes = segmentCacheBytes;
             this.decayIntervalNanos = decayIntervalNanos;
+            if (regionSize != 0 && (regionSize < 0 || regionSize % segmentSize != 0
+                    || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
+                throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor 2 to " + Long.SIZE
+                        + " segments of " + segmentSize);
+            }
+            if (regionAlignment < 0 || (regionAlignment & regionAlignment - 1) != 0) {
+                throw new IllegalArgumentException("regionAlignment: " + regionAlignment);
+            }
             this.decayFraction = decayFraction;
+            this.regionSize = regionSize;
+            this.regionAlignment = regionAlignment;
         }
 
-        /** The direct defaults: {@link #SEGMENT_SIZE}, {@link #SLICE_SIZE}, {@link #SEGMENT_CACHE_BYTES}, 10 s, half */
+        /**
+         * The direct defaults: {@link #SEGMENT_SIZE}, {@link #SLICE_SIZE}, {@link #SEGMENT_CACHE_BYTES}, 10 s, half,
+         * {@link #SEGMENT_REGION_SIZE} and {@link #REGION_ALIGNMENT}.
+         */
         static PageStoreConfig directDefaults() {
             return new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, SEGMENT_CACHE_BYTES, IdleDecay.DECAY_INTERVAL_NANOS,
-                    0.5);
+                    0.5, SEGMENT_REGION_SIZE, REGION_ALIGNMENT);
+        }
+
+        int segmentsPerRegion() {
+            return regionSize / segmentSize;
         }
 
         int slicesPerSegment() {
@@ -815,6 +911,29 @@ final class AdaptivePoolingAllocator {
          * them) and never freeing any memory: releasing it, or not, changes nothing to the segment.
          */
         AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
+
+        /** Where regions of segments come from, or {@code null} when this source has none. */
+        default RegionSource regionSource() {
+            return null;
+        }
+    }
+
+    /**
+     * Where the regions of a {@link RegionPool} come from. A region is one buffer that segments are carved out of by
+     * {@link SegmentSource#span}; it goes back by {@link AbstractByteBuf#release()}, whole.
+     */
+    interface RegionSource {
+        /**
+         * A new region of exactly {@code size} bytes, starting at a multiple of {@code alignment} if this source can
+         * (0: any address).
+         */
+        AbstractByteBuf allocateRegion(int size, int alignment);
+
+        /**
+         * The bytes allocated for {@code region}, which it holds until released: its capacity, or more when aligning
+         * it took more (an over-allocation). What {@link #usedMemory()} and the chunk events account for it.
+         */
+        int allocatedBytes(AbstractByteBuf region);
     }
 
     /**
@@ -848,6 +967,9 @@ final class AdaptivePoolingAllocator {
         volatile long free;
         /** The heap whose chunks it holds, or {@code null} in the {@link SegmentCache} or on its way to it. */
         volatile HeapSegments owner;
+        /** The region this segment is carved out of, at slot {@link #slot}; {@code null} for a segment of its own. */
+        final Region region;
+        final int slot;
         /**
          * The span buffers made so far, by first slice: a span claimed again at the same place with the same length
          * reuses its buffer, so that re-creating a chunk allocates no buffer object. At most one per slice.
@@ -855,6 +977,12 @@ final class AdaptivePoolingAllocator {
         private final AbstractByteBuf[] spans;
 
         Segment(AbstractByteBuf buffer, int sliceSize) {
+            this(buffer, sliceSize, null, -1);
+        }
+
+        Segment(AbstractByteBuf buffer, int sliceSize, Region region, int slot) {
+            this.region = region;
+            this.slot = slot;
             int slices = buffer.capacity() / sliceSize;
             assert slices > 0 && slices <= Long.SIZE && buffer.capacity() == slices * sliceSize;
             this.buffer = buffer;
@@ -1227,6 +1355,184 @@ final class AdaptivePoolingAllocator {
 
         int capacity() {
             return stack.length;
+        }
+    }
+
+    /**
+     * A region: one allocation from the {@link RegionSource} that {@link #slots} segments are carved out of, one per
+     * slot. It is what the allocator holds from its memory, so it is the unit of {@link #usedMemory()} and of the chunk
+     * events (its {@link #capacity()} is what was allocated for it); the segments carved out of it fire none.
+     * <p>
+     * A slot is free while its segment is back in the region: neither in a heap nor in the {@link SegmentCache}.
+     * Guarded by the {@link RegionPool}'s lock.
+     */
+    static final class Region implements ChunkInfo {
+        final AbstractByteBuf buffer;
+        final int allocatedBytes;
+        final int slots;
+        /** {@link #freeSlots} of a region whose segments are all back. */
+        final long allFree;
+        /** Bit {@code i} set when slot {@code i} is free. */
+        long freeSlots;
+        /** The segment of each slot, made when the slot is first taken and kept with the region. */
+        private final Segment[] segments;
+
+        Region(AbstractByteBuf buffer, int allocatedBytes, int slots) {
+            assert slots > 0 && slots <= Long.SIZE;
+            this.buffer = buffer;
+            this.allocatedBytes = allocatedBytes;
+            this.slots = slots;
+            allFree = slots == Long.SIZE ? -1L : (1L << slots) - 1;
+            freeSlots = allFree;
+            segments = new Segment[slots];
+        }
+
+        /** Take the lowest free slot's segment. */
+        Segment takeSlot(SegmentSource source, PageStoreConfig config) {
+            assert freeSlots != 0;
+            int slot = Long.numberOfTrailingZeros(freeSlots);
+            freeSlots &= ~(1L << slot);
+            Segment segment = segments[slot];
+            if (segment == null) {
+                int size = config.segmentSize;
+                segment = new Segment(source.span(buffer, slot * size, size), config.sliceSize, this, slot);
+                segments[slot] = segment;
+            }
+            return segment;
+        }
+
+        int freeSlotCount() {
+            return Long.bitCount(freeSlots);
+        }
+
+        @Override
+        public int capacity() {
+            return allocatedBytes;
+        }
+
+        @Override
+        public boolean isDirect() {
+            return buffer.isDirect();
+        }
+
+        @Override
+        public long memoryAddress() {
+            return buffer._memoryAddress();
+        }
+
+        @Override
+        public String toString() {
+            return "Region[slots: " + slots + ", free: " + Long.bitCount(freeSlots) + ']';
+        }
+    }
+
+    /**
+     * The regions of an allocator, shared by all its heaps: where a segment comes from when the
+     * {@link SegmentCache} has none, and where it goes back when it leaves the cache (evicted by the cache's bound, or
+     * aged out by its decay). A segment is taken from the fullest region that has a free slot (the oldest of equally
+     * full ones), lowest slot first, and a new region is allocated only when none has one: the emptiest regions are
+     * left to drain. A region whose segments are all back is freed at once.
+     * <p>
+     * No delay is added before a region is freed: a segment reaches its region only after the cache kept it through at
+     * least one whole interval (the ageing frees only segments that stayed there that long), or when the cache was
+     * full, where without regions the segment would have been freed at once just the same. A region therefore goes
+     * back no earlier than its last segment would have without regions.
+     * <p>
+     * Why regions: with glibc, a {@code malloc} above {@link #MALLOC_MMAP_THRESHOLD_MAX} is always an {@code mmap} and
+     * its {@code free} a {@code munmap}; 4 MiB segments allocated one by one fall under the dynamic threshold once it
+     * rose, and their frees leave holes in the arenas. The cost: a region stays allocated while any of its segments is
+     * out, which the fullest-first rule is there to keep rare.
+     * <p>
+     * Guarded by its monitor, taken on slow paths only: a segment taken from or given back to a region, and the
+     * dump. A region is allocated outside the lock.
+     */
+    static final class RegionPool {
+        private final AdaptivePoolingAllocator allocator;
+        private final RegionSource source;
+        private final PageStoreConfig config;
+        // Visible for dumps and tests: the regions with a segment out, oldest first; guarded by this.
+        Region[] regions = new Region[4];
+        int count;
+        // Counters, for dumps and tests; guarded by this.
+        long allocated;
+        long freed;
+
+        RegionPool(AdaptivePoolingAllocator allocator, RegionSource source, PageStoreConfig config) {
+            assert config.regionSize > 0;
+            this.allocator = allocator;
+            this.source = source;
+            this.config = config;
+        }
+
+        /** A segment of the fullest region with a free slot, else of a new region, which is announced. */
+        Segment take(boolean threadLocal) {
+            synchronized (this) {
+                Segment segment = takeFromFullest();
+                if (segment != null) {
+                    return segment;
+                }
+            }
+            AbstractByteBuf buffer = source.allocateRegion(config.regionSize, config.regionAlignment);
+            assert buffer.capacity() == config.regionSize;
+            Region region = new Region(buffer, source.allocatedBytes(buffer), config.segmentsPerRegion());
+            allocator.chunkBufferAllocated(region, true, threadLocal);
+            synchronized (this) {
+                if (count == regions.length) {
+                    regions = Arrays.copyOf(regions, count << 1);
+                }
+                regions[count++] = region;
+                allocated++;
+                // Another thread may have given a segment back meanwhile: the fullest rule still applies.
+                return takeFromFullest();
+            }
+        }
+
+        private Segment takeFromFullest() {
+            Region best = null;
+            int bestFree = Integer.MAX_VALUE;
+            for (int i = 0; i < count; i++) {
+                Region region = regions[i];
+                int free = region.freeSlotCount();
+                if (free != 0 && free < bestFree) {
+                    best = region;
+                    bestFree = free;
+                    if (free == 1) {
+                        break;
+                    }
+                }
+            }
+            return best == null ? null : best.takeSlot(allocator.segmentSource, config);
+        }
+
+        /** {@code segment}, wholly free and owned by no heap, is back; its region is freed if it was the last out. */
+        void giveBack(Segment segment) {
+            Region region = segment.region;
+            synchronized (this) {
+                assert (region.freeSlots & 1L << segment.slot) == 0 : "slot " + segment.slot + " is already free";
+                region.freeSlots |= 1L << segment.slot;
+                if (region.freeSlots != region.allFree) {
+                    return;
+                }
+                remove(region);
+                freed++;
+            }
+            allocator.chunkBufferFreed(region, true);
+            region.buffer.release();
+        }
+
+        private void remove(Region region) {
+            for (int i = 0; i < count; i++) {
+                if (regions[i] == region) {
+                    System.arraycopy(regions, i + 1, regions, i, count - i - 1);
+                    regions[--count] = null;
+                    return;
+                }
+            }
+            throw new IllegalStateException(region + " is not in the pool");
+        }
+
+        synchronized int regionCount() {
+            return count;
         }
     }
 

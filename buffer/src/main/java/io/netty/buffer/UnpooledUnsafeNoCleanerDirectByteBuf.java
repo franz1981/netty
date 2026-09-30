@@ -33,6 +33,11 @@ class UnpooledUnsafeNoCleanerDirectByteBuf extends UnpooledUnsafeDirectByteBuf {
         super(alloc, span, capacity, false);
     }
 
+    /** Over {@code memory}, which it frees when released. */
+    UnpooledUnsafeNoCleanerDirectByteBuf(ByteBufAllocator alloc, CleanableDirectBuffer memory) {
+        super(alloc, memory);
+    }
+
     @Override
     protected ByteBuffer allocateDirect(int initialCapacity) {
         throw new UnsupportedOperationException();

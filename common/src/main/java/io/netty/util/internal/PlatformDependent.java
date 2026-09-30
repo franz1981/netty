@@ -1141,6 +1141,16 @@ public final class PlatformDependent {
     }
 
     /**
+     * Whether {@link #allocateDirect(int, boolean)} and {@link #allocateDirectAligned(int, int)} leave the new memory
+     * untouched, so that its pages cost nothing until used: {@code malloc} without zeroing ({@code Unsafe} without a
+     * cleaner, or the libc linker cleaner). {@code ByteBuffer.allocateDirect} zeroes what it allocates; the memory
+     * segment cleaner is counted as touching too.
+     */
+    public static boolean directAllocationLeavesMemoryUntouched() {
+        return CLEANER instanceof DirectCleaner || CLEANER instanceof CleanerJava24Linker;
+    }
+
+    /**
      * Compare two {@code byte} arrays for equality. For performance reasons no bounds checking on the
      * parameters is performed.
      *

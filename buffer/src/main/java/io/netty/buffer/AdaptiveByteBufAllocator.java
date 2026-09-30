@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -130,6 +131,51 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         @Override
         public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
             return directSpan(allocator, segment, offset, length);
+        }
+
+        /**
+         * Regions only where allocating one leaves its memory untouched: where it is zeroed at allocation
+         * ({@code ByteBuffer.allocateDirect}), a region would cost its whole size at once, so segments are then
+         * allocated one by one.
+         */
+        @Override
+        public AdaptivePoolingAllocator.RegionSource regionSource() {
+            return PlatformDependent.directAllocationLeavesMemoryUntouched() ? new MallocRegionSource(allocator) : null;
+        }
+    }
+
+    /**
+     * Regions from the direct chunk allocator's memory (libc {@code malloc} behind the platform's cleaner), aligned
+     * through {@link PlatformDependent#allocateDirectAligned} when the platform can ({@code aligned_alloc} on the libc
+     * linker cleaner, an over-allocation otherwise), unaligned when it cannot. Freed whole when released.
+     */
+    static final class MallocRegionSource implements AdaptivePoolingAllocator.RegionSource {
+        private final ByteBufAllocator allocator;
+        /** Set once an aligned allocation was refused: every later region is unaligned. */
+        private volatile boolean cannotAlign;
+
+        MallocRegionSource(ByteBufAllocator allocator) {
+            this.allocator = allocator;
+        }
+
+        @Override
+        public AbstractByteBuf allocateRegion(int size, int alignment) {
+            if (alignment > 0 && !cannotAlign) {
+                try {
+                    return UnsafeByteBufUtil.newDirectByteBuf(allocator,
+                            PlatformDependent.allocateDirectAligned(size, alignment));
+                } catch (UnsupportedOperationException e) {
+                    cannotAlign = true;
+                    logger.debug("Cannot align direct regions, allocating them unaligned", e);
+                }
+            }
+            return UnsafeByteBufUtil.newDirectByteBuf(allocator, size, size);
+        }
+
+        @Override
+        public int allocatedBytes(AbstractByteBuf region) {
+            CleanableDirectBuffer memory = ((UnpooledDirectByteBuf) region).cleanable;
+            return memory != null ? memory.allocatedCapacity() : region.capacity();
         }
     }
 
