@@ -20,7 +20,7 @@ import java.util.Arrays;
 /**
  * The regions of one allocator that have a segment out, oldest first. A segment comes from the fullest region with a
  * free slot (the oldest on a tie), its lowest slot; a region is allocated only when none has one, and freed as soon
- * as its last segment is back. Segments come back only from the {@link SegmentCache}, so a region is never freed
+ * as its last segment is back. Segments come back only when their heap gives them back, so a region is never freed
  * earlier than its last segment would have been without regions.
  * <p>
  * Why: with glibc, a {@code malloc} above {@link PageStoreConfig#MALLOC_MMAP_THRESHOLD_MAX_BYTES} is always an

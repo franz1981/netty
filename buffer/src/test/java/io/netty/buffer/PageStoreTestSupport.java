@@ -31,6 +31,7 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Real memory sources that count what they hand out, and allocators built on them: the page store's accounting goes
@@ -139,15 +140,24 @@ final class PageStoreTestSupport {
         }
     }
 
-    static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize, int cacheBytes) {
+    static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {
         return new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, cacheBytes, INTERVAL, 0.5));
+                new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL));
     }
 
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource segments, CountingRegionSource regions,
-                                                 int cacheBytes, int regionSize, int alignment) {
+                                                 int regionSize, int alignment) {
         return new AdaptivePoolingAllocator(segments, true, segments, regions,
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, cacheBytes, INTERVAL, 0.5, regionSize, alignment));
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
+    }
+
+    /** Gives {@code segment}'s one span back, then its heap's spare with two decays: it goes back to the store. */
+    static void giveBack(HeapSegments heap, Segment segment, int start, int slices) {
+        heap.release(segment, start, slices);
+        heap.decay(0);
+        heap.decay(0);
+        assertNull(heap.spare);
+        assertNull(segment.owner);
     }
 
     static void assertAccounted(CountingSegmentSource source, AdaptivePoolingAllocator allocator) {

@@ -20,12 +20,14 @@ import java.util.concurrent.locks.StampedLock;
 
 /**
  * The segments one heap has spans in, oldest first, and the rule that packs its spans: the fullest segment with a
- * long enough free run wins (the oldest on a tie), and a segment is taken from the {@link PageStore} only when none
- * fits. A segment that becomes wholly free leaves the heap for the {@link SegmentCache} at once.
+ * long enough free run wins (the oldest on a tie), then the {@link #spare}, and a segment is taken from the
+ * {@link PageStore} only when none fits. A segment that becomes wholly free leaves the list: it becomes the spare,
+ * and the previous spare goes back to the store. The spare goes back too once it stayed unused from one
+ * {@link #decay} to the next.
  * <p>
- * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim})
- * and chunk deallocation ({@link #release}) only. After {@link #markFreed}, releases may come from any thread: the
- * release that empties a segment hands it to the cache, and the list is no longer touched.
+ * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim}),
+ * chunk deallocation ({@link #release}) and decays only. After {@link #markFreed}, releases may come from any thread:
+ * the release that empties a segment gives it back to the store, and the list is no longer touched.
  */
 final class HeapSegments {
     private final PageStore store;
@@ -35,6 +37,10 @@ final class HeapSegments {
     // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;
+    /** The heap's one wholly free segment, not in {@link #segments}; {@code null} when none. */
+    Segment spare;
+    /** Whether a decay saw the {@link #spare} already: the next one gives it back. */
+    private boolean spareSeenByDecay;
     private volatile boolean freed;
     private int claimedStart = -1;
 
@@ -72,7 +78,12 @@ final class HeapSegments {
             }
         }
         if (best == null) {
-            best = store.take(this);
+            best = spare;
+            if (best != null) {
+                spare = null;
+            } else {
+                best = store.take(this);
+            }
             add(best);
         }
         int start = best.claim(slices);
@@ -92,17 +103,26 @@ final class HeapSegments {
             return;
         }
         // The chunk's deallocation follows the free() that marked it, so a release on a freed heap sees the flag.
-        if (!freed) {
-            assert inOwnerContext();
-            remove(segment);
+        if (freed) {
+            dispose(segment);
+            return;
         }
-        dispose(segment);
+        assert inOwnerContext();
+        remove(segment);
+        Segment previous = spare;
+        spare = segment;
+        spareSeenByDecay = false;
+        if (previous != null) {
+            dispose(previous);
+        }
     }
 
-    /** The release that emptied it and {@link #afterFree} may both get here: only the owner CAS winner offers it. */
+    /**
+     * The release that emptied it and {@link #afterFree} may both get here: only the owner CAS winner gives it back.
+     */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
-            store.segmentCache.offer(segment);
+            store.free(segment);
         }
     }
 
@@ -131,9 +151,15 @@ final class HeapSegments {
         freed = true;
     }
 
-    /** Offers the segments the heap's frees emptied, forgets all; the others go with their last span. */
+    /**
+     * Gives back the spare and the segments the heap's frees emptied, forgets all; the others go with their last span.
+     */
     void afterFree() {
         assert freed;
+        if (spare != null) {
+            dispose(spare);
+            spare = null;
+        }
         for (int i = 0; i < count; i++) {
             Segment segment = segments[i];
             // A volatile read after the volatile write of freed: a release that emptied it and read freed as
@@ -146,8 +172,18 @@ final class HeapSegments {
         count = 0;
     }
 
-    /** Ages the shared {@link SegmentCache}: at most once per interval across all heaps. */
+    /** Owner only. Gives back the spare if the previous decay saw it already: it stayed unused a whole interval. */
     void decay(long now) {
-        store.segmentCache.decayIfDue(now);
+        assert inOwnerContext();
+        Segment spare = this.spare;
+        if (spare == null) {
+            return;
+        }
+        if (spareSeenByDecay) {
+            this.spare = null;
+            dispose(spare);
+        } else {
+            spareSeenByDecay = true;
+        }
     }
 }

@@ -39,14 +39,6 @@ final class PageStoreConfig {
     static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
     /**
-     * {@code io.netty.allocator.segmentCacheBytes}: how many bytes of wholly free {@link Segment}s a direct allocator
-     * keeps for any of its heaps, at most; see {@link SegmentCache}. 0: none, a wholly free segment is given back at
-     * once. Default: 64 MiB, 8 MiB in low-memory mode.
-     */
-    static final int SEGMENT_CACHE_BYTES = Math.max(0, SystemPropertyUtil.getInt(
-            "io.netty.allocator.segmentCacheBytes",
-            AdaptivePoolingAllocator.IS_LOW_MEM ? 8 * 1024 * 1024 : 64 * 1024 * 1024));
-    /**
      * glibc's dynamic mmap threshold never rises above {@code DEFAULT_MMAP_THRESHOLD_MAX}, 32 MiB on 64-bit, and a
      * chunk above it never moves the threshold: a {@code malloc} above 32 MiB is always an {@code mmap}, its
      * {@code free} always a {@code munmap}, so it leaves no hole in an arena (glibc {@code malloc.c}: the max at 901,
@@ -103,28 +95,22 @@ final class PageStoreConfig {
     /** 1 to {@link Long#SIZE} whole slices. */
     final int segmentSize;
     final int sliceSize;
-    /** 0: no cache, a wholly free segment is freed at once. */
-    final int segmentCacheBytes;
     /**
-     * The cache ages at most once per interval, driven by the heaps' decays: an interval shorter than theirs ages it
+     * What is aged runs at most once per interval, driven by the heaps' decays: an interval shorter than theirs ages
      * no more often than they run.
      */
     final long decayIntervalNanos;
-    /** In (0, 1]: the share of the segments cold for a whole interval that one ageing frees, rounded up. */
-    final double decayFraction;
     /** 2 to {@link Long#SIZE} whole segments, or 0: one allocation per segment. */
     final int regionSize;
     /** A power of two, honoured if the region source can; 0: any address. */
     final int regionAlignment;
 
     /** Without regions: one allocation per segment. */
-    PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
-                    double decayFraction) {
-        this(segmentSize, sliceSize, segmentCacheBytes, decayIntervalNanos, decayFraction, 0, 0);
+    PageStoreConfig(int segmentSize, int sliceSize, long decayIntervalNanos) {
+        this(segmentSize, sliceSize, decayIntervalNanos, 0, 0);
     }
 
-    PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
-                    double decayFraction, int regionSize, int regionAlignment) {
+    PageStoreConfig(int segmentSize, int sliceSize, long decayIntervalNanos, int regionSize, int regionAlignment) {
         if (sliceSize <= 0 || sliceSize % PAGE_SIZE_BYTES != 0) {
             throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES);
         }
@@ -132,18 +118,11 @@ final class PageStoreConfig {
             throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
                     + " slices of " + sliceSize);
         }
-        if (segmentCacheBytes < 0) {
-            throw new IllegalArgumentException("segmentCacheBytes: " + segmentCacheBytes);
-        }
         if (decayIntervalNanos <= 0) {
             throw new IllegalArgumentException("decayIntervalNanos: " + decayIntervalNanos);
         }
-        if (!(decayFraction > 0 && decayFraction <= 1)) {
-            throw new IllegalArgumentException("decayFraction: " + decayFraction);
-        }
         this.segmentSize = segmentSize;
         this.sliceSize = sliceSize;
-        this.segmentCacheBytes = segmentCacheBytes;
         this.decayIntervalNanos = decayIntervalNanos;
         if (regionSize != 0 && (regionSize < 0 || regionSize % segmentSize != 0
                 || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
@@ -157,15 +136,14 @@ final class PageStoreConfig {
             throw new IllegalArgumentException("segments of " + segmentSize + " would not start on "
                     + regionAlignment + " boundaries of their region");
         }
-        this.decayFraction = decayFraction;
         this.regionSize = regionSize;
         this.regionAlignment = regionAlignment;
     }
 
-    /** The cache ages with the heaps' decay interval, by halves. */
+    /** Ages with the heaps' decay interval. */
     static PageStoreConfig directDefaults() {
-        return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES, SEGMENT_CACHE_BYTES,
-                AdaptivePoolingAllocator.IdleDecay.DECAY_INTERVAL_NANOS, 0.5, SEGMENT_REGION_SIZE_BYTES,
+        return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
+                AdaptivePoolingAllocator.IdleDecay.DECAY_INTERVAL_NANOS, SEGMENT_REGION_SIZE_BYTES,
                 REGION_ALIGNMENT_BYTES);
     }
 
@@ -175,10 +153,5 @@ final class PageStoreConfig {
 
     int slicesPerSegment() {
         return segmentSize / sliceSize;
-    }
-
-    /** How many of {@code cold} idle segments one ageing gives back: {@link #decayFraction} of them, rounded up. */
-    int toFree(int cold) {
-        return cold == 0 ? 0 : (int) Math.min(cold, (long) Math.ceil(cold * decayFraction));
     }
 }

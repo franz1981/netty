@@ -20,6 +20,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Random;
 
+import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
@@ -28,10 +29,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The packing rule of {@link HeapSegments} (fullest segment with room first, oldest on a tie, a new one only when none
- * fits), segments leaving the heap once wholly free, and the hand-over after the heap is freed.
+ * The packing rule of {@link HeapSegments} (fullest segment with room first, oldest on a tie, then the spare, a new one
+ * only when none fits), the one spare and its ageing, and the hand-over after the heap is freed.
  */
 final class HeapSegmentsTest {
     /**
@@ -41,7 +43,7 @@ final class HeapSegmentsTest {
     @Test
     void claimsFromTheFullestSegmentWithRoom() {
         CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 0);
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(60);
         assertEquals(0, heap.claimedStart());
@@ -78,11 +80,14 @@ final class HeapSegmentsTest {
         assertAccounted(source, allocator);
     }
 
-    /** Equally full segments: the oldest wins. A wholly free segment leaves the heap for the cache. */
+    /**
+     * Equally full segments: the oldest wins. A wholly free segment leaves the list and becomes the heap's spare, which
+     * a claim that fits no segment takes before the store.
+     */
     @Test
-    void oldestOfEquallyFullSegmentsWinsAndEmptySegmentsLeave() {
+    void oldestOfEquallyFullSegmentsWinsAndEmptySegmentsBecomeTheSpare() {
         CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 2 * SEGMENT_SIZE);
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(40);
         Segment b = heap.claim(40);
@@ -98,25 +103,66 @@ final class HeapSegmentsTest {
         // a: 56 used, 8 free; b, c: 40 used. Room for 9: b, the older of the two.
         assertSame(b, heap.claim(9));
         heap.release(c, 0, 40);
-        assertEquals(2, heap.count, "c left the heap");
-        assertNull(c.owner);
-        assertEquals(1, allocator.pageStore.segmentCache.size());
-        // A heap taking a segment takes c from the cache: no new one is allocated.
-        HeapSegments other = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
-        assertSame(c, other.claim(32));
-        assertSame(other, c.owner);
+        assertEquals(2, heap.count, "c left the list");
+        assertSame(c, heap.spare);
+        assertSame(heap, c.owner, "the spare is still the heap's");
+        // No room for 32 in a (8 free) nor b (15 free): the spare, before the store.
+        assertSame(c, heap.claim(32));
+        assertNull(heap.spare);
+        assertEquals(3, heap.count);
         assertEquals(3, source.segmentsAllocated());
         assertAccounted(source, allocator);
     }
 
     /**
-     * Once its heap is freed, a segment goes to the cache with the release that empties it, from any thread, exactly
-     * once: {@link HeapSegments#afterFree} and the last release may both see it wholly free.
+     * One spare at most: a second segment that empties becomes the spare and the previous one goes back to the store.
+     * A spare goes back when a decay finds it already seen by the previous one, and a spare taken meanwhile starts
+     * over.
+     */
+    @Test
+    void oneSpareAgedByTheHeapsDecays() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
+        Segment a = heap.claim(63);
+        Segment b = heap.claim(63);
+        Segment c = heap.claim(63);
+        heap.release(a, 0, 63);
+        assertSame(a, heap.spare);
+        heap.release(b, 0, 63);
+        assertSame(b, heap.spare, "the newest is kept");
+        assertNull(a.owner);
+        assertEquals(2, source.segmentsLive(), "a went back");
+        long now = System.nanoTime();
+        heap.decay(now);
+        assertSame(b, heap.spare, "seen once");
+        assertSame(b, heap.claim(63), "taken: its age starts over");
+        heap.release(b, 0, 63);
+        heap.decay(now += INTERVAL);
+        assertSame(b, heap.spare);
+        heap.decay(now += INTERVAL);
+        assertNull(heap.spare, "unused a whole interval");
+        assertNull(b.owner);
+        assertEquals(1, source.segmentsLive());
+        assertAccounted(source, allocator);
+        heap.release(c, 0, 63);
+        assertEquals(1, source.segmentsLive());
+        heap.markFreed();
+        heap.afterFree();
+        assertNull(heap.spare, "a freed heap gives its spare back");
+        assertEquals(0, source.segmentsLive());
+        assertEquals(0, allocator.usedMemory());
+        assertAccounted(source, allocator);
+    }
+
+    /**
+     * Once its heap is freed, a segment goes back to its source with the release that empties it, from any thread,
+     * exactly once: {@link HeapSegments#afterFree} and the last release may both see it wholly free.
      */
     @Test
     void segmentsOfAFreedHeapGoWithTheirLastSpan() throws Exception {
         CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 64 * 1024 * 1024);
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         final Segment a = heap.claim(10);
         final Segment b = heap.claim(50);
@@ -126,10 +172,12 @@ final class HeapSegmentsTest {
         assertNotSame(a, c);
         heap.markFreed();
         heap.release(c, 0, 60);
-        assertEquals(1, allocator.pageStore.segmentCache.size(), "emptied after the heap was freed");
+        assertNull(c.owner, "emptied after the heap was freed: given back, not kept");
+        assertNull(heap.spare);
+        assertEquals(1, source.segmentsLive());
         heap.afterFree();
         assertEquals(0, heap.count);
-        assertEquals(1, allocator.pageStore.segmentCache.size(), "c is not offered twice");
+        assertEquals(1, source.segmentsLive(), "c is not given back twice");
         assertSame(heap, a.owner, "a still has spans out");
         final HeapSegments dead = heap;
         Thread t = new Thread(() -> {
@@ -138,19 +186,20 @@ final class HeapSegmentsTest {
         });
         t.start();
         t.join();
-        assertEquals(2, allocator.pageStore.segmentCache.size());
+        assertEquals(0, source.segmentsLive());
         assertNull(a.owner);
         assertAccounted(source, allocator);
     }
 
     /**
-     * Random claims and releases on one heap: no wholly free segment stays in it, every segment in it is its own, and
-     * their used slices are exactly the live spans. The accounting matches the source at every step.
+     * Random claims and releases on one heap: no wholly free segment stays in its list, every segment in it is its
+     * own, their used slices are exactly the live spans, and it keeps one spare at most. The accounting matches the
+     * source at every step.
      */
     @Test
     void randomClaimsAndReleasesKeepOnlyUsedSegments() {
         CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 4 * SEGMENT_SIZE);
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment[] segments = new Segment[128];
         int[] starts = new int[128];
@@ -184,6 +233,11 @@ final class HeapSegmentsTest {
                 used += segment.usedSlices();
             }
             assertEquals(liveSlices, used, "op " + op);
+            if (heap.spare != null) {
+                assertTrue(heap.spare.isWhollyFree());
+                assertSame(heap, heap.spare.owner);
+            }
+            assertTrue(source.segmentsLive() <= heap.count + 1, "at most one wholly free segment kept");
             assertAccounted(source, allocator);
         }
     }

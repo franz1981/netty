@@ -176,9 +176,9 @@ public class JfrEventsTest {
 
     /**
      * The same balance for direct memory, whose size-class chunks are spans of segments: the events are per segment,
-     * or per region when segments are carved out of regions (a span fires none, nor does a segment of a region),
-     * segments that empty wait in the allocator's segment cache without an event, and a segment still holding a buffer
-     * when its thread-local heap dies goes there too, when another thread releases that buffer.
+     * or per region when segments are carved out of regions (a span fires none, nor does a segment of a region), and
+     * a segment still holding a buffer when its thread-local heap dies goes back when another thread releases that
+     * buffer, with its events on that thread.
      */
     @SuppressWarnings("Since15")
     @Test
@@ -239,13 +239,14 @@ public class JfrEventsTest {
             thread.start();
             thread.join();
             // The heap is gone; this release empties its last segment, from another thread.
-            heldPastTheEnd[0].release();
+            Thread releaser = new Thread(() -> heldPastTheEnd[0].release(), threadName + "-releaser");
+            releaser.start();
+            releaser.join();
             new AdaptiveByteBufAllocator(false).heapBuffer(sentinel).release();
             sentinelSeen.await();
         }
         assertTrue(segments[0] > 0, "segments are announced");
-        assertEquals(0, segments[1], "no segment is freed: the cache holds them");
-        assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload thread");
+        assertEquals(0, otherSegmentEvents.get(), "segment events are on the workload threads");
         long unit = AdaptiveByteBufAllocatorTest.directPageStoreUnit(alloc);
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment, or of a region");
@@ -293,7 +294,8 @@ public class JfrEventsTest {
 
     @SuppressWarnings("Since15")
     private static boolean onWorkloadThread(RecordedEvent event, String threadName) {
-        return event.getThread() != null && threadName.equals(event.getThread().getJavaName());
+        return event.getThread() != null && event.getThread().getJavaName() != null
+                && event.getThread().getJavaName().startsWith(threadName);
     }
 
     private static List<ByteBuf> allocateMany(ByteBufAllocator alloc, int size, int count) {

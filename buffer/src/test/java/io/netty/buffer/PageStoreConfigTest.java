@@ -28,49 +28,35 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * {@link PageStoreConfig}: its validation (whole slices and pages, whole segments per region, aligned segments), the
- * ageing share, and the direct defaults with their property fallbacks.
+ * {@link PageStoreConfig}: its validation (whole slices and pages, whole segments per region, aligned segments), and
+ * the direct defaults with their property fallbacks.
  */
 final class PageStoreConfigTest {
-    /** Bad parameters are rejected: too many slices, a partial slice or page, bad retention. */
+    /** Bad parameters are rejected: too many slices, a partial slice or page, no interval. */
     @Test
     void pageStoreConfigRejectsBadParameters() {
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(65 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5), "65 slices");
+                () -> new PageStoreConfig(65 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL), "65 slices");
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5), "partial slice");
+                () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE_BYTES, INTERVAL), "partial slice");
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, 0, 0, INTERVAL, 0.5), "no slice");
+                () -> new PageStoreConfig(SEGMENT_SIZE, 0, INTERVAL), "no slice");
         assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(SEGMENT_SIZE,
-                PageStoreConfig.PAGE_SIZE_BYTES / 2, 0, INTERVAL, 0.5), "a slice is whole pages");
+                PageStoreConfig.PAGE_SIZE_BYTES / 2, INTERVAL), "a slice is whole pages");
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, -1, INTERVAL, 0.5), "negative cache");
-        assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, 0, 0.5), "no interval");
-        assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, INTERVAL, 0), "frees nothing");
-        assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, INTERVAL, 1.5), "more than all");
-        PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, INTERVAL, 1);
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0), "no interval");
+        PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL);
         assertEquals(64, ok.slicesPerSegment());
-        assertEquals(0, ok.toFree(0));
-        assertEquals(5, ok.toFree(5));
-        PageStoreConfig half = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5);
-        assertEquals(3, half.toFree(5));
-        assertEquals(1, half.toFree(1));
-        assertEquals(2, half.toFree(4));
     }
 
-    /** The direct defaults: 64 KiB slices, the property-driven segment size and cache bound, 10 s, half. */
+    /** The direct defaults: 64 KiB slices, the property-driven segment size, the heaps' decay interval. */
     @Test
     void directDefaults() {
         PageStoreConfig direct = PageStoreConfig.directDefaults();
         assertEquals(SLICE_SIZE_BYTES, direct.sliceSize);
         assertEquals(64 * 1024, direct.sliceSize);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, direct.segmentSize);
-        assertEquals(PageStoreConfig.SEGMENT_CACHE_BYTES, direct.segmentCacheBytes);
         assertEquals(IdleDecay.DECAY_INTERVAL_NANOS, direct.decayIntervalNanos);
-        assertEquals(0.5, direct.decayFraction);
     }
 
     /**
@@ -104,8 +90,8 @@ final class PageStoreConfigTest {
         // Segments of 3 MiB in a 2 MiB-aligned region would not start on 2 MiB boundaries: the constructor still
         // rejects this combination when it is built directly, for programmatic misuse.
         assertRejected(3 * MIB, 36 * MIB, REGION_ALIGNMENT);
-        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, MIB);
-        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, 36 * MIB, 0);
+        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, INTERVAL, 36 * MIB, MIB);
+        new PageStoreConfig(3 * MIB, SLICE_SIZE_BYTES, INTERVAL, 36 * MIB, 0);
     }
 
     /**
@@ -132,6 +118,6 @@ final class PageStoreConfigTest {
 
     private static void assertRejected(final int segmentSize, final int regionSize, final int alignment) {
         assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(
-                segmentSize, SLICE_SIZE_BYTES, 0, INTERVAL, 0.5, regionSize, alignment));
+                segmentSize, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 }

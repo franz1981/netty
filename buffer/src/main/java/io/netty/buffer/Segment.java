@@ -39,7 +39,7 @@ final class Segment implements ChunkInfo {
     final long allFree;
     /** Bit {@code i} set when slice {@code i} is free. */
     volatile long free;
-    /** {@code null} while in the {@link SegmentCache}, or on its way there. */
+    /** {@code null} once given back to the {@link PageStore}, or on its way there. */
     volatile HeapSegments owner;
     /** {@code null} for a segment allocated on its own. */
     final Region region;

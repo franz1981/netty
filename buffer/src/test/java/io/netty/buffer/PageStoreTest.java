@@ -24,56 +24,53 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.Random;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
-import static io.netty.buffer.PageStoreTestSupport.MIB;
 import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
+import static io.netty.buffer.PageStoreTestSupport.giveBack;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * {@link PageStore}: the order a heap's segments come from (cache, fullest region, new region), and the accounting
- * of segments and regions against what the sources handed out, through a random workload and the close.
+ * {@link PageStore}: the order a heap's segments come from (fullest region, new region), and the accounting of
+ * segments and regions against what the sources handed out, through a random workload and the heaps' free.
  */
 final class PageStoreTest {
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
-    /** The cache's newest segment first, even with free slots in a region; then the fullest region; then a new one. */
+    /** A free slot of the fullest region, its lowest; then a new region. */
     @Test
-    void takesFromTheCacheThenTheFullestRegionThenANewRegion() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, 64 * MIB, REGION_SIZE, REGION_ALIGNMENT);
+    void takesFromTheFullestRegionThenANewRegion() {
+        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         PageStore store = allocator.pageStore;
         HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
         Segment a = heap.claim(63);
         heap.claim(63);
-        heap.release(a, 0, 63);
-        assertNull(a.owner);
-        assertEquals(1, store.segmentCache.size());
-        Segment cached = store.take(heap);
-        assertSame(a, cached, "the cache first");
-        assertSame(heap, cached.owner);
-        Segment fromRegion = heap.claim(63);
+        giveBack(heap, a, 0, 63);
+        Segment again = store.take(heap);
+        assertSame(a, again, "slot 0 is free again: the lowest");
+        assertSame(heap, again.owner);
+        Segment fromRegion = store.take(heap);
         assertSame(a.region, fromRegion.region);
         assertEquals(2, fromRegion.slot, "the lowest free slot of the fullest region");
         for (int slot = 3; slot < REGION_SIZE / SEGMENT_SIZE; slot++) {
-            assertEquals(slot, heap.claim(63).slot);
+            assertEquals(slot, store.take(heap).slot);
         }
         assertEquals(1, store.regionPool.regionCount());
-        Segment fresh = heap.claim(63);
+        Segment fresh = store.take(heap);
         assertNotSame(a.region, fresh.region, "no free slot left: a new region");
         assertEquals(0, fresh.slot);
         assertEquals(2, store.regionPool.regionCount());
-        store.segmentCache.offer(releaseOwnership(cached));
+        store.free(releaseOwnership(again));
         assertAccounted(segments, regions, allocator);
     }
 
-    /** A segment taken by take() and never claimed from is handed back as {@link HeapSegments#afterFree} would. */
+    /** A segment taken by take() and never claimed from is given back as {@link HeapSegments#afterFree} would. */
     private static Segment releaseOwnership(Segment segment) {
         assertTrue(segment.isWhollyFree());
         assertTrue(Segment.OWNER.compareAndSet(segment, segment.owner, null));
@@ -81,15 +78,15 @@ final class PageStoreTest {
     }
 
     /**
-     * Several heaps claiming and releasing at random, with the cache ageing: at every step the allocator's used memory
-     * is exactly what the sources handed out and did not get back, and after the close nothing is left.
+     * Several heaps claiming and releasing at random, with their spares ageing: at every step the allocator's used
+     * memory is exactly what the sources handed out and did not get back, and once the heaps are freed nothing is left.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void accountingMatchesTheSourcesThroughARandomWorkload(boolean withRegions) {
         AdaptivePoolingAllocator allocator = withRegions ?
-                newAllocator(segments, regions, 2 * SEGMENT_SIZE, REGION_SIZE, REGION_ALIGNMENT) :
-                newAllocator(segments, SEGMENT_SIZE, 2 * SEGMENT_SIZE);
+                newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT) :
+                newAllocator(segments, SEGMENT_SIZE);
         PageStore store = allocator.pageStore;
         HeapSegments[] heaps = new HeapSegments[3];
         for (int i = 0; i < heaps.length; i++) {
@@ -106,7 +103,7 @@ final class PageStoreTest {
         for (int op = 0; op < 10_000; op++) {
             int dice = random.nextInt(16);
             if (dice == 0) {
-                store.segmentCache.decayIfDue(now += INTERVAL / 2);
+                heaps[random.nextInt(heaps.length)].decay(now += INTERVAL / 2);
             } else if (live == capacity || live > 0 && dice < 8) {
                 int k = random.nextInt(live);
                 owners[k].release(spans[k], starts[k], lengths[k]);
@@ -130,8 +127,11 @@ final class PageStoreTest {
             live--;
             owners[live].release(spans[live], starts[live], lengths[live]);
         }
-        assertTrue(store.segmentCache.size() <= 2);
-        store.close();
+        for (HeapSegments heap : heaps) {
+            assertEquals(0, heap.count, "no span out: a spare at most");
+            heap.markFreed();
+            heap.afterFree();
+        }
         assertEquals(0, allocator.usedMemory());
         assertEquals(0, segments.segmentsLive());
         assertEquals(0, regions.live());

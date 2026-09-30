@@ -23,7 +23,6 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
-import static io.netty.buffer.PageStoreTestSupport.MIB;
 import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
@@ -43,7 +42,7 @@ public class AdaptiveSegmentRegionsTest {
     /** Buffers of the size classes through the allocator's own heaps, with regions: data lands inside the region. */
     @Test
     void sizeClassBuffersLiveInRegions() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, 64 * MIB, REGION_SIZE, REGION_ALIGNMENT);
+        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int size : new int[] {32, 1024, 4352, 16896}) { // size classes in low-memory mode too
             ByteBuf buf = allocator.allocate(size, size);

@@ -17,8 +17,8 @@ package io.netty.buffer;
 
 /**
  * The part of an allocator's page store that all its heaps share: where a heap's segments come from and where they
- * go once wholly free. It has no mutable state of its own; the {@link SegmentCache} and the {@link RegionPool} guard
- * theirs. Slow paths only: once per segment taken or freed.
+ * go once wholly free. It has no mutable state of its own; the {@link RegionPool} guards its own. Slow paths only:
+ * once per segment taken or freed.
  * <p>
  * Every segment or region allocated here is reported to {@link AdaptivePoolingAllocator#chunkBufferAllocated} and
  * {@link AdaptivePoolingAllocator#chunkBufferFreed}, so that the allocator's used memory and its chunk events count
@@ -28,7 +28,6 @@ final class PageStore {
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
     final SegmentSource segmentSource;
-    final SegmentCache segmentCache;
     /** {@code null} when every segment is an allocation of its own. */
     final RegionPool regionPool;
 
@@ -38,23 +37,20 @@ final class PageStore {
         this.allocator = allocator;
         this.config = config;
         this.segmentSource = segmentSource;
-        segmentCache = new SegmentCache(this, config.segmentCacheBytes / config.segmentSize);
         regionPool = regionSource != null && config.regionSize > 0 ? new RegionPool(this, regionSource) : null;
     }
 
     /**
-     * A segment for {@code heap}, which owns it from now on: the cache's newest, else a free slot of the fullest
-     * region, else a new allocation (a new region, with regions).
+     * A segment for {@code heap}, which owns it from now on: a free slot of the fullest region, else a new allocation
+     * (a new region, with regions).
      */
     Segment take(HeapSegments heap) {
-        Segment segment = segmentCache.poll();
-        if (segment == null) {
-            if (regionPool != null) {
-                segment = regionPool.take(heap.isThreadLocal());
-            } else {
-                segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
-                allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
-            }
+        Segment segment;
+        if (regionPool != null) {
+            segment = regionPool.take(heap.isThreadLocal());
+        } else {
+            segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
+            allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
         }
         segment.owner = heap;
         return segment;
@@ -72,10 +68,5 @@ final class PageStore {
         }
         allocator.chunkBufferFreed(segment, true);
         segment.buffer.release();
-    }
-
-    /** Frees every cached segment, and every one given back from now on. */
-    void close() {
-        segmentCache.close();
     }
 }

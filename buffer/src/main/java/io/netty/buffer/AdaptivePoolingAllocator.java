@@ -85,8 +85,9 @@ import java.util.function.IntConsumer;
  * For direct memory the size classes do not allocate their chunks one by one: each heap takes uniform
  * {@link Segment}s (4 MiB) and carves every size-class chunk out of one as a span of 64 KiB slices (see
  * {@link HeapSegments}); a chunk given up frees its span at once, for any chunk size of the heap, and a segment that
- * empties goes to the allocator's {@link SegmentCache}, which any heap takes from and which gives idle segments back
- * by halves. The buffers above the size classes keep their own chunks. Heap memory keeps chunks allocated one by one.
+ * empties is kept by its heap as its one spare, or given back to the allocator's {@link PageStore}; an idle spare is
+ * given back by the heap's decay. The buffers above the size classes keep their own chunks. Heap memory keeps chunks
+ * allocated one by one.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -594,8 +595,8 @@ final class AdaptivePoolingAllocator {
      * minus the bytes freed in a JFR recording equal this number.
      * <p>
      * A {@link Segment} is one such buffer, whole, from the moment it is taken from the
-     * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, the
-     * {@link PageStore#segmentCache}, or a heap that was freed while spans were still out): the events are per
+     * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, spare or not, or
+     * a heap that was freed while spans were still out): the events are per
      * segment, and the size-class chunks carved out of a segment as spans fire none, since their memory never leaves
      * the allocator. With a {@link PageStore#regionPool}, the unit is the {@link Region} instead, counted for what was
      * allocated for it (its alignment included), from its allocation to its free: the segments carved out of it fire
@@ -678,9 +679,6 @@ final class AdaptivePoolingAllocator {
     private void free() {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
-        }
-        if (pageStore != null) {
-            pageStore.close();
         }
     }
 
@@ -961,8 +959,8 @@ final class AdaptivePoolingAllocator {
      * stops allocating keeps its memory until it is freed.
      * <p>
      * With segments (direct memory), a size class that gives up its chunks frees their spans at once, and a segment
-     * they empty waits in the allocator's {@link SegmentCache}, which the decay of any heap ages the same way, at most
-     * once per interval for all heaps (see {@link HeapSegments#decay}).
+     * they empty becomes the heap's spare, which its decay gives back once it stayed unused a whole interval (see
+     * {@link HeapSegments#decay}).
      * <p>
      * What a heap keeps idle is bounded: up to {@link SizeClassChunkRecycler#RECYCLED_BYTES_BUDGET} in its recycler,
      * up to {@link #CHUNK_REUSE_QUEUE_BYTES} of wholly free large-buffer chunks, the large-buffer chunk it allocates
@@ -1030,8 +1028,8 @@ final class AdaptivePoolingAllocator {
             if (buddyMagazine != null) {
                 buddyMagazine.decay();
             }
-            // Last: what the size classes gave up above may have emptied a segment, which then waits in the cache for
-            // a whole interval before its first chance to be freed, like a buffer offered to the recycler.
+            // Last: what the size classes gave up above may have emptied a segment, which then stays the spare for a
+            // whole interval before its first chance to be given back, like a buffer offered to the recycler.
             if (heapSegments != null) {
                 heapSegments.decay(now);
             }
@@ -1747,7 +1745,7 @@ final class AdaptivePoolingAllocator {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     // A recycler that keeps no memory (chunks are spans of segments) never holds a chunk back: its
-                    // span goes back to the segment, and the segment cache's halving is what gives memory back.
+                    // span goes back to the segment, and the heap's spare ageing is what gives memory back.
                     if (chunkRecycler != null && chunkRecycler.holdsBuffers
                             && !chunkRecycler.hasRoomFor(sizeClassIndex)) {
                         return;

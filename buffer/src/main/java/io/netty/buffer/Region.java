@@ -18,7 +18,7 @@ package io.netty.buffer;
 /**
  * One allocation from a {@link RegionSource}, carved into {@link #slots} segments, one per slot: the unit the
  * allocator accounts ({@link #capacity()} is what was allocated for it, alignment included). A slot is free while its
- * segment is back in the region: in no heap and not in the cache. Guarded by the {@link RegionPool}'s monitor.
+ * segment is back in the region: in no heap. Guarded by the {@link RegionPool}'s monitor.
  */
 final class Region implements ChunkInfo {
     final AbstractByteBuf buffer;
