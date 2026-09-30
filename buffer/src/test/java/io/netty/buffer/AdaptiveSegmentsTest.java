@@ -18,6 +18,7 @@ package io.netty.buffer;
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
 import io.netty.buffer.AdaptivePoolingAllocator.HeapSegments;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
+import io.netty.buffer.AdaptivePoolingAllocator.PageStoreConfig;
 import io.netty.buffer.AdaptivePoolingAllocator.Segment;
 import io.netty.buffer.AdaptivePoolingAllocator.SegmentCache;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
@@ -34,7 +35,6 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.StampedLock;
 
-import static io.netty.buffer.AdaptivePoolingAllocator.SLICE_SHIFT;
 import static io.netty.buffer.AdaptivePoolingAllocator.SLICE_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -110,7 +110,8 @@ public class AdaptiveSegmentsTest {
     }
 
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize, int cacheBytes) {
-        return new AdaptivePoolingAllocator(source, true, source, segmentSize, cacheBytes);
+        return new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(segmentSize, SLICE_SIZE, cacheBytes, INTERVAL, 0.5));
     }
 
     static void assertAccounted(CountingSegmentSource source, AdaptivePoolingAllocator allocator) {
@@ -118,7 +119,7 @@ public class AdaptiveSegmentsTest {
     }
 
     private static Segment segment(int slices) {
-        return new Segment((AbstractByteBuf) Unpooled.buffer(slices << SLICE_SHIFT), slices);
+        return new Segment((AbstractByteBuf) Unpooled.buffer(slices * SLICE_SIZE), SLICE_SIZE);
     }
 
     /** Every length and every start of a lone span in an empty segment, both segment sizes. */
@@ -511,8 +512,8 @@ public class AdaptiveSegmentsTest {
                 assertEquals(chunk.capacity() / size, field(chunk, "segments"), "segments of size " + size);
                 long base = chunk.segment.memoryAddress();
                 long address = buf.memoryAddress();
-                assertTrue(address >= base + ((long) chunk.spanStart << SLICE_SHIFT)
-                        && address + size <= base + ((long) chunk.spanStart + expectedSlices(size) << SLICE_SHIFT),
+                assertTrue(address >= base + (long) chunk.spanStart * SLICE_SIZE
+                        && address + size <= base + ((long) chunk.spanStart + expectedSlices(size)) * SLICE_SIZE,
                         "size " + size + " outside its span");
                 buf.setLong(0, 0x0123456789ABCDEFL);
                 assertEquals(0x0123456789ABCDEFL, buf.getLong(0));
@@ -725,5 +726,120 @@ public class AdaptiveSegmentsTest {
         heap.release();
         assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, allocator.metric().usedDirectMemory(),
                 "the segment stays with the chunk its size class keeps");
+    }
+
+    // ---- Per-allocator parameters ----
+
+    /** Bad parameters are rejected: too many slices, a partial slice, no room for the largest chunk, bad retention. */
+    @Test
+    void pageStoreConfigRejectsBadParameters() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(65 * SLICE_SIZE, SLICE_SIZE, 0, INTERVAL, 0.5), "65 slices");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE, 0, INTERVAL, 0.5), "partial slice");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(512 * 1024, 8 * 1024, 0, INTERVAL, 0.5), "576 KiB chunks do not fit");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE, 0, 0, INTERVAL, 0.5), "no slice");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, -1, INTERVAL, 0.5), "negative cache");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 0, 0, 0.5), "no interval");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 0, INTERVAL, 0), "frees nothing");
+        assertThrows(IllegalArgumentException.class,
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 0, INTERVAL, 1.5), "more than all");
+        PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 0, INTERVAL, 1);
+        assertEquals(64, ok.slicesPerSegment());
+        assertEquals(0, ok.toFree(0));
+        assertEquals(5, ok.toFree(5));
+        PageStoreConfig half = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 0, INTERVAL, 0.5);
+        assertEquals(3, half.toFree(5));
+        assertEquals(1, half.toFree(1));
+        assertEquals(2, half.toFree(4));
+    }
+
+    /** The direct defaults: 64 KiB slices, the property-driven segment size and cache bound, 10 s, half. */
+    @Test
+    void directDefaults() {
+        PageStoreConfig direct = PageStoreConfig.directDefaults();
+        assertEquals(SLICE_SIZE, direct.sliceSize);
+        assertEquals(64 * 1024, direct.sliceSize);
+        assertEquals(AdaptivePoolingAllocator.SEGMENT_SIZE, direct.segmentSize);
+        assertEquals(AdaptivePoolingAllocator.SEGMENT_CACHE_BYTES, direct.segmentCacheBytes);
+        assertEquals(IdleDecay.DECAY_INTERVAL_NANOS, direct.decayIntervalNanos);
+        assertEquals(0.5, direct.decayFraction);
+    }
+
+    /**
+     * The chunk-to-span table comes from the allocator's own slice size: with 32 KiB slices the 4352-byte class gets
+     * 160 KiB chunks (136 KiB rounded up to 5 slices), with 64 KiB slices 192 KiB; and each allocator's spans are
+     * slices of its own size.
+     */
+    @Test
+    void chunkSizesFollowTheInstanceSliceSize() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator small = new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, 0, INTERVAL, 0.5));
+        AdaptivePoolingAllocator large = newAllocator(source, SEGMENT_SIZE, 0);
+        ByteBuf a = small.allocate(4352, 4352);
+        ByteBuf b = large.allocate(4352, 4352);
+        try {
+            assertEquals(160 * 1024, chunkOf(a).capacity());
+            assertEquals(32 * 1024, chunkOf(a).segment.sliceSize);
+            assertEquals(64, chunkOf(a).segment.slices);
+            assertEquals(192 * 1024, chunkOf(b).capacity());
+            assertEquals(SLICE_SIZE, chunkOf(b).segment.sliceSize);
+            assertEquals(2L * 1024 * 1024, small.usedMemory());
+            assertEquals(SEGMENT_SIZE, large.usedMemory());
+        } finally {
+            a.release();
+            b.release();
+        }
+    }
+
+    /** A cache of 0 bytes keeps nothing: a segment that empties is given back at once. */
+    @Test
+    void noCacheGivesAWhollyFreeSegmentBackAtOnce() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 0);
+        assertEquals(0, allocator.segmentCache.capacity());
+        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        Segment a = heap.claim(10);
+        assertEquals(SEGMENT_SIZE, allocator.usedMemory());
+        heap.release(a, 0, 10);
+        assertEquals(0, a.buffer.refCnt());
+        assertEquals(0, allocator.segmentCache.size());
+        assertEquals(1, allocator.segmentCache.freed);
+        assertEquals(0, allocator.usedMemory());
+        assertAccounted(source, allocator);
+    }
+
+    /** The cache's interval and fraction are the allocator's: 1 s and all of them frees every cold segment at once. */
+    @Test
+    void cacheAgesByTheInstanceIntervalAndFraction() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        long second = 1000L * 1000 * 1000;
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 64 * 1024 * 1024, second, 1));
+        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        List<Segment> segments = new ArrayList<Segment>();
+        for (int i = 0; i < 3; i++) {
+            segments.add(heap.claim(63));
+        }
+        for (Segment segment : segments) {
+            heap.release(segment, 0, 63);
+        }
+        SegmentCache cache = allocator.segmentCache;
+        assertEquals(3, cache.size());
+        long now = System.nanoTime() + second;
+        heap.decay(now); // starts the interval in which the three are cold
+        assertEquals(3, cache.size());
+        heap.decay(now + second / 2);
+        assertEquals(3, cache.size(), "not an interval later");
+        heap.decay(now + second);
+        assertEquals(0, cache.size(), "all of the cold ones");
+        assertEquals(0, allocator.usedMemory());
+        assertAccounted(source, allocator);
     }
 }

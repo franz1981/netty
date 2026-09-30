@@ -188,23 +188,27 @@ final class AdaptivePoolingAllocator {
      */
     private static final boolean DIRECT_SEGMENTS =
             SystemPropertyUtil.getBoolean("io.netty.allocator.directSegments", true);
-    /** A {@link Segment} is handed out in slices of 64 KiB: a chunk carved from it is a span of whole slices. */
-    static final int SLICE_SHIFT = 16;
-    static final int SLICE_SIZE = 1 << SLICE_SHIFT;
+    /*
+     * The defaults of a direct allocator's page store, read once; each allocator carries its own parameters in a
+     * PageStoreConfig, and nothing below the constructor reads these.
+     */
+    /** The slice of a direct allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
+    static final int SLICE_SIZE = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
     static final int MAX_SEGMENT_SIZE = Long.SIZE * SLICE_SIZE;
     /** Room for the largest size-class chunk (9 slices) with some to spare. */
     static final int MIN_SEGMENT_SIZE = 1024 * 1024;
     /**
-     * {@code io.netty.allocator.segmentSize}: the size of every {@link Segment}, a multiple of {@link #SLICE_SIZE}
-     * from {@link #MIN_SEGMENT_SIZE} to {@link #MAX_SEGMENT_SIZE}. Default: 4 MiB, 2 MiB in low-memory mode (where
-     * nothing else the allocator holds is above 2 MiB either).
+     * {@code io.netty.allocator.segmentSize}: the size of every {@link Segment} of a direct allocator, a multiple of
+     * {@link #SLICE_SIZE} from {@link #MIN_SEGMENT_SIZE} to {@link #MAX_SEGMENT_SIZE}. Default: 4 MiB, 2 MiB in
+     * low-memory mode (where nothing else the allocator holds is above 2 MiB either).
      */
     static final int SEGMENT_SIZE = segmentSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentSize", IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE));
     /**
-     * {@code io.netty.allocator.segmentCacheBytes}: how many bytes of wholly free {@link Segment}s the allocator keeps
-     * for any of its heaps, at most; see {@link SegmentCache}. Default: 64 MiB, 8 MiB in low-memory mode.
+     * {@code io.netty.allocator.segmentCacheBytes}: how many bytes of wholly free {@link Segment}s a direct allocator
+     * keeps for any of its heaps, at most; see {@link SegmentCache}. 0: none, a wholly free segment is given back at
+     * once. Default: 64 MiB, 8 MiB in low-memory mode.
      */
     static final int SEGMENT_CACHE_BYTES = Math.max(0, SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentCacheBytes", IS_LOW_MEM ? 8 * 1024 * 1024 : 64 * 1024 * 1024));
@@ -333,7 +337,13 @@ final class AdaptivePoolingAllocator {
     final byte[] sizeClassToChunkPool;
     /** Where {@link Segment}s come from, or {@code null} when this allocator carves no chunk out of segments. */
     final SegmentSource segmentSource;
-    /** The size of every {@link Segment}; meaningless without a {@link #segmentSource}. */
+    /**
+     * The parameters of this allocator's page store (segment and slice sizes, the segment cache's bound and aging);
+     * {@code null} without a {@link #segmentSource}. Read on slow paths only: chunk creation and deallocation,
+     * segment take and give-back, decays.
+     */
+    final PageStoreConfig pageStore;
+    /** The size of every {@link Segment}, {@link PageStoreConfig#segmentSize}; 0 without a {@link #segmentSource}. */
     final int segmentSize;
     /** The wholly free segments any heap takes first; {@code null} without a {@link #segmentSource}. */
     final SegmentCache segmentCache;
@@ -341,35 +351,36 @@ final class AdaptivePoolingAllocator {
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
         this(chunkAllocator, useCacheForNonEventLoopThreads,
                 DIRECT_SEGMENTS && chunkAllocator instanceof SegmentSource ? (SegmentSource) chunkAllocator : null,
-                SEGMENT_SIZE, SEGMENT_CACHE_BYTES);
+                PageStoreConfig.directDefaults());
     }
 
     /**
-     * @param segmentSource     where the segments come from, or {@code null} for chunks allocated one by one
-     * @param segmentSize       the size of every segment, see {@link #SEGMENT_SIZE}
-     * @param segmentCacheBytes the bound of the {@link SegmentCache}, see {@link #SEGMENT_CACHE_BYTES}
+     * @param segmentSource where the segments come from, or {@code null} for chunks allocated one by one
+     * @param pageStore     the page store's parameters; ignored without a {@code segmentSource}
      */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             SegmentSource segmentSource, int segmentSize, int segmentCacheBytes) {
+                             SegmentSource segmentSource, PageStoreConfig pageStore) {
         this.segmentSource = segmentSource;
-        this.segmentSize = segmentSize;
         if (segmentSource != null) {
-            if (segmentSize % SLICE_SIZE != 0 || segmentSize < MIN_SEGMENT_SIZE || segmentSize > MAX_SEGMENT_SIZE) {
-                throw new IllegalArgumentException("segmentSize: " + segmentSize);
-            }
-            segmentCache = new SegmentCache(this, segmentCacheBytes / segmentSize);
+            this.pageStore = ObjectUtil.checkNotNull(pageStore, "pageStore");
+            segmentSize = pageStore.segmentSize;
+            segmentCache = new SegmentCache(this, pageStore.segmentCacheBytes / segmentSize);
         } else {
+            this.pageStore = null;
+            segmentSize = 0;
             segmentCache = null;
         }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
-        boolean spans = segmentSource != null;
-        chunkSizes = spans ? distinctChunkSizes(SIZE_CLASSES, true) : CHUNK_SIZES;
-        sizeClassToChunkPool = spans ? chunkPools(SIZE_CLASSES, chunkSizes, true) : SIZE_CLASS_TO_CHUNK_POOL;
+        // The chunk-to-span table: from this allocator's slice size, 0 for chunks allocated one by one.
+        int sliceSize = this.pageStore != null ? this.pageStore.sliceSize : 0;
+        chunkSizes = sliceSize != 0 ? distinctChunkSizes(SIZE_CLASSES, sliceSize) : CHUNK_SIZES;
+        sizeClassToChunkPool = sliceSize != 0 ? chunkPools(SIZE_CLASSES, chunkSizes, sliceSize)
+                : SIZE_CLASS_TO_CHUNK_POOL;
         sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
             sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(
-                    SIZE_CLASSES[i], chunkSizeOf(SIZE_CLASSES[i], spans));
+                    SIZE_CLASSES[i], chunkSizeOf(SIZE_CLASSES[i], sliceSize));
         }
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
@@ -485,17 +496,19 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * The size of the chunks of a size class when they are spans of a {@link Segment}: {@link #chunkSizeOf} rounded
-     * up to whole slices. 128, 256 and 512 KiB stay; the chunks of the classes that add a header grow to 192 KiB
-     * (4352), 320 KiB (8704) and 576 KiB (16896 up), and hold as many segments as fit, the tail unused: at most 8.3%
-     * of the chunk, for 67584 and 135168.
+     * The size of the chunks of a size class when they are spans of a {@link Segment} of {@code sliceSize} slices:
+     * {@link #chunkSizeOf} rounded up to whole slices. With 64 KiB slices, 128, 256 and 512 KiB stay; the chunks of
+     * the classes that add a header grow to 192 KiB (4352), 320 KiB (8704) and 576 KiB (16896 up), and hold as many
+     * segments as fit, the tail unused: at most 8.3% of the chunk, for 67584 and 135168.
      */
-    static int spanChunkSizeOf(int segmentSize) {
-        return chunkSizeOf(segmentSize) + SLICE_SIZE - 1 & -SLICE_SIZE;
+    static int spanChunkSizeOf(int segmentSize, int sliceSize) {
+        int chunkSize = chunkSizeOf(segmentSize);
+        return (chunkSize + sliceSize - 1) / sliceSize * sliceSize;
     }
 
-    private static int chunkSizeOf(int segmentSize, boolean spans) {
-        return spans ? spanChunkSizeOf(segmentSize) : chunkSizeOf(segmentSize);
+    /** {@link #spanChunkSizeOf} for slices of {@code sliceSize}, or {@link #chunkSizeOf} when it is 0. */
+    private static int chunkSizeOf(int segmentSize, int sliceSize) {
+        return sliceSize != 0 ? spanChunkSizeOf(segmentSize, sliceSize) : chunkSizeOf(segmentSize);
     }
 
     /**
@@ -504,15 +517,15 @@ final class AdaptivePoolingAllocator {
      */
     // Visible for testing.
     static int[] distinctChunkSizes(int[] sizeClasses) {
-        return distinctChunkSizes(sizeClasses, false);
+        return distinctChunkSizes(sizeClasses, 0);
     }
 
-    /** As {@link #distinctChunkSizes(int[])}, for chunks that are spans of segments when {@code spans}. */
-    static int[] distinctChunkSizes(int[] sizeClasses, boolean spans) {
+    /** As {@link #distinctChunkSizes(int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0. */
+    static int[] distinctChunkSizes(int[] sizeClasses, int sliceSize) {
         int[] distinct = new int[sizeClasses.length];
         int count = 0;
         for (int sizeClass : sizeClasses) {
-            int chunkSize = chunkSizeOf(sizeClass, spans);
+            int chunkSize = chunkSizeOf(sizeClass, sliceSize);
             if (indexOf(distinct, count, chunkSize) == -1) {
                 distinct[count++] = chunkSize;
             }
@@ -525,15 +538,15 @@ final class AdaptivePoolingAllocator {
      */
     // Visible for testing.
     static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes) {
-        return chunkPools(sizeClasses, chunkSizes, false);
+        return chunkPools(sizeClasses, chunkSizes, 0);
     }
 
-    /** As {@link #chunkPools(int[], int[])}, for chunks that are spans of segments when {@code spans}. */
-    static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes, boolean spans) {
+    /** As {@link #chunkPools(int[], int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0. */
+    static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes, int sliceSize) {
         assert chunkSizes.length <= Byte.MAX_VALUE;
         byte[] pools = new byte[sizeClasses.length];
         for (int i = 0; i < pools.length; i++) {
-            int pool = indexOf(chunkSizes, chunkSizes.length, chunkSizeOf(sizeClasses[i], spans));
+            int pool = indexOf(chunkSizes, chunkSizes.length, chunkSizeOf(sizeClasses[i], sliceSize));
             assert pool >= 0;
             pools[i] = (byte) pool;
         }
@@ -645,7 +658,7 @@ final class AdaptivePoolingAllocator {
     Segment takeSegment(HeapSegments heap) {
         Segment segment = segmentCache.poll();
         if (segment == null) {
-            segment = new Segment(segmentSource.allocateSegment(segmentSize), segmentSize >> SLICE_SHIFT);
+            segment = new Segment(segmentSource.allocateSegment(segmentSize), pageStore.sliceSize);
             chunkBufferAllocated(segment, true, heap.isThreadLocal());
         }
         segment.owner = heap;
@@ -716,6 +729,78 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
+     * The parameters of one allocator's page store, so that allocators of different memory (direct, and later heap)
+     * carve and keep segments their own way: the segment and slice sizes, and how long wholly free segments are kept.
+     * Immutable; read on slow paths only (chunk creation and deallocation, segment take and give-back, decays), never
+     * per buffer.
+     */
+    static final class PageStoreConfig {
+        /** The size of every {@link Segment}: a whole number of slices, at most {@link Long#SIZE} of them. */
+        final int segmentSize;
+        /** The unit spans are claimed in; a size-class chunk is its {@link #chunkSizeOf} rounded up to it. */
+        final int sliceSize;
+        /** The bound of the {@link SegmentCache} in bytes; 0: no cache, a wholly free segment is given back at once. */
+        final int segmentCacheBytes;
+        /**
+         * The {@link SegmentCache} ages at most once per this interval. The ageing is driven by the heaps' own
+         * {@link IdleDecay}s, so an interval shorter than {@link IdleDecay#DECAY_INTERVAL_NANOS} ages it no more often
+         * than they run.
+         */
+        final long decayIntervalNanos;
+        /**
+         * The fraction of the segments that stayed in the cache through a whole interval that one ageing gives back,
+         * rounded up, oldest first: in (0, 1], 0.5 by default (the recycler's halving).
+         */
+        final double decayFraction;
+
+        PageStoreConfig(int segmentSize, int sliceSize, int segmentCacheBytes, long decayIntervalNanos,
+                        double decayFraction) {
+            if (sliceSize <= 0 || segmentSize <= 0 || segmentSize % sliceSize != 0
+                    || segmentSize / sliceSize > Long.SIZE) {
+                throw new IllegalArgumentException("segmentSize " + segmentSize + " is not 1 to " + Long.SIZE
+                        + " slices of " + sliceSize);
+            }
+            int largestChunk = 0;
+            for (int sizeClass : SIZE_CLASSES) {
+                largestChunk = Math.max(largestChunk, spanChunkSizeOf(sizeClass, sliceSize));
+            }
+            if (largestChunk > segmentSize) {
+                throw new IllegalArgumentException("segmentSize " + segmentSize + " cannot hold a size-class chunk of "
+                        + largestChunk + " (slices of " + sliceSize + ')');
+            }
+            if (segmentCacheBytes < 0) {
+                throw new IllegalArgumentException("segmentCacheBytes: " + segmentCacheBytes);
+            }
+            if (decayIntervalNanos <= 0) {
+                throw new IllegalArgumentException("decayIntervalNanos: " + decayIntervalNanos);
+            }
+            if (!(decayFraction > 0 && decayFraction <= 1)) {
+                throw new IllegalArgumentException("decayFraction: " + decayFraction);
+            }
+            this.segmentSize = segmentSize;
+            this.sliceSize = sliceSize;
+            this.segmentCacheBytes = segmentCacheBytes;
+            this.decayIntervalNanos = decayIntervalNanos;
+            this.decayFraction = decayFraction;
+        }
+
+        /** The direct defaults: {@link #SEGMENT_SIZE}, {@link #SLICE_SIZE}, {@link #SEGMENT_CACHE_BYTES}, 10 s, half */
+        static PageStoreConfig directDefaults() {
+            return new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, SEGMENT_CACHE_BYTES, IdleDecay.DECAY_INTERVAL_NANOS,
+                    0.5);
+        }
+
+        int slicesPerSegment() {
+            return segmentSize / sliceSize;
+        }
+
+        /** How many of {@code cold} idle segments one ageing gives back: {@link #decayFraction} of them, rounded up. */
+        int toFree(int cold) {
+            return cold == 0 ? 0 : (int) Math.min(cold, (long) Math.ceil(cold * decayFraction));
+        }
+    }
+
+    /**
      * Where the {@link Segment}s of a direct allocator come from: the memory the allocator is built on, as for any
      * chunk buffer (libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}). A segment goes back by
      * {@link AbstractByteBuf#release()}.
@@ -733,7 +818,8 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A uniform piece of memory from the {@link SegmentSource}, handed out in {@link #SLICE_SIZE} slices: a span is a
+     * A uniform piece of memory from the {@link SegmentSource}, handed out in slices of its allocator's
+     * {@link PageStoreConfig#sliceSize} (at most {@link Long#SIZE} of them): a span is a
      * run of contiguous slices. The free slices are one bit each in {@link #free}, so claiming a span, freeing it and
      * merging it with its free neighbours are bit operations (a freed span is simply free bits next to other free
      * bits), and no metadata lives in the segment's memory. Spans are claimed first fit from the lowest slice, so live
@@ -750,6 +836,8 @@ final class AdaptivePoolingAllocator {
                 AtomicReferenceFieldUpdater.newUpdater(Segment.class, HeapSegments.class, "owner");
 
         final AbstractByteBuf buffer;
+        /** The size of a slice, and how many the segment has. */
+        final int sliceSize;
         final int slices;
         /** {@link #free} of a wholly free segment: one bit per slice. */
         final long allFree;
@@ -766,9 +854,11 @@ final class AdaptivePoolingAllocator {
          */
         private final AbstractByteBuf[] spans;
 
-        Segment(AbstractByteBuf buffer, int slices) {
-            assert slices > 0 && slices <= Long.SIZE && buffer.capacity() == slices << SLICE_SHIFT;
+        Segment(AbstractByteBuf buffer, int sliceSize) {
+            int slices = buffer.capacity() / sliceSize;
+            assert slices > 0 && slices <= Long.SIZE && buffer.capacity() == slices * sliceSize;
             this.buffer = buffer;
+            this.sliceSize = sliceSize;
             this.slices = slices;
             allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
             free = allFree;
@@ -839,10 +929,10 @@ final class AdaptivePoolingAllocator {
          * new one from {@code source}. Owner only, when a chunk is created.
          */
         AbstractByteBuf span(SegmentSource source, int start, int n) {
-            int length = n << SLICE_SHIFT;
+            int length = n * sliceSize;
             AbstractByteBuf span = spans[start];
             if (span == null || span.capacity() != length) {
-                span = source.span(buffer, start << SLICE_SHIFT, length);
+                span = source.span(buffer, start * sliceSize, length);
                 spans[start] = span;
             }
             return span;
@@ -1030,14 +1120,14 @@ final class AdaptivePoolingAllocator {
 
     /**
      * The wholly free segments of an allocator, which any of its heaps takes before a new one from the
-     * {@link SegmentSource}: a stack, newest on top, bounded by {@link #SEGMENT_CACHE_BYTES}; a segment beyond the
-     * bound is freed at once. Taken from and given to only when a heap takes a segment or one leaves its heap, never
-     * per buffer.
+     * {@link SegmentSource}: a stack, newest on top, bounded by {@link PageStoreConfig#segmentCacheBytes}; a segment
+     * beyond the bound (every one, with a bound of 0) is freed at once. Taken from and given to only when a heap takes
+     * a segment or one leaves its heap, never per buffer.
      * <p>
-     * It ages like the recycler of a heap: at most once per {@link IdleDecay#DECAY_INTERVAL_NANOS}, run by the decay of
-     * whichever heap comes first after the interval, it frees half, rounded up, of the segments that stayed in it
-     * through the whole interval, oldest first. Taking from the top leaves the bottom untouched, so the fewest segments
-     * it held since the last decay are exactly those.
+     * It ages like the recycler of a heap: at most once per {@link PageStoreConfig#decayIntervalNanos}, run by the
+     * decay of whichever heap comes first after the interval, it frees {@link PageStoreConfig#decayFraction} (half by
+     * default), rounded up, of the segments that stayed in it through the whole interval, oldest first. Taking from
+     * the top leaves the bottom untouched, so the fewest segments it held since the last decay are exactly those.
      * <p>
      * Guarded by its monitor: the operations are a few field writes, one per segment taken or given up, and the aging
      * has to take the oldest segments from the bottom, which a lock-free stack cannot.
@@ -1047,6 +1137,7 @@ final class AdaptivePoolingAllocator {
                 AtomicLongFieldUpdater.newUpdater(SegmentCache.class, "lastDecayNanos");
 
         private final AdaptivePoolingAllocator allocator;
+        private final long decayIntervalNanos;
         private final Segment[] stack;
         private int size;
         /** The fewest segments held since the last decay: the bottom ones up to it were not taken since. */
@@ -1061,6 +1152,7 @@ final class AdaptivePoolingAllocator {
 
         SegmentCache(AdaptivePoolingAllocator allocator, int capacity) {
             this.allocator = allocator;
+            decayIntervalNanos = allocator.pageStore.decayIntervalNanos;
             stack = new Segment[Math.max(0, capacity)];
         }
 
@@ -1095,14 +1187,14 @@ final class AdaptivePoolingAllocator {
         /** Age the cache if no decay did during the last interval: any heap's decay calls this. */
         void decayIfDue(long now) {
             long last = lastDecayNanos;
-            if (now - last >= IdleDecay.DECAY_INTERVAL_NANOS && LAST_DECAY_NANOS.compareAndSet(this, last, now)) {
+            if (now - last >= decayIntervalNanos && LAST_DECAY_NANOS.compareAndSet(this, last, now)) {
                 decay();
             }
         }
 
         // Visible for testing.
         synchronized void decay() {
-            int free = (coldCount + 1) >>> 1;
+            int free = allocator.pageStore.toFree(coldCount);
             for (int i = 0; i < free; i++) {
                 Segment segment = stack[i];
                 freed++;
@@ -2389,7 +2481,7 @@ final class AdaptivePoolingAllocator {
          */
         private SizeClassedChunk newSpanChunk(SizeClassMagazine magazine, SizeClassChunkRecycler recycler,
                                               HeapSegments heapSegments) {
-            int slices = chunkSize >> SLICE_SHIFT;
+            int slices = chunkSize / magazine.allocator.pageStore.sliceSize;
             Segment segment = heapSegments.claim(slices);
             int start = heapSegments.claimedStart();
             try {
@@ -3548,7 +3640,7 @@ final class AdaptivePoolingAllocator {
         protected void deallocate() {
             Segment segment = this.segment;
             if (segment != null) {
-                heapSegments.release(segment, spanStart, capacity >> SLICE_SHIFT);
+                heapSegments.release(segment, spanStart, capacity / segment.sliceSize);
             } else {
                 super.deallocate();
             }
