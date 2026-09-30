@@ -16,24 +16,30 @@
 package io.netty.buffer;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * Where an allocator's heaps take their segments from and give them back to: free slots of its {@link Region}s, or,
- * without a {@link RegionSource}, one allocation per segment. Slow paths only: once per segment taken or given back.
+ * without a {@link RegionSource}, one allocation per segment. Slow paths only: once per segment taken or given back,
+ * and the heaps' decays.
  * <p>
  * Regions: a slot is taken and given back by a CAS on its region's bitmap, without a lock; a new region is mapped
  * under this store's monitor, the only lock, when no region has a free slot. Regions are only added, never removed,
- * until {@link #close}.
+ * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}.
  * <p>
  * Used memory, reported to {@link AdaptivePoolingAllocator#chunkBufferAllocated} and
  * {@link AdaptivePoolingAllocator#chunkBufferFreed} per segment: without regions, a segment from its allocation to
- * its free. With regions, the committed segments: a slot counts from the first time it is taken to the close, whether
- * a heap holds it or it is free again; a mapped slot never taken does not count.
+ * its free. With regions, the committed segments: a slot counts from the time it is taken with no memory behind it to
+ * the time it is purged (or the close), whether a heap holds it or it is free meanwhile. A slot never taken, or
+ * purged and not taken since, does not count: this follows what the process has resident, except for the pages of a
+ * committed segment nobody touched yet.
  */
 final class PageStore {
     private static final AtomicLongFieldUpdater<PageStore> SEGMENTS_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "segmentsCommitted");
+    private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
+            AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
     private static final Region[] NO_REGIONS = new Region[0];
 
     final AdaptivePoolingAllocator allocator;
@@ -44,9 +50,19 @@ final class PageStore {
     /** Replaced, one longer, under this store's monitor; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
+    /** 1 while a thread purges: one purger at a time. */
+    private volatile int purging;
+    private volatile long lastPurgeNanos = System.nanoTime();
+    /** Counts the purges; a slot given back stamps itself with it. Written by the purger. */
+    volatile int purgeEpoch;
     // Read by tests and dumps.
     /** Slots taken while no memory backed them: each such take costs page faults as the segment is touched. */
     volatile long segmentsCommitted;
+    // Written by the purger only.
+    long purges;
+    long purgeCalls;
+    long segmentsPurged;
+    long bytesPurged;
 
     /** Without {@code regionSource}, or without regions in {@code config}, every segment is allocated on its own. */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
@@ -103,8 +119,8 @@ final class PageStore {
                 continue; // taken meanwhile: look again
             }
             Segment segment = fullest.segment(slot, segmentSource, config);
-            if (!fullest.committed[slot]) {
-                fullest.committed[slot] = true;
+            if (fullest.freedEpoch[slot] == Region.UNCOMMITTED) {
+                fullest.freedEpoch[slot] = 0;
                 SEGMENTS_COMMITTED.incrementAndGet(this);
                 allocator.chunkBufferAllocated(segment, true, heap.isThreadLocal());
             }
@@ -134,7 +150,7 @@ final class PageStore {
     void free(Segment segment) {
         assert segment.isWhollyFree() && segment.owner == null;
         if (segment.region != null) {
-            segment.region.giveBack(segment.slot);
+            segment.region.giveBack(segment.slot, purgeEpoch);
             return;
         }
         allocator.chunkBufferFreed(segment, true);
@@ -151,8 +167,8 @@ final class PageStore {
         this.regions = NO_REGIONS;
         for (Region region : regions) {
             for (int slot = 0; slot < region.slots; slot++) {
-                if (region.committed[slot]) {
-                    region.committed[slot] = false;
+                if (region.freedEpoch[slot] != Region.UNCOMMITTED) {
+                    region.freedEpoch[slot] = Region.UNCOMMITTED;
                     allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
                 }
             }
@@ -160,7 +176,105 @@ final class PageStore {
         }
     }
 
+    /**
+     * Any thread, from a heap's decay. At most once per {@link PageStoreConfig#decayIntervalNanos}, and by one thread
+     * at a time (a try-guard: a caller that finds a purge running returns at once), gives back to the OS the memory
+     * of the free slots that stayed free through a whole interval: those given back before the previous purge.
+     */
+    void purgeIfDue(long now) {
+        if (regionSource == null || now - lastPurgeNanos < config.decayIntervalNanos
+                || !PURGING.compareAndSet(this, 0, 1)) {
+            return;
+        }
+        try {
+            if (now - lastPurgeNanos >= config.decayIntervalNanos) {
+                lastPurgeNanos = now;
+                purge();
+            }
+        } finally {
+            purging = 0;
+        }
+    }
+
+    /**
+     * Claims the purgeable free slots of each region by CAS, purges each run of contiguous ones with one
+     * {@link RegionSource#purge} call, then frees them again. A slot purged keeps its free bit's place in the order of
+     * takes: taking it again only costs the page faults of touching it.
+     */
+    private void purge() {
+        int epoch = purgeEpoch + 1;
+        purgeEpoch = epoch;
+        purges++;
+        for (Region region : regions) {
+            long claimed = region.claim(purgeable(region, region.free, epoch));
+            if (claimed == 0) {
+                continue;
+            }
+            try {
+                purgeRuns(region, purgeable(region, claimed, epoch));
+            } finally {
+                region.giveBackAll(claimed);
+            }
+        }
+    }
+
+    /**
+     * The slots of {@code slots} with memory behind them, given back before the previous purge: free through a whole
+     * interval. Racy for slots the caller does not own, exact for those it does.
+     */
+    private static long purgeable(Region region, long slots, int epoch) {
+        long purgeable = 0;
+        for (long bits = slots; bits != 0; bits &= bits - 1) {
+            int slot = Long.numberOfTrailingZeros(bits);
+            int freed = region.freedEpoch[slot];
+            if (freed != Region.UNCOMMITTED && epoch - freed >= 2) {
+                purgeable |= 1L << slot;
+            }
+        }
+        return purgeable;
+    }
+
+    /** Purges each run of contiguous slots of {@code slots}, which the caller claimed, with one call. */
+    private void purgeRuns(Region region, long slots) {
+        int segmentSize = config.segmentSize;
+        while (slots != 0) {
+            int start = Long.numberOfTrailingZeros(slots);
+            int run = Long.numberOfTrailingZeros(~(slots >>> start));
+            long bits = run == Long.SIZE ? -1L : (1L << run) - 1 << start;
+            regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
+            purgeCalls++;
+            bytesPurged += (long) run * segmentSize;
+            for (int slot = start; slot < start + run; slot++) {
+                region.freedEpoch[slot] = Region.UNCOMMITTED;
+                segmentsPurged++;
+                allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
+            }
+            slots &= ~bits;
+        }
+    }
+
     int regionCount() {
         return regions.length;
+    }
+
+    /**
+     * Racy, for tests and dumps: the slots of all regions {@code {in heaps, free with memory behind, free without}}.
+     * A slot the purger claimed counts as in a heap.
+     */
+    int[] slotCounts() {
+        int[] counts = new int[3];
+        for (Region region : regions) {
+            long free = region.free;
+            for (int slot = 0; slot < region.slots; slot++) {
+                if ((free & 1L << slot) == 0) {
+                    counts[0]++;
+                } else if (region.freedEpoch[slot] != Region.UNCOMMITTED) {
+                    counts[1]++;
+                } else {
+                    counts[2]++;
+                }
+            }
+        }
+        return counts;
     }
 }

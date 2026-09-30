@@ -16,10 +16,17 @@
 package io.netty.buffer;
 
 /**
- * Memory for regions: address space whose pages cost nothing until touched. Implementations: {@link MmapRegionSource}
- * and test sources. Called once per region; a region is given back whole by {@link AbstractByteBuf#release()}.
+ * Memory for regions: address space whose pages cost nothing until touched, and can be given back to the OS in place.
+ * Implementations: {@link MmapRegionSource} and test sources. Called once per region, and once per purged run of
+ * slots; a region is given back whole by {@link AbstractByteBuf#release()}.
  */
 interface RegionSource {
     /** A new region of exactly {@code size} bytes, untouched, starting at a multiple of {@code alignment} (0: any). */
     AbstractByteBuf allocateRegion(int size, int alignment);
+
+    /**
+     * Gives {@code length} bytes of {@code region} from {@code offset}, whole pages, back to the OS: they read zero
+     * when touched again. One system call.
+     */
+    void purge(AbstractByteBuf region, int offset, int length);
 }

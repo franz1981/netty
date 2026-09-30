@@ -15,17 +15,21 @@
  */
 package io.netty.buffer;
 
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * One mapping from a {@link RegionSource}, cut into {@link #slots} segments at fixed offsets. Its slots are taken and
  * given back from any thread by a CAS on the {@link #free} bitmap: a cleared bit is owned by exactly one thread (the
- * heap that took the slot, or its releaser), which alone touches the slot's {@link #segments} and
- * {@link #committed} entries; the CAS that gives the bit back publishes them to the next owner. A region lives as
- * long as its {@link PageStore}.
+ * heap that took the slot, its releaser, or the purger that claimed it), which alone touches the slot's
+ * {@link #segments} and {@link #freedEpoch} entries; the CAS that gives the bit back publishes them to the next owner.
+ * A region lives as long as its {@link PageStore}.
  */
 final class Region {
     private static final AtomicLongFieldUpdater<Region> FREE = AtomicLongFieldUpdater.newUpdater(Region.class, "free");
+
+    /** No memory behind the slot: never taken since the region was mapped, or purged since. */
+    static final int UNCOMMITTED = Integer.MIN_VALUE;
 
     final AbstractByteBuf buffer;
     final int slots;
@@ -34,8 +38,11 @@ final class Region {
     volatile long free;
     /** The segment of each slot, made the first time it is taken, then reused. Slot owner only. */
     private final Segment[] segments;
-    /** Whether the slot's memory was touched since the region was mapped: counted in the used memory. Slot owner. */
-    final boolean[] committed;
+    /**
+     * Per slot, slot owner only: {@link #UNCOMMITTED}, else memory is behind it (counted in the used memory) and, once
+     * given back, the {@link PageStore#purgeEpoch} it was given back in.
+     */
+    final int[] freedEpoch;
 
     Region(AbstractByteBuf buffer, int slots) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -44,7 +51,8 @@ final class Region {
         allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
         free = allSlots;
         segments = new Segment[slots];
-        committed = new boolean[slots];
+        freedEpoch = new int[slots];
+        Arrays.fill(freedEpoch, UNCOMMITTED);
     }
 
     /** Takes the lowest free slot: returns it, or -1 when none is free. Lock-free. */
@@ -61,16 +69,37 @@ final class Region {
         }
     }
 
-    /** Frees {@code slot}, which the caller owns. Lock-free. */
-    void giveBack(int slot) {
-        long bit = 1L << slot;
+    /** Frees {@code slot}, which the caller owns, stamped with {@code epoch}. Lock-free. */
+    void giveBack(int slot, int epoch) {
+        if (freedEpoch[slot] != UNCOMMITTED) {
+            freedEpoch[slot] = epoch;
+        }
+        giveBackAll(1L << slot);
+    }
+
+    /** Frees the slots of {@code bits}, which the caller owns. Lock-free. */
+    void giveBackAll(long bits) {
         for (;;) {
             long current = free;
-            if ((current & bit) != 0) {
-                throw new IllegalStateException("slot " + slot + " is already free: " + Long.toHexString(current));
+            if ((current & bits) != 0) {
+                throw new IllegalStateException("slots " + Long.toHexString(current & bits) + " are already free");
             }
-            if (FREE.compareAndSet(this, current, current | bit)) {
+            if (FREE.compareAndSet(this, current, current | bits)) {
                 return;
+            }
+        }
+    }
+
+    /**
+     * Takes every slot of {@code bits} that is still free: returns them, the caller owns them until
+     * {@link #giveBackAll}. Lock-free.
+     */
+    long claim(long bits) {
+        for (;;) {
+            long current = free;
+            long claimed = current & bits;
+            if (claimed == 0 || FREE.compareAndSet(this, current, current & ~claimed)) {
+                return claimed;
             }
         }
     }

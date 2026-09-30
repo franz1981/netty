@@ -231,9 +231,9 @@ final class PageStoreTest {
     }
 
     /**
-     * Several heaps claiming and releasing at random, with their spares ageing: at every step the allocator's used
-     * memory is exactly the segments allocated on their own and not freed plus the committed slots; once the heaps
-     * are freed and the store closed, nothing is left.
+     * Several heaps claiming and releasing at random, with their spares ageing and idle slots purged: at every step
+     * the allocator's used memory is exactly the segments allocated on their own and not freed plus the committed
+     * slots; once the heaps are freed and the store closed, nothing is left.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -288,6 +288,7 @@ final class PageStoreTest {
         }
         assertEquals(0, segments.segmentsLive());
         assertEquals(withRegions, !regions.regions.isEmpty());
+        assertEquals(withRegions, store.segmentsPurged > 0, "the decays purged idle slots");
         assertAccounted(segments, regions, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());

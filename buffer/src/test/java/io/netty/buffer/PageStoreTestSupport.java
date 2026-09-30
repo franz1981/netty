@@ -104,13 +104,38 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Regions counted as they are mapped: {@code mmap} where {@link MmapRegionSource} is available, else plain direct
-     * buffers (untouched {@code malloc} memory, unaligned).
+     * Regions counted as they are mapped, and purges as they are called: {@code mmap} and {@code madvise} where
+     * {@link MmapRegionSource} is available, else plain direct buffers (untouched {@code malloc} memory, unaligned)
+     * whose purged ranges are zeroed.
      */
     static final class CountingRegionSource implements RegionSource {
         final MmapRegionSource mmap = MmapRegionSource.isAvailable() ?
                 new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) : null;
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
+        /** {offset, length} of each purge call, in call order. */
+        final List<int[]> purges = new ArrayList<int[]>();
+        /** Runs inside each purge call, before it purges, when set. */
+        volatile Runnable onPurge;
+
+        @Override
+        public void purge(AbstractByteBuf region, int offset, int length) {
+            Runnable hook = onPurge;
+            if (hook != null) {
+                hook.run();
+            }
+            synchronized (this) {
+                purges.add(new int[] {offset, length});
+            }
+            if (mmap != null) {
+                mmap.purge(region, offset, length);
+            } else {
+                region.setZero(offset, length);
+            }
+        }
+
+        synchronized int purgeCalls() {
+            return purges.size();
+        }
 
         @Override
         public synchronized AbstractByteBuf allocateRegion(int size, int alignment) {
@@ -166,8 +191,8 @@ final class PageStoreTestSupport {
     static int committedSlots(PageStore store) {
         int committed = 0;
         for (Region region : store.regions) {
-            for (boolean slot : region.committed) {
-                committed += slot ? 1 : 0;
+            for (int freedEpoch : region.freedEpoch) {
+                committed += freedEpoch != Region.UNCOMMITTED ? 1 : 0;
             }
         }
         return committed;

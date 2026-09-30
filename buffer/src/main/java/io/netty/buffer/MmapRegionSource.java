@@ -216,7 +216,8 @@ final class MmapRegionSource implements RegionSource {
      * {@code madvise(MADV_DONTNEED)} on {@code length} bytes of {@code region} from {@code offset}, whole pages: one
      * system call, and one TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
      */
-    void purge(AbstractByteBuf region, int offset, int length) {
+    @Override
+    public void purge(AbstractByteBuf region, int offset, int length) {
         if (offset < 0 || length <= 0 || offset > region.capacity() - length
                 || ((offset | length) & PageStoreConfig.PAGE_SIZE_BYTES - 1) != 0) {
             throw new IllegalArgumentException("offset: " + offset + ", length: " + length + " of "

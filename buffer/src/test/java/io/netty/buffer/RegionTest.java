@@ -45,14 +45,14 @@ final class RegionTest {
             assertEquals(slot, region.takeSlot());
         }
         assertEquals(-1, region.takeSlot());
-        region.giveBack(4);
-        region.giveBack(2);
+        region.giveBack(4, 0);
+        region.giveBack(2, 0);
         assertEquals(2, region.freeSlotCount());
         assertEquals(2, region.takeSlot());
         assertEquals(4, region.takeSlot());
         assertThrows(IllegalStateException.class, () -> {
-            region.giveBack(7);
-            region.giveBack(7);
+            region.giveBack(7, 0);
+            region.giveBack(7, 0);
         }, "a slot is given back once");
     }
 
@@ -64,7 +64,7 @@ final class RegionTest {
             assertEquals(slot, region.takeSlot());
         }
         assertEquals(0, region.free);
-        region.giveBack(63);
+        region.giveBack(63, 0);
         assertEquals(Long.MIN_VALUE, region.free);
     }
 
@@ -112,14 +112,14 @@ final class RegionTest {
                                 throw new AssertionError("slot " + slot + " given back by " + id + " is owned by "
                                         + owners.get(slot));
                             }
-                            region.giveBack(slot);
+                            region.giveBack(slot, 0);
                             givesBack[id - 1]++;
                         }
                     }
                     while (count > 0) {
                         int slot = held[--count];
                         owners.set(slot, 0);
-                        region.giveBack(slot);
+                        region.giveBack(slot, 0);
                         givesBack[id - 1]++;
                     }
                 } catch (Throwable e) {

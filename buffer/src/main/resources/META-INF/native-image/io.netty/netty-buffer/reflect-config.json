@@ -111,6 +111,9 @@
     "name": "io.netty.buffer.PageStore",
     "fields": [
       {
+        "name": "purging"
+      },
+      {
         "name": "segmentsCommitted"
       }
     ]

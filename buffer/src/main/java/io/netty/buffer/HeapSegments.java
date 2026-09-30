@@ -174,18 +174,21 @@ final class HeapSegments {
         count = 0;
     }
 
-    /** Owner only. Gives back the spare if the previous decay saw it already: it stayed unused a whole interval. */
+    /**
+     * Owner only. Gives back the spare if the previous decay saw it already: it stayed unused a whole interval. Then
+     * lets the store purge its idle free slots, if due and no other heap's decay is purging.
+     */
     void decay(long now) {
         assert inOwnerContext();
         Segment spare = this.spare;
-        if (spare == null) {
-            return;
+        if (spare != null) {
+            if (spareSeenByDecay) {
+                this.spare = null;
+                dispose(spare);
+            } else {
+                spareSeenByDecay = true;
+            }
         }
-        if (spareSeenByDecay) {
-            this.spare = null;
-            dispose(spare);
-        } else {
-            spareSeenByDecay = true;
-        }
+        store.purgeIfDue(now);
     }
 }
