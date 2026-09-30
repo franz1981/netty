@@ -38,7 +38,7 @@ import java.util.Arrays;
  * dump. A region is allocated outside the lock.
  */
 final class RegionPool {
-    private final AdaptivePoolingAllocator allocator;
+    private final PageStore store;
     private final RegionSource source;
     private final PageStoreConfig config;
     // Visible for dumps and tests: the regions with a segment out, oldest first; guarded by this.
@@ -48,11 +48,11 @@ final class RegionPool {
     long allocated;
     long freed;
 
-    RegionPool(AdaptivePoolingAllocator allocator, RegionSource source, PageStoreConfig config) {
-        assert config.regionSize > 0;
-        this.allocator = allocator;
+    RegionPool(PageStore store, RegionSource source) {
+        assert store.config.regionSize > 0;
+        this.store = store;
         this.source = source;
-        this.config = config;
+        config = store.config;
     }
 
     /** A segment of the fullest region with a free slot, else of a new region, which is announced. */
@@ -66,7 +66,7 @@ final class RegionPool {
         AbstractByteBuf buffer = source.allocateRegion(config.regionSize, config.regionAlignment);
         assert buffer.capacity() == config.regionSize;
         Region region = new Region(buffer, source.allocatedBytes(buffer), config.segmentsPerRegion());
-        allocator.chunkBufferAllocated(region, true, threadLocal);
+        store.allocator.chunkBufferAllocated(region, true, threadLocal);
         synchronized (this) {
             if (count == regions.length) {
                 regions = Arrays.copyOf(regions, count << 1);
@@ -92,7 +92,7 @@ final class RegionPool {
                 }
             }
         }
-        return best == null ? null : best.takeSlot(allocator.segmentSource, config);
+        return best == null ? null : best.takeSlot(store.segmentSource, config);
     }
 
     /** {@code segment}, wholly free and owned by no heap, is back; its region is freed if it was the last out. */
@@ -107,7 +107,7 @@ final class RegionPool {
             remove(region);
             freed++;
         }
-        allocator.chunkBufferFreed(region, true);
+        store.allocator.chunkBufferFreed(region, true);
         region.buffer.release();
     }
 

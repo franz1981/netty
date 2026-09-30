@@ -36,7 +36,7 @@ final class SegmentCache {
     private static final AtomicLongFieldUpdater<SegmentCache> LAST_DECAY_NANOS =
             AtomicLongFieldUpdater.newUpdater(SegmentCache.class, "lastDecayNanos");
 
-    private final AdaptivePoolingAllocator allocator;
+    private final PageStore store;
     private final long decayIntervalNanos;
     private final Segment[] stack;
     private int size;
@@ -50,9 +50,9 @@ final class SegmentCache {
     long returned;
     long freed;
 
-    SegmentCache(AdaptivePoolingAllocator allocator, int capacity) {
-        this.allocator = allocator;
-        decayIntervalNanos = allocator.pageStore.decayIntervalNanos;
+    SegmentCache(PageStore store, int capacity) {
+        this.store = store;
+        decayIntervalNanos = store.config.decayIntervalNanos;
         stack = new Segment[Math.max(0, capacity)];
     }
 
@@ -81,7 +81,7 @@ final class SegmentCache {
             }
             freed++;
         }
-        allocator.freeSegment(segment);
+        store.free(segment);
     }
 
     /** Age the cache if no decay did during the last interval: any heap's decay calls this. */
@@ -94,11 +94,11 @@ final class SegmentCache {
 
     // Visible for testing.
     synchronized void decay() {
-        int free = allocator.pageStore.toFree(coldCount);
+        int free = store.config.toFree(coldCount);
         for (int i = 0; i < free; i++) {
             Segment segment = stack[i];
             freed++;
-            allocator.freeSegment(segment);
+            store.free(segment);
         }
         if (free > 0) {
             int kept = size - free;
@@ -114,7 +114,7 @@ final class SegmentCache {
         closed = true;
         for (int i = 0; i < size; i++) {
             freed++;
-            allocator.freeSegment(stack[i]);
+            store.free(stack[i]);
             stack[i] = null;
         }
         size = 0;

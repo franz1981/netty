@@ -32,7 +32,7 @@ import java.util.concurrent.locks.StampedLock;
  * it, whatever the thread, and the list is not touched again.
  */
 final class HeapSegments {
-    private final AdaptivePoolingAllocator allocator;
+    private final PageStore store;
     /** The stripe's lock, or {@code null} on a thread-local heap. For the assertions only. */
     private final StampedLock stripeLock;
     /** The thread of a thread-local heap, or {@code null} on a stripe. */
@@ -45,10 +45,9 @@ final class HeapSegments {
     /** The first slice of the span the last {@link #claim} returned the segment of. */
     private int claimedStart = -1;
 
-    HeapSegments(AdaptivePoolingAllocator allocator, StampedLock stripeLock, Thread ownerThread) {
-        assert allocator.segmentSource != null;
+    HeapSegments(PageStore store, StampedLock stripeLock, Thread ownerThread) {
         assert (stripeLock == null) != (ownerThread == null);
-        this.allocator = allocator;
+        this.store = store;
         this.stripeLock = stripeLock;
         this.ownerThread = ownerThread;
     }
@@ -64,7 +63,7 @@ final class HeapSegments {
     /**
      * Claim a span of {@code slices} for a new chunk and return its segment; {@link #claimedStart()} tells where in
      * it. The fullest segment with a free run long enough wins, the oldest on a tie; with none, the heap takes a
-     * segment (see {@link AdaptivePoolingAllocator#takeSegment}). Scans the heap's segments once.
+     * segment (see {@link PageStore#take}). Scans the heap's segments once.
      */
     Segment claim(int slices) {
         assert inOwnerContext() && !freed;
@@ -84,7 +83,7 @@ final class HeapSegments {
             }
         }
         if (best == null) {
-            best = allocator.takeSegment(this);
+            best = store.take(this);
             add(best);
         }
         int start = best.claim(slices);
@@ -121,7 +120,7 @@ final class HeapSegments {
      */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
-            allocator.segmentCache.offer(segment);
+            store.segmentCache.offer(segment);
         }
     }
 
@@ -173,6 +172,6 @@ final class HeapSegments {
 
     /** Called by the heap's {@link IdleDecay}: the {@link SegmentCache} ages at most once per interval. */
     void decay(long now) {
-        allocator.segmentCache.decayIfDue(now);
+        store.segmentCache.decayIfDue(now);
     }
 }

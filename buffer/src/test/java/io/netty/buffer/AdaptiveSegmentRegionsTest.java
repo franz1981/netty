@@ -104,9 +104,9 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void segmentsComeFromRegions() {
         AdaptivePoolingAllocator allocator = newAllocator(64 * MIB, REGION, ALIGNMENT);
-        RegionPool pool = allocator.regionPool;
+        RegionPool pool = allocator.pageStore.regionPool;
         assertNotNull(pool);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> taken = new ArrayList<Segment>();
         for (int i = 0; i < 9; i++) {
             Segment segment = heap.claim(63);
@@ -144,12 +144,12 @@ public class AdaptiveSegmentRegionsTest {
     void regionsAreAligned() {
         org.junit.jupiter.api.Assumptions.assumeTrue(addressesReadable());
         AdaptivePoolingAllocator allocator = newAllocator(0, REGION, ALIGNMENT);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         for (int i = 0; i < 3; i++) {
             Segment segment = heap.claim(63);
             assertEquals(0, segment.memoryAddress() & (ALIGNMENT - 1), "segment " + i);
         }
-        assertEquals(0, allocator.regionPool.regions[0].buffer.memoryAddress() & (ALIGNMENT - 1));
+        assertEquals(0, allocator.pageStore.regionPool.regions[0].buffer.memoryAddress() & (ALIGNMENT - 1));
         assertAccounted(allocator);
     }
 
@@ -161,8 +161,8 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void fullestRegionFirstAndFreedWhenAllBack() {
         AdaptivePoolingAllocator allocator = newAllocator(0, REGION, ALIGNMENT);
-        RegionPool pool = allocator.regionPool;
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        RegionPool pool = allocator.pageStore.regionPool;
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> taken = new ArrayList<Segment>();
         for (int i = 0; i < 18; i++) {
             taken.add(heap.claim(63));
@@ -218,8 +218,8 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void regionFreedOnceTheCacheAgedAllItsSegmentsOut() {
         AdaptivePoolingAllocator allocator = newAllocator(64 * MIB, REGION, ALIGNMENT);
-        RegionPool pool = allocator.regionPool;
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        RegionPool pool = allocator.pageStore.regionPool;
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> taken = new ArrayList<Segment>();
         for (int i = 0; i < 3; i++) {
             taken.add(heap.claim(63));
@@ -228,21 +228,21 @@ public class AdaptiveSegmentRegionsTest {
         for (Segment segment : taken) {
             heap.release(segment, 0, 63);
         }
-        assertEquals(3, allocator.segmentCache.size());
+        assertEquals(3, allocator.pageStore.segmentCache.size());
         assertEquals(1, pool.regionCount(), "the cache holds its segments: not back yet");
         assertEquals(region.capacity(), allocator.usedMemory());
         assertEquals(6, region.freeSlotCount());
         long now = System.nanoTime() + INTERVAL;
         heap.decay(now); // starts the interval in which the three are cold
-        assertEquals(3, allocator.segmentCache.size());
+        assertEquals(3, allocator.pageStore.segmentCache.size());
         heap.decay(now += INTERVAL);
-        assertEquals(1, allocator.segmentCache.size(), "two of three back");
+        assertEquals(1, allocator.pageStore.segmentCache.size(), "two of three back");
         assertEquals(8, region.freeSlotCount());
         assertEquals(1, pool.regionCount());
         assertEquals(1, region.buffer.refCnt());
         assertAccounted(allocator);
         heap.decay(now += INTERVAL);
-        assertEquals(0, allocator.segmentCache.size());
+        assertEquals(0, allocator.pageStore.segmentCache.size());
         assertEquals(0, pool.regionCount(), "the last segment back frees the region");
         assertEquals(0, region.buffer.refCnt());
         assertEquals(0, allocator.usedMemory());
@@ -253,7 +253,7 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void noCacheFreesSegmentAndRegionAtOnce() {
         AdaptivePoolingAllocator allocator = newAllocator(0, REGION, ALIGNMENT);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(10);
         Segment b = heap.claim(60);
         assertSame(a.region, b.region);
@@ -270,7 +270,7 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void aSegmentBackInItsRegionIsReused() {
         AdaptivePoolingAllocator allocator = newAllocator(0, REGION, ALIGNMENT);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment keep = heap.claim(63); // keeps the region
         Segment a = heap.claim(63);
         heap.release(a, 0, 63);
@@ -314,12 +314,12 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void regionsOffAllocatesSegmentsOneByOne() {
         AdaptivePoolingAllocator noRegions = newAllocator(0, 0, 0);
-        assertNull(noRegions.regionPool);
+        assertNull(noRegions.pageStore.regionPool);
         AdaptivePoolingAllocator noSource = new AdaptivePoolingAllocator(segments, true, segments, null,
                 new PageStoreConfig(SEGMENT, SLICE_SIZE, 0, INTERVAL, 0.5, REGION, ALIGNMENT));
-        assertNull(noSource.regionPool);
+        assertNull(noSource.pageStore.regionPool);
         for (AdaptivePoolingAllocator allocator : new AdaptivePoolingAllocator[] {noRegions, noSource}) {
-            HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+            HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
             Segment segment = heap.claim(10);
             assertNull(segment.region);
             assertEquals(SEGMENT, allocator.usedMemory());
@@ -385,7 +385,7 @@ public class AdaptiveSegmentRegionsTest {
     @Test
     void foreignReleaseGivesTheSegmentBackToItsRegion() throws Exception {
         final AdaptivePoolingAllocator allocator = newAllocator(0, REGION, ALIGNMENT);
-        final HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        final HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         final Segment segment = heap.claim(10);
         heap.markFreed();
         heap.afterFree();

@@ -191,7 +191,7 @@ public class AdaptiveSegmentsTest {
     void claimsFromTheFullestSegmentWithRoom() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 0);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(60);
         assertEquals(0, heap.claimedStart());
         Segment b = heap.claim(10);
@@ -208,7 +208,7 @@ public class AdaptiveSegmentsTest {
         assertEquals(2, source.segmentsAllocated());
 
         // x: eight spans of 8, then three of them freed: 24 free slices in runs of 8.
-        HeapSegments fragmented = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments fragmented = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment x = fragmented.claim(8);
         for (int i = 1; i < 8; i++) {
             assertSame(x, fragmented.claim(8));
@@ -232,7 +232,7 @@ public class AdaptiveSegmentsTest {
     void oldestOfEquallyFullSegmentsWinsAndEmptySegmentsLeave() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 2 * SEGMENT_SIZE);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(40);
         Segment b = heap.claim(40);
         assertNotSame(a, b);
@@ -249,9 +249,9 @@ public class AdaptiveSegmentsTest {
         heap.release(c, 0, 40);
         assertEquals(2, heap.count, "c left the heap");
         assertNull(c.owner);
-        assertEquals(1, allocator.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.size());
         // A heap taking a segment takes c from the cache: no new one is allocated.
-        HeapSegments other = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments other = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         assertSame(c, other.claim(32));
         assertSame(other, c.owner);
         assertEquals(3, source.segmentsAllocated());
@@ -266,7 +266,7 @@ public class AdaptiveSegmentsTest {
     void cacheIsBoundedAndSegmentsAreAccountedWherever() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 2 * SEGMENT_SIZE);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> segments = new ArrayList<Segment>();
         for (int i = 0; i < 4; i++) {
             segments.add(heap.claim(64 - 1));
@@ -277,7 +277,7 @@ public class AdaptiveSegmentsTest {
             heap.release(segment, 0, 63);
             assertAccounted(source, allocator);
         }
-        SegmentCache cache = allocator.segmentCache;
+        SegmentCache cache = allocator.pageStore.segmentCache;
         assertEquals(2, cache.size());
         assertEquals(2, source.segmentsLive());
         assertEquals(2L * SEGMENT_SIZE, allocator.usedMemory());
@@ -298,7 +298,7 @@ public class AdaptiveSegmentsTest {
     void cacheFreesHalfOfItsColdSegmentsPerInterval() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 64 * 1024 * 1024);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> segments = new ArrayList<Segment>();
         for (int i = 0; i < 5; i++) {
             segments.add(heap.claim(64 - 1));
@@ -306,7 +306,7 @@ public class AdaptiveSegmentsTest {
         for (Segment segment : segments) {
             heap.release(segment, 0, 63);
         }
-        SegmentCache cache = allocator.segmentCache;
+        SegmentCache cache = allocator.pageStore.segmentCache;
         assertEquals(5, cache.size());
         long now = System.nanoTime() + INTERVAL;
         // The first decay starts the interval in which the five are candidates: they arrived during the last one.
@@ -338,13 +338,13 @@ public class AdaptiveSegmentsTest {
     void closedCacheFreesEverything() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 64 * 1024 * 1024);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(10);
         Segment b = heap.claim(60);
         heap.release(a, 0, 10);
-        assertEquals(1, allocator.segmentCache.size());
-        allocator.segmentCache.close();
-        assertEquals(0, allocator.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.size());
+        allocator.pageStore.segmentCache.close();
+        assertEquals(0, allocator.pageStore.segmentCache.size());
         heap.release(b, 0, 60);
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
@@ -358,7 +358,7 @@ public class AdaptiveSegmentsTest {
     void segmentsOfAFreedHeapGoWithTheirLastSpan() throws Exception {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 64 * 1024 * 1024);
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         final Segment a = heap.claim(10);
         final Segment b = heap.claim(50);
         final int bStart = heap.claimedStart();
@@ -367,10 +367,10 @@ public class AdaptiveSegmentsTest {
         assertNotSame(a, c);
         heap.markFreed();
         heap.release(c, 0, 60);
-        assertEquals(1, allocator.segmentCache.size(), "emptied after the heap was freed");
+        assertEquals(1, allocator.pageStore.segmentCache.size(), "emptied after the heap was freed");
         heap.afterFree();
         assertEquals(0, heap.count);
-        assertEquals(1, allocator.segmentCache.size(), "c is not offered twice");
+        assertEquals(1, allocator.pageStore.segmentCache.size(), "c is not offered twice");
         assertSame(heap, a.owner, "a still has spans out");
         final HeapSegments dead = heap;
         Thread t = new Thread(() -> {
@@ -379,7 +379,7 @@ public class AdaptiveSegmentsTest {
         });
         t.start();
         t.join();
-        assertEquals(2, allocator.segmentCache.size());
+        assertEquals(2, allocator.pageStore.segmentCache.size());
         assertNull(a.owner);
         assertAccounted(source, allocator);
     }
@@ -531,8 +531,7 @@ public class AdaptiveSegmentsTest {
     void heapBuffersKeepTheirChunks() throws Exception {
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, false);
         AdaptivePoolingAllocator heap = (AdaptivePoolingAllocator) field(allocator, "heap");
-        assertNull(heap.segmentSource);
-        assertNull(heap.segmentCache);
+        assertNull(heap.pageStore);
         ByteBuf small = allocator.heapBuffer(1024, 1024);
         assertEquals(AdaptivePoolingAllocator.MIN_CHUNK_SIZE, allocator.metric().usedHeapMemory());
         ByteBuf headered = allocator.heapBuffer(4352, 4352);
@@ -574,7 +573,7 @@ public class AdaptiveSegmentsTest {
         // the second segment. The first segment emptied and went to the cache.
         assertEquals(1, heapSegments.count);
         assertEquals(8, heapSegments.segments[0].usedSlices());
-        assertEquals(1, allocator.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.size());
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 2-slice chunks
         for (int i = 0; i < 20 * (2 * SLICE_SIZE / other); i++) {
@@ -582,7 +581,7 @@ public class AdaptiveSegmentsTest {
         }
         assertEquals(2, source.segmentsAllocated(), "40 slices fit in the free ones");
         assertEquals(1, heapSegments.count, "the fullest segment with room: the heap's own, not the cached one");
-        assertEquals(1, allocator.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.size());
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -590,7 +589,7 @@ public class AdaptiveSegmentsTest {
 
         // Decays, forced, one interval apart. Nothing allocates in between, so both classes go idle.
         long now = System.nanoTime();
-        SegmentCache cache = allocator.segmentCache;
+        SegmentCache cache = allocator.pageStore.segmentCache;
         for (int decay = 1; decay <= 8; decay++) {
             now += INTERVAL;
             decayStripe(stripe, now);
@@ -632,13 +631,13 @@ public class AdaptiveSegmentsTest {
             releaser.join();
             // Nothing applied yet: the segment still holds its three spans.
             assertEquals(24, heapSegments.segments[0].usedSlices());
-            assertEquals(0, allocator.segmentCache.size());
+            assertEquals(0, allocator.pageStore.segmentCache.size());
             long now = System.nanoTime();
             idleDecay(heap).decay(now + INTERVAL); // the class allocated since the last decay: not idle yet
             assertEquals(1, heapSegments.count);
             idleDecay(heap).decay(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
             assertEquals(0, heapSegments.count);
-            assertEquals(1, allocator.segmentCache.size());
+            assertEquals(1, allocator.pageStore.segmentCache.size());
             assertAccounted(source, allocator);
             return null;
         });
@@ -669,7 +668,7 @@ public class AdaptiveSegmentsTest {
         });
         assertEquals(1, source.segmentsAllocated());
         assertEquals(SEGMENT_SIZE, allocator.usedMemory());
-        assertEquals(0, allocator.segmentCache.size(), "spans are still out");
+        assertEquals(0, allocator.pageStore.segmentCache.size(), "spans are still out");
         Segment segment = chunkOf(bufs.get(0)).segment;
         assertNotNull(segment.owner, "still the ended heap's");
         for (ByteBuf buf : bufs) {
@@ -677,7 +676,7 @@ public class AdaptiveSegmentsTest {
         }
         assertTrue(segment.isWhollyFree());
         assertNull(segment.owner);
-        assertEquals(1, allocator.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.size());
         assertAccounted(source, allocator);
     }
 
@@ -709,7 +708,7 @@ public class AdaptiveSegmentsTest {
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
         boolean lowMemory = isLowMemory();
         assumeFalse(System.getProperty("io.netty.allocator.segmentSize") != null
-                || System.getProperty("io.netty.allocator.segmentCacheBytes") != null
+                || System.getProperty("io.netty.allocator.pageStore.segmentCacheBytes") != null
                 || System.getProperty("io.netty.allocator.segmentRegionSize") != null, "set explicitly");
         assertEquals(lowMemory ? 2 * 1024 * 1024 : 4 * 1024 * 1024, PageStoreConfig.SEGMENT_SIZE);
         assertEquals(lowMemory ? 8 * 1024 * 1024 : 64 * 1024 * 1024, PageStoreConfig.SEGMENT_CACHE_BYTES);
@@ -815,14 +814,14 @@ public class AdaptiveSegmentsTest {
     void noCacheGivesAWhollyFreeSegmentBackAtOnce() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE, 0);
-        assertEquals(0, allocator.segmentCache.capacity());
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        assertEquals(0, allocator.pageStore.segmentCache.capacity());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         Segment a = heap.claim(10);
         assertEquals(SEGMENT_SIZE, allocator.usedMemory());
         heap.release(a, 0, 10);
         assertEquals(0, a.buffer.refCnt());
-        assertEquals(0, allocator.segmentCache.size());
-        assertEquals(1, allocator.segmentCache.freed);
+        assertEquals(0, allocator.pageStore.segmentCache.size());
+        assertEquals(1, allocator.pageStore.segmentCache.freed);
         assertEquals(0, allocator.usedMemory());
         assertAccounted(source, allocator);
     }
@@ -834,7 +833,7 @@ public class AdaptiveSegmentsTest {
         long second = 1000L * 1000 * 1000;
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE, 64 * 1024 * 1024, second, 1));
-        HeapSegments heap = new HeapSegments(allocator, null, Thread.currentThread());
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         List<Segment> segments = new ArrayList<Segment>();
         for (int i = 0; i < 3; i++) {
             segments.add(heap.claim(63));
@@ -842,7 +841,7 @@ public class AdaptiveSegmentsTest {
         for (Segment segment : segments) {
             heap.release(segment, 0, 63);
         }
-        SegmentCache cache = allocator.segmentCache;
+        SegmentCache cache = allocator.pageStore.segmentCache;
         assertEquals(3, cache.size());
         long now = System.nanoTime() + second;
         heap.decay(now); // starts the interval in which the three are cold

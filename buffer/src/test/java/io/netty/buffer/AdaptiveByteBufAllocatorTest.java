@@ -148,12 +148,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /** The size of the direct allocator's segments, or 0 when its chunks are not carved out of segments. */
     static int directSegmentSize(AdaptiveByteBufAllocator allocator) {
         AdaptivePoolingAllocator direct = direct(allocator);
-        return direct.segmentSource != null ? direct.segmentSize : 0;
+        return direct.pageStore != null ? direct.pageStore.config.segmentSize : 0;
     }
 
     /** Whether the direct allocator carves its segments out of regions. */
     static boolean directRegions(AdaptiveByteBufAllocator allocator) {
-        return direct(allocator).regionPool != null;
+        PageStore store = direct(allocator).pageStore;
+        return store != null && store.regionPool != null;
     }
 
     /**
@@ -162,12 +163,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     static long directPageStoreUnit(AdaptiveByteBufAllocator allocator) {
         AdaptivePoolingAllocator direct = direct(allocator);
-        if (direct.segmentSource == null) {
+        if (direct.pageStore == null) {
             return 0;
         }
-        RegionPool pool = direct.regionPool;
+        RegionPool pool = direct.pageStore.regionPool;
         if (pool == null) {
-            return direct.segmentSize;
+            return direct.pageStore.config.segmentSize;
         }
         synchronized (pool) {
             return pool.count > 0 ? pool.regions[0].allocatedBytes : -1;

@@ -301,20 +301,8 @@ final class AdaptivePoolingAllocator {
      */
     final int[] chunkSizes;
     final byte[] sizeClassToChunkPool;
-    /** Where {@link Segment}s come from, or {@code null} when this allocator carves no chunk out of segments. */
-    final SegmentSource segmentSource;
-    /**
-     * The parameters of this allocator's page store (segment and slice sizes, the segment cache's bound and aging);
-     * {@code null} without a {@link #segmentSource}. Read on slow paths only: chunk creation and deallocation,
-     * segment take and give-back, decays.
-     */
-    final PageStoreConfig pageStore;
-    /** The size of every {@link Segment}, {@link PageStoreConfig#segmentSize}; 0 without a {@link #segmentSource}. */
-    final int segmentSize;
-    /** The wholly free segments any heap takes first; {@code null} without a {@link #segmentSource}. */
-    final SegmentCache segmentCache;
-    /** The regions segments are carved out of; {@code null} when each segment is an allocation of its own. */
-    final RegionPool regionPool;
+    /** {@code null} when this allocator carves no chunk out of segments. */
+    final PageStore pageStore;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
         this(chunkAllocator, useCacheForNonEventLoopThreads,
@@ -324,37 +312,30 @@ final class AdaptivePoolingAllocator {
 
     /** The regions come from {@code segmentSource}'s {@link SegmentSource#regionSource()}, if the config has them. */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             SegmentSource segmentSource, PageStoreConfig pageStore) {
+                             SegmentSource segmentSource, PageStoreConfig config) {
         this(chunkAllocator, useCacheForNonEventLoopThreads, segmentSource,
-                segmentSource != null && pageStore.regionSize > 0 ? segmentSource.regionSource() : null, pageStore);
+                segmentSource != null && config.regionSize > 0 ? segmentSource.regionSource() : null, config);
     }
 
     /**
      * @param segmentSource where the segments come from, or {@code null} for chunks allocated one by one
      * @param regionSource  where the regions segments are carved out of come from, or {@code null} for one allocation
      *                      per segment; ignored when the config has no regions
-     * @param pageStore     the page store's parameters; ignored without a {@code segmentSource}
+     * @param config        the page store's parameters; ignored without a {@code segmentSource}
      */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             SegmentSource segmentSource, RegionSource regionSource, PageStoreConfig pageStore) {
-        this.segmentSource = segmentSource;
+                             SegmentSource segmentSource, RegionSource regionSource, PageStoreConfig config) {
         if (segmentSource != null) {
-            this.pageStore = ObjectUtil.checkNotNull(pageStore, "pageStore");
-            checkSizeClassSpansFit(pageStore);
-            segmentSize = pageStore.segmentSize;
-            segmentCache = new SegmentCache(this, pageStore.segmentCacheBytes / segmentSize);
-            regionPool = regionSource != null && pageStore.regionSize > 0 ?
-                    new RegionPool(this, regionSource, pageStore) : null;
+            ObjectUtil.checkNotNull(config, "config");
+            checkSizeClassSpansFit(config);
+            pageStore = new PageStore(this, config, segmentSource, regionSource);
         } else {
-            this.pageStore = null;
-            segmentSize = 0;
-            segmentCache = null;
-            regionPool = null;
+            pageStore = null;
         }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
         // The chunk-to-span table: from this allocator's slice size, 0 for chunks allocated one by one.
-        int sliceSize = this.pageStore != null ? this.pageStore.sliceSize : 0;
+        int sliceSize = this.pageStore != null ? this.pageStore.config.sliceSize : 0;
         chunkSizes = sliceSize != 0 ? distinctChunkSizes(SIZE_CLASSES, sliceSize) : CHUNK_SIZES;
         sizeClassToChunkPool = sliceSize != 0 ? chunkPools(SIZE_CLASSES, chunkSizes, sliceSize)
                 : SIZE_CLASS_TO_CHUNK_POOL;
@@ -612,12 +593,13 @@ final class AdaptivePoolingAllocator {
      * the only places that fire the {@link AllocateChunkEvent} and the {@link FreeChunkEvent}, so the bytes allocated
      * minus the bytes freed in a JFR recording equal this number.
      * <p>
-     * A {@link Segment} is one such buffer, whole, from the moment it is taken from the {@link #segmentSource} to the
-     * moment it is freed, wherever it is in between (a heap, the {@link #segmentCache}, or a heap that was freed
-     * while spans were still out): the events are per segment, and the size-class chunks carved out of a segment as
-     * spans fire none, since their memory never leaves the allocator. With a {@link #regionPool}, the unit is the
-     * {@link Region} instead, counted for what was allocated for it (its alignment included), from its allocation to
-     * its free: the segments carved out of it fire no events, wherever they are.
+     * A {@link Segment} is one such buffer, whole, from the moment it is taken from the
+     * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, the
+     * {@link PageStore#segmentCache}, or a heap that was freed while spans were still out): the events are per
+     * segment, and the size-class chunks carved out of a segment as spans fire none, since their memory never leaves
+     * the allocator. With a {@link PageStore#regionPool}, the unit is the {@link Region} instead, counted for what was
+     * allocated for it (its alignment included), from its allocation to its free: the segments carved out of it fire
+     * no events, wherever they are.
      */
     long usedMemory() {
         return chunkRegistry.totalCapacity();
@@ -643,40 +625,6 @@ final class AdaptivePoolingAllocator {
                 event.commit();
             }
         }
-    }
-
-    /**
-     * A segment for {@code heap}: the newest one of the {@link #segmentCache}, else a new one from the
-     * {@link #segmentSource}, which is announced like any chunk buffer taken from the memory the allocator is built
-     * on. Slow path: once per segment a heap takes.
-     */
-    Segment takeSegment(HeapSegments heap) {
-        Segment segment = segmentCache.poll();
-        if (segment == null) {
-            if (regionPool != null) {
-                // A free slot of a region, or a new region (announced, as the unit the allocator holds).
-                segment = regionPool.take(heap.isThreadLocal());
-            } else {
-                segment = new Segment(segmentSource.allocateSegment(segmentSize), pageStore.sliceSize);
-                chunkBufferAllocated(segment, true, heap.isThreadLocal());
-            }
-        }
-        segment.owner = heap;
-        return segment;
-    }
-
-    /**
-     * Give {@code segment}, wholly free and owned by no heap, back: to its region, which is freed if that was its
-     * last segment out (see {@link RegionPool#giveBack}), or to the {@link #segmentSource}.
-     */
-    void freeSegment(Segment segment) {
-        assert segment.isWhollyFree() && segment.owner == null;
-        if (segment.region != null) {
-            regionPool.giveBack(segment);
-            return;
-        }
-        chunkBufferFreed(segment, true);
-        segment.buffer.release();
     }
 
     /**
@@ -731,8 +679,8 @@ final class AdaptivePoolingAllocator {
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
         }
-        if (segmentCache != null) {
-            segmentCache.close();
+        if (pageStore != null) {
+            pageStore.close();
         }
     }
 
@@ -805,7 +753,7 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             chunkSizes = allocator.chunkSizes;
             sizeClassToChunkPool = allocator.sizeClassToChunkPool;
-            holdsBuffers = allocator.segmentSource == null;
+            holdsBuffers = allocator.pageStore == null;
             int pools = chunkSizes.length;
             buffers = new AbstractByteBuf[pools][];
             freeLists = new MpscIntQueue[pools][];
@@ -1119,8 +1067,8 @@ final class AdaptivePoolingAllocator {
             chunkRecycler = new SizeClassChunkRecycler(allocator);
             idleDecay.recycler = chunkRecycler;
             idleDecay.magazines = magazines;
-            if (allocator.segmentSource != null) {
-                heapSegments = new HeapSegments(allocator, lock, null);
+            if (allocator.pageStore != null) {
+                heapSegments = new HeapSegments(allocator.pageStore, lock, null);
                 idleDecay.heapSegments = heapSegments;
             }
             return createMagazine(sizeClassIndex, allocator);
@@ -1242,8 +1190,8 @@ final class AdaptivePoolingAllocator {
             idleDecay.recycler = chunkRecycler;
             idleDecay.magazines = magazines;
             // Created on the owner thread, by the FastThreadLocal's initialValue().
-            heapSegments = allocator.segmentSource != null ?
-                    new HeapSegments(allocator, null, Thread.currentThread()) : null;
+            heapSegments = allocator.pageStore != null ?
+                    new HeapSegments(allocator.pageStore, null, Thread.currentThread()) : null;
             idleDecay.heapSegments = heapSegments;
         }
 
@@ -1987,11 +1935,11 @@ final class AdaptivePoolingAllocator {
          */
         private SizeClassedChunk newSpanChunk(SizeClassMagazine magazine, SizeClassChunkRecycler recycler,
                                               HeapSegments heapSegments) {
-            int slices = chunkSize / magazine.allocator.pageStore.sliceSize;
+            int slices = chunkSize / magazine.allocator.pageStore.config.sliceSize;
             Segment segment = heapSegments.claim(slices);
             int start = heapSegments.claimedStart();
             try {
-                AbstractByteBuf span = segment.span(magazine.allocator.segmentSource, start, slices);
+                AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices);
                 if (recycler.poll(magazine.sizeClassIndex)) {
                     AbstractByteBuf none = recycler.takeBuffer();
                     assert none == null;
