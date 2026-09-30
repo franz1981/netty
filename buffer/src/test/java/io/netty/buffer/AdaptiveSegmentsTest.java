@@ -356,9 +356,10 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * Without regions, a heap's last segment whose free slices were claimed once more than it uses now is given back
-     * once nothing in it holds a buffer: the next chunk is made in a new segment. Not while the reserve holds one,
-     * and not again while the new segment's free slices were never claimed.
+     * Without regions, a heap's last segment whose free slices were claimed once more than it uses is renewed, with a
+     * buffer still out in it: new chunks go to a new segment, its chunks that hold no buffer are freed by the decays,
+     * and it goes back to the store once the last buffer in it is released and a decay frees that chunk. Not again
+     * while the new segment's free slices were never claimed.
      */
     @Test
     void aLastSegmentTouchedMoreThanItUsesIsRenewed() throws Exception {
@@ -373,29 +374,38 @@ public class AdaptiveSegmentsTest {
         ByteBuf small = allocator.allocate(1024, 1024);
         Object stripe = usedStripe(allocator);
         HeapSegments heapSegments = idleDecay(stripe).heapSegments;
+        PageStore store = allocator.pageStore;
         Segment first = heapSegments.segments[0];
         assertEquals(50, first.usedSlices());
         long now = System.nanoTime();
         decayStripe(stripe, now += INTERVAL);
-        assertSame(first, heapSegments.segments[0], "all of it in use");
+        assertEquals(0, store.renewalsStarted, "all of it in use");
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        small.release();
         assertEquals(10, first.usedSlices(), "the big class keeps its floor chunk, the small one its current");
         allocator.allocate(size, size).release(); // both classes stay in use: their decays keep their chunks
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(1, store.renewalsStarted, "40 free slices claimed once, 10 used, a buffer out");
+        assertEquals(2, first.usedSlices(), "the empty chunk of the big class is freed; the small one holds a buffer");
+        ByteBuf big = allocator.allocate(size, size);
+        assertNotSame(first, chunkOf(big).segment, "new chunks go to a new segment");
+        assertEquals(2, source.segmentsAllocated());
+        Segment second = chunkOf(big).segment;
+        small.release();
+        allocator.allocate(1024, 1024).release(); // from the chunk in the renewed segment, which is its current
+        decayStripe(stripe, now += INTERVAL);
+        assertEquals(1, store.renewalsDone);
+        assertTrue(first.isWhollyFree());
+        assertNull(first.owner, "given back at once, not reserved");
+        assertEquals(0, heapSegments.reserved);
+        assertEquals(1, heapSegments.count);
+        assertSame(second, heapSegments.segments[0]);
+        assertEquals(1, source.segmentsLive());
+        big.release();
         allocator.allocate(1024, 1024).release();
         decayStripe(stripe, now += INTERVAL);
-        assertEquals(0, heapSegments.count, "40 free slices claimed once, 10 used: given back");
-        assertEquals(0, heapSegments.reserved);
-        assertEquals(0, source.segmentsLive());
-        small = allocator.allocate(1024, 1024);
-        Segment second = heapSegments.segments[0];
-        assertNotSame(first, second);
-        assertEquals(2, source.segmentsAllocated());
-        decayStripe(stripe, now += INTERVAL);
-        assertSame(second, heapSegments.segments[0], "nothing claimed there but what it uses");
-        small.release();
+        assertEquals(1, store.renewalsStarted, "8 slices claimed once and free: under a quarter of the segment");
         assertAccounted(source, allocator);
     }
 
