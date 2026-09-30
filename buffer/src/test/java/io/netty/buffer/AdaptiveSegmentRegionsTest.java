@@ -17,9 +17,7 @@ package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.HeapSegments;
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
-import io.netty.buffer.AdaptivePoolingAllocator.Region;
 import io.netty.buffer.AdaptivePoolingAllocator.RegionPool;
-import io.netty.buffer.AdaptivePoolingAllocator.Segment;
 import io.netty.buffer.AdaptiveSegmentsTest.CountingSegmentSource;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
