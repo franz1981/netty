@@ -221,8 +221,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * With a page store, a direct buffer above the pooled sizes and up to a segment takes a whole segment, given back
-     * to the store when it is released: with regions its slot stays committed, counted, until a purge; without, the
+     * With a page store, a direct buffer above half a segment and up to a segment takes a whole segment, given back to
+     * the store when it is released: with regions its slot stays committed, counted, until a purge; without, the
      * segment is freed.
      */
     @Test
@@ -232,15 +232,16 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         long unit = directPageStoreUnit(allocator);
         assumeTrue(unit == 4 * 1024 * 1024, "sized for 4 MiB segments");
         ByteBufAllocatorMetric metric = allocator.metric();
-        int size = 2 * 1024 * 1024;
+        int size = 3 * 1024 * 1024;
         ByteBuf buffer = allocator.directBuffer(size, Integer.MAX_VALUE);
         assertEquals(size, buffer.capacity());
         assertEquals(unit, metric.usedDirectMemory());
         buffer.writeLong(0x0123456789ABCDEFL);
         buffer.setLong(size - 8, 0xFEDCBA9876543210L);
 
-        buffer.capacity(2 * size);
-        assertEquals(2 * size, buffer.capacity());
+        int grown = 4 * 1024 * 1024;
+        buffer.capacity(grown);
+        assertEquals(grown, buffer.capacity());
         boolean regions = directRegions(allocator);
         // The first segment went back: a region slot stays committed, a segment of its own is freed.
         assertEquals(regions ? 2 * unit : unit, metric.usedDirectMemory());

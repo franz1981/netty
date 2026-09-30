@@ -60,6 +60,11 @@ final class Segment implements ChunkInfo {
     int movableSlices;
     /** Whether the owner frees its chunks here that hold no buffer, which empties this segment. */
     boolean evacuate;
+    /**
+     * The chunk of the large-buffer spans made here since the segment joined its heap, or {@code null}: set by the
+     * owner, dropped by whichever thread gives the segment back to the store (see {@link HeapSegments#dispose}).
+     */
+    AdaptivePoolingAllocator.SpanChunk spanChunk;
 
     Segment(AbstractByteBuf buffer, int sliceSize) {
         this(buffer, sliceSize, null, -1);

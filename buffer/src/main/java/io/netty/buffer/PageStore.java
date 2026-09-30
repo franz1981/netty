@@ -187,10 +187,9 @@ final class PageStore {
      * {@link Segment#releasedWhole}.
      *
      * @param regionOffset where to start looking among the regions, as {@link HeapSegments#regionOffset}
-     * @param heap         the heap the chunk is for, or {@code null} for a buffer of its own
      */
-    Segment takeWhole(int regionOffset, HeapSegments heap) {
-        return takeSegment(regionOffset, heap != null ? heap.kind() : NO_HEAP);
+    Segment takeWhole(int regionOffset) {
+        return takeSegment(regionOffset, NO_HEAP);
     }
 
     private Segment takeSegment(int regionOffset, String heap) {

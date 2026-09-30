@@ -150,8 +150,8 @@ final class AdaptivePoolingAllocator {
      * emptied by releases the heap could not apply at once (another thread's, on a thread-local heap or a busy
      * stripe) counts from the heap's next slow path or decay, which applies them.
      * <p>
-     * No effect where the chunks are segments of a {@link PageStore} (direct memory, by default): there a wholly
-     * free chunk goes back to the store at once, whose free slots, or the heap's reserve, keep it for reuse.
+     * No effect with a {@link PageStore} (direct memory, by default): there buffers above the size classes are spans
+     * of their heap's segments, see {@link SpanMagazine}.
      */
     static final int CHUNK_REUSE_QUEUE = Math.max(2, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueCapacity", NettyRuntime.availableProcessors() * 2));
@@ -160,8 +160,8 @@ final class AdaptivePoolingAllocator {
      * {@code io.netty.allocator.chunkReuseQueueBytes}: how many bytes of wholly free chunks for buffers above the
      * size classes each heap keeps, at most, next to {@link #CHUNK_REUSE_QUEUE}. Those chunks are 2 to 8 MiB, so
      * a count alone let a burst of large buffers stay whole. Those that stay idle are given back by halves, see
-     * {@link IdleDecay}. Default: 32 MiB, 4 MiB in low-memory mode; never below the largest chunk. No effect where
-     * the chunks are segments of a {@link PageStore}, as {@link #CHUNK_REUSE_QUEUE}.
+     * {@link IdleDecay}. Default: 32 MiB, 4 MiB in low-memory mode; never below the largest chunk. No effect with a
+     * {@link PageStore}, as {@link #CHUNK_REUSE_QUEUE}.
      */
     static final int CHUNK_REUSE_QUEUE_BYTES = Math.max(MAX_CHUNK_SIZE, SystemPropertyUtil.getInt(
             "io.netty.allocator.chunkReuseQueueBytes", IS_LOW_MEM ? 4 * 1024 * 1024 : 32 * 1024 * 1024));
@@ -307,6 +307,11 @@ final class AdaptivePoolingAllocator {
     final byte[] sizeClassToChunkPool;
     /** {@code null} when this allocator carves no chunk out of segments. */
     final PageStore pageStore;
+    /**
+     * With a page store, outside low-memory mode: the largest buffer that is a span of its heap's segments, half a
+     * segment as mimalloc's largest large page; above it a buffer takes whole segments. Else 0.
+     */
+    private final int largeSpanLimit;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
         this(chunkAllocator, useCacheForNonEventLoopThreads,
@@ -333,8 +338,10 @@ final class AdaptivePoolingAllocator {
             ObjectUtil.checkNotNull(config, "config");
             checkSizeClassSpansFit(config);
             pageStore = new PageStore(this, config, segmentSource, regionSource);
+            largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize >>> 1;
         } else {
             pageStore = null;
+            largeSpanLimit = 0;
         }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
@@ -556,6 +563,13 @@ final class AdaptivePoolingAllocator {
     }
 
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
+        if (size > MAX_POOLED_BUF_SIZE && size <= largeSpanLimit) {
+            // Above the pooled sizes, up to half a segment: a span of the heap's segments, as smaller large buffers.
+            AdaptiveByteBuf spanned = allocateLargeSpan(size, maxCapacity, buf);
+            if (spanned != null) {
+                return spanned;
+            }
+        }
         if (buf == null) {
             buf = newFallbackBuffer();
         }
@@ -577,6 +591,18 @@ final class AdaptivePoolingAllocator {
         return buf;
     }
 
+    /** A span of the calling thread's heap, or of a stripe; {@code null} when every stripe is busy. */
+    private AdaptiveByteBuf allocateLargeSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
+        Thread current = Thread.currentThread();
+        if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+            ThreadLocalSizeClassHeap heap = threadLocalSizeClassHeap.get();
+            if (heap != null) {
+                return heap.allocateLarge(size, maxCapacity, buf);
+            }
+        }
+        return allocateShared(SIZE_CLASSES_COUNT, size, maxCapacity, current, buf);
+    }
+
     /**
      * A one-shot chunk from the page store: a whole segment up to its size; above, with regions, a run of slots.
      * {@code null} when neither fits: a buffer larger than a region, or larger than a segment without regions.
@@ -589,7 +615,7 @@ final class AdaptivePoolingAllocator {
         int segmentSize = store.config.segmentSize;
         int hint = threadIndex(Thread.currentThread()) & Integer.MAX_VALUE;
         if (size <= segmentSize) {
-            Segment segment = store.takeWhole(hint, null);
+            Segment segment = store.takeWhole(hint);
             boolean made = false;
             try {
                 BuddyChunk chunk = new BuddyChunk(segment, this);
@@ -1037,6 +1063,8 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine[] magazines;
         /** Set once the heap has one: a stripe's, or a thread-local heap's for its buffers above the size classes. */
         BuddyMagazine buddyMagazine;
+        /** Instead of {@link #buddyMagazine} when the allocator has a page store. */
+        SpanMagazine spanMagazine;
         /** The heap's segments, when its size classes carve their chunks out of segments; see {@link #decay}. */
         HeapSegments heapSegments;
         // Visible for testing.
@@ -1093,6 +1121,9 @@ final class AdaptivePoolingAllocator {
             if (buddyMagazine != null) {
                 buddyMagazine.decay();
             }
+            if (spanMagazine != null) {
+                spanMagazine.decay();
+            }
             // Last: what the size classes gave up above may have emptied a segment, which then stays reserved for a
             // whole interval before its first chance to be given back, like a buffer offered to the recycler.
             if (heapSegments != null) {
@@ -1132,6 +1163,7 @@ final class AdaptivePoolingAllocator {
         final IdleDecay idleDecay = new IdleDecay();
         SizeClassMagazine[] magazines;
         BuddyMagazine buddyMagazine;
+        SpanMagazine spanMagazine;
         AdaptiveRecycler recycler;
         SizeClassChunkRecycler chunkRecycler;
         /** The stripe's segments, when its size classes carve their chunks out of segments; else {@code null}. */
@@ -1185,12 +1217,57 @@ final class AdaptivePoolingAllocator {
             return mag;
         }
 
+        /** Above the size classes, under the stripe lock: a span with a page store, else a buddy block. */
+        private AdaptiveByteBuf allocateLargeLocked(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate,
+                                                    AdaptivePoolingAllocator allocator) {
+            if (allocator.pageStore != null) {
+                SpanMagazine mag = getOrCreateSpanMagazine(allocator);
+                if (buf == null) {
+                    buf = mag.newBuffer();
+                }
+                boolean allocated = false;
+                try {
+                    mag.allocate(size, maxCapacity, buf);
+                    allocated = true;
+                    return buf;
+                } finally {
+                    if (!allocated && !reallocate) {
+                        buf.release();
+                    }
+                }
+            }
+            BuddyMagazine mag = getOrCreateBuddyMagazine(allocator);
+            if (buf == null) {
+                buf = mag.newBuffer();
+            }
+            if (mag.allocate(size, maxCapacity, buf)) {
+                return buf;
+            }
+            if (!reallocate) {
+                buf.release();
+            }
+            return null;
+        }
+
+        SpanMagazine getOrCreateSpanMagazine(AdaptivePoolingAllocator allocator) {
+            SpanMagazine mag = spanMagazine;
+            if (mag == null) {
+                if (recycler == null) {
+                    recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+                }
+                createHeapSegments(allocator);
+                mag = new SpanMagazine(allocator, recycler, lock, null, idleDecay, heapSegments);
+                spanMagazine = mag;
+                idleDecay.spanMagazine = mag;
+            }
+            return mag;
+        }
+
         private BuddyMagazine createBuddyMagazine(AdaptivePoolingAllocator allocator) {
             if (recycler == null) {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
-            createHeapSegments(allocator);
-            BuddyMagazine mag = new BuddyMagazine(allocator, recycler, lock, null, idleDecay, heapSegments);
+            BuddyMagazine mag = new BuddyMagazine(allocator, recycler, lock, null, idleDecay);
             buddyMagazine = mag;
             idleDecay.buddyMagazine = mag;
             return mag;
@@ -1216,6 +1293,11 @@ final class AdaptivePoolingAllocator {
                     buddyMagazine.free();
                     buddyMagazine = null;
                     idleDecay.buddyMagazine = null;
+                }
+                if (spanMagazine != null) {
+                    spanMagazine.free();
+                    spanMagazine = null;
+                    idleDecay.spanMagazine = null;
                 }
                 if (chunkRecycler != null) {
                     chunkRecycler.freeAll();
@@ -1247,14 +1329,8 @@ final class AdaptivePoolingAllocator {
                         return buf;
                     }
                 } else {
-                    // No purge tick here: the buddy magazine counts its allocations itself.
-                    BuddyMagazine mag = getOrCreateBuddyMagazine(allocator);
-                    if (buf == null) {
-                        buf = mag.newBuffer();
-                    }
-                    if (mag.allocate(size, maxCapacity, buf)) {
-                        return buf;
-                    }
+                    // No purge tick here: the large-buffer magazines count their allocations themselves.
+                    return allocateLargeLocked(size, maxCapacity, buf, reallocate, allocator);
                 }
                 if (!reallocate) {
                     buf.release();
@@ -1273,6 +1349,7 @@ final class AdaptivePoolingAllocator {
         private final HeapSegments heapSegments;
         /** Buffers above the size classes; {@code null} until the first one. */
         private BuddyMagazine buddyMagazine;
+        private SpanMagazine spanMagazine;
         // Visible for testing.
         final IdleDecay idleDecay = new IdleDecay();
         private final AdaptivePoolingAllocator allocator;
@@ -1306,9 +1383,12 @@ final class AdaptivePoolingAllocator {
          * counting, ages the magazine's idle chunks with the rest of the heap.
          */
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            if (heapSegments != null) {
+                return allocateSpan(size, maxCapacity, buf);
+            }
             BuddyMagazine mag = buddyMagazine;
             if (mag == null) {
-                mag = new BuddyMagazine(allocator, null, null, Thread.currentThread(), idleDecay, heapSegments);
+                mag = new BuddyMagazine(allocator, null, null, Thread.currentThread(), idleDecay);
                 buddyMagazine = mag;
                 idleDecay.buddyMagazine = mag;
             }
@@ -1323,6 +1403,30 @@ final class AdaptivePoolingAllocator {
                 buf.release();
             }
             return null;
+        }
+
+        /** {@link #allocateLarge} with a page store: a span of the heap's segments, see {@link SpanMagazine}. */
+        private AdaptiveByteBuf allocateSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            SpanMagazine mag = spanMagazine;
+            if (mag == null) {
+                mag = new SpanMagazine(allocator, null, null, Thread.currentThread(), idleDecay, heapSegments);
+                spanMagazine = mag;
+                idleDecay.spanMagazine = mag;
+            }
+            boolean reallocate = buf != null;
+            if (!reallocate) {
+                buf = mag.newBuffer();
+            }
+            boolean allocated = false;
+            try {
+                mag.allocate(size, maxCapacity, buf);
+                allocated = true;
+                return buf;
+            } finally {
+                if (!allocated && !reallocate) {
+                    buf.release();
+                }
+            }
         }
 
         SizeClassMagazine getOrCreateMagazine(int sizeClassIndex) {
@@ -1359,6 +1463,12 @@ final class AdaptivePoolingAllocator {
                 buddy.free();
                 buddyMagazine = null;
                 idleDecay.buddyMagazine = null;
+            }
+            SpanMagazine spans = spanMagazine;
+            if (spans != null) {
+                spans.free();
+                spanMagazine = null;
+                idleDecay.spanMagazine = null;
             }
             chunkRecycler.freeAll();
             if (heapSegments != null) {
@@ -2083,10 +2193,6 @@ final class AdaptivePoolingAllocator {
 
     private static final class BuddyChunkController {
         private final ChunkAllocator chunkAllocator;
-        /** Where the chunks come from, one whole segment each, when the allocator has a page store; else null. */
-        private final PageStore store;
-        /** With a store, the size of every chunk: the largest power of two a segment holds. Else the largest chunk. */
-        final int largestChunkSize;
         /**
          * The largest chunk this magazine made so far; its chunks never shrink below it, so a magazine serving mixed
          * sizes does not go back and forth between chunk sizes. One per magazine, guarded like it: a heap that only
@@ -2094,10 +2200,8 @@ final class AdaptivePoolingAllocator {
          */
         private int maxChunkSize;
 
-        BuddyChunkController(AdaptivePoolingAllocator allocator) {
-            chunkAllocator = allocator.chunkAllocator;
-            store = allocator.pageStore;
-            largestChunkSize = store != null ? Integer.highestOneBit(store.config.segmentSize) : MAX_CHUNK_SIZE;
+        BuddyChunkController(ChunkAllocator chunkAllocator) {
+            this.chunkAllocator = chunkAllocator;
         }
 
         /**
@@ -2111,9 +2215,6 @@ final class AdaptivePoolingAllocator {
          * Allocate a new {@link BuddyChunk} for the given {@link BuddyMagazine}.
          */
         BuddyChunk newChunkAllocation(int promptingSize, BuddyMagazine magazine) {
-            if (store != null) {
-                return newSegmentChunk(magazine);
-            }
             int maxChunkSize = this.maxChunkSize;
             int proposedChunkSize = MathUtil.safeFindNextPositivePowerOfTwo(BUFS_PER_CHUNK * promptingSize);
             int chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(maxChunkSize, proposedChunkSize));
@@ -2123,28 +2224,6 @@ final class AdaptivePoolingAllocator {
             BuddyChunk chunk = new BuddyChunk(chunkAllocator.allocate(chunkSize, chunkSize), magazine);
             magazine.allocator.chunkBufferAllocated(chunk, true, magazine.isThreadLocal());
             return chunk;
-        }
-
-        /**
-         * A chunk over one whole segment: the newest one of the heap's reserve, else one from the store. The store
-         * accounts for the segment, so nothing is announced here.
-         */
-        private BuddyChunk newSegmentChunk(BuddyMagazine magazine) {
-            HeapSegments heap = magazine.heapSegments;
-            Segment segment = heap.takeReservedWhole();
-            if (segment == null) {
-                segment = store.takeWhole(heap.regionOffset, heap);
-            }
-            boolean made = false;
-            try {
-                BuddyChunk chunk = new BuddyChunk(segment, largestChunkSize, magazine);
-                made = true;
-                return chunk;
-            } finally {
-                if (!made) {
-                    store.free(segment);
-                }
-            }
         }
     }
 
@@ -2342,6 +2421,10 @@ final class AdaptivePoolingAllocator {
             if (buddy != null) {
                 buddy.drainPending();
             }
+            SpanMagazine spans = idleDecay.spanMagazine;
+            if (spans != null) {
+                spans.drainPending();
+            }
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -2494,30 +2577,22 @@ final class AdaptivePoolingAllocator {
         private final IdleDecay idleDecay;
         /** How many decays ran; a chunk filed wholly free records it in {@link BuddyChunk#whollyFreeSince}. */
         private int decays;
-        /**
-         * The heap's segments when the chunks are segments of the page store, else {@code null}. The magazine keeps no
-         * wholly free chunk then: its segment goes back to the store, whose free slots are the shared reserve, or,
-         * allocated on its own, to this heap's reserve (see {@link BuddyChunk#release(HeapSegments)}).
-         */
-        final HeapSegments heapSegments;
 
         /**
          * @param bufRecycler the stripe's buffer pool, or {@code null} on a thread-local heap for the event-loop pool
          * @param stripeLock  the stripe's lock, or {@code null} on a thread-local heap
          * @param ownerThread the thread-local heap's thread, or {@code null} on a stripe
-         * @param heapSegments the heap's segments, exactly when the allocator has a page store
          */
         BuddyMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                      Thread ownerThread, IdleDecay idleDecay, HeapSegments heapSegments) {
+                      Thread ownerThread, IdleDecay idleDecay) {
             assert (stripeLock == null) != (ownerThread == null);
-            assert (heapSegments != null) == (allocator.pageStore != null);
+            assert allocator.pageStore == null : "with a page store, buffers above the size classes are spans";
             this.allocator = allocator;
-            this.heapSegments = heapSegments;
             this.idleDecay = idleDecay;
             this.bufRecycler = bufRecycler;
             this.stripeLock = stripeLock;
             this.ownerThread = ownerThread;
-            this.chunkController = new BuddyChunkController(allocator);
+            this.chunkController = new BuddyChunkController(allocator.chunkAllocator);
             for (int order = 0; order < ORDERS; order++) {
                 byLargestFreeOrder[order] = new ChunkQueue();
             }
@@ -2538,11 +2613,6 @@ final class AdaptivePoolingAllocator {
          * chunk with the largest free block active if that block fits (see {@link #poll}), or a new chunk.
          */
         private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int blockSize) {
-            if (blockSize > chunkController.largestChunkSize) {
-                // Segments smaller than the block: a buffer of its own.
-                allocator.allocateFallback(size, maxCapacity, buf);
-                return true;
-            }
             BuddyChunk chunk = active;
             if (chunk != null) {
                 active = null;
@@ -2626,9 +2696,8 @@ final class AdaptivePoolingAllocator {
         private void file(BuddyChunk chunk) {
             chunk.processFreelistEntries();
             if (chunk.isWhollyFree()) {
-                if (heapSegments != null || whollyFree.size >= CHUNK_REUSE_QUEUE
-                        || idleBytes + chunk.capacity > CHUNK_REUSE_QUEUE_BYTES) {
-                    chunk.release(heapSegments);
+                if (whollyFree.size >= CHUNK_REUSE_QUEUE || idleBytes + chunk.capacity > CHUNK_REUSE_QUEUE_BYTES) {
+                    chunk.markToDeallocate();
                     return;
                 }
                 idleBytes += chunk.capacity;
@@ -2663,9 +2732,8 @@ final class AdaptivePoolingAllocator {
             BuddyChunk current = active;
             if (current != null) {
                 current.processFreelistEntries();
-                // With segments, filing gives it back at once: the store's free slots age it instead.
-                if (current.isWhollyFree() && (heapSegments != null || whollyFree.size < CHUNK_REUSE_QUEUE &&
-                        idleBytes + current.capacity <= CHUNK_REUSE_QUEUE_BYTES)) {
+                if (current.isWhollyFree() && whollyFree.size < CHUNK_REUSE_QUEUE &&
+                        idleBytes + current.capacity <= CHUNK_REUSE_QUEUE_BYTES) {
                     active = null;
                     file(current);
                 }
@@ -2687,7 +2755,7 @@ final class AdaptivePoolingAllocator {
                 BuddyChunk chunk = (BuddyChunk) cur;
                 if (chunk.whollyFreeSince < previous) {
                     unfile(chunk);
-                    chunk.release(heapSegments);
+                    chunk.markToDeallocate();
                     free--;
                 }
                 cur = newer;
@@ -2757,7 +2825,7 @@ final class AdaptivePoolingAllocator {
             BuddyChunk chunk = active;
             active = null;
             if (chunk != null) {
-                chunk.release(heapSegments);
+                chunk.markToDeallocate();
             }
             freeAll(full);
             freeAll(whollyFree);
@@ -2773,7 +2841,7 @@ final class AdaptivePoolingAllocator {
             Chunk cur;
             while ((cur = queue.head) != null) {
                 unfile(cur);
-                ((BuddyChunk) cur).release(heapSegments);
+                ((BuddyChunk) cur).markToDeallocate();
             }
         }
 
@@ -2787,6 +2855,237 @@ final class AdaptivePoolingAllocator {
 
         boolean isThreadLocal() {
             return ownerThread != null;
+        }
+    }
+
+    /**
+     * Buffers above the size classes when the allocator has a {@link PageStore}: each one is a span of whole slices of
+     * its heap's segments (see {@link HeapSegments#claim}), sized to the buffer rounded up to slices, as mimalloc's
+     * large pages. No block of a chunk, nothing kept for reuse but the segments themselves.
+     * <p>
+     * The heap's owner (the stripe lock holder, or the thread of a thread-local heap) claims and releases the spans.
+     * A release by any other thread puts its span on its segment's {@link SpanChunk} queue and leaves a note in
+     * {@link #pending}, the protocol of {@link BuddyMagazine}: the owner applies the notes before each claim, at decay,
+     * and on a thread-local heap's size-class slow path. Once the heap is freed, the releases apply themselves (see
+     * {@link #free}).
+     */
+    private static final class SpanMagazine {
+        /** An allocation counts toward the heap's {@link IdleDecay} as its size in units of the smallest size class. */
+        private static final int COUNT_SHIFT = 5;
+        private static final long OWNER_STAMP = 1;
+
+        final AdaptivePoolingAllocator allocator;
+        final HeapSegments heapSegments;
+        private final AdaptiveRecycler bufRecycler;
+        private final StampedLock stripeLock;
+        private final Thread ownerThread;
+        private final IdleDecay idleDecay;
+        final int sliceShift;
+        private final int segmentSlices;
+        /** Segments that other threads' releases asked this magazine to look at. */
+        final PendingChunks pending = new PendingChunks();
+        /** Set by {@link #free}; from then on a release applies its span itself. */
+        volatile boolean freed;
+
+        SpanMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
+                     Thread ownerThread, IdleDecay idleDecay, HeapSegments heapSegments) {
+            assert (stripeLock == null) != (ownerThread == null);
+            this.allocator = allocator;
+            this.bufRecycler = bufRecycler;
+            this.stripeLock = stripeLock;
+            this.ownerThread = ownerThread;
+            this.idleDecay = idleDecay;
+            this.heapSegments = heapSegments;
+            int sliceSize = allocator.pageStore.config.sliceSize;
+            assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
+            sliceShift = Integer.numberOfTrailingZeros(sliceSize);
+            segmentSlices = allocator.pageStore.config.slicesPerSegment();
+        }
+
+        void allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            drainPending();
+            int sliceShift = this.sliceShift;
+            int slices = (int) ((size + (1L << sliceShift) - 1) >>> sliceShift);
+            if (slices > segmentSlices) {
+                // Segments smaller than the buffer (a small configured segment size): a buffer of its own.
+                allocator.allocateFallback(size, maxCapacity, buf);
+                return;
+            }
+            HeapSegments heap = heapSegments;
+            Segment segment = heap.claim(slices);
+            int start = heap.claimedStart();
+            SpanChunk chunk = segment.spanChunk;
+            if (chunk == null) {
+                chunk = new SpanChunk(segment, this);
+                segment.spanChunk = chunk;
+            }
+            assert chunk.magazine == this && !chunk.retired;
+            boolean initialized = false;
+            try {
+                buf.init(segment.buffer, chunk, 0, 0, start << sliceShift, size, slices << sliceShift, maxCapacity);
+                initialized = true;
+            } finally {
+                if (!initialized) {
+                    heap.release(segment, start, slices);
+                }
+            }
+            idleDecay.count(size >>> COUNT_SHIFT);
+        }
+
+        /** Owner only: apply the spans other threads released. One volatile read when there are none. */
+        void drainPending() {
+            Chunk cur = pending.takeAll();
+            while (cur != null) {
+                // Re-arm BEFORE processing: see PendingChunks#rearm.
+                Chunk next = PendingChunks.rearm(cur);
+                SpanChunk chunk = (SpanChunk) cur;
+                if (!chunk.retired) {
+                    chunk.applyReleases();
+                }
+                cur = next;
+            }
+        }
+
+        void decay() {
+            drainPending();
+        }
+
+        /**
+         * Owner only, after {@link HeapSegments#markFreed}: from now on every release applies its span itself, and
+         * the notes left before are applied here. A release that left a note reads {@link #freed} after pushing it:
+         * either it sees the flag and applies its span, or this drain sees its note; both may, which
+         * {@link SpanChunk#applyReleasesAfterFree} makes safe.
+         */
+        void free() {
+            freed = true;
+            Chunk cur = pending.takeAll();
+            while (cur != null) {
+                Chunk next = PendingChunks.rearm(cur);
+                ((SpanChunk) cur).applyReleasesAfterFree();
+                cur = next;
+            }
+        }
+
+        long tryLockForRelease() {
+            Thread owner = ownerThread;
+            if (owner != null) {
+                return owner == Thread.currentThread() ? OWNER_STAMP : 0;
+            }
+            return stripeLock.tryWriteLock();
+        }
+
+        void unlockAfterRelease(long stamp) {
+            if (ownerThread == null) {
+                stripeLock.unlockWrite(stamp);
+            }
+        }
+
+        AdaptiveByteBuf newBuffer() {
+            AdaptiveByteBuf buf = bufRecycler != null ? bufRecycler.get()
+                    : SizeClassMagazine.EVENT_LOOP_LOCAL_BUFFER_POOL.get();
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
+        }
+
+        boolean isThreadLocal() {
+            return ownerThread != null;
+        }
+    }
+
+    /**
+     * The chunk the large-buffer spans of one segment refer to, for as long as the segment is in its heap, its reserve
+     * included: the whole segment is its buffer, a span is an offset and a length in it. It holds the queue of the
+     * spans other threads released (at most one entry per span, so at most one per slice). Made once per stay of the
+     * segment in the heap: no allocation per buffer.
+     */
+    static final class SpanChunk extends Chunk implements IntConsumer {
+        private static final AtomicIntegerFieldUpdater<SpanChunk> DRAINING =
+                AtomicIntegerFieldUpdater.newUpdater(SpanChunk.class, "draining");
+        private static final int START_BITS = 8;
+
+        final Segment segment;
+        final SpanMagazine magazine;
+        private final MpscIntQueue released;
+        /** Owner only: set when the segment was wholly free again; a note that finds it set is stale. */
+        boolean retired;
+        /** After the heap was freed: 1 while a thread applies the queued releases, so that one does at a time. */
+        private volatile int draining;
+
+        SpanChunk(Segment segment, SpanMagazine magazine) {
+            super(segment.buffer, magazine.allocator, true);
+            this.segment = segment;
+            this.magazine = magazine;
+            released = MpscIntQueue.create(segment.slices, -1);
+        }
+
+        /** Any thread: the span of {@code length} bytes at {@code offset} is free. */
+        @Override
+        void releaseSegment(int offset, int length) {
+            SpanMagazine owner = magazine;
+            int shift = owner.sliceShift;
+            int start = offset >>> shift;
+            int slices = length >>> shift;
+            long stamp = owner.tryLockForRelease();
+            if (stamp != 0) {
+                try {
+                    owner.heapSegments.release(segment, start, slices);
+                } finally {
+                    owner.unlockAfterRelease(stamp);
+                }
+                return;
+            }
+            // Offer before the note, and the note before reading freed: see SpanMagazine#free.
+            boolean offered = released.offer(start | slices << START_BITS);
+            assert offered : "more released spans than slices in " + segment;
+            owner.pending.push(this);
+            if (owner.freed) {
+                applyReleasesAfterFree();
+            }
+        }
+
+        @Override
+        public void accept(int packed) {
+            magazine.heapSegments.release(segment, packed & (1 << START_BITS) - 1, packed >>> START_BITS);
+        }
+
+        /**
+         * Owner only, while the heap lives. An offer takes its index before it stores its entry, and the drain stops
+         * at an entry not stored yet: a queue that still looks non-empty keeps its note for the next drain, since its
+         * releaser may have found the note already pushed and left none of its own.
+         */
+        void applyReleases() {
+            MpscIntQueue released = this.released;
+            if (!released.isEmpty()) {
+                released.drain(segment.slices, this);
+                if (!released.isEmpty()) {
+                    magazine.pending.push(this);
+                }
+            }
+        }
+
+        /**
+         * Any thread, once the heap is freed: whoever finds queued releases applies them, one thread at a time. A
+         * thread that loses the race leaves its entry to the one applying, which looks again after letting go.
+         */
+        void applyReleasesAfterFree() {
+            while (!released.isEmpty() && DRAINING.compareAndSet(this, 0, 1)) {
+                try {
+                    released.drain(segment.slices, this);
+                } finally {
+                    draining = 0;
+                }
+            }
+        }
+
+        @Override
+        boolean inThreadLocalMagazine() {
+            return magazine.isThreadLocal();
+        }
+
+        @Override
+        public String toString() {
+            return "SpanChunk[" + segment + ", queued: " + released.size() + ']';
         }
     }
 
@@ -3311,10 +3610,9 @@ final class AdaptivePoolingAllocator {
      * allocations that are not pooled. It belongs to no magazine, is never cached, and is freed when its buffer
      * is released.
      * <p>
-     * With a {@link PageStore}, a chunk's memory is one whole {@link Segment} of it, or, for a one-shot chunk larger
-     * than a segment, a run of region slots. Whichever thread drops the last reference gives it back to the store,
-     * which takes it from any thread; only the magazine's owner puts a segment allocated on its own in its heap's
-     * reserve instead (see {@link #release(HeapSegments)}).
+     * With a {@link PageStore}, only one-shot chunks exist: one whole {@link Segment} of it, or a run of region slots
+     * for a buffer larger than a segment. Whichever thread drops the last reference gives it back to the store, which
+     * takes it from any thread.
      */
     private static final class BuddyChunk extends Chunk implements IntConsumer {
         private static final int MIN_BUDDY_SIZE = BuddyTree.MIN_BLOCK_SIZE;
@@ -3360,11 +3658,6 @@ final class AdaptivePoolingAllocator {
 
         BuddyChunk(AbstractByteBuf delegate, BuddyMagazine owner) {
             this(delegate, owner.allocator, owner, delegate.capacity(), null, null, 0, 0);
-        }
-
-        /** A chunk of {@code owner} over a whole store segment, whose first {@code capacity} bytes the tree covers. */
-        BuddyChunk(Segment segment, int capacity, BuddyMagazine owner) {
-            this(segment.buffer, owner.allocator, owner, capacity, segment, null, 0, 0);
         }
 
         private BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, BuddyMagazine owner,
@@ -3453,8 +3746,7 @@ final class AdaptivePoolingAllocator {
          * straight back in the tree, refiling the chunk. Otherwise put the block on the free list, then leave a note
          * for the owner: offer before note, so a
          * drain that pops the note sees the block. Either way the buffer's reference is dropped last, so the chunk
-         * is alive throughout; on the first path before the lock is let go, so that the owner's context decides where
-         * a segment the chunk no longer needs goes. A one-shot chunk only drops the reference.
+         * is alive throughout. A one-shot chunk only drops the reference.
          */
         @Override
         void releaseSegment(int startingIndex, int size) {
@@ -3465,42 +3757,21 @@ final class AdaptivePoolingAllocator {
                 if (stamp != 0) {
                     try {
                         owner.releaseInPlace(this, startingIndex, size);
-                        // Still in the owner's context: a last reference dropped here keeps a segment in the heap.
-                        release(owner.heapSegments);
                     } finally {
                         owner.unlockAfterRelease(stamp);
                     }
-                    return;
+                } else {
+                    int packedOffset = startingIndex / MIN_BUDDY_SIZE;
+                    int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
+                    freeList.offer(packedOffset | packedSize);
+                    owner.pending.push(this);
                 }
-                int packedOffset = startingIndex / MIN_BUDDY_SIZE;
-                int packedSize = Integer.numberOfTrailingZeros(size / MIN_BUDDY_SIZE) << PACK_SIZE_SHIFT;
-                freeList.offer(packedOffset | packedSize);
-                owner.pending.push(this);
             }
             release();
         }
 
-        /**
-         * Drop a reference in the magazine's owner context: the magazine's own when it gives this chunk up, or a
-         * buffer's released there. When that is the last one, a segment allocated on its own joins the heap's reserve
-         * while the heap is not freed; anything else is freed as by any other thread, see {@link #deallocate}.
-         */
-        void release(HeapSegments heap) {
-            if (RefCnt.release(refCnt)) {
-                lastReleasedByOwner(heap);
-            }
-        }
-
-        private void lastReleasedByOwner(HeapSegments heap) {
-            Segment segment = this.segment;
-            if (segment == null || heap == null) {
-                deallocate();
-                return;
-            }
-            segment.releasedWhole(System.nanoTime());
-            if (segment.region != null || !heap.reserveWhole(segment)) {
-                allocator.pageStore.free(segment, heap.kind());
-            }
+        void markToDeallocate() {
+            release();
         }
 
         /** Any thread, on the last reference: the store's memory goes back to the store, the rest is freed. */

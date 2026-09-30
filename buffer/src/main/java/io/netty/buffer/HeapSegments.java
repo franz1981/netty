@@ -143,32 +143,6 @@ final class HeapSegments {
                 PageStore.HEAP_RESERVE, kind());
     }
 
-    /**
-     * Owner only. {@code segment}, taken whole with {@link PageStore#takeWhole} and wholly free again, joins the
-     * reserve, where {@link #claim} and {@link #takeReservedWhole} find it. False once the heap is freed: give it back
-     * to the store instead.
-     */
-    boolean reserveWhole(Segment segment) {
-        assert inOwnerContext() && segment.owner == null && segment.isWhollyFree();
-        if (freed) {
-            return false;
-        }
-        segment.owner = this;
-        pushReserved(segment);
-        return true;
-    }
-
-    /** Owner only. The newest reserved segment, owned by no heap as after {@link PageStore#takeWhole}, or null. */
-    Segment takeReservedWhole() {
-        assert inOwnerContext() && !freed;
-        if (reserved == 0) {
-            return null;
-        }
-        Segment segment = takeReservedFor(kind());
-        segment.owner = null;
-        return segment;
-    }
-
     private Segment takeReservedFor(String heap) {
         Segment segment = takeNewestReserved();
         PageStore.taken(segment.memoryAddress(), segment.capacity(), 1, regionIndex(segment), PageStore.HEAP_RESERVE,
@@ -203,6 +177,13 @@ final class HeapSegments {
      */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
+            // The segment is this thread's alone until the store has it: its large-buffer chunk, kept through the
+            // heap's reserve, ends with its stay in the heap. No span is out, and a note left for it finds it retired.
+            AdaptivePoolingAllocator.SpanChunk spans = segment.spanChunk;
+            if (spans != null) {
+                spans.retired = true;
+                segment.spanChunk = null;
+            }
             // After the heap was freed, any thread: on behalf of no heap.
             store.free(segment, freed ? PageStore.NO_HEAP : kind());
         }
