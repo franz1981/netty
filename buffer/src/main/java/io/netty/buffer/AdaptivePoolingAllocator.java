@@ -346,15 +346,16 @@ final class AdaptivePoolingAllocator {
         }
         this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
         chunkRegistry = new ChunkRegistry();
-        // The chunk-to-span table: from this allocator's slice size, 0 for chunks allocated one by one.
+        // The chunk-to-span table: from this allocator's slice and segment sizes, 0 for chunks allocated one by one.
         int sliceSize = this.pageStore != null ? this.pageStore.config.sliceSize : 0;
-        chunkSizes = sliceSize != 0 ? distinctChunkSizes(SIZE_CLASSES, sliceSize) : CHUNK_SIZES;
-        sizeClassToChunkPool = sliceSize != 0 ? chunkPools(SIZE_CLASSES, chunkSizes, sliceSize)
+        int segmentSize = this.pageStore != null ? this.pageStore.config.segmentSize : 0;
+        chunkSizes = sliceSize != 0 ? distinctChunkSizes(SIZE_CLASSES, sliceSize, segmentSize) : CHUNK_SIZES;
+        sizeClassToChunkPool = sliceSize != 0 ? chunkPools(SIZE_CLASSES, chunkSizes, sliceSize, segmentSize)
                 : SIZE_CLASS_TO_CHUNK_POOL;
         sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
             sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(
-                    SIZE_CLASSES[i], chunkSizeOf(SIZE_CLASSES[i], sliceSize));
+                    SIZE_CLASSES[i], chunkSizeOf(SIZE_CLASSES[i], sliceSize, segmentSize));
         }
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
@@ -382,14 +383,13 @@ final class AdaptivePoolingAllocator {
         };
     }
 
+    /** A chunk is at most a segment (see {@link #chunkSizeOf(int, int, int)}): it must hold the largest class. */
     private static void checkSizeClassSpansFit(PageStoreConfig config) {
-        int largestChunk = 0;
-        for (int sizeClass : SIZE_CLASSES) {
-            largestChunk = Math.max(largestChunk, spanChunkSizeOf(sizeClass, config.sliceSize));
-        }
-        if (largestChunk > config.segmentSize) {
+        int largest = SIZE_CLASSES[SIZE_CLASSES_COUNT - 1];
+        int slices = (largest + config.sliceSize - 1) / config.sliceSize;
+        if (slices * config.sliceSize > config.segmentSize) {
             throw new IllegalArgumentException("segmentSize " + config.segmentSize
-                    + " cannot hold a size-class chunk of " + largestChunk + " (slices of " + config.sliceSize + ')');
+                    + " cannot hold a buffer of " + largest + " (slices of " + config.sliceSize + ')');
         }
     }
 
@@ -490,9 +490,13 @@ final class AdaptivePoolingAllocator {
         return (chunkSize + sliceSize - 1) / sliceSize * sliceSize;
     }
 
-    /** {@link #spanChunkSizeOf} for slices of {@code sliceSize}, or {@link #chunkSizeOf} when it is 0. */
-    private static int chunkSizeOf(int segmentSize, int sliceSize) {
-        return sliceSize != 0 ? spanChunkSizeOf(segmentSize, sliceSize) : chunkSizeOf(segmentSize);
+    /**
+     * {@link #spanChunkSizeOf} for slices of {@code sliceSize}, at most {@code maxChunkSize} (a segment, whole slices:
+     * heap segments under G1 can be smaller than 9 slices), or {@link #chunkSizeOf} when {@code sliceSize} is 0.
+     */
+    private static int chunkSizeOf(int segmentSize, int sliceSize, int maxChunkSize) {
+        return sliceSize != 0 ? Math.min(spanChunkSizeOf(segmentSize, sliceSize), maxChunkSize)
+                : chunkSizeOf(segmentSize);
     }
 
     /**
@@ -501,15 +505,18 @@ final class AdaptivePoolingAllocator {
      */
     // Visible for testing.
     static int[] distinctChunkSizes(int[] sizeClasses) {
-        return distinctChunkSizes(sizeClasses, 0);
+        return distinctChunkSizes(sizeClasses, 0, 0);
     }
 
-    /** As {@link #distinctChunkSizes(int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0. */
-    static int[] distinctChunkSizes(int[] sizeClasses, int sliceSize) {
+    /**
+     * As {@link #distinctChunkSizes(int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0, at
+     * most {@code maxChunkSize}.
+     */
+    static int[] distinctChunkSizes(int[] sizeClasses, int sliceSize, int maxChunkSize) {
         int[] distinct = new int[sizeClasses.length];
         int count = 0;
         for (int sizeClass : sizeClasses) {
-            int chunkSize = chunkSizeOf(sizeClass, sliceSize);
+            int chunkSize = chunkSizeOf(sizeClass, sliceSize, maxChunkSize);
             if (indexOf(distinct, count, chunkSize) == -1) {
                 distinct[count++] = chunkSize;
             }
@@ -522,15 +529,18 @@ final class AdaptivePoolingAllocator {
      */
     // Visible for testing.
     static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes) {
-        return chunkPools(sizeClasses, chunkSizes, 0);
+        return chunkPools(sizeClasses, chunkSizes, 0, 0);
     }
 
-    /** As {@link #chunkPools(int[], int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0. */
-    static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes, int sliceSize) {
+    /**
+     * As {@link #chunkPools(int[], int[])}, for chunks that are spans of slices of {@code sliceSize} unless 0, at most
+     * {@code maxChunkSize}.
+     */
+    static byte[] chunkPools(int[] sizeClasses, int[] chunkSizes, int sliceSize, int maxChunkSize) {
         assert chunkSizes.length <= Byte.MAX_VALUE;
         byte[] pools = new byte[sizeClasses.length];
         for (int i = 0; i < pools.length; i++) {
-            int pool = indexOf(chunkSizes, chunkSizes.length, chunkSizeOf(sizeClasses[i], sliceSize));
+            int pool = indexOf(chunkSizes, chunkSizes.length, chunkSizeOf(sizeClasses[i], sliceSize, maxChunkSize));
             assert pool >= 0;
             pools[i] = (byte) pool;
         }
