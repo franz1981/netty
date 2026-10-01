@@ -581,6 +581,11 @@ final class AdaptivePoolingAllocator {
                 return spanned;
             }
         }
+        return allocateOneShot(size, maxCapacity, buf);
+    }
+
+    /** A one-shot chunk for this buffer alone; never a span, so a span magazine can fall back to it. */
+    private AdaptiveByteBuf allocateOneShot(int size, int maxCapacity, AdaptiveByteBuf buf) {
         if (buf == null) {
             buf = newFallbackBuffer();
         }
@@ -2972,7 +2977,7 @@ final class AdaptivePoolingAllocator {
             int slices = (int) ((size + (1L << sliceShift) - 1) >>> sliceShift);
             if (slices > segmentSlices) {
                 // Segments smaller than the buffer (a small configured segment size): a buffer of its own.
-                allocator.allocateFallback(size, maxCapacity, buf);
+                allocator.allocateOneShot(size, maxCapacity, buf);
                 return;
             }
             HeapSegments heap = heapSegments;
