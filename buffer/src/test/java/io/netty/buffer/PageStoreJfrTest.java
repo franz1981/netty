@@ -39,6 +39,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
@@ -181,5 +182,29 @@ public class PageStoreJfrTest {
         assertEquals(REGION_SIZE, state.getLong("length"));
         assertEquals(4L * SEGMENT_SIZE, state.getLong("outBytes"), "the chunk, the one-shot and the run");
         assertTrue(state.getString("out").startsWith(Long.toHexString(base) + '-'), state.getString("out"));
+    }
+
+    /**
+     * The segments allocated on their own are tracked for the periodic state event only while that event is enabled:
+     * with JFR available but no recording, the store keeps no reference to them.
+     */
+    @Test
+    @EnabledForJreRange(min = JRE.JAVA_17)
+    void ownSegmentsAreTrackedOnlyWhileTheStateEventIsEnabled() {
+        AdaptivePoolingAllocator allocator = newAllocator(new CountingSegmentSource(), SEGMENT_SIZE);
+        PageStore store = allocator.pageStore;
+        assumeFalse(store.ownSegments == null, "JFR is not available");
+        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
+        Segment untracked = heap.claim(63);
+        assertFalse(store.ownSegments.contains(untracked), "no recording: not tracked");
+        try (RecordingStream stream = new RecordingStream()) {
+            stream.enable(PageStoreStateEvent.NAME);
+            stream.startAsync();
+            Segment tracked = heap.claim(63); // no room left in the first
+            assertTrue(untracked != tracked);
+            assertTrue(store.ownSegments.contains(tracked), "recorded: tracked");
+            PageStoreTestSupport.giveBack(heap, tracked, 0, 63);
+            assertFalse(store.ownSegments.contains(tracked), "given back: forgotten");
+        }
     }
 }

@@ -114,7 +114,7 @@ final class PageStore {
     volatile long slicePurgeFailures;
     /**
      * With JFR available, for {@link PageStoreStateEvent} only, else {@code null}: the segments allocated on their own
-     * that are out, and the heaps, weakly.
+     * while that event was enabled that are out, and the heaps, weakly.
      */
     final Set<Segment> ownSegments;
     final Queue<WeakReference<HeapSegments>> heaps;
@@ -197,7 +197,7 @@ final class PageStore {
         if (segment == null) {
             segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
             allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
-            if (ownSegments != null) {
+            if (ownSegments != null && PageStoreStateEvent.isEventEnabled()) {
                 ownSegments.add(segment);
             }
             taken(segment.memoryAddress(), config.segmentSize, 1, -1, OWN_ALLOCATION, heap);

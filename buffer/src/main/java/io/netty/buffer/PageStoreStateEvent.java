@@ -103,6 +103,12 @@ final class PageStoreStateEvent extends Event {
     @Description("Address ranges of the segments allocated on their own")
     public String own;
 
+    private static final PageStoreStateEvent INSTANCE = new PageStoreStateEvent();
+
+    static boolean isEventEnabled() {
+        return INSTANCE.isEnabled();
+    }
+
     static void register(PageStore store) {
         for (WeakReference<PageStore> ref : STORES) {
             if (ref.get() == null) {
