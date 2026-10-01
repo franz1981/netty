@@ -480,25 +480,15 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * The size of the chunks of a size class when they are spans of a {@link Segment} of {@code sliceSize} slices. Up
-     * to {@link #MEDIUM_SEGMENT_SIZE}: {@link #chunkSizeOf} rounded up to whole slices (with 64 KiB slices 128, 192
-     * (4352), 256, 320 (8704) and 512 KiB), the classes most allocations hit, whose chunk creations it keeps rare.
-     * Above, where a heap holds a few buffers of a class at most: the fewest whole slices that hold
-     * {@link #MIN_SPAN_CHUNK_SEGMENTS} segments, as mimalloc Java's 512 KiB pages hold 4 blocks at least (with 64 KiB
-     * slices 2 (16896, 32768), 3 (33792), 4 (65536), 5 (67584), 8 (131072) and 9 (135168) slices), since memory
-     * moves between classes through the segments, not through chunks of one size.
+     * The size of the chunks of a size class when they are spans of a {@link Segment} of {@code sliceSize} slices:
+     * {@link #chunkSizeOf} rounded up to whole slices. With 64 KiB slices, 128, 256 and 512 KiB stay; the chunks of
+     * the classes that add a header grow to 192 KiB (4352), 320 KiB (8704) and 576 KiB (16896 up), and hold as many
+     * segments as fit, the tail unused: at most 8.3% of the chunk, for 67584 and 135168.
      */
     static int spanChunkSizeOf(int segmentSize, int sliceSize) {
-        if (segmentSize <= MEDIUM_SEGMENT_SIZE) {
-            int chunkSize = chunkSizeOf(segmentSize);
-            return (chunkSize + sliceSize - 1) / sliceSize * sliceSize;
-        }
-        long bytes = (long) MIN_SPAN_CHUNK_SEGMENTS * segmentSize;
-        return (int) ((bytes + sliceSize - 1) / sliceSize) * sliceSize;
+        int chunkSize = chunkSizeOf(segmentSize);
+        return (chunkSize + sliceSize - 1) / sliceSize * sliceSize;
     }
-
-    /** See {@link #spanChunkSizeOf}. */
-    private static final int MIN_SPAN_CHUNK_SEGMENTS = 4;
 
     /**
      * {@link #spanChunkSizeOf} for slices of {@code sliceSize}, at most {@code maxChunkSize} (a segment, whole slices:
