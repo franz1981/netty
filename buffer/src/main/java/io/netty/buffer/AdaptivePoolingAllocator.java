@@ -1788,8 +1788,12 @@ final class AdaptivePoolingAllocator {
         }
 
         private boolean atOrBelowFloor() {
-            return exhausted.size + reusable.size <= 1;
+            return exhausted.size + reusable.size <= CHUNK_FLOOR;
         }
+
+        /** Experiment: {@code io.netty.allocator.chunkFloor}, queued chunks a class keeps before evicting. */
+        static final int CHUNK_FLOOR =
+                io.netty.util.internal.SystemPropertyUtil.getInt("io.netty.allocator.chunkFloor", 1);
 
         // Signal A (see refile): exhausted → reusable
         void moveToReusable(SizeClassedChunk chunk) {
