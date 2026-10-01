@@ -249,8 +249,9 @@ final class PageStore {
                     SEGMENTS_COMMITTED.incrementAndGet(this);
                     allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
                 }
-                taken = true;
+                // The event before the flag: if it throws, the slot goes back.
                 taken(segment.memoryAddress(), config.segmentSize, 1, fullest.index, source, heap);
+                taken = true;
                 return segment;
             } finally {
                 if (!taken) {
@@ -318,8 +319,6 @@ final class PageStore {
                 int start = region.takeRun(slots);
                 if (start >= 0) {
                     commitRun(region, start, slots);
-                    taken(region.buffer._memoryAddress() + (long) start * config.segmentSize,
-                            (long) slots * config.segmentSize, slots, i, SLOT_RUN, NO_HEAP);
                     return (long) i << 32 | start;
                 }
             }
@@ -343,6 +342,9 @@ final class PageStore {
                     allocator.chunkBufferAllocated(segment, true, false);
                 }
             }
+            // The event before the flag: if it throws, the run goes back.
+            taken(region.buffer._memoryAddress() + (long) start * config.segmentSize,
+                    (long) slots * config.segmentSize, slots, region.index, SLOT_RUN, NO_HEAP);
             committed = true;
         } finally {
             if (!committed) {
