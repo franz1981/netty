@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -25,8 +24,6 @@ import java.util.Random;
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -180,44 +177,5 @@ final class SegmentTest {
             }
         }
         return -1;
-    }
-
-    /** A span claimed again at the same place with the same length gets the same buffer, over the segment's memory. */
-    @Test
-    void aSpanOfTheSameLengthReusesItsBuffer() {
-        CountingSegmentSource source = new CountingSegmentSource();
-        Segment segment = new Segment(source.allocateSegment(SEGMENT_SIZE), SLICE_SIZE_BYTES);
-        try {
-            AbstractByteBuf two = segment.span(source, 0, 2);
-            assertEquals(2 * SLICE_SIZE_BYTES, two.capacity());
-            assertSame(two, segment.span(source, 0, 2));
-            AbstractByteBuf three = segment.span(source, 0, 3);
-            assertNotSame(two, three);
-            assertSame(three, segment.span(source, 0, 3));
-            AbstractByteBuf fifth = segment.span(source, 5, 1);
-            fifth.setByte(7, 42);
-            assertEquals(42, segment.buffer.getByte(5 * SLICE_SIZE_BYTES + 7));
-        } finally {
-            segment.buffer.release();
-        }
-    }
-
-    /** A coloured span starts that many bytes into its first slice, ends with its last, and is kept per colour. */
-    @Test
-    void aColouredSpanStartsInsideItsFirstSlice() {
-        CountingSegmentSource source = new CountingSegmentSource();
-        Segment segment = new Segment(source.allocateSegment(SEGMENT_SIZE), SLICE_SIZE_BYTES);
-        try {
-            AbstractByteBuf plain = segment.span(source, 3, 2);
-            AbstractByteBuf coloured = segment.span(source, 3, 2, 192);
-            assertNotSame(plain, coloured);
-            assertEquals(2 * SLICE_SIZE_BYTES - 192, coloured.capacity());
-            assertSame(coloured, segment.span(source, 3, 2, 192));
-            coloured.setByte(0, 42);
-            assertEquals(42, segment.buffer.getByte(3 * SLICE_SIZE_BYTES + 192));
-            assertNotSame(coloured, segment.span(source, 3, 2, 256));
-        } finally {
-            segment.buffer.release();
-        }
     }
 }

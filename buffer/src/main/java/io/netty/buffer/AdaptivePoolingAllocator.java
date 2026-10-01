@@ -2235,9 +2235,10 @@ final class AdaptivePoolingAllocator {
             int start = heapSegments.claimedStart();
             try {
                 int colour = nextColourOffset();
-                AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices, colour);
-                // A heap segment is its own span: the chunk's buffers start at the span's offset in it, coloured.
-                int base = span == segment.buffer ? start * segment.sliceSize + colour : 0;
+                // The chunk reads the segment's own buffer, as a large-buffer span does: its buffers start at the
+                // span's offset in it, coloured. No buffer object per chunk.
+                AbstractByteBuf span = segment.buffer;
+                int base = start * segment.sliceSize + colour;
                 int capacity = chunkSize - colour;
                 if (recycler.poll(magazine.sizeClassIndex)) {
                     AbstractByteBuf none = recycler.takeBuffer();

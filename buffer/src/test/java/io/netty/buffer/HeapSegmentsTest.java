@@ -121,7 +121,7 @@ final class HeapSegmentsTest {
 
     /**
      * Without regions, a segment that empties stays whole in the heap's reserve, up to 8 of 4 MiB: taken again, newest
-     * first, it is the same segment with the same span buffers, and nothing is allocated. A full reserve gives back
+     * first, it is the same segment, and nothing is allocated. A full reserve gives back
      * its oldest.
      */
     @Test
@@ -131,10 +131,8 @@ final class HeapSegmentsTest {
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         assertEquals(8, allocator.pageStore.reserveLimit());
         Segment[] taken = new Segment[10];
-        AbstractByteBuf[] spans = new AbstractByteBuf[taken.length];
         for (int i = 0; i < taken.length; i++) {
             taken[i] = heap.claim(63);
-            spans[i] = taken[i].span(source, 0, 63);
         }
         for (Segment segment : taken) {
             heap.release(segment, 0, 63);
@@ -146,7 +144,6 @@ final class HeapSegmentsTest {
         assertAccounted(source, allocator);
         for (int i = taken.length - 1; i >= 2; i--) {
             assertSame(taken[i], heap.claim(63), "newest first");
-            assertSame(spans[i], taken[i].span(source, 0, 63), "the span buffer is reused");
         }
         assertEquals(0, heap.reserved);
         assertEquals(10, source.segmentsAllocated(), "nothing allocated for the reused ones");

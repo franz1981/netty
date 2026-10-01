@@ -172,6 +172,7 @@ public class AdaptiveSegmentsTest {
                 bufs.add(buf);
                 SizeClassedChunk chunk = chunkOf(buf);
                 assertNotNull(chunk.segment, "size " + size);
+                assertSame(chunk.segment.buffer, field(chunk, "delegate"), "reads the segment's own buffer: no view");
                 assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity(), "chunk of size " + size);
                 assertEquals(expectedBuffers(size), field(chunk, "segments"), "segments of size " + size);
                 long offset = offsetIn(buf, chunk.segment);

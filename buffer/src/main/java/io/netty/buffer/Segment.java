@@ -24,9 +24,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * state is one bit per slice in {@link #free}, none in the memory: claims are first fit from the lowest slice, and a
  * released span merges with its free neighbours by construction.
  * <p>
- * Single writer: the {@link #owner} heap claims spans, releases them and makes their buffers. Once that heap is
- * freed, the last releases of its spans may come from any thread, hence the CAS on {@link #free}. Chunk creation and
- * deallocation only, never per buffer.
+ * Single writer: the {@link #owner} heap claims spans and releases them; their chunks read {@link #buffer} itself.
+ * Once that heap is freed, the last releases of its spans may come from any thread, hence the CAS on {@link #free}.
+ * Chunk creation and deallocation only, never per buffer.
  */
 final class Segment implements ChunkInfo {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -46,7 +46,6 @@ final class Segment implements ChunkInfo {
     final Region region;
     final int slot;
     /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
-    private final AbstractByteBuf[] spans;
     // Owner only, for the purge of idle slices (see HeapSegments#purgeTick).
     /**
      * Slices that may have memory behind them: claimed since the last purge of their memory, or, for a segment
@@ -80,7 +79,6 @@ final class Segment implements ChunkInfo {
         this.slices = slices;
         allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
         free = allFree;
-        spans = new AbstractByteBuf[slices];
         freedAt = new long[slices];
     }
 
@@ -157,26 +155,6 @@ final class Segment implements ChunkInfo {
 
     int usedSlices() {
         return slices - freeSlices();
-    }
-
-    /** Owner only. The buffer made last time for this exact span, else a new one from {@code source}. */
-    AbstractByteBuf span(SegmentSource source, int start, int n) {
-        return span(source, start, n, 0);
-    }
-
-    /**
-     * {@link #span(SegmentSource, int, int)} starting {@code colour} bytes, less than a slice, into its first slice.
-     * Its capacity tells the slices and the colour apart, so the buffer kept for the start is reused only for both.
-     */
-    AbstractByteBuf span(SegmentSource source, int start, int n, int colour) {
-        assert colour >= 0 && colour < sliceSize : colour;
-        int length = n * sliceSize - colour;
-        AbstractByteBuf span = spans[start];
-        if (span == null || span.capacity() != length) {
-            span = source.span(buffer, start * sliceSize + colour, length);
-            spans[start] = span;
-        }
-        return span;
     }
 
     @Override
