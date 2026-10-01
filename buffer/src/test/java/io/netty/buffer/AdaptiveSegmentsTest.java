@@ -74,7 +74,9 @@ public class AdaptiveSegmentsTest {
     private static int expectedBuffers(int sizeClass) {
         int span = expectedSlices(sizeClass) * SLICE_SIZE_BYTES;
         int fit = span / sizeClass;
-        return span - fit * sizeClass < 64 && fit >= 32 ? fit - 1 : fit;
+        int room = span - fit * sizeClass;
+        // An exact fit gives up a buffer only when that buffer makes room for a second colour: not the 32-byte class.
+        return room < 64 && fit >= 32 && room + sizeClass >= 64 ? fit - 1 : fit;
     }
 
     private static boolean isLowMemory() throws Exception {

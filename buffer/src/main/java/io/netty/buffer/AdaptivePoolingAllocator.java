@@ -2127,7 +2127,8 @@ final class AdaptivePoolingAllocator {
             // Slab colouring: each new span chunk starts its segments 64 bytes further into the span than the
             // previous one of its heap's class, round robin over at most 16 offsets, so that segment k of consecutive
             // chunks does not share its offset in a 4 KiB page. The room is the tail the segments leave unused; a
-            // class that fits exactly gives up one segment for it when it has 32 or more, else stays uncoloured. See
+            // class that fits exactly gives up one segment for it when it has 32 or more and the segment makes room for
+            // a second colour (not the 32-byte class), else stays uncoloured. See
             // Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator", USENIX Summer 1994, section
             // 4.3 https://people.eecs.berkeley.edu/~kubitron/courses/cs194-24-S14/hand-outs/bonwick_slab.pdf, Linux's
             // colour_off/colour/colour_next https://github.com/torvalds/linux/blob/v4.19/mm/slab.c#L2684-L2693 and
@@ -2135,7 +2136,8 @@ final class AdaptivePoolingAllocator {
             // https://www.cs.tau.ac.il/~mad/publications/ismm2011-CIF.pdf
             int buffers = chunkSize / segmentSize;
             int room = chunkSize - buffers * segmentSize;
-            if (spans && room < 1 << COLOUR_SHIFT && buffers >= MIN_BUFFERS_TO_DROP_ONE) {
+            if (spans && room < 1 << COLOUR_SHIFT && buffers >= MIN_BUFFERS_TO_DROP_ONE
+                    && room + segmentSize >= 1 << COLOUR_SHIFT) {
                 buffers--;
                 room += segmentSize;
             }
