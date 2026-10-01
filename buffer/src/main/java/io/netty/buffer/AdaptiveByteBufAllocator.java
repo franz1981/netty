@@ -21,6 +21,7 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 /**
  * An auto-tuning pooling {@link ByteBufAllocator}, that follows an anti-generational hypothesis.
@@ -131,6 +132,11 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
             return directSpan(allocator, segment, offset, length);
         }
 
+        @Override
+        public boolean respan(AbstractByteBuf view, AbstractByteBuf segment, int offset, int length) {
+            return directRespan(view, segment, offset, length);
+        }
+
         /**
          * {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none: one
          * {@code malloc} per segment, which glibc maps on its own, so that its free returns it, only below its mmap
@@ -147,6 +153,22 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
      * from {@code offset}: of the class of {@code segment}, so that the buffers reading a chunk see one class whatever
      * the chunk, and never freeing the memory.
      */
+    /**
+     * {@link #directSpan} again on the same object: one NIO buffer over the new bytes, no new view, so that the
+     * buffers of the next chunk at the same slice keep reading the same object. Only for an unsafe view.
+     */
+    static boolean directRespan(AbstractByteBuf view, AbstractByteBuf segment, int offset, int length) {
+        if (!(view instanceof UnpooledUnsafeDirectByteBuf) || !(segment instanceof UnpooledDirectByteBuf)) {
+            return false;
+        }
+        UnpooledUnsafeDirectByteBuf unsafeView = (UnpooledUnsafeDirectByteBuf) view;
+        ByteBuffer span = PlatformDependent.offsetSlice(((UnpooledDirectByteBuf) segment).buffer, offset, length);
+        unsafeView.maxCapacity(length);
+        unsafeView.setByteBuffer(span.order(ByteOrder.BIG_ENDIAN), false);
+        unsafeView.setIndex0(0, length);
+        return true;
+    }
+
     static AbstractByteBuf directSpan(ByteBufAllocator allocator, AbstractByteBuf segment, int offset, int length) {
         ByteBuffer span = segment.nioBuffer(offset, length);
         if (segment instanceof UnpooledUnsafeNoCleanerDirectByteBuf) {

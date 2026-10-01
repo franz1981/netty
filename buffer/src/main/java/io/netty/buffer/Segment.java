@@ -15,6 +15,8 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.SystemPropertyUtil;
+
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -29,6 +31,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * deallocation only, never per buffer.
  */
 final class Segment implements ChunkInfo {
+    /** {@code io.netty.allocator.reuseSpanViews}: re-point the view kept for a slice instead of making a new one. */
+    static final boolean REUSE_SPAN_VIEWS = SystemPropertyUtil.getBoolean("io.netty.allocator.reuseSpanViews", false);
+
     private static final AtomicLongFieldUpdater<Segment> FREE =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
     static final AtomicReferenceFieldUpdater<Segment, HeapSegments> OWNER =
@@ -173,8 +178,10 @@ final class Segment implements ChunkInfo {
         int length = n * sliceSize - colour;
         AbstractByteBuf span = spans[start];
         if (span == null || span.capacity() != length) {
-            span = source.span(buffer, start * sliceSize + colour, length);
-            spans[start] = span;
+            if (span == null || !REUSE_SPAN_VIEWS || !source.respan(span, buffer, start * sliceSize + colour, length)) {
+                span = source.span(buffer, start * sliceSize + colour, length);
+                spans[start] = span;
+            }
         }
         return span;
     }

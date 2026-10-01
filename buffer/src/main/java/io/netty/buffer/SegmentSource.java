@@ -29,6 +29,14 @@ interface SegmentSource {
      */
     AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
 
+    /**
+     * Points {@code view}, made by {@link #span} over the same {@code segment} and no longer in use, at another
+     * {@code length} bytes from {@code offset}; {@code false} when it cannot, and a new view is needed.
+     */
+    default boolean respan(AbstractByteBuf view, AbstractByteBuf segment, int offset, int length) {
+        return false;
+    }
+
     /** {@code null}: no regions, one allocation per segment. */
     default RegionSource regionSource() {
         return null;

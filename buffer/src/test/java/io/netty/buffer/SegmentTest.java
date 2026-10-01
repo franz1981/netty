@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The slice bitmap of a {@link Segment}: first-fit claims, releases that merge with free neighbours, and span buffers.
@@ -199,6 +200,28 @@ final class SegmentTest {
             assertEquals(42, segment.buffer.getByte(5 * SLICE_SIZE_BYTES + 7));
         } finally {
             segment.buffer.release();
+        }
+    }
+
+    /** A direct view re-pointed at other bytes of its segment stays the same object over the new bytes. */
+    @Test
+    void aDirectViewCanBeRepointed() {
+        AbstractByteBuf segment = UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, SEGMENT_SIZE,
+                SEGMENT_SIZE);
+        try {
+            AbstractByteBuf view = AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, segment,
+                    SLICE_SIZE_BYTES, 2 * SLICE_SIZE_BYTES);
+            assumeTrue(view instanceof UnpooledUnsafeDirectByteBuf, "unsafe views only");
+            assertTrue(AdaptiveByteBufAllocator.directRespan(view, segment, 3 * SLICE_SIZE_BYTES + 192,
+                    SLICE_SIZE_BYTES - 192));
+            assertEquals(SLICE_SIZE_BYTES - 192, view.capacity());
+            assertEquals(SLICE_SIZE_BYTES - 192, view.maxCapacity());
+            assertEquals(segment.memoryAddress() + 3 * SLICE_SIZE_BYTES + 192, view.memoryAddress());
+            view.setByte(SLICE_SIZE_BYTES - 193, 42);
+            assertEquals(42, segment.getByte(4 * SLICE_SIZE_BYTES - 1));
+            assertEquals(SLICE_SIZE_BYTES - 192, view.nioBuffer(0, view.capacity()).remaining());
+        } finally {
+            segment.release();
         }
     }
 
