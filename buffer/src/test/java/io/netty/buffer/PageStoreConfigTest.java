@@ -68,8 +68,8 @@ final class PageStoreConfigTest {
     }
 
     /**
-     * Under G1 a heap segment is the most whole slices whose {@code byte[]} stays within half a region, the header
-     * included: G1 allocates a larger object in regions of its own. Without G1 (0) it is the segment size.
+     * A heap segment is the most whole slices whose {@code byte[]} stays within half a G1 region, the header included:
+     * G1 allocates a larger object in regions of its own. Without a region (0) it is the segment size.
      */
     @Test
     void heapSegmentsAreNeverHumongousUnderG1() {
@@ -83,6 +83,30 @@ final class PageStoreConfigTest {
         }
         assertEquals(4 * mib, PageStoreConfig.heapSegmentSizeOf(4 * mib, SLICE_SIZE_BYTES, 0));
         assertEquals(2 * mib, PageStoreConfig.heapSegmentSizeOf(2 * mib, SLICE_SIZE_BYTES, 32L * mib));
+    }
+
+    /** HotSpot's ergonomic G1 region: a 2048th of the heap from 1 to 32 MiB, rounded up to a power of two. */
+    @Test
+    void g1RegionSizeFollowsHotSpotErgonomics() {
+        long mib = 1024 * 1024;
+        long gib = 1024 * mib;
+        assertEquals(mib, PageStoreConfig.g1RegionSizeOf(256 * mib));
+        assertEquals(mib, PageStoreConfig.g1RegionSizeOf(2 * gib));
+        assertEquals(2 * mib, PageStoreConfig.g1RegionSizeOf(3 * gib));
+        assertEquals(4 * mib, PageStoreConfig.g1RegionSizeOf(8 * gib));
+        assertEquals(8 * mib, PageStoreConfig.g1RegionSizeOf(16 * gib));
+        assertEquals(16 * mib, PageStoreConfig.g1RegionSizeOf(32 * gib));
+        assertEquals(32 * mib, PageStoreConfig.g1RegionSizeOf(128 * gib));
+        assertEquals(32 * mib, PageStoreConfig.g1RegionSizeOf(Long.MAX_VALUE));
+    }
+
+    /** The heap segment property is rounded to whole slices, from 3 (one 132 KiB buffer) to 64. */
+    @Test
+    void heapSegmentSizePropertyIsClamped() {
+        assertEquals(3 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(100 * 1024));
+        assertEquals(7 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(7 * SLICE_SIZE_BYTES + 100));
+        assertEquals(64 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(10 * 1024 * 1024));
+        assertEquals(PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES, PageStoreConfig.heapDefaults().segmentSize);
     }
 
     /** The purge delay property is clamped to 10 ms .. 10 minutes. */
