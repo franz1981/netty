@@ -16,7 +16,10 @@
 package io.netty.buffer;
 
 import io.netty.util.internal.SystemPropertyUtil;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -159,10 +162,79 @@ final class PageStoreConfig {
         this.regionAlignment = regionAlignment;
     }
 
-    /** The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. */
+    /**
+     * The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. Under G1
+     * the segment is cut to {@link #heapSegmentSizeOf} so that it is never a humongous object.
+     */
     static PageStoreConfig heapDefaults() {
-        return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
+        return new PageStoreConfig(G1.HEAP_SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
                 TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS));
+    }
+
+    /**
+     * The most a {@code byte[]} of whole slices adds to its length: its header (12 to 24 bytes) rounded up to the
+     * object alignment, at most 256 bytes ({@code ObjectAlignmentInBytes}).
+     */
+    static final int BYTE_ARRAY_OVERHEAD_BYTES = 256;
+
+    /**
+     * {@code segmentSize}, or under G1 regions of {@code g1RegionSize} the most whole slices whose {@code byte[]} is
+     * not humongous: G1 allocates an object larger than half a region in regions of its own
+     * ({@code G1CollectedHeap::is_humongous}). 1 MiB regions: 7 slices of 64 KiB; 2 MiB: 15; 4 MiB: 31; 8 MiB: 63;
+     * 16 MiB and up: no cut. A {@code g1RegionSize} of 0 or less: not G1, nothing to cut.
+     */
+    static int heapSegmentSizeOf(int segmentSize, int sliceSize, long g1RegionSize) {
+        if (g1RegionSize <= 0) {
+            return segmentSize;
+        }
+        long slices = Math.min(segmentSize / sliceSize, (g1RegionSize / 2 - BYTE_ARRAY_OVERHEAD_BYTES) / sliceSize);
+        return (int) Math.max(1, slices) * sliceSize;
+    }
+
+    /** Read on the first heap allocator only: the management beans cost nothing to a direct-only process. */
+    private static final class G1 {
+        private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStoreConfig.class);
+        /** G1's minimum region, assumed when the VM does not publish the one it chose (JDK 8). */
+        private static final long MIN_REGION_SIZE_BYTES = 1024 * 1024;
+        static final int HEAP_SEGMENT_SIZE_BYTES;
+
+        static {
+            long regionSize = regionSize();
+            HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES, regionSize);
+            logger.debug("Heap segments: {} bytes (G1 region size: {})", HEAP_SEGMENT_SIZE_BYTES,
+                    regionSize > 0 ? regionSize : "not G1, or unknown");
+        }
+
+        private G1() {
+        }
+
+        /**
+         * The G1 region size in bytes, 0 when the VM does not use G1 or that cannot be told ({@code java.management}
+         * or {@code com.sun.management} absent, or denied). Reflective, so that this class loads where they are not.
+         */
+        private static long regionSize() {
+            try {
+                Class<?> factory = Class.forName("java.lang.management.ManagementFactory");
+                Class<?> beanType = Class.forName("com.sun.management.HotSpotDiagnosticMXBean");
+                Class<?> optionType = Class.forName("com.sun.management.VMOption");
+                Object bean = factory.getMethod("getPlatformMXBean", Class.class).invoke(null, beanType);
+                if (bean == null) {
+                    return 0;
+                }
+                Method getVMOption = beanType.getMethod("getVMOption", String.class);
+                Method getValue = optionType.getMethod("getValue");
+                if (!Boolean.parseBoolean((String) getValue.invoke(getVMOption.invoke(bean, "UseG1GC")))) {
+                    return 0;
+                }
+                Object option = getVMOption.invoke(bean, "G1HeapRegionSize");
+                long regionSize = Long.parseLong((String) getValue.invoke(option));
+                // JDK 8 leaves the flag at 0 when it picks the size itself (heapRegion.cpp, setup_heap_region_size).
+                return regionSize > 0 ? regionSize : MIN_REGION_SIZE_BYTES;
+            } catch (Throwable t) {
+                logger.debug("Could not read the G1 VM options", t);
+                return 0;
+            }
+        }
     }
 
     static PageStoreConfig directDefaults() {

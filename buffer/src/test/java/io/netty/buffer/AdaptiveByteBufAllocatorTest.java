@@ -190,6 +190,22 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return heap.pageStore != null ? heap.pageStore.config.segmentSize : 0;
     }
 
+    /**
+     * Whether the heap allocator pools buffers of {@code size}: always without heap segments, else up to a segment,
+     * which G1 regions below 16 MiB make smaller than 4 MiB (see {@link PageStoreConfig#heapSegmentSizeOf}).
+     */
+    static boolean heapSegmentsHold(AdaptiveByteBufAllocator allocator, int size) {
+        int segmentSize = heapSegmentSize(allocator);
+        return segmentSize == 0 || size <= segmentSize;
+    }
+
+    @Override
+    @Test
+    public void shouldReuseChunks() throws Exception {
+        assumeTrue(heapSegmentsHold(newAllocator(false), 1024 * 1024), "1 MiB heap buffers are not pooled");
+        super.shouldReuseChunks();
+    }
+
     /** As {@link #testUsedDirectMemory}: heap segments are accounted whole, as direct ones. */
     @Override
     @Test
@@ -270,9 +286,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         assumeTrue(storeOneShots(allocator, direct), "no page store for buffers above the pooled sizes");
         long unit = direct ? directPageStoreUnit(allocator) : heapSegmentSize(allocator);
-        assumeTrue(unit == 4 * 1024 * 1024, "sized for 4 MiB segments");
+        int size = (int) (unit / 4 * 3); // above half a segment
+        assumeTrue(size > 1024 * 1024, "one-shots are above 1 MiB: segments of " + unit + " hold none");
         ByteBufAllocatorMetric metric = allocator.metric();
-        int size = 3 * 1024 * 1024;
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
         assertEquals(size, buffer.capacity());
@@ -280,7 +296,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         buffer.writeLong(0x0123456789ABCDEFL);
         buffer.setLong(size - 8, 0xFEDCBA9876543210L);
 
-        int grown = 4 * 1024 * 1024;
+        int grown = (int) unit;
         buffer.capacity(grown);
         assertEquals(grown, buffer.capacity());
         boolean regions = direct && directRegions(allocator);
@@ -295,7 +311,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     @Test
     void adaptiveChunkMustDeallocateOrReuseWthBufferRelease() throws Exception {
-        AdaptiveByteBufAllocator allocator = newAllocator(false);
+        // Counts in chunks: with heap segments the used memory is whole segments, of a size that depends on the GC.
+        AdaptiveByteBufAllocator allocator = newAllocatorWithoutHeapSegments(false);
         Deque<ByteBuf> bufs = new ArrayDeque<>();
         assertEquals(0, allocator.usedHeapMemory());
         assertEquals(0, allocator.usedHeapMemory());
@@ -644,6 +661,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         int size = 512 * 1024; // above the largest size class, below the unpooled fallback
+        assumeTrue(direct || heapSegmentsHold(allocator, size), "heap buffers above a heap segment are not pooled");
         ByteBuf[] bufs = new ByteBuf[24];
         long afterFirstRound = -1;
         for (int round = 0; round < 50; round++) {

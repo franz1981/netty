@@ -218,7 +218,8 @@ public class JfrEventsTest {
                         segments[0]++;
                         units.add(event.getInt("capacity"));
                     }
-                } else if (isPageStore(event)) {
+                } else if (isPageStore(event) && !"Finalizer".equals(threadOf(event))) {
+                    // The finalizer frees the allocators earlier tests dropped, with their segments.
                     otherSegmentEvents.add(threadOf(event));
                 }
             });
@@ -227,7 +228,8 @@ public class JfrEventsTest {
                     allocatedFreed[1] += event.getInt("capacity");
                     oneShots[1] += event.getBoolean("pooled") ? 0 : 1;
                     segments[1] += isPageStore(event) ? 1 : 0;
-                } else if (isPageStore(event)) {
+                } else if (isPageStore(event) && !"Finalizer".equals(threadOf(event))) {
+                    // The finalizer frees the allocators earlier tests dropped, with their segments.
                     otherSegmentEvents.add(threadOf(event));
                 }
             });
@@ -237,8 +239,9 @@ public class JfrEventsTest {
                 // Spans of 8 slices: the 16 KiB burst fills a segment, the 64 KiB one reuses its spans.
                 releaseAll(allocateMany(alloc, direct, 16 * 1024, 32 * 8));
                 releaseAll(allocateMany(alloc, direct, 64 * 1024, 8 * 8));
-                allocateMany(alloc, direct, 4 * 1024 * 1024, 1).get(0).release();
-                releaseAll(allocateMany(alloc, direct, 512 * 1024, 8));
+                allocateMany(alloc, direct, segmentSize, 1).get(0).release();
+                // At most a segment: heap segments are smaller under G1 with small regions.
+                releaseAll(allocateMany(alloc, direct, Math.min(512 * 1024, segmentSize), 8));
                 // The size classes go idle and give their spans back: the emptied segment waits in the cache.
                 decayThreadLocalHeap(alloc, direct ? "direct" : "heap", 3);
                 heldPastTheEnd[0] = allocateMany(alloc, direct, 1024, 1).get(0);
@@ -258,7 +261,7 @@ public class JfrEventsTest {
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment");
         }
-        // The 4 MiB buffer and the 512 KiB ones take whole segments of the page store: segment events, no one-shot.
+        // The segment-sized buffer and the 512 KiB ones take segments of the page store: segment events, no one-shot.
         assertEquals(0, oneShots[0], "no chunk is allocated outside the page store");
         assertEquals(0, oneShots[1]);
         assertEquals(direct ? alloc.metric().usedDirectMemory() : alloc.metric().usedHeapMemory(),

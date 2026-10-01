@@ -27,6 +27,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link PageStoreConfig}: its validation (whole slices and pages, whole segments per region, aligned segments), and
@@ -64,6 +65,24 @@ final class PageStoreConfigTest {
         if (System.getProperty("io.netty.allocator.segmentPurgeDelay") == null) {
             assertEquals(4000, PageStoreConfig.PURGE_DELAY_MILLIS, "mimalloc's 1000 ms purge delay x 4");
         }
+    }
+
+    /**
+     * Under G1 a heap segment is the most whole slices whose {@code byte[]} stays within half a region, the header
+     * included: G1 allocates a larger object in regions of its own. Without G1 (0) it is the segment size.
+     */
+    @Test
+    void heapSegmentsAreNeverHumongousUnderG1() {
+        int mib = 1024 * 1024;
+        int[][] regionAndSlices = {{1, 7}, {2, 15}, {4, 31}, {8, 63}, {16, 64}, {32, 64}};
+        for (int[] expected : regionAndSlices) {
+            long region = (long) expected[0] * mib;
+            int size = PageStoreConfig.heapSegmentSizeOf(4 * mib, SLICE_SIZE_BYTES, region);
+            assertEquals(expected[1] * SLICE_SIZE_BYTES, size, "region " + expected[0] + " MiB");
+            assertTrue(size + PageStoreConfig.BYTE_ARRAY_OVERHEAD_BYTES <= region / 2, "not humongous");
+        }
+        assertEquals(4 * mib, PageStoreConfig.heapSegmentSizeOf(4 * mib, SLICE_SIZE_BYTES, 0));
+        assertEquals(2 * mib, PageStoreConfig.heapSegmentSizeOf(2 * mib, SLICE_SIZE_BYTES, 32L * mib));
     }
 
     /** The purge delay property is clamped to 10 ms .. 10 minutes. */

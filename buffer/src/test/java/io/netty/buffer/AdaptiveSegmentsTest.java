@@ -469,8 +469,9 @@ public class AdaptiveSegmentsTest {
     /**
      * The defaults: 4 MiB segments in 64-segment regions; 2 MiB segments in low-memory mode, where the single stripe
      * carves its chunks out of segments too. Regions wherever they can be mapped, for direct memory only. The memory
-     * accounted is a segment, with regions or not, direct or heap. A heap reserves up to 8 heap segments, as a direct
-     * heap does without regions.
+     * accounted is a segment, with regions or not, direct or heap. Heap segments are cut under G1 (see
+     * {@link PageStoreConfig#heapSegmentSizeOf}); a heap reserves up to 8 of them, as a direct heap does without
+     * regions.
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
@@ -489,14 +490,15 @@ public class AdaptiveSegmentsTest {
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
         assumeTrue(AdaptivePoolingAllocator.HEAP_SEGMENTS, "heap segments turned off");
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, heapStore.config.segmentSize);
+        int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
+        assertEquals(heapSegmentSize, heapStore.config.segmentSize);
         assertNull(heapStore.regionSource);
         assertEquals(8, heapStore.reserveLimit());
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNotNull(chunkOf(heap).segment);
         assertNull(chunkOf(heap).segment.region);
         assertSame(chunkOf(heap).segment.buffer.array(), heap.array());
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedHeapMemory());
+        assertEquals(heapSegmentSize, allocator.metric().usedHeapMemory());
         buf.release();
         heap.release();
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory(),
@@ -530,11 +532,43 @@ public class AdaptiveSegmentsTest {
         }
     }
 
-    /** The allocator rejects a page store whose segments cannot hold its largest size-class chunk. */
+    /** The allocator rejects a page store whose segments cannot hold a buffer of its largest size class. */
     @Test
-    void segmentsMustHoldTheLargestSizeClassChunk() {
+    void segmentsMustHoldTheLargestSizeClass() {
         final CountingSegmentSource source = new CountingSegmentSource();
         assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(512 * 1024, 8 * 1024, INTERVAL)), "576 KiB chunks do not fit");
+                new PageStoreConfig(2 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL)), "132 KiB takes 3 slices");
+    }
+
+    /**
+     * Segments smaller than the largest size-class chunk (9 slices), as heap segments under G1 with 1 MiB regions
+     * (7 slices): the chunks are cut to a segment, every size class still allocates, and every buffer stays inside
+     * its segment.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void chunksAreCutToSegmentsSmallerThanThem(boolean heap) throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource(heap);
+        int segmentSize = 7 * SLICE_SIZE_BYTES;
+        AdaptivePoolingAllocator allocator = newAllocator(source, segmentSize);
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        for (int i = 0; i < pooledSizeClassesCount(); i++) {
+            int size = SIZE_CLASSES[i];
+            for (int j = 0; j < 2; j++) {
+                ByteBuf buf = allocator.allocate(size, size);
+                SizeClassedChunk chunk = chunkOf(buf);
+                assertEquals(Math.min(expectedSlices(size), 7) * SLICE_SIZE_BYTES, chunk.capacity(), "size " + size);
+                long offset = offsetIn(buf, chunk.segment);
+                assertTrue(offset >= 0 && offset + size <= segmentSize, "size " + size + " outside its segment");
+                buf.setLong(size - 8, size);
+                bufs.add(buf);
+            }
+        }
+        for (ByteBuf buf : bufs) {
+            assertEquals(buf.capacity(), buf.getLong(buf.capacity() - 8));
+            buf.release();
+        }
+        assertTrue(source.chunks.isEmpty(), "no chunk buffer of its own");
+        assertAccounted(source, allocator);
     }
 }
