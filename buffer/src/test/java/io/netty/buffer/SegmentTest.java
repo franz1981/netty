@@ -201,4 +201,23 @@ final class SegmentTest {
             segment.buffer.release();
         }
     }
+
+    /** A coloured span starts that many bytes into its first slice, ends with its last, and is kept per colour. */
+    @Test
+    void aColouredSpanStartsInsideItsFirstSlice() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        Segment segment = new Segment(source.allocateSegment(SEGMENT_SIZE), SLICE_SIZE_BYTES);
+        try {
+            AbstractByteBuf plain = segment.span(source, 3, 2);
+            AbstractByteBuf coloured = segment.span(source, 3, 2, 192);
+            assertNotSame(plain, coloured);
+            assertEquals(2 * SLICE_SIZE_BYTES - 192, coloured.capacity());
+            assertSame(coloured, segment.span(source, 3, 2, 192));
+            coloured.setByte(0, 42);
+            assertEquals(42, segment.buffer.getByte(3 * SLICE_SIZE_BYTES + 192));
+            assertNotSame(coloured, segment.span(source, 3, 2, 256));
+        } finally {
+            segment.buffer.release();
+        }
+    }
 }

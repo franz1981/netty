@@ -2079,7 +2079,8 @@ final class AdaptivePoolingAllocator {
         }
 
         SizeClassChunkController createController(AdaptivePoolingAllocator allocator) {
-            return new SizeClassChunkController(allocator.chunkAllocator, segmentSize, chunkSize);
+            return new SizeClassChunkController(allocator.chunkAllocator, segmentSize, chunkSize,
+                    allocator.pageStore != null);
         }
 
         SizeClassedChunkCache createChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
@@ -2090,22 +2091,56 @@ final class AdaptivePoolingAllocator {
 
     private static final class SizeClassChunkController {
 
+        private static final int COLOUR_SHIFT = 6;
+        private static final int MAX_COLOURS = 16;
+        private static final int MIN_BUFFERS_TO_DROP_ONE = 32;
+
         private final ChunkAllocator chunkAllocator;
         private final int segmentSize;
         private final int chunkSize;
+        /** The segments a chunk hands out: those that fit, less one an exact fit gives up for its colours. */
+        final int buffers;
+        /** How many start offsets, 64 bytes apart, the span chunks of this class rotate through. */
+        private final int colours;
+        private int nextColour;
 
-        private SizeClassChunkController(ChunkAllocator chunkAllocator, int segmentSize, int chunkSize) {
+        private SizeClassChunkController(ChunkAllocator chunkAllocator, int segmentSize, int chunkSize,
+                                         boolean spans) {
             this.chunkAllocator = chunkAllocator;
             this.segmentSize = segmentSize;
             this.chunkSize = chunkSize;
+            // Slab colouring: each new span chunk starts its segments 64 bytes further into the span than the
+            // previous one of its heap's class, round robin over at most 16 offsets, so that segment k of consecutive
+            // chunks does not share its offset in a 4 KiB page. The room is the tail the segments leave unused; a
+            // class that fits exactly gives up one segment for it when it has 32 or more, else stays uncoloured. See
+            // Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator", USENIX Summer 1994, section
+            // 4.3 https://people.eecs.berkeley.edu/~kubitron/courses/cs194-24-S14/hand-outs/bonwick_slab.pdf, Linux's
+            // colour_off/colour/colour_next https://github.com/torvalds/linux/blob/v4.19/mm/slab.c#L2684-L2693 and
+            // Afek, Dice, Morrison, "Cache Index-Aware Memory Allocation", ISMM 2011
+            // https://www.cs.tau.ac.il/~mad/publications/ismm2011-CIF.pdf
+            int buffers = chunkSize / segmentSize;
+            int room = chunkSize - buffers * segmentSize;
+            if (spans && room < 1 << COLOUR_SHIFT && buffers >= MIN_BUFFERS_TO_DROP_ONE) {
+                buffers--;
+                room += segmentSize;
+            }
+            this.buffers = buffers;
+            colours = Math.min(MAX_COLOURS, (room >>> COLOUR_SHIFT) + 1);
+        }
+
+        /** The start offset of the next span chunk's segments; single writer, as the magazine. */
+        private int nextColourOffset() {
+            int colour = nextColour;
+            nextColour = colour + 1 == colours ? 0 : colour + 1;
+            return colour << COLOUR_SHIFT;
         }
 
         private MpscIntQueue createEmptyFreeList() {
-            return MpscIntQueue.create(chunkSize / segmentSize, SizeClassedChunk.FREE_LIST_EMPTY);
+            return MpscIntQueue.create(buffers, SizeClassedChunk.FREE_LIST_EMPTY);
         }
 
         private MpscIntQueue createFreeList() {
-            final int segmentsCount = chunkSize / segmentSize;
+            final int segmentsCount = buffers;
             final MpscIntQueue freeList = MpscIntQueue.create(segmentsCount, SizeClassedChunk.FREE_LIST_EMPTY);
             int segmentOffset = 0;
             for (int i = 0; i < segmentsCount; i++) {
@@ -2116,8 +2151,8 @@ final class AdaptivePoolingAllocator {
         }
 
         private IntStack createLocalFreeList() {
-            final int segmentsCount = chunkSize / segmentSize;
-            int segmentOffset = chunkSize;
+            final int segmentsCount = buffers;
+            int segmentOffset = buffers * segmentSize;
             int[] offsets = new int[segmentsCount];
             for (int i = 0; i < segmentsCount; i++) {
                 segmentOffset -= segmentSize;
@@ -2127,7 +2162,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private IntStack createEmptyLocalFreeList() {
-            final int segmentsCount = chunkSize / segmentSize;
+            final int segmentsCount = buffers;
             int[] offsets = new int[segmentsCount];
             return new IntStack(offsets, -1);
         }
@@ -2175,7 +2210,8 @@ final class AdaptivePoolingAllocator {
             Segment segment = heapSegments.claim(slices);
             int start = heapSegments.claimedStart();
             try {
-                AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices);
+                AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices,
+                        nextColourOffset());
                 if (recycler.poll(magazine.sizeClassIndex)) {
                     AbstractByteBuf none = recycler.takeBuffer();
                     assert none == null;
@@ -3310,7 +3346,7 @@ final class AdaptivePoolingAllocator {
             this.spanStart = spanStart;
             heapSegments = magazine.heapSegments;
             segmentSize = controller.segmentSize;
-            segments = controller.chunkSize / segmentSize;
+            segments = controller.buffers;
             STATE.lazySet(this, AVAILABLE);
             ownerThread = magazine.ownerThread;
             owningCache = magazine.chunkCache;
@@ -3337,7 +3373,7 @@ final class AdaptivePoolingAllocator {
             this.spanStart = spanStart;
             heapSegments = magazine.heapSegments;
             segmentSize = controller.segmentSize;
-            segments = controller.chunkSize / segmentSize;
+            segments = controller.buffers;
             MpscIntQueue externalFreeList = recycledFreeList.capacity() >= segments ?
                     recycledFreeList : controller.createEmptyFreeList();
             boolean reuseLocal = recycledLocalFreeList.capacity() >= segments;
@@ -3553,9 +3589,9 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /** The slices of the span this chunk is; only for a chunk that is one. */
+        /** The slices of the span this chunk is; only for a chunk that is one; its colour is less than one. */
         int spanSlices() {
-            return capacity / segment.sliceSize;
+            return (capacity + segment.sliceSize - 1) / segment.sliceSize;
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {

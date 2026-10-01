@@ -161,10 +161,19 @@ final class Segment implements ChunkInfo {
 
     /** Owner only. The buffer made last time for this exact span, else a new one from {@code source}. */
     AbstractByteBuf span(SegmentSource source, int start, int n) {
-        int length = n * sliceSize;
+        return span(source, start, n, 0);
+    }
+
+    /**
+     * {@link #span(SegmentSource, int, int)} starting {@code colour} bytes, less than a slice, into its first slice.
+     * Its capacity tells the slices and the colour apart, so the buffer kept for the start is reused only for both.
+     */
+    AbstractByteBuf span(SegmentSource source, int start, int n, int colour) {
+        assert colour >= 0 && colour < sliceSize : colour;
+        int length = n * sliceSize - colour;
         AbstractByteBuf span = spans[start];
         if (span == null || span.capacity() != length) {
-            span = source.span(buffer, start * sliceSize, length);
+            span = source.span(buffer, start * sliceSize + colour, length);
             spans[start] = span;
         }
         return span;

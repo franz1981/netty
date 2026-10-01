@@ -67,6 +67,13 @@ public class AdaptiveSegmentsTest {
         }
     }
 
+    /** The buffers a chunk hands out: an exact fit of 32 or more gives one up for its colours. */
+    private static int expectedBuffers(int sizeClass) {
+        int span = expectedSlices(sizeClass) * SLICE_SIZE_BYTES;
+        int fit = span / sizeClass;
+        return span - fit * sizeClass < 64 && fit >= 32 ? fit - 1 : fit;
+    }
+
     private static boolean isLowMemory() throws Exception {
         Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         f.setAccessible(true);
@@ -161,7 +168,7 @@ public class AdaptiveSegmentsTest {
                 SizeClassedChunk chunk = chunkOf(buf);
                 assertNotNull(chunk.segment, "size " + size);
                 assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity(), "chunk of size " + size);
-                assertEquals(chunk.capacity() / size, field(chunk, "segments"), "segments of size " + size);
+                assertEquals(expectedBuffers(size), field(chunk, "segments"), "segments of size " + size);
                 long base = chunk.segment.memoryAddress();
                 long address = buf.memoryAddress();
                 assertTrue(address >= base + (long) chunk.spanStart * SLICE_SIZE_BYTES
@@ -179,6 +186,130 @@ public class AdaptiveSegmentsTest {
         for (ByteBuf buf : bufs) {
             buf.release();
         }
+    }
+
+    /**
+     * Consecutive chunks of a class whose segments leave a tail start 64 bytes further into their span each time,
+     * as many times as the tail allows, then wrap; a class that fits its chunk exactly always starts at the span.
+     * Buffers stay inside the span, and a released chunk gives back exactly the slices it claimed, recycled or not.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {640, 1024, 2048, 2304, 4096})
+    void spanChunksRotateTheirStartThroughTheirTail(int size) throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        int slices = expectedSlices(size);
+        int perChunk = expectedBuffers(size);
+        int colours = Math.min(16, (slices * SLICE_SIZE_BYTES - perChunk * size) / 64 + 1);
+        assertEquals(size == 640 ? 9 : 16, colours);
+        int chunks = 40;
+        Object stripe = null;
+        for (int round = 0; round < 2; round++) {
+            // The second round re-creates the chunks with the free lists the first one gave up.
+            List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+            List<SizeClassedChunk> seen = new ArrayList<SizeClassedChunk>();
+            for (int i = 0; i < chunks * perChunk; i++) {
+                ByteBuf buf = allocator.allocate(size, size);
+                bufs.add(buf);
+                SizeClassedChunk chunk = chunkOf(buf);
+                if (!seen.contains(chunk)) {
+                    seen.add(chunk);
+                }
+                long spanBase = chunk.segment.memoryAddress() + (long) chunk.spanStart * SLICE_SIZE_BYTES;
+                long address = buf.memoryAddress();
+                assertTrue(address >= spanBase && address + size <= spanBase + (long) slices * SLICE_SIZE_BYTES,
+                        "size " + size + " outside its span");
+                buf.setLong(size - 8, 0x0123456789ABCDEFL);
+            }
+            assertEquals(chunks, seen.size());
+            stripe = usedStripe(allocator);
+            HeapSegments heapSegments = idleDecay(stripe).heapSegments;
+            int usedSlices = 0;
+            for (int i = 0; i < heapSegments.count; i++) {
+                usedSlices += heapSegments.segments[i].usedSlices();
+            }
+            assertEquals(chunks * slices, usedSlices, "each chunk claimed its slices, no more");
+            if (round == 0) {
+                for (int i = 0; i < chunks; i++) {
+                    SizeClassedChunk chunk = seen.get(i);
+                    long spanBase = chunk.segment.memoryAddress() + (long) chunk.spanStart * SLICE_SIZE_BYTES;
+                    long colour = ((AbstractByteBuf) field(chunk, "delegate")).memoryAddress() - spanBase;
+                    assertEquals(i % colours * 64, colour, "chunk " + i + " of size " + size);
+                    assertEquals(slices, chunk.spanSlices());
+                }
+            }
+            for (ByteBuf buf : bufs) {
+                assertEquals(0x0123456789ABCDEFL, buf.getLong(size - 8));
+                buf.release();
+            }
+            assertAccounted(source, allocator);
+        }
+        long now = System.nanoTime();
+        for (int decay = 1; decay <= 8; decay++) {
+            decayStripe(stripe, now += INTERVAL);
+        }
+        assertEquals(0, idleDecay(stripe).heapSegments.count, "every span went back whole");
+        assertEquals(0, source.segmentsLive());
+        assertAccounted(source, allocator);
+    }
+
+    /**
+     * As {@link #spanChunksRotateTheirStartThroughTheirTail} on a thread-local heap, whose owner allocates from the
+     * chunk's local free list: an exact fit's dropped segment is never handed out, coloured or not.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {1024, 4096})
+    void threadLocalSpanChunksNeverHandOutTheDroppedSegment(final int size) throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final CountingSegmentSource source = new CountingSegmentSource();
+        final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
+        final int slices = expectedSlices(size);
+        final int perChunk = expectedBuffers(size);
+        assertEquals(slices * SLICE_SIZE_BYTES / size - 1, perChunk);
+        final int chunks = 20;
+        onFastThreadLocalThread(() -> {
+            for (int round = 0; round < 2; round++) {
+                // The second round re-creates the chunks with the free lists the first one gave up.
+                List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+                List<SizeClassedChunk> seen = new ArrayList<SizeClassedChunk>();
+                for (int i = 0; i < chunks * perChunk; i++) {
+                    ByteBuf buf = allocator.allocate(size, size);
+                    bufs.add(buf);
+                    SizeClassedChunk chunk = chunkOf(buf);
+                    assertTrue(chunk.inThreadLocalMagazine());
+                    if (!seen.contains(chunk)) {
+                        seen.add(chunk);
+                    }
+                    long spanBase = chunk.segment.memoryAddress() + (long) chunk.spanStart * SLICE_SIZE_BYTES;
+                    long address = buf.memoryAddress();
+                    assertTrue(address >= spanBase && address + size <= spanBase + (long) slices * SLICE_SIZE_BYTES,
+                            "size " + size + " outside its span");
+                    buf.setLong(size - 8, 0x0123456789ABCDEFL);
+                }
+                assertEquals(chunks, seen.size(), perChunk + " buffers per chunk");
+                for (int i = 0; i < chunks; i++) {
+                    SizeClassedChunk chunk = seen.get(i);
+                    long spanBase = chunk.segment.memoryAddress() + (long) chunk.spanStart * SLICE_SIZE_BYTES;
+                    long colour = ((AbstractByteBuf) field(chunk, "delegate")).memoryAddress() - spanBase;
+                    assertTrue(colour >= 0 && colour < 16 * 64 && colour % 64 == 0, "colour " + colour);
+                    if (round == 0) {
+                        assertEquals(i % 16 * 64, colour, "chunk " + i + " of size " + size);
+                    }
+                }
+                for (ByteBuf buf : bufs) {
+                    assertEquals(0x0123456789ABCDEFL, buf.getLong(size - 8));
+                    buf.release();
+                }
+            }
+            Object heap = threadLocalHeap(allocator);
+            long now = System.nanoTime();
+            for (int decay = 1; decay <= 8; decay++) {
+                idleDecay(heap).decay(now += INTERVAL);
+            }
+            assertEquals(0, idleDecay(heap).heapSegments.count, "every span went back whole");
+            return null;
+        });
+        assertAccounted(source, allocator);
     }
 
     /** Heap buffers are untouched: their chunks are allocated one by one, at the sizes of old. */
@@ -207,7 +338,7 @@ public class AdaptiveSegmentsTest {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
-        int perChunk = 8 * SLICE_SIZE_BYTES / size;
+        int perChunk = expectedBuffers(size);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < 10 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
@@ -231,7 +362,7 @@ public class AdaptiveSegmentsTest {
         assertEquals(1, heapSegments.reserved);
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 2-slice chunks
-        for (int i = 0; i < 20 * (2 * SLICE_SIZE_BYTES / other); i++) {
+        for (int i = 0; i < 20 * expectedBuffers(other); i++) {
             bufs.add(allocator.allocate(other, other));
         }
         assertEquals(2, source.segmentsAllocated(), "40 slices fit in the free ones");
@@ -267,7 +398,7 @@ public class AdaptiveSegmentsTest {
         final CountingSegmentSource source = new CountingSegmentSource();
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         final int size = 65536;
-        final int perChunk = 8 * SLICE_SIZE_BYTES / size;
+        final int perChunk = expectedBuffers(size);
         onFastThreadLocalThread(() -> {
             final List<ByteBuf> bufs = new ArrayList<ByteBuf>();
             for (int i = 0; i < 3 * perChunk; i++) {
@@ -309,7 +440,7 @@ public class AdaptiveSegmentsTest {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
-        int perChunk = 8 * SLICE_SIZE_BYTES / size;
+        int perChunk = expectedBuffers(size);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < 8 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
