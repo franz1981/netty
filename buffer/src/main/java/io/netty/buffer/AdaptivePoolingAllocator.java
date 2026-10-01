@@ -2909,6 +2909,9 @@ final class AdaptivePoolingAllocator {
         /** An allocation counts toward the heap's {@link IdleDecay} as its size in units of the smallest size class. */
         private static final int COUNT_SHIFT = 5;
         private static final long OWNER_STAMP = 1;
+        private static final int COLOUR_SHIFT = 6;
+        /** 4032 bytes at most, as mimalloc's large-allocation colours. */
+        private static final int MAX_COLOURS = 64;
 
         final AdaptivePoolingAllocator allocator;
         final HeapSegments heapSegments;
@@ -2918,6 +2921,8 @@ final class AdaptivePoolingAllocator {
         private final IdleDecay idleDecay;
         final int sliceShift;
         private final int segmentSlices;
+        /** Round robin over the colours of the spans; single writer, as the magazine. */
+        private int nextColour;
         /** Segments that other threads' releases asked this magazine to look at. */
         final PendingChunks pending = new PendingChunks();
         /** Set by {@link #free}; from then on a release applies its span itself. */
@@ -2950,6 +2955,12 @@ final class AdaptivePoolingAllocator {
             HeapSegments heap = heapSegments;
             Segment segment = heap.claim(slices);
             int start = heap.claimedStart();
+            // Colour, as the size classes' spans (see SizeClassChunkController) and as mimalloc does for its large
+            // allocations (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to
+            // 4032 bytes into its span, in 64-byte steps taken round robin, out of the tail the span leaves unused
+            // past the buffer, so it costs no memory. A release rounds its capacity up to whole slices again.
+            int colours = Math.min(MAX_COLOURS, (int) (((long) slices << sliceShift) - size >>> COLOUR_SHIFT) + 1);
+            int colour = colours == 1 ? 0 : (nextColour++ & Integer.MAX_VALUE) % colours << COLOUR_SHIFT;
             SpanChunk chunk = segment.spanChunk;
             if (chunk == null) {
                 chunk = new SpanChunk(segment, this);
@@ -2958,7 +2969,8 @@ final class AdaptivePoolingAllocator {
             assert chunk.magazine == this && !chunk.retired;
             boolean initialized = false;
             try {
-                buf.init(segment.buffer, chunk, 0, 0, start << sliceShift, size, slices << sliceShift, maxCapacity);
+                buf.init(segment.buffer, chunk, 0, 0, (start << sliceShift) + colour, size,
+                        (slices << sliceShift) - colour, maxCapacity);
                 initialized = true;
             } finally {
                 if (!initialized) {
@@ -3060,8 +3072,9 @@ final class AdaptivePoolingAllocator {
         void releaseSegment(int offset, int length) {
             SpanMagazine owner = magazine;
             int shift = owner.sliceShift;
+            // A colour, less than a slice, moved the start into the span's first slice and shortened its capacity.
             int start = offset >>> shift;
-            int slices = length >>> shift;
+            int slices = length + (1 << shift) - 1 >>> shift;
             long stamp = owner.tryLockForRelease();
             if (stamp != 0) {
                 try {

@@ -25,7 +25,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -81,8 +83,11 @@ final class AdaptiveLargeSpansTest {
             ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
             bufs.add(buf);
             assertEquals(size, buf.capacity());
-            assertEquals((size + SLICE - 1) / SLICE * SLICE, buf.maxFastWritableBytes() + buf.writerIndex(),
-                    "a span of whole slices for " + size);
+            int wholeSlices = (size + SLICE - 1) / SLICE * SLICE;
+            int fast = buf.maxFastWritableBytes() + buf.writerIndex();
+            assertTrue(fast >= size && fast <= wholeSlices && (wholeSlices - fast) % 64 == 0
+                    && wholeSlices - fast <= Math.min(4032, wholeSlices - size),
+                    "a span of whole slices, less its colour, for " + size + ": " + fast);
             assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SpanChunk, "a span for " + size);
         }
         ByteBuf whole = allocator.allocate(SEGMENT_SIZE / 2 + 1, SEGMENT_SIZE / 2 + 1);
@@ -96,7 +101,79 @@ final class AdaptiveLargeSpansTest {
         assertAccounted(segments, allocator);
     }
 
+    private static long colourOf(ByteBuf buf) {
+        AdaptivePoolingAllocator.SpanChunk chunk = (AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk;
+        return (buf.memoryAddress() - chunk.segment.memoryAddress()) % SLICE;
+    }
+
     /**
+     * Large buffers start 64 bytes further into their span each time, round robin over as many colours as the span's
+     * unused tail allows, 64 at most: none for an exact fit, four for a 200-byte tail. Released, they give back
+     * exactly the slices they claimed.
+     */
+    @Test
+    void largeSpansRotateTheirColourThroughTheirTail() {
+        AdaptivePoolingAllocator allocator = allocator(false);
+        int[][] cases = {{256 * 1024 - 8192, 64}, {256 * 1024, 1}, {256 * 1024 - 200, 4}};
+        Set<Segment> seen = new HashSet<Segment>();
+        for (int[] c : cases) {
+            int size = c[0];
+            int colours = c[1];
+            List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+            for (int i = 0; i < 70; i++) {
+                bufs.add(allocator.allocate(size, size));
+            }
+            for (int i = 0; i < bufs.size(); i++) {
+                ByteBuf buf = bufs.get(i);
+                long colour = colourOf(buf);
+                assertTrue(colour % 64 == 0 && colour < colours * 64L, "size " + size + " colour " + colour);
+                if (colours > 1 && i > 0) {
+                    assertEquals((colourOf(bufs.get(i - 1)) + 64) % (colours * 64L), colour, "round robin");
+                }
+                AdaptivePoolingAllocator.SpanChunk chunk = (AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk;
+                long spanEnd = chunk.segment.memoryAddress() + (buf.memoryAddress() - chunk.segment.memoryAddress())
+                        / SLICE * SLICE + 4L * SLICE;
+                assertTrue(buf.memoryAddress() + buf.maxFastWritableBytes() + buf.writerIndex() <= spanEnd,
+                        "inside its span");
+                buf.setByte(size - 1, 42);
+                seen.add(chunk.segment);
+            }
+            for (ByteBuf buf : bufs) {
+                buf.release();
+            }
+            assertAccounted(segments, allocator);
+        }
+        for (Segment segment : seen) {
+            assertEquals(0, segment.usedSlices(), "every claimed slice went back: " + segment);
+        }
+    }
+
+    /** A coloured buffer grows in place up to the end of its span, and away from it beyond, freeing the span. */
+    @Test
+    void aColouredBufferGrowsWithinItsSpan() {
+        AdaptivePoolingAllocator allocator = allocator(false);
+        int size = 256 * 1024 - 8192;
+        allocator.allocate(size, Integer.MAX_VALUE).release(); // colour 0 taken: the next is coloured
+        ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
+        long colour = colourOf(buf);
+        assertEquals(64, colour);
+        long address = buf.memoryAddress();
+        int fast = buf.maxFastWritableBytes();
+        assertEquals(4 * SLICE - colour, fast);
+        buf.writerIndex(0).writeZero(fast);
+        assertEquals(address, buf.memoryAddress(), "grown in place");
+        assertEquals(fast, buf.capacity());
+        Segment segment = ((AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk).segment;
+        assertEquals(4, segment.usedSlices());
+        buf.writeByte(1);
+        assertTrue(buf.memoryAddress() != address, "beyond its span: moved");
+        buf.release();
+        assertEquals(0, segment.usedSlices(), "the old span went back whole");
+        assertAccounted(segments, allocator);
+    }
+
+    /**
+     * The spans of one segment share one chunk    /**
      * The spans of one segment share one chunk for as long as the segment stays in the heap, its reserve included:
      * allocating and releasing large buffers makes no chunk, even when each release empties the segment. The chunk
      * ends when the segment goes back to the store.
