@@ -216,18 +216,36 @@ final class AdaptiveLargeSegmentsTest {
         assertAccountedIn(allocator);
     }
 
-    /** Above the pooled sizes and up to a segment: a whole segment, from any thread, given back on release. */
+    /**
+     * Above half a segment and up to a segment, without regions: a buffer of its own, of its exact size, as before
+     * the page store, not a whole segment charged up to twice the buffer's size.
+     */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void oneShotsUpToASegmentTakeASegment(boolean heap) {
+    void oneShotsUpToASegmentAreTheirOwnAllocationWithoutRegions(boolean heap) {
         AdaptivePoolingAllocator allocator = withoutRegions(heap);
-        ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
-        assertEquals(1, segments.segmentsAllocated());
-        assertEquals(0, segments.chunks.size());
+        int size = 2200000;
+        ByteBuf buf = allocate(allocator, size, 1).get(0);
+        assertEquals(0, segments.segmentsAllocated());
+        assertEquals(1, segments.chunks.size());
+        assertEquals(size, allocator.usedMemory());
         assertAccounted(segments, allocator);
         buf.release();
-        assertEquals(0, segments.segmentsLive());
+        assertEquals(0, allocator.usedMemory());
         assertAccounted(segments, allocator);
+    }
+
+    /** With regions, a one-shot up to a segment takes a whole slot, given back to the region on release. */
+    @Test
+    void oneShotsUpToASegmentTakeASlotWithRegions() {
+        AdaptivePoolingAllocator allocator = withRegions();
+        ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
+        assertInRegion(buf);
+        assertEquals(1, slotsInHeaps(allocator));
+        assertEquals(0, segments.segmentsAllocated() + segments.chunks.size());
+        buf.release();
+        assertEquals(0, slotsInHeaps(allocator));
+        assertAccounted(segments, regions, allocator);
     }
 
     /**

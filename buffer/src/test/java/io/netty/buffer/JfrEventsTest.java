@@ -261,9 +261,11 @@ public class JfrEventsTest {
         for (int capacity : units) {
             assertEquals(unit, capacity, "segment events have the size of a segment");
         }
-        // The segment-sized buffer and the 512 KiB ones take segments of the page store: segment events, no one-shot.
-        assertEquals(0, oneShots[0], "no chunk is allocated outside the page store");
-        assertEquals(0, oneShots[1]);
+        // The 512 KiB buffers are spans of the heaps' segments. The segment-sized one takes a slot of a region, or,
+        // without regions, is a one-shot of its own exact size.
+        int oneShot = direct && AdaptiveByteBufAllocatorTest.directRegions(alloc) ? 0 : 1;
+        assertEquals(oneShot, oneShots[0], "one-shots allocated outside the page store");
+        assertEquals(oneShot, oneShots[1]);
         assertEquals(direct ? alloc.metric().usedDirectMemory() : alloc.metric().usedHeapMemory(),
                 allocatedFreed[0] - allocatedFreed[1],
                 "allocated " + allocatedFreed[0] + " - freed " + allocatedFreed[1] + " must be the used memory");

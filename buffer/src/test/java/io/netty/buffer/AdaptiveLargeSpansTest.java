@@ -80,7 +80,7 @@ final class AdaptiveLargeSpansTest {
                 buf : buf.unwrap());
     }
 
-    /** Up to half a segment: a span of whole slices; above: a whole segment of the store. */
+    /** Up to half a segment: a span of whole slices; above, without regions: a one-shot of its own exact size. */
     @Test
     void spansAreSizedToWholeSlicesUpToHalfASegment() {
         AdaptivePoolingAllocator allocator = allocator(false);
@@ -97,14 +97,16 @@ final class AdaptiveLargeSpansTest {
                     "a span of whole slices, less its colour, for " + size + ": " + fast);
             assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SpanChunk, "a span for " + size);
         }
-        ByteBuf whole = allocator.allocate(SEGMENT_SIZE / 2 + 1, SEGMENT_SIZE / 2 + 1);
-        assertTrue(!(adaptive(whole).chunk instanceof AdaptivePoolingAllocator.SpanChunk), "above half a segment");
-        assertEquals(segments.segmentsAllocated(), segments.segmentsLive(), "a whole segment of its own");
-        whole.release();
+        int segmentsBefore = segments.segmentsAllocated();
+        ByteBuf own = allocator.allocate(SEGMENT_SIZE / 2 + 1, SEGMENT_SIZE / 2 + 1);
+        assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SpanChunk), "above half a segment");
+        assertEquals(segmentsBefore, segments.segmentsAllocated(), "no segment for it");
+        assertEquals(1, segments.chunks.size(), "a buffer of its own");
+        assertEquals(SEGMENT_SIZE / 2 + 1, segments.chunks.get(0).capacity());
+        own.release();
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertEquals(0, segments.chunks.size(), "nothing from the chunk allocator");
         assertAccounted(segments, allocator);
     }
 

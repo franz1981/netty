@@ -242,8 +242,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Buffers above the largest pooled size get a one-shot chunk of their own: accounted while the buffer lives,
-     * replaced on growth with the content kept, and freed as soon as the buffer is released.
+     * Buffers above the largest pooled size, and above half a segment with a page store, get a one-shot chunk of
+     * their own, of their exact size: accounted while the buffer lives, replaced on growth with the content kept, and
+     * freed as soon as the buffer is released.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
@@ -251,7 +252,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         assumeFalse(storeOneShots(allocator, direct), "see oneShotBuffersTakeWholeSegments");
         ByteBufAllocatorMetric metric = allocator.metric();
-        int size = 2 * 1024 * 1024;
+        int size = 2200000; // above half of a 4 MiB or 4032 KiB segment
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
         assertEquals(size, buffer.capacity());
@@ -270,21 +271,23 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
     }
 
-    /** Whether the direct or heap allocator takes buffers above the pooled sizes from its page store. */
+    /**
+     * Whether the allocator takes buffers above half a segment from its page store: only direct memory in regions;
+     * without them such a buffer is a one-shot of its own.
+     */
     private static boolean storeOneShots(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
-        return (direct ? directPageStoreUnit(allocator) : heapSegmentSize(allocator)) != 0 && !isLowMemory();
+        return direct && directRegions(allocator) && !isLowMemory();
     }
 
     /**
-     * With a page store, a buffer above half a segment and up to a segment takes a whole segment, given back to the
-     * store when it is released: with regions (direct) its slot stays committed, counted, until a purge; without, the
-     * segment is freed.
+     * With regions, a buffer above half a segment and up to a segment takes a whole slot, given back to its region
+     * when it is released, where it stays committed, counted, until a purge.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void oneShotBuffersTakeWholeSegments(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeTrue(storeOneShots(allocator, direct), "no page store for buffers above the pooled sizes");
+        assumeTrue(storeOneShots(allocator, direct), "no regions for buffers above half a segment");
         long unit = direct ? directPageStoreUnit(allocator) : heapSegmentSize(allocator);
         int size = (int) (unit / 4 * 3); // above half a segment
         assumeTrue(size > 1024 * 1024, "one-shots are above 1 MiB: segments of " + unit + " hold none");

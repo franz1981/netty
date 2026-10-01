@@ -615,12 +615,16 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A one-shot chunk from the page store: a whole segment up to its size; above, with regions, a run of slots.
-     * {@code null} when neither fits: a buffer larger than a region, or larger than a segment without regions.
-     * The buffer is charged the whole segment or run, and its slots stay committed until the store purges them.
+     * With regions, a one-shot chunk from the page store: a whole segment up to its size, above a run of slots.
+     * {@code null} without regions, where a whole segment would charge the buffer up to twice its size, or when
+     * neither fits: a buffer larger than a region. The buffer is charged the whole segment or run, and its slots stay
+     * committed until the store purges them.
      */
     private BuddyChunk newStoreOneShot(int size) {
         PageStore store = pageStore;
+        if (store.regionSource == null) {
+            return null;
+        }
         // The heaps' decays drive the store's purge; these buffers count toward no heap's, so they drive it too.
         store.purgeIfDue(System.nanoTime());
         int segmentSize = store.config.segmentSize;
