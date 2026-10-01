@@ -56,8 +56,14 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 public class AdaptiveSegmentsTest {
     private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
 
-    /** Slices of the chunk of each size class, as the page-store plan's table has them. */
+    /**
+     * Slices of the chunk of each size class: the plan's table up to 16 KiB, above the fewest that hold 4 buffers (2
+     * for 16896 and 32768, 3, 4, 5, 8 for 131072, 9 for 135168).
+     */
     private static int expectedSlices(int sizeClass) {
+        if (sizeClass > 16384) {
+            return (4 * sizeClass + SLICE_SIZE_BYTES - 1) / SLICE_SIZE_BYTES;
+        }
         if (sizeClass <= 4096) {
             return 2;
         }
@@ -65,8 +71,7 @@ public class AdaptiveSegmentsTest {
             case 4352: return 3;
             case 8192: return 4;
             case 8704: return 5;
-            case 16896: case 33792: case 67584: case 135168: return 9;
-            default: return 8; // 16384, 32768, 65536, 131072
+            default: return 8; // 16384
         }
     }
 
@@ -340,7 +345,7 @@ public class AdaptiveSegmentsTest {
         final CountingSegmentSource source = new CountingSegmentSource(heap);
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
         final int small = 1024; // 2-slice chunks
-        final int large = isLowMemory() ? 16384 : 65536; // 8-slice chunks
+        final int large = isLowMemory() ? 16384 : 131072; // 8-slice chunks
         Callable<Void> work = () -> {
             List<Object> firstLists = new ArrayList<Object>();
             List<ByteBuf> bufs = new ArrayList<ByteBuf>();
@@ -405,7 +410,7 @@ public class AdaptiveSegmentsTest {
     void spansAreReusedAcrossClassesAndDecaysGiveSegmentsBack(boolean heap) throws Exception {
         CountingSegmentSource source = new CountingSegmentSource(heap);
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
-        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
+        int size = isLowMemory() ? 16384 : 131072; // 8-slice chunks either way
         int perChunk = expectedBuffers(size);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < 10 * perChunk; i++) {
@@ -466,7 +471,7 @@ public class AdaptiveSegmentsTest {
         assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
         final CountingSegmentSource source = new CountingSegmentSource(heapMemory);
         final AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
-        final int size = 65536;
+        final int size = 131072; // 8-slice chunks
         final int perChunk = expectedBuffers(size);
         onFastThreadLocalThread(() -> {
             final List<ByteBuf> bufs = new ArrayList<ByteBuf>();
@@ -508,7 +513,7 @@ public class AdaptiveSegmentsTest {
     void decaysMoveEmptyChunksOutOfSparseSegments() throws Exception {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
-        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
+        int size = isLowMemory() ? 16384 : 131072; // 8-slice chunks either way
         int perChunk = expectedBuffers(size);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < 8 * perChunk; i++) {
@@ -595,10 +600,11 @@ public class AdaptiveSegmentsTest {
     /** 2 MiB segments: 32 slices, the same chunks, three 9-slice chunks per segment. */
     @Test
     void twoMebibyteSegments() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode pools no class with 9-slice chunks");
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator allocator = newAllocator(source, 2 * 1024 * 1024);
-        int size = 16896;
-        int perChunk = 9 * SLICE_SIZE_BYTES / size; // 34
+        int size = 135168;
+        int perChunk = expectedBuffers(size); // 4
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < 4 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
@@ -688,7 +694,7 @@ public class AdaptiveSegmentsTest {
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, reserve));
         assertEquals(reserve, allocator.pageStore.maxReserveLimit());
-        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks
+        int size = isLowMemory() ? 16384 : 131072; // 8-slice chunks
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         // Exactly 96 chunks of 8 slices: 12 segments. Buffers per chunk as colouring leaves them (31 for 16 KiB).
         for (int i = 0; i < 12 * 8 * expectedBuffers(size); i++) {
