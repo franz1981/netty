@@ -1504,6 +1504,40 @@ final class AdaptivePoolingAllocator {
      * that touches it. Used by both magazines: by capacity on the size-class path, by largest free block on the
      * buddy path.
      */
+    /** Experiment: churn counters, written to a file at exit. */
+    static final class Telemetry {
+        static final String[] NAMES = {"alloc", "newChunk", "newRecycledLists", "newFreshLists", "evictRelease",
+                "evictTick", "evictDecayIdle", "decayIdleCurrent", "evictFreeActive", "evictFreeMovable",
+                "recreate1ms", "recreate10ms", "recreateAfterEvict"};
+        static final java.util.concurrent.atomic.LongAdder[] C =
+                new java.util.concurrent.atomic.LongAdder[NAMES.length];
+        static {
+            for (int i = 0; i < C.length; i++) {
+                C[i] = new java.util.concurrent.atomic.LongAdder();
+            }
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder sb = new StringBuilder("TELEMETRY");
+                long alloc = C[0].sum();
+                for (int i = 0; i < C.length; i++) {
+                    long v = C[i].sum();
+                    sb.append(' ').append(NAMES[i]).append('=').append(v)
+                      .append(String.format("(%.3e/op)", alloc == 0 ? 0.0 : (double) v / alloc));
+                }
+                String dir = System.getProperty("io.netty.allocator.telemetryDir", "/tmp");
+                String tag = System.getProperty("io.netty.allocator.telemetryTag", "run");
+                try (java.io.FileWriter w = new java.io.FileWriter(dir + "/telemetry-" + tag + "-"
+                        + System.nanoTime() + ".txt")) {
+                    w.write(sb.append('\n').toString());
+                } catch (java.io.IOException e) {
+                    System.err.println(sb);
+                }
+            }));
+        }
+        static void inc(int i) {
+            C[i].increment();
+        }
+    }
+
     static final class ChunkQueue {
         Chunk head;
         int size;
@@ -1744,6 +1778,15 @@ final class AdaptivePoolingAllocator {
          * chunk that empties goes to the heap's {@link SizeClassChunkRecycler}, whose byte budget bounds idle
          * memory.
          */
+        long lastEvictNanos;
+        boolean evictedSinceCreate;
+
+        void markEvict(int counter) {
+            Telemetry.inc(counter);
+            lastEvictNanos = System.nanoTime();
+            evictedSinceCreate = true;
+        }
+
         private boolean atOrBelowFloor() {
             return exhausted.size + reusable.size <= 1;
         }
@@ -1758,6 +1801,7 @@ final class AdaptivePoolingAllocator {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
+                markEvict(4);
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1949,6 +1993,7 @@ final class AdaptivePoolingAllocator {
             while (cur != null && !atOrBelowFloor()) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
+                    markEvict(5);
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                 }
@@ -1974,6 +2019,7 @@ final class AdaptivePoolingAllocator {
                             && !chunkRecycler.hasRoomFor(sizeClassIndex)) {
                         return;
                     }
+                    markEvict(6);
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                 }
@@ -1998,6 +2044,7 @@ final class AdaptivePoolingAllocator {
         /** The magazine drops its active chunk, which holds no buffer: its span goes back to its segment. */
         void freeActive(SizeClassedChunk chunk) {
             assert chunk == active && chunk.hasFullCapacity();
+            markEvict(8);
             active = null;
             chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
         }
@@ -2008,6 +2055,7 @@ final class AdaptivePoolingAllocator {
             while (cur != null) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.segment.evacuate && cur.hasFullCapacity()) {
+                    markEvict(9);
                     reusable.remove(cur);
                     cur.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
                 }
@@ -2203,6 +2251,19 @@ final class AdaptivePoolingAllocator {
          * buffer of its heap's {@link SizeClassChunkRecycler}, or allocate a new buffer.
          */
         SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
+            Telemetry.inc(1);
+            SizeClassedChunkCache cc = magazine.chunkCache;
+            if (cc != null && cc.evictedSinceCreate) {
+                long since = System.nanoTime() - cc.lastEvictNanos;
+                Telemetry.inc(12);
+                if (since < 1_000_000L) {
+                    Telemetry.inc(10);
+                }
+                if (since < 10_000_000L) {
+                    Telemetry.inc(11);
+                }
+                cc.evictedSinceCreate = false;
+            }
             SizeClassChunkRecycler recycler = magazine.chunkRecycler;
             HeapSegments heapSegments = magazine.heapSegments;
             if (heapSegments != null) {
@@ -2241,6 +2302,7 @@ final class AdaptivePoolingAllocator {
                 int base = start * segment.sliceSize + colour;
                 int capacity = chunkSize - colour;
                 if (recycler.poll(magazine.sizeClassIndex)) {
+                    Telemetry.inc(2);
                     AbstractByteBuf none = recycler.takeBuffer();
                     assert none == null;
                     MpscIntQueue recycledFL = recycler.takeFreeList();
@@ -2248,6 +2310,7 @@ final class AdaptivePoolingAllocator {
                     return new SizeClassedChunk(span, recycledFL, recycledLocal, magazine, this, segment, start, base,
                             capacity);
                 }
+                Telemetry.inc(3);
                 return new SizeClassedChunk(span, magazine, this, segment, start, base, capacity);
             } catch (Throwable t) {
                 heapSegments.release(segment, start, slices);
@@ -2422,6 +2485,7 @@ final class AdaptivePoolingAllocator {
             }
             SizeClassedChunk curr = current;
             if (curr != null && curr.hasFullCapacity()) {
+                Telemetry.inc(7);
                 current = null;
                 curr.releaseFromMagazine();
             }
@@ -2493,6 +2557,7 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            Telemetry.inc(0);
             int startingCapacity = chunkController.computeBufferCapacity(maxCapacity);
             SizeClassedChunk curr = current;
             if (curr != null) {
