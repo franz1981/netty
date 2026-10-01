@@ -603,8 +603,12 @@ final class PageStore {
      * its {@link Segment} reused, while a reserved slot is not free to the other heaps nor to the purge.
      */
     int reserveLimit() {
-        return mapsRegions ? 1 : maxReserveLimit();
+        return mapsRegions ? 1 : RESERVE_WITHOUT_REGIONS >= 0 ? RESERVE_WITHOUT_REGIONS : maxReserveLimit();
     }
+
+    /** Experiment: {@code io.netty.allocator.segmentReserveWithoutRegions}, the reserve limit without regions. */
+    private static final int RESERVE_WITHOUT_REGIONS =
+            io.netty.util.internal.SystemPropertyUtil.getInt("io.netty.allocator.segmentReserveWithoutRegions", -1);
 
     int maxReserveLimit() {
         int configured = config.maxReservedSegments;
