@@ -1502,7 +1502,14 @@ final class AdaptivePoolingAllocator {
                     sb.append(' ').append(NAMES[i]).append('=').append(v)
                       .append(String.format("(%.6f/op)", alloc == 0 ? 0.0 : (double) v / alloc));
                 }
-                System.err.println(sb);
+                String dir = System.getProperty("io.netty.allocator.telemetryDir", "/tmp");
+                String tag = System.getProperty("io.netty.allocator.telemetryTag", "run");
+                try (java.io.FileWriter w = new java.io.FileWriter(dir + "/telemetry-" + tag + "-"
+                        + System.nanoTime() + ".txt")) {
+                    w.write(sb.append('\n').toString());
+                } catch (java.io.IOException e) {
+                    System.err.println(sb);
+                }
             }));
         }
         static void inc(int i) {
