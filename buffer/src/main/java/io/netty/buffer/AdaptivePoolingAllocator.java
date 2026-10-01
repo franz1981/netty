@@ -479,15 +479,19 @@ final class AdaptivePoolingAllocator {
         return Math.max(MIN_CHUNK_SIZE, segmentSize * MIN_SEGMENTS_PER_CHUNK);
     }
 
+    /** See {@link #spanChunkSizeOf}. */
+    private static final int MIN_SPAN_CHUNK_SEGMENTS = 4;
+
     /**
-     * The size of the chunks of a size class when they are spans of a {@link Segment} of {@code sliceSize} slices:
-     * {@link #chunkSizeOf} rounded up to whole slices. With 64 KiB slices, 128, 256 and 512 KiB stay; the chunks of
-     * the classes that add a header grow to 192 KiB (4352), 320 KiB (8704) and 576 KiB (16896 up), and hold as many
-     * segments as fit, the tail unused: at most 8.3% of the chunk, for 67584 and 135168.
+     * The size of the chunks of a size class when they are spans of a {@link Segment} of {@code sliceSize} slices: the
+     * fewest whole slices that hold {@link #MIN_SPAN_CHUNK_SEGMENTS} segments. Memory moves between size classes
+     * through the segments, so a chunk only needs to keep chunk creation rare; mimalloc's pages are as small (64 KiB
+     * for blocks up to 8 KiB, 512 KiB, 4 blocks at least, above). With 64 KiB slices: one slice up to 16 KiB, then 2
+     * (16896, 32768), 3 (33792), 4 (65536), 5 (67584), 8 (131072) and 9 (135168).
      */
     static int spanChunkSizeOf(int segmentSize, int sliceSize) {
-        int chunkSize = chunkSizeOf(segmentSize);
-        return (chunkSize + sliceSize - 1) / sliceSize * sliceSize;
+        long bytes = (long) MIN_SPAN_CHUNK_SEGMENTS * segmentSize;
+        return (int) Math.max(1, (bytes + sliceSize - 1) / sliceSize) * sliceSize;
     }
 
     /**
@@ -2113,7 +2117,7 @@ final class AdaptivePoolingAllocator {
 
         private static final int COLOUR_SHIFT = 6;
         private static final int MAX_COLOURS = 16;
-        private static final int MIN_BUFFERS_TO_DROP_ONE = 32;
+        private static final int MIN_BUFFERS_TO_DROP_ONE = 8;
 
         private final ChunkAllocator chunkAllocator;
         private final int segmentSize;
@@ -2132,7 +2136,7 @@ final class AdaptivePoolingAllocator {
             // Slab colouring: each new span chunk starts its segments 64 bytes further into the span than the
             // previous one of its heap's class, round robin over at most 16 offsets, so that segment k of consecutive
             // chunks does not share its offset in a 4 KiB page. The room is the tail the segments leave unused; a
-            // class that fits exactly gives up one segment for it when it has 32 or more and the segment makes room for
+            // class that fits exactly gives up one segment for it when it has 8 or more and the segment makes room for
             // a second colour (not the 32-byte class), else stays uncoloured. See
             // Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator", USENIX Summer 1994, section
             // 4.3 https://people.eecs.berkeley.edu/~kubitron/courses/cs194-24-S14/hand-outs/bonwick_slab.pdf, Linux's
