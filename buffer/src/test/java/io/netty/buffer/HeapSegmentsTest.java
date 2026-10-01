@@ -156,6 +156,43 @@ final class HeapSegmentsTest {
     }
 
     /**
+     * An evacuee that empties and goes back to the store leaves its mark behind: a segment in the store, or taken by
+     * another heap since, is not this heap's to mark or unmark.
+     */
+    @Test
+    void anEvacueeGivenBackKeepsNoMarkOfThisHeap() {
+        CountingSegmentSource source = new CountingSegmentSource();
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(SEGMENT_SIZE, PageStoreConfig.SLICE_SIZE_BYTES, INTERVAL, 1));
+        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
+        Segment full = heap.claim(60);
+        Segment sparse = heap.claim(60);
+        Segment other = heap.claim(60);
+        assertEquals(3, heap.count);
+        assertNotSame(full, sparse);
+        assertNotSame(sparse, other);
+        // Two sparse segments: 4 slices used each, by chunks without buffers.
+        heap.release(sparse, 4, 56);
+        heap.release(other, 4, 56);
+        sparse.movableSlices = sparse.usedSlices();
+        other.movableSlices = other.usedSlices();
+        assertTrue(heap.markEvacuees());
+        assertTrue(sparse.evacuate);
+        // Its chunk freed, the evacuee goes to the reserve; the next one emptied pushes it out to the store.
+        heap.release(sparse, 0, 4);
+        assertSame(sparse, heap.reserve[0]);
+        heap.release(other, 0, 4);
+        assertNull(sparse.owner);
+        assertFalse(sparse.evacuate, "unmarked when given back");
+        // Another heap takes and marks it before this heap's decay ends.
+        HeapSegments otherHeap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
+        Segment.OWNER.set(sparse, otherHeap);
+        sparse.evacuate = true;
+        heap.clearEvacuees();
+        assertTrue(sparse.evacuate, "the other heap's mark");
+    }
+
+    /**
      * Each decay gives back half, rounded up, of the reserved segments that stayed unused since the previous one,
      * oldest first. Taking one makes the cold count no larger than what is left; the ones reserved since are not cold.
      */

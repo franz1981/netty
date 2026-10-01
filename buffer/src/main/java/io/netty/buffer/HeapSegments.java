@@ -177,6 +177,7 @@ final class HeapSegments {
      */
     private void dispose(Segment segment) {
         if (Segment.OWNER.compareAndSet(segment, this, null)) {
+            segment.evacuate = false;
             // The segment is this thread's alone until the store has it: its large-buffer chunk, kept through the
             // heap's reserve, ends with its stay in the heap. No span is out, and a note left for it finds it retired.
             AdaptivePoolingAllocator.SpanChunk spans = segment.spanChunk;
@@ -255,10 +256,16 @@ final class HeapSegments {
         return evacueeCount != 0;
     }
 
-    /** Owner only: unmarks what {@link #markEvacuees} marked. */
+    /**
+     * Owner only: unmarks what {@link #markEvacuees} marked and is still this heap's. One the freed chunks emptied and
+     * {@link #dispose} gave back was unmarked there, and may be another heap's by now.
+     */
     void clearEvacuees() {
         for (int i = 0; i < evacueeCount; i++) {
-            evacuees[i].evacuate = false;
+            Segment segment = evacuees[i];
+            if (segment.owner == this) {
+                segment.evacuate = false;
+            }
             evacuees[i] = null;
         }
         evacueeCount = 0;
