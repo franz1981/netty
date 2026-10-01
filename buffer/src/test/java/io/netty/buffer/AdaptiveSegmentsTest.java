@@ -635,7 +635,7 @@ public class AdaptiveSegmentsTest {
         int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
         assertEquals(heapSegmentSize, heapStore.config.segmentSize);
         assertNull(heapStore.regionSource);
-        assertEquals(8, heapStore.reserveLimit());
+        assertEquals(PageStoreConfig.HEAP_RESERVED_SEGMENTS, heapStore.reserveLimit());
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNotNull(chunkOf(heap).segment);
         assertNull(chunkOf(heap).segment.region);
@@ -672,6 +672,31 @@ public class AdaptiveSegmentsTest {
             a.release();
             b.release();
         }
+    }
+
+    /**
+     * A configured reserve bounds the wholly free segments a heap keeps after a burst: one, over the segment the
+     * class's floor chunk keeps, where mimalloc's rule keeps eight.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 8})
+    void aBurstLeavesAtMostTheConfiguredReserve(int reserve) throws Exception {
+        CountingSegmentSource source = new CountingSegmentSource(true);
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, reserve));
+        assertEquals(reserve, allocator.pageStore.maxReserveLimit());
+        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks
+        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        // Exactly 96 chunks of 8 slices: 12 segments. Buffers per chunk as colouring leaves them (31 for 16 KiB).
+        for (int i = 0; i < 12 * 8 * expectedBuffers(size); i++) {
+            bufs.add(allocator.allocate(size, size));
+        }
+        assertEquals(12, source.segmentsAllocated());
+        for (ByteBuf buf : bufs) {
+            buf.release();
+        }
+        assertEquals(1 + reserve, source.segmentsLive(), "the floor chunk's segment and the reserve");
+        assertAccounted(source, allocator);
     }
 
     /** The allocator rejects a page store whose segments cannot hold a buffer of its largest size class. */

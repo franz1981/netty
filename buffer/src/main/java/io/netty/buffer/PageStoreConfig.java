@@ -117,13 +117,25 @@ final class PageStoreConfig {
     final int regionSize;
     /** A power of two, honoured if the region source can; 0: any address. */
     final int regionAlignment;
+    /** The most wholly free segments a heap keeps, or 0: see {@link PageStore#maxReserveLimit}. */
+    final int maxReservedSegments;
 
     /** Without regions: one allocation per segment. */
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos) {
         this(segmentSize, sliceSize, purgeDelayNanos, 0, 0);
     }
 
+    /** Without regions, a heap keeping at most {@code maxReservedSegments} wholly free segments. */
+    PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int maxReservedSegments) {
+        this(segmentSize, sliceSize, purgeDelayNanos, 0, 0, maxReservedSegments);
+    }
+
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment) {
+        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0);
+    }
+
+    private PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
+                            int maxReservedSegments) {
         if (sliceSize <= 0) {
             throw new IllegalArgumentException("sliceSize: " + sliceSize);
         }
@@ -156,13 +168,25 @@ final class PageStoreConfig {
         }
         this.regionSize = regionSize;
         this.regionAlignment = regionAlignment;
+        if (maxReservedSegments < 0) {
+            throw new IllegalArgumentException("maxReservedSegments: " + maxReservedSegments);
+        }
+        this.maxReservedSegments = maxReservedSegments;
     }
 
     /** The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. */
     static PageStoreConfig heapDefaults() {
         return new PageStoreConfig(HEAP_SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
-                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS));
+                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), HEAP_RESERVED_SEGMENTS);
     }
+
+    /**
+     * {@code io.netty.allocator.heapSegmentReserve}: the most wholly free segments a heap allocator's heap keeps, from
+     * 1 to 8. A reserved {@code byte[]} is live heap that every marking walks: after a burst a heap keeps 4 MiB per
+     * reserved segment. Default: 1.
+     */
+    static final int HEAP_RESERVED_SEGMENTS = Math.max(1, Math.min(8,
+            SystemPropertyUtil.getInt("io.netty.allocator.heapSegmentReserve", 1)));
 
     /** The fewest slices of a heap segment: one buffer of the largest size class, 132 KiB, takes 3. */
     static final int MIN_HEAP_SEGMENT_SLICES = 3;

@@ -674,7 +674,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             long used = direct ? metric.usedDirectMemory() : metric.usedHeapMemory();
             if (afterFirstRound < 0) {
                 afterFirstRound = used;
-                assertTrue(used >= (long) size * bufs.length, "used " + used);
+                // Heap memory keeps one wholly free segment (see PageStoreConfig#HEAP_RESERVED_SEGMENTS).
+                long kept = direct ? (long) size * bufs.length
+                        : (long) PageStoreConfig.HEAP_RESERVED_SEGMENTS * heapSegmentSize(allocator);
+                assertTrue(used >= kept, "used " + used);
             } else {
                 assertEquals(afterFirstRound, used, "round " + round);
             }

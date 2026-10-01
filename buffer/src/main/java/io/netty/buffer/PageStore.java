@@ -605,7 +605,9 @@ final class PageStore {
     }
 
     int maxReserveLimit() {
-        return Math.min(Math.max(1, RESERVE_BYTES / config.segmentSize), MAX_RESERVED_SEGMENTS);
+        int configured = config.maxReservedSegments;
+        return configured > 0 ? configured
+                : Math.min(Math.max(1, RESERVE_BYTES / config.segmentSize), MAX_RESERVED_SEGMENTS);
     }
 
     int regionCount() {
