@@ -131,12 +131,7 @@ final class HeapSegments {
     }
 
     private void pushReserved(Segment segment) {
-        int limit = Math.min(store.reserveLimit(), reserve.length);
-        if (limit == 0) {
-            dispose(segment);
-            return;
-        }
-        if (reserved >= limit) {
+        if (reserved >= Math.min(store.reserveLimit(), reserve.length)) {
             // The oldest, cold if any is, makes room: at a limit of one, the newest wholly free segment is kept.
             disposeOldestReserved(1);
             if (cold > 0) {
