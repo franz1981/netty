@@ -27,7 +27,6 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * {@link PageStoreConfig}: its validation (whole slices and pages, whole segments per region, aligned segments), and
@@ -67,22 +66,13 @@ final class PageStoreConfigTest {
         }
     }
 
-    /**
-     * Under G1 a heap segment is the most whole slices whose {@code byte[]} stays within half a region, the header
-     * included: G1 allocates a larger object in regions of its own. Without G1 (0) it is the segment size.
-     */
+    /** The heap segment property is rounded down to whole slices, from 3 (one 132 KiB buffer) to 64. */
     @Test
-    void heapSegmentsAreNeverHumongousUnderG1() {
-        int mib = 1024 * 1024;
-        int[][] regionAndSlices = {{1, 7}, {2, 15}, {4, 31}, {8, 63}, {16, 64}, {32, 64}};
-        for (int[] expected : regionAndSlices) {
-            long region = (long) expected[0] * mib;
-            int size = PageStoreConfig.heapSegmentSizeOf(4 * mib, SLICE_SIZE_BYTES, region);
-            assertEquals(expected[1] * SLICE_SIZE_BYTES, size, "region " + expected[0] + " MiB");
-            assertTrue(size + PageStoreConfig.BYTE_ARRAY_OVERHEAD_BYTES <= region / 2, "not humongous");
-        }
-        assertEquals(4 * mib, PageStoreConfig.heapSegmentSizeOf(4 * mib, SLICE_SIZE_BYTES, 0));
-        assertEquals(2 * mib, PageStoreConfig.heapSegmentSizeOf(2 * mib, SLICE_SIZE_BYTES, 32L * mib));
+    void heapSegmentSizeIsWholeSlices() {
+        assertEquals(3 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(100 * 1024));
+        assertEquals(7 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(8 * SLICE_SIZE_BYTES - 1));
+        assertEquals(64 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(10 * 1024 * 1024));
+        assertEquals(PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES, PageStoreConfig.heapDefaults().segmentSize);
     }
 
     /** The purge delay property is clamped to 10 ms .. 10 minutes. */
