@@ -1484,6 +1484,32 @@ final class AdaptivePoolingAllocator {
      * that touches it. Used by both magazines: by capacity on the size-class path, by largest free block on the
      * buddy path.
      */
+    /** Experiment: slow-path event counters, printed at exit. */
+    static final class Telemetry {
+        static final String[] NAMES = {"alloc", "allocSlow", "pollHit", "newChunk", "releaseFromMagazine", "refile",
+                "moveToReusable", "evict", "tickPurge", "recycleOrDeallocate", "chunkDeallocate", "remoteRelease",
+                "remoteOffer", "drainPendingNonEmpty"};
+        static final java.util.concurrent.atomic.LongAdder[] C = new java.util.concurrent.atomic.LongAdder[NAMES.length];
+        static {
+            for (int i = 0; i < C.length; i++) {
+                C[i] = new java.util.concurrent.atomic.LongAdder();
+            }
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                StringBuilder sb = new StringBuilder("TELEMETRY");
+                long alloc = C[0].sum();
+                for (int i = 0; i < C.length; i++) {
+                    long v = C[i].sum();
+                    sb.append(' ').append(NAMES[i]).append('=').append(v)
+                      .append(String.format("(%.6f/op)", alloc == 0 ? 0.0 : (double) v / alloc));
+                }
+                System.err.println(sb);
+            }));
+        }
+        static void inc(int i) {
+            C[i].increment();
+        }
+    }
+
     static final class ChunkQueue {
         Chunk head;
         int size;
@@ -1730,6 +1756,7 @@ final class AdaptivePoolingAllocator {
 
         // Signal A (see refile): exhausted → reusable
         void moveToReusable(SizeClassedChunk chunk) {
+            Telemetry.inc(6);
             exhausted.remove(chunk);
             reusable.pushFront(chunk);
         }
@@ -1738,6 +1765,7 @@ final class AdaptivePoolingAllocator {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
             if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
+                Telemetry.inc(7);
                 reusable.remove(chunk);
                 chunk.recycleOrDeallocate(chunkRecycler, sizeClassIndex);
             }
@@ -1817,6 +1845,7 @@ final class AdaptivePoolingAllocator {
          * stripe lock or is the owner thread.
          */
         void refile(SizeClassedChunk chunk) {
+            Telemetry.inc(5);
             ChunkQueue queue = chunk.queue;
             if (queue == exhausted) {
                 // A note may be stale; a return by the owner or under the lock has just pushed the segment.
@@ -1922,6 +1951,7 @@ final class AdaptivePoolingAllocator {
         }
 
         void tickPurge() {
+            Telemetry.inc(8);
             drainPending();
             // Exhausted→reusable is applied by the drain above. All that is left is evicting
             // fully-free reusable chunks above the retention floor.
@@ -2464,6 +2494,7 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            Telemetry.inc(0);
             int startingCapacity = chunkController.computeBufferCapacity(maxCapacity);
             SizeClassedChunk curr = current;
             if (curr != null) {
@@ -2491,6 +2522,7 @@ final class AdaptivePoolingAllocator {
          */
         private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity) {
             assert current == null;
+            Telemetry.inc(1);
             SizeClassedChunk curr;
             boolean polledChunkWithoutSegment = false;
 
@@ -2498,6 +2530,7 @@ final class AdaptivePoolingAllocator {
             drainHeapPending();
             curr = chunkCache.pollChunk();
             if (curr != null) {
+                Telemetry.inc(2);
                 chunkCache.activate(curr);
                 // The size-class cache only hands out chunks with a free segment, and a segment always fits the size,
                 // so this never happens; if that invariant ever broke, fall back to a fresh chunk rather than fail.
@@ -2508,6 +2541,7 @@ final class AdaptivePoolingAllocator {
                 }
             }
             if (curr == null) {
+                Telemetry.inc(3);
                 curr = chunkController.newChunkAllocation(this);
                 chunkCache.activate(curr);
             }
@@ -3406,6 +3440,7 @@ final class AdaptivePoolingAllocator {
          * ever allocates from this chunk.
          */
         void releaseFromMagazine() {
+            Telemetry.inc(4);
             owningCache.deactivate(this);
         }
 
@@ -3496,6 +3531,7 @@ final class AdaptivePoolingAllocator {
                 localFreeList.push(startIndex);
                 afterLocalRelease();
             } else {
+                Telemetry.inc(11);
                 final SizeClassedChunkCache cache = owningCache;
                 final long stamp = cache.tryLockForRelease();
                 if (stamp != 0) {
@@ -3506,6 +3542,7 @@ final class AdaptivePoolingAllocator {
                         cache.unlockAfterRelease(stamp);
                     }
                 } else {
+                    Telemetry.inc(12);
                     boolean segmentReturned = externalFreeList.offer(startIndex);
                     assert segmentReturned;
                     // implicit StoreLoad barrier from MPSC offer()
@@ -3595,6 +3632,7 @@ final class AdaptivePoolingAllocator {
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
+            Telemetry.inc(9);
             if (segment != null) {
                 // Only the free lists are pooled: the span goes back to its segment at the deallocation below.
                 if (recycler != null) {
@@ -3615,6 +3653,7 @@ final class AdaptivePoolingAllocator {
          */
         @Override
         protected void deallocate() {
+            Telemetry.inc(10);
             Segment segment = this.segment;
             if (segment != null) {
                 heapSegments.release(segment, spanStart, spanSlices());
