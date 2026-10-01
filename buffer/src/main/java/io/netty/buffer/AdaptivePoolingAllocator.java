@@ -1488,7 +1488,7 @@ final class AdaptivePoolingAllocator {
     static final class Telemetry {
         static final String[] NAMES = {"alloc", "allocSlow", "pollHit", "newChunk", "releaseFromMagazine", "refile",
                 "moveToReusable", "evict", "tickPurge", "recycleOrDeallocate", "chunkDeallocate", "remoteRelease",
-                "remoteOffer", "drainPendingNonEmpty"};
+                "remoteOffer", "drainPendingNonEmpty", "probeCalls", "probeVisited", "probeHit"};
         static final java.util.concurrent.atomic.LongAdder[] C = new java.util.concurrent.atomic.LongAdder[NAMES.length];
         static {
             for (int i = 0; i < C.length; i++) {
@@ -1945,10 +1945,13 @@ final class AdaptivePoolingAllocator {
         private SizeClassedChunk probeExhausted() {
             SizeClassedChunk cur = (SizeClassedChunk) exhausted.head;
             int visited = 0;
+            Telemetry.inc(14);
             while (cur != null && visited < MAX_EXHAUSTED_PROBE) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 visited++;
+                Telemetry.inc(15);
                 if (cur.hasRemainingCapacity()) {
+                    Telemetry.inc(16);
                     exhausted.remove(cur);
                     return cur;
                 }
