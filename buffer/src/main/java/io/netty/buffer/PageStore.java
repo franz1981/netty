@@ -429,8 +429,8 @@ final class PageStore {
     /**
      * Any thread, from a heap's purge tick (see {@code IdleDecay#count}) or a one-shot buffer. At most once per
      * {@link PageStoreConfig#purgeCheckNanos}, and by one thread at a time (a try-guard: a caller that finds a purge
-     * running returns at once), gives back to the OS the memory of the free slots that stayed free for
-     * {@link PageStoreConfig#purgeDelayNanos} at least.
+     * running returns at once), gives back to the OS the memory of the free slices, or of the regions of one block,
+     * that stayed free for {@link PageStoreConfig#purgeDelayNanos} at least.
      */
     void purgeIfDue(long now) {
         if (now - lastPurgeNanos < config.purgeCheckNanos
@@ -447,11 +447,7 @@ final class PageStore {
         }
     }
 
-    /**
-     * Purges each run of contiguous purgeable free slots with one {@link RegionSource#purge} call, holding only that
-     * run's slots, claimed by CAS, for the call: a take meanwhile still finds every other free slot. A slot purged
-     * keeps its free bit's place in the order of takes: taking it again only costs the page faults of touching it.
-     */
+    /** See {@link #purgeSharedSlices} and {@link #releaseIdleRegions}. */
     private void purge(long now) {
         purges++;
         purgeSharedSlices(now);
@@ -615,7 +611,10 @@ final class PageStore {
             } catch (Throwable t) {
                 failure = t;
             }
-            purged(event, SLICES, region, offset, length, failure);
+            if (event != null) {
+                AbstractPageStoreEvent.end(event, region.buffer._memoryAddress() + offset, length, region.index,
+                        failure);
+            }
             if (failure != null) {
                 purgeFailed(failure);
             }
@@ -644,15 +643,6 @@ final class PageStore {
         int start = Long.numberOfTrailingZeros(bits);
         int length = Long.numberOfTrailingZeros(~(bits >>> start));
         return length == Long.SIZE ? -1L : (1L << length) - 1 << start;
-    }
-
-    private static final String SLICES = "slices";
-
-    private static void purged(Object event, String unit, Region region, int offset, int length, Throwable failure) {
-        if (event != null) {
-            PageStorePurgeEvent.end(event, unit, region.buffer._memoryAddress() + offset, length, region.index,
-                    failure);
-        }
     }
 
     private void purgeFailed(Throwable cause) {

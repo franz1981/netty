@@ -127,7 +127,6 @@ public class PageStoreJfrTest {
         }
         long purged = 0;
         for (RecordedEvent purge : named(PageStorePurgeEvent.NAME)) {
-            assertEquals("slices", purge.getString("unit"));
             assertEquals(0, purge.getInt("errno"));
             purged += purge.getLong("length");
         }

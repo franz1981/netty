@@ -1515,7 +1515,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassedChunk pollChunk() {
             // Slow-path only (once per chunk-worth of allocations), which is exactly where a chunk is
-            // wanted. Draining per allocation is what made the old notification cache expensive.
+            // wanted; never per allocation.
             drainPending();
             return pollChunkInternal();
         }
@@ -1827,7 +1827,7 @@ final class AdaptivePoolingAllocator {
             // Interval 0: pool every recycled buffer object, as the stripes' pools do, instead of the
             // io.netty.recycler.ratio default, which admits one in eight at the cost of a counter and a
             // data-dependent branch per allocation; retention is already bounded by the recycler's
-            // capacity. Measured: up to 15 ns less per allocation with many buffers live, neutral otherwise.
+            // capacity.
             return new AdaptiveRecycler(true, 0);
         }
 

@@ -54,9 +54,9 @@ final class PageStoreConfig {
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
 
     /**
-     * {@code io.netty.allocator.segmentPurgeDelay}: milliseconds a free region slot, or a free slice of a segment a
-     * heap holds, stays free before its memory goes back to the OS, as mimalloc's purge delay times its arena
-     * multiplier (1000 ms x 4). From 10 ms to 10 minutes. Default: 4000.
+     * {@code io.netty.allocator.segmentPurgeDelay}: milliseconds a free slice, or a region of one block, stays free
+     * before its memory goes back to the OS, as mimalloc's purge delay times its arena multiplier (1000 ms x 4). From
+     * 10 ms to 10 minutes. Default: 4000.
      */
     static final long PURGE_DELAY_MILLIS = purgeDelayMillisOf(
             SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
@@ -192,8 +192,8 @@ final class PageStoreConfig {
      * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them. Below 9 slices the size-class chunks
      * are cut to a segment. Default: one slice less than {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose
      * regions are powers of two, its {@code byte[]} with the header fits in whole regions with a slice to spare, and
-     * in half a region from 8 MiB regions up (a humongous object takes regions of its own: a 4 MiB array took two
-     * 4 MiB regions, or a whole 8 MiB one, and ran a 15 GiB heap out of memory where 4032 KiB did not).
+     * in half a region from 8 MiB regions up (a humongous object takes regions of its own: a 4 MiB array would take
+     * two 4 MiB regions, or a whole 8 MiB one).
      */
     static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));
