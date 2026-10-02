@@ -40,7 +40,8 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * {@link PageStore} as heaps see it: aligned blocks of the regions, accounting through a random workload of several
- * heaps and the close, the fallback of one allocation per block once no region can be mapped, and no regions at all.
+ * heaps and the close, the fallback to regions of one block once no region can be mapped, and no store without
+ * regions.
  */
 final class PageStoreTest {
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
@@ -55,17 +56,17 @@ final class PageStoreTest {
     void regionsAreAligned() {
         assumeTrue(regions.mmap != null, "aligned regions need mmap");
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
+        PageStore store = allocator.pageStore;
         for (int i = 0; i < 3; i++) {
-            Segment block = heap.claim(63);
-            assertEquals(0, heap.claimedStart());
-            assertEquals(0, block.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
+            long run = store.claimSlices(63, 0, PageStore.NO_HEAP);
+            assertEquals(0, store.start(run));
+            assertEquals(0, store.block(run).memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
         }
         assertEquals(0, allocator.pageStore.regions[0].buffer.memoryAddress() & REGION_ALIGNMENT - 1);
     }
 
     /**
-     * Several heaps claiming and releasing at random, with their ticks driving the purge, on regions of many blocks or
+     * Several heaps claiming and releasing at random, with purges in between, on regions of many blocks or
      * of one: at every step the allocator's used memory is exactly the committed slices, or the regions of one block
      * not given back; once the store is closed, nothing is left.
      */
@@ -76,12 +77,8 @@ final class PageStoreTest {
                 newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT) :
                 newAllocator(segments, SEGMENT_SIZE);
         PageStore store = allocator.pageStore;
-        HeapSegments[] heaps = new HeapSegments[3];
-        for (int i = 0; i < heaps.length; i++) {
-            heaps[i] = new HeapSegments(store, null, Thread.currentThread());
-        }
+        int heaps = 3;
         int capacity = 48;
-        HeapSegments[] owners = new HeapSegments[capacity];
         Segment[] spans = new Segment[capacity];
         int[] starts = new int[capacity];
         int[] lengths = new int[capacity];
@@ -94,18 +91,16 @@ final class PageStoreTest {
                 store.purgeIfDue(now += INTERVAL / 2);
             } else if (live == capacity || live > 0 && dice < 8) {
                 int k = random.nextInt(live);
-                owners[k].release(spans[k], starts[k], lengths[k]);
+                store.releaseSlices(spans[k], starts[k], lengths[k]);
                 live--;
-                owners[k] = owners[live];
                 spans[k] = spans[live];
                 starts[k] = starts[live];
                 lengths[k] = lengths[live];
             } else {
-                HeapSegments heap = heaps[random.nextInt(heaps.length)];
                 int n = 1 + random.nextInt(16);
-                owners[live] = heap;
-                spans[live] = heap.claim(n);
-                starts[live] = heap.claimedStart();
+                long run = store.claimSlices(n, random.nextInt(heaps), PageStore.NO_HEAP);
+                spans[live] = store.block(run);
+                starts[live] = store.start(run);
                 lengths[live] = n;
                 live++;
             }
@@ -113,11 +108,11 @@ final class PageStoreTest {
         }
         while (live > 0) {
             live--;
-            owners[live].release(spans[live], starts[live], lengths[live]);
+            store.releaseSlices(spans[live], starts[live], lengths[live]);
         }
         assertEquals(0, store.sliceCounts()[0], "no span out");
         assertEquals(withRegions, !regions.regions.isEmpty());
-        assertEquals(withRegions, store.slicesPurged > 0, "the ticks drove the purge of idle slices");
+        assertEquals(withRegions, store.slicesPurged > 0, "the purges took idle slices");
         assertEquals(!withRegions, store.regionsReleased > 0, "and gave back idle regions of one block");
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(0, segments.segmentsLive());
@@ -133,16 +128,15 @@ final class PageStoreTest {
     void closeUnmapsEveryRegion() {
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
         for (int i = 0; i < SLOTS + 2; i++) {
-            heap.claim(PER_BLOCK);
+            store.claimSlices(PER_BLOCK, 0, PageStore.NO_HEAP);
         }
         assertEquals(2, regions.live());
         assertEquals((SLOTS + 2L) * SEGMENT_SIZE, allocator.usedMemory());
         store.close();
         assertEquals(0, regions.live());
         assertEquals(0, allocator.usedMemory());
-        assertThrows(IllegalStateException.class, () -> heap.claim(1));
+        assertThrows(IllegalStateException.class, () -> store.claimSlices(1, 0, PageStore.NO_HEAP));
     }
 
     /**
@@ -172,20 +166,19 @@ final class PageStoreTest {
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT,
                         SEGMENT_SIZE));
         PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
         Segment[] blocks = new Segment[SLOTS];
         for (int i = 0; i < SLOTS; i++) {
-            blocks[i] = heap.claim(SPAN);
+            blocks[i] = claim(store, SPAN);
             assertSame(failing, blocks[i].region.source);
         }
-        Segment first = heap.claim(SPAN);
+        Segment first = claim(store, SPAN);
         assertEquals(2, calls[0]);
         assertSame(malloc, store.regionSource);
         assertSame(malloc, first.region.source);
         assertEquals(1, first.region.slots, "a region of one block");
-        heap.release(blocks[4], 0, SPAN);
-        assertSame(blocks[4], heap.claim(SPAN), "the free slices of the mapped region");
-        Segment second = heap.claim(SPAN);
+        store.releaseSlices(blocks[4], 0, SPAN);
+        assertSame(blocks[4], claim(store, SPAN), "the free slices of the mapped region");
+        Segment second = claim(store, SPAN);
         assertSame(malloc, second.region.source);
         assertEquals(2, calls[0], "never tried again");
         assertEquals(3, store.regionCount());
@@ -194,10 +187,10 @@ final class PageStoreTest {
         assertEquals(0, segments.segmentsAllocated());
         assertSharedAccounted(segments, allocator);
         for (Segment block : new Segment[] {first, second}) {
-            heap.release(block, 0, SPAN);
+            store.releaseSlices(block, 0, SPAN);
         }
         for (Segment block : blocks) {
-            heap.release(block, 0, SPAN);
+            store.releaseSlices(block, 0, SPAN);
         }
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
         assertEquals(2, store.regionsReleased, "the idle one-block regions went back, the mapped one stays");
@@ -205,6 +198,13 @@ final class PageStoreTest {
         assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());
+    }
+
+    /** The block of a run of {@code n} slices claimed from its start. */
+    private static Segment claim(PageStore store, int n) {
+        long run = store.claimSlices(n, 0, PageStore.NO_HEAP);
+        assertEquals(0, store.start(run));
+        return store.block(run);
     }
 
     /** A page store needs regions: a config without them, or no region source, is rejected. */

@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  *    chunk    a run of slices serving one size class              SizeClassedChunk
  *     slot    one buffer's place in a chunk                       SizeClassedChunk's "segment", segmentSize
  *    span     a run of slices holding one buffer above the sizes  SpanMagazine, SharedSpanChunk
- * heap        a thread-local heap or a stripe                     {@link HeapSegments}
+ * heap        a thread-local heap or a stripe                     StripedHeap, ThreadLocalSizeClassHeap
  * </pre>
  * Heaps own chunks, never blocks: any heap claims a run of slices from the regions' shared bitmaps by CAS, and
  * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link #releaseSlices}), as mimalloc v3
@@ -100,7 +100,7 @@ final class PageStore {
      * again when it gave them back.
      */
     private volatile long purgeSequence;
-    /** The next heap's {@link HeapSegments#seq}. */
+    /** The next heap's sequence: see {@link #nextHeapSequence}. */
     private volatile int heapSequence;
     // Written by the purger only.
     long purges;
@@ -132,7 +132,10 @@ final class PageStore {
         }
     }
 
-    /** As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. */
+    /**
+     * As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. A heap's claims start in the block of
+     * its sequence (see {@link Region#claimSlices}).
+     */
     int nextHeapSequence() {
         return HEAP_SEQUENCE.getAndIncrement(this) & Integer.MAX_VALUE;
     }
@@ -369,6 +372,16 @@ final class PageStore {
                 block.releaseRun(start, n, System.nanoTime());
             }
         }
+    }
+
+    /** The block of a run {@link #claimSlices} returned. */
+    Segment block(long run) {
+        return regions[(int) (run >>> 32)].block((int) run / config.slicesPerSegment());
+    }
+
+    /** The first slice in its block of a run {@link #claimSlices} returned. */
+    int start(long run) {
+        return (int) run % config.slicesPerSegment();
     }
 
     /**

@@ -862,7 +862,7 @@ final class AdaptivePoolingAllocator {
      * recycler frees half, rounded up, of the buffers that sat in its pools through the whole interval, oldest first.
      * <p>
      * When the size classes carve their chunks out of a page store, the pools keep no memory: a chunk given up frees
-     * its span of shared slices at once (see {@link HeapSegments}), where any chunk size of any heap reuses it, and
+     * its span of shared slices at once (see {@link PageStore}), where any chunk size of any heap reuses it, and
      * the pools keep only its free lists, keyed by the chunk sizes of spans, so that re-creating a chunk still
      * allocates no list. The byte budget then bounds how many lists are kept, as it did with their buffers, and the
      * decays drop lists without any memory event.
@@ -1213,8 +1213,8 @@ final class AdaptivePoolingAllocator {
         SpanMagazine spanMagazine;
         AdaptiveRecycler recycler;
         SizeClassChunkRecycler chunkRecycler;
-        /** The stripe's link to the page store, when the allocator has one; else {@code null}. */
-        HeapSegments heapSegments;
+        /** Where the stripe's claims start in a region, with a page store: see {@link PageStore#nextHeapSequence}. */
+        int seq = -1;
 
         SizeClassMagazine getOrCreateMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             SizeClassMagazine[] mags = magazines;
@@ -1233,14 +1233,14 @@ final class AdaptivePoolingAllocator {
             chunkRecycler = new SizeClassChunkRecycler(allocator);
             idleDecay.recycler = chunkRecycler;
             idleDecay.magazines = magazines;
-            createHeapSegments(allocator);
+            joinPageStore(allocator);
             return createMagazine(sizeClassIndex, allocator);
         }
 
         /** Once per stripe, by whichever magazine comes first, when the allocator has a page store. */
-        private void createHeapSegments(AdaptivePoolingAllocator allocator) {
-            if (allocator.pageStore != null && heapSegments == null) {
-                heapSegments = new HeapSegments(allocator.pageStore, lock, null);
+        private void joinPageStore(AdaptivePoolingAllocator allocator) {
+            if (allocator.pageStore != null && seq < 0) {
+                seq = allocator.pageStore.nextHeapSequence();
                 idleDecay.store = allocator.pageStore;
             }
         }
@@ -1251,7 +1251,7 @@ final class AdaptivePoolingAllocator {
             }
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
             SizeClassMagazine mag = new SizeClassMagazine(allocator, strategy, chunkRecycler, idleDecay,
-                    sizeClassIndex, null, recycler, lock, magazines, heapSegments);
+                    sizeClassIndex, null, recycler, lock, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -1302,8 +1302,8 @@ final class AdaptivePoolingAllocator {
                 if (recycler == null) {
                     recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
                 }
-                createHeapSegments(allocator);
-                mag = new SpanMagazine(allocator, recycler, null, idleDecay, heapSegments);
+                joinPageStore(allocator);
+                mag = new SpanMagazine(allocator, recycler, null, idleDecay, seq);
                 spanMagazine = mag;
             }
             return mag;
@@ -1381,8 +1381,8 @@ final class AdaptivePoolingAllocator {
     private static final class ThreadLocalSizeClassHeap {
         private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
         private final SizeClassChunkRecycler chunkRecycler;
-        /** The heap's link to the page store, when the allocator has one; else {@code null}. */
-        private final HeapSegments heapSegments;
+        /** Where the heap's claims start in a region, with a page store: see {@link PageStore#nextHeapSequence}. */
+        private final int seq;
         /** Buffers above the size classes; {@code null} until the first one. */
         private BuddyMagazine buddyMagazine;
         private SpanMagazine spanMagazine;
@@ -1395,9 +1395,7 @@ final class AdaptivePoolingAllocator {
             chunkRecycler = new SizeClassChunkRecycler(allocator);
             idleDecay.recycler = chunkRecycler;
             idleDecay.magazines = magazines;
-            // Created on the owner thread, by the FastThreadLocal's initialValue().
-            heapSegments = allocator.pageStore != null ?
-                    new HeapSegments(allocator.pageStore, null, Thread.currentThread()) : null;
+            seq = allocator.pageStore != null ? allocator.pageStore.nextHeapSequence() : -1;
             idleDecay.store = allocator.pageStore;
         }
 
@@ -1419,7 +1417,7 @@ final class AdaptivePoolingAllocator {
          * counting, ages the magazine's idle chunks with the rest of the heap.
          */
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            if (heapSegments != null) {
+            if (allocator.pageStore != null) {
                 return allocateSpan(size, maxCapacity, buf);
             }
             BuddyMagazine mag = buddyMagazine;
@@ -1445,7 +1443,7 @@ final class AdaptivePoolingAllocator {
         private AdaptiveByteBuf allocateSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
             SpanMagazine mag = spanMagazine;
             if (mag == null) {
-                mag = new SpanMagazine(allocator, null, Thread.currentThread(), idleDecay, heapSegments);
+                mag = new SpanMagazine(allocator, null, Thread.currentThread(), idleDecay, seq);
                 spanMagazine = mag;
             }
             boolean reallocate = buf != null;
@@ -1475,8 +1473,7 @@ final class AdaptivePoolingAllocator {
         private SizeClassMagazine createMagazine(int sizeClassIndex) {
             SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
             SizeClassMagazine mag = new SizeClassMagazine(allocator, strategy, chunkRecycler, idleDecay,
-                                       sizeClassIndex, Thread.currentThread(), null, null, magazines,
-                                       heapSegments);
+                                       sizeClassIndex, Thread.currentThread(), null, null, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -2184,9 +2181,9 @@ final class AdaptivePoolingAllocator {
          */
         SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
             SizeClassChunkRecycler recycler = magazine.chunkRecycler;
-            HeapSegments heapSegments = magazine.heapSegments;
-            if (heapSegments != null) {
-                return newSpanChunk(magazine, recycler, heapSegments);
+            PageStore store = magazine.allocator.pageStore;
+            if (store != null) {
+                return newSpanChunk(magazine, recycler, store);
             }
             if (recycler.poll(magazine.sizeClassIndex)) {
                 AbstractByteBuf recycledBuf = recycler.takeBuffer();
@@ -2204,15 +2201,17 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * A chunk that is a span of shared slices (see {@link HeapSegments#claim}), with the free lists of a chunk
+         * A chunk that is a span of shared slices (see {@link PageStore#claimSlices}), with the free lists of a chunk
          * given up earlier when the heap's recycler has some. The store accounts the slices, so nothing is announced
          * here.
          */
         private SizeClassedChunk newSpanChunk(SizeClassMagazine magazine, SizeClassChunkRecycler recycler,
-                                              HeapSegments heapSegments) {
-            int slices = chunkSize / magazine.allocator.pageStore.config.sliceSize;
-            Segment segment = heapSegments.claim(slices);
-            int start = heapSegments.claimedStart();
+                                              PageStore store) {
+            int slices = chunkSize / store.config.sliceSize;
+            long run = store.claimSlices(slices, magazine.seq,
+                    magazine.ownerThread != null ? PageStore.THREAD_LOCAL : PageStore.STRIPE);
+            Segment segment = store.block(run);
+            int start = store.start(run);
             try {
                 int colour = nextColourOffset();
                 // The chunk reads the segment's own buffer, as a large-buffer span does: its buffers start at the
@@ -2230,7 +2229,7 @@ final class AdaptivePoolingAllocator {
                 }
                 return new SizeClassedChunk(span, magazine, this, segment, start, base, capacity);
             } catch (Throwable t) {
-                heapSegments.release(segment, start, slices);
+                store.releaseSlices(segment, start, slices);
                 throw t;
             }
         }
@@ -2340,8 +2339,8 @@ final class AdaptivePoolingAllocator {
         final SizeClassChunkRecycler chunkRecycler;
         private final IdleDecay idleDecay;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
-        /** The heap's link to the page store; {@code null} when chunks are allocated one by one. */
-        final HeapSegments heapSegments;
+        /** The heap's sequence, with a page store: see {@link PageStore#nextHeapSequence}. */
+        final int seq;
         private final int purgeTickThreshold;
         private int allocCount;
         /** Purge ticks so far; with {@link #allocCount} it tells whether the class allocated since the last decay. */
@@ -2352,9 +2351,9 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
                           SizeClassChunkRecycler chunkRecycler, IdleDecay idleDecay, int sizeClassIndex,
                           Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                          SizeClassMagazine[] heapMagazines, HeapSegments heapSegments) {
+                          SizeClassMagazine[] heapMagazines, int seq) {
             this.idleDecay = idleDecay;
-            this.heapSegments = heapSegments;
+            this.seq = seq;
             this.heapMagazines = heapMagazines;
             this.allocator = allocator;
             this.ownerThread = ownerThread;
@@ -2886,7 +2885,7 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Buffers above the size classes when the allocator has a {@link PageStore}: each one is a span of whole slices of
-     * the store's shared slices (see {@link HeapSegments#claim}), sized to the buffer rounded up to slices, as
+     * the store's shared slices (see {@link PageStore#claimSlices}), sized to the buffer rounded up to slices, as
      * mimalloc's large pages. No block of a chunk, nothing kept for reuse: a release, from any thread, gives the span
      * back to the store at once (see {@link SharedSpanChunk}).
      * <p>
@@ -2900,7 +2899,8 @@ final class AdaptivePoolingAllocator {
         private static final int MAX_COLOURS = 64;
 
         final AdaptivePoolingAllocator allocator;
-        final HeapSegments heapSegments;
+        /** The heap's sequence: see {@link PageStore#nextHeapSequence}. */
+        private final int seq;
         private final AdaptiveRecycler bufRecycler;
         private final Thread ownerThread;
         private final IdleDecay idleDecay;
@@ -2910,12 +2910,12 @@ final class AdaptivePoolingAllocator {
         private int nextColour;
 
         SpanMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, Thread ownerThread,
-                     IdleDecay idleDecay, HeapSegments heapSegments) {
+                     IdleDecay idleDecay, int seq) {
             this.allocator = allocator;
             this.bufRecycler = bufRecycler;
             this.ownerThread = ownerThread;
             this.idleDecay = idleDecay;
-            this.heapSegments = heapSegments;
+            this.seq = seq;
             int sliceSize = allocator.pageStore.config.sliceSize;
             assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
             sliceShift = Integer.numberOfTrailingZeros(sliceSize);
@@ -2930,9 +2930,10 @@ final class AdaptivePoolingAllocator {
                 allocator.allocateOneShot(size, maxCapacity, buf);
                 return;
             }
-            HeapSegments heap = heapSegments;
-            Segment segment = heap.claim(slices);
-            int start = heap.claimedStart();
+            PageStore store = allocator.pageStore;
+            long run = store.claimSlices(slices, seq, ownerThread != null ? PageStore.THREAD_LOCAL : PageStore.STRIPE);
+            Segment segment = store.block(run);
+            int start = store.start(run);
             // Colour, as the size classes' spans (see SizeClassChunkController) and as mimalloc does for its large
             // allocations (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to
             // 4032 bytes into its span, in 64-byte steps taken round robin, out of the tail the span leaves unused
@@ -2948,7 +2949,7 @@ final class AdaptivePoolingAllocator {
                 initialized = true;
             } finally {
                 if (!initialized) {
-                    heap.release(segment, start, slices);
+                    store.releaseSlices(segment, start, slices);
                 }
             }
             idleDecay.count(size >>> COUNT_SHIFT);
@@ -3196,14 +3197,12 @@ final class AdaptivePoolingAllocator {
 
         final SizeClassedChunkCache owningCache;
         /**
-         * The segment this chunk is a span of, from slice {@link #spanStart}, and the heap that owns it; {@code null}
-         * for a chunk whose buffer was allocated on its own. Its {@link #delegate} is then a buffer over the span,
-         * which {@link #deallocate} gives back to the segment instead of freeing.
+         * The block this chunk is a span of, from slice {@link #spanStart}; {@code null} for a chunk whose buffer was
+         * allocated on its own. {@link #deallocate} gives the span back to the store instead of freeing.
          */
         // Visible for testing.
         final Segment segment;
         final int spanStart;
-        private final HeapSegments heapSegments;
 
         /**
          * Constructor only used by {@link PendingChunks}' end marker.
@@ -3215,7 +3214,6 @@ final class AdaptivePoolingAllocator {
             owningCache = null;
             segment = null;
             spanStart = 0;
-            heapSegments = null;
         }
 
         /**
@@ -3231,7 +3229,6 @@ final class AdaptivePoolingAllocator {
             super(delegate, magazine.allocator, true, capacity);
             this.segment = segment;
             this.spanStart = spanStart;
-            heapSegments = magazine.heapSegments;
             segmentSize = controller.segmentSize;
             segments = controller.buffers;
             STATE.lazySet(this, AVAILABLE);
@@ -3258,7 +3255,6 @@ final class AdaptivePoolingAllocator {
             super(recycledDelegate, magazine.allocator, true, capacity);
             this.segment = segment;
             this.spanStart = spanStart;
-            heapSegments = magazine.heapSegments;
             segmentSize = controller.segmentSize;
             segments = controller.buffers;
             MpscIntQueue externalFreeList = recycledFreeList.capacity() >= segments ?
@@ -3509,14 +3505,14 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * A span goes back to the store's shared slices, from any thread (see {@link HeapSegments#release}). Any
+         * A span goes back to the store's shared slices, from any thread (see {@link PageStore#releaseSlices}). Any
          * other chunk frees its buffer, as every chunk does.
          */
         @Override
         protected void deallocate() {
             Segment segment = this.segment;
             if (segment != null) {
-                heapSegments.release(segment, spanStart, spanSlices());
+                allocator.pageStore.releaseSlices(segment, spanStart, spanSlices());
             } else {
                 super.deallocate();
             }
