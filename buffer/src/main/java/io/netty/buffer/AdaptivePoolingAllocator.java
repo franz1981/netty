@@ -117,6 +117,8 @@ final class AdaptivePoolingAllocator {
     private static final int MEDIUM_SEGMENT_SIZE = 16 * 1024;
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
+    private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> FREED =
+            AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "freed");
     private static final int EXPANSION_ATTEMPTS = 3;
     private static final int MAX_STRIPES = IS_LOW_MEM ? 1 :
             MathUtil.safeFindNextPositivePowerOfTwo(NettyRuntime.availableProcessors() * 2);
@@ -232,6 +234,8 @@ final class AdaptivePoolingAllocator {
     private final ChunkRegistry chunkRegistry;
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
+    /** 1 once {@link #free} ran, by {@link #close} or the finalizer. */
+    private volatile int freed;
 
     private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
@@ -635,7 +639,21 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    /**
+     * Frees the calling thread's heap, the striped heaps and the store's regions now, not at finalization. The caller
+     * holds no live buffer of this allocator: the regions under it are unmapped or freed.
+     */
+    void close() {
+        if (threadLocalSizeClassHeap != null) {
+            threadLocalSizeClassHeap.remove();
+        }
+        free();
+    }
+
     private void free() {
+        if (!FREED.compareAndSet(this, 0, 1)) {
+            return;
+        }
         for (StripedHeap stripe : stripedHeaps) {
             stripe.freeStripe();
         }

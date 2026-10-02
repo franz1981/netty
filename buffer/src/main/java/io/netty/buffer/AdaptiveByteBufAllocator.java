@@ -93,6 +93,12 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
+    /** As {@link AdaptivePoolingAllocator#close()}, for both allocators: no live buffer of either. */
+    void close() {
+        direct.close();
+        heap.close();
+    }
+
     /** Heap chunk buffers, and the blocks the size classes carve their chunks out of: one {@code byte[]} each. */
     private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
         private final ByteBufAllocator allocator;
