@@ -31,11 +31,6 @@ public class AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest extends 
     }
 
     @Override
-    protected AdaptiveByteBufAllocator newAllocatorWithoutHeapSegments(boolean preferDirect) {
-        return new AdaptiveByteBufAllocator(preferDirect, true, false);
-    }
-
-    @Override
     protected AdaptiveByteBufAllocator newUnpooledAllocator() {
         return newAllocator(false);
     }
