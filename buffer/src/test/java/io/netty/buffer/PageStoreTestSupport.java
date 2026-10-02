@@ -240,7 +240,8 @@ final class PageStoreTestSupport {
         // A region of one block is a malloc'd one's size.
         PageStoreConfig config = regionSize == SEGMENT_SIZE ? PageStoreConfig.sharedSlices(SEGMENT_SIZE,
                 SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE).withMallocRegions() :
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT, true);
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT,
+                        true);
         return new AdaptivePoolingAllocator(segments, true, segments, regions, config);
     }
 

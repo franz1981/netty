@@ -85,8 +85,8 @@ public class AdaptiveSegmentRegionsTest {
     }
 
     /**
-     * Below Java 22, or without native access: {@code malloc}'d regions of {@link PageStoreConfig#MALLOC_REGION_SIZE_BYTES},
-     * counted whole from their allocation.
+     * Below Java 22, or without native access: {@code malloc}'d regions of one block, counted whole from their
+     * allocation.
      */
     @Test
     void withoutMmapRegionsAreMalloced() {
