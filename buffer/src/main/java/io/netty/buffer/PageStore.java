@@ -26,6 +26,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -73,6 +74,10 @@ final class PageStore {
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeFailures");
     private static final AtomicLongFieldUpdater<PageStore> SLICES_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
+    private static final AtomicLongFieldUpdater<PageStore> PURGE_WAITS =
+            AtomicLongFieldUpdater.newUpdater(PageStore.class, "purgeWaits");
+    /** The longest a claim waits for the purger to give back the run it holds: see {@link #awaitPurgedRun}. */
+    private static final long PURGE_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
@@ -115,6 +120,13 @@ final class PageStore {
     volatile long segmentsCommitted;
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
+    /** Shared slices: claims that found no fit while the purger held slices, and waited for it. */
+    volatile long purgeWaits;
+    /**
+     * Shared slices, written by the purger only: odd while it holds slices it claimed for their purge, incremented
+     * again when it gave them back.
+     */
+    private volatile long purgeSequence;
     /** The next heap's {@link HeapSegments#seq}. */
     private volatile int heapSequence;
     // Written by the purger only.
@@ -348,7 +360,9 @@ final class PageStore {
      * {@link #commitSlices}); give it back with {@link #releaseSlices}, from any thread.
      */
     long claimSlices(int slices, int seq, String heap) {
+        boolean rescanned = false;
         for (;;) {
+            long purgeSeen = purgeSequence;
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
@@ -359,7 +373,14 @@ final class PageStore {
                     return (long) i << 32 | slice;
                 }
             }
-            if (!mapsRegions || !addRegion(regions)) {
+            if (!mapsRegions) {
+                return -1;
+            }
+            if (!rescanned && awaitPurgedRun(purgeSeen)) {
+                rescanned = true;
+                continue;
+            }
+            if (!addRegion(regions)) {
                 return -1;
             }
         }
@@ -372,7 +393,9 @@ final class PageStore {
      * {@link #releaseSlices}.
      */
     private long takeBlocks(int blocks, String heap) {
+        boolean rescanned = false;
         for (;;) {
+            long purgeSeen = purgeSequence;
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
@@ -382,10 +405,36 @@ final class PageStore {
                     return (long) i << 32 | first;
                 }
             }
-            if (!mapsRegions || !addRegion(regions)) {
+            if (!mapsRegions) {
+                return -1;
+            }
+            if (!rescanned && awaitPurgedRun(purgeSeen)) {
+                rescanned = true;
+                continue;
+            }
+            if (!addRegion(regions)) {
                 return -1;
             }
         }
+    }
+
+    /**
+     * Before a claim that found no fit maps a region: whether the purger held slices while the claim scanned (its
+     * sequence moved since {@code seen}, or is odd), in which case this waits, by yields and at most
+     * {@link #PURGE_WAIT_NANOS}, until it holds none, so that the caller scans once more instead of mapping a region
+     * for slices that were only out for their purge.
+     */
+    private boolean awaitPurgedRun(long seen) {
+        long current = purgeSequence;
+        if (current == seen && (current & 1) == 0) {
+            return false;
+        }
+        PURGE_WAITS.incrementAndGet(this);
+        long start = System.nanoTime();
+        while ((purgeSequence & 1) != 0 && System.nanoTime() - start < PURGE_WAIT_NANOS) {
+            Thread.yield();
+        }
+        return true;
     }
 
     private void commitBlocks(Region region, int first, int blocks, String heap) {
@@ -682,7 +731,7 @@ final class PageStore {
      * (arena.c): a run's slices are claimed by CAS first, so that no claim can take them while their memory goes, and
      * given back after; and as its {@code _mi_bitmap_forall_setc_ranges} (bitmap.c), a run never spans more than one
      * bitmap word (a block): the purger holds at most one block's run at a time, and a claim meanwhile finds every
-     * other free slice.
+     * other free slice (see {@link #awaitPurgedRun}).
      */
     private void purgeSharedSlices(long now) {
         long delay = config.purgeDelayNanos;
@@ -693,15 +742,20 @@ final class PageStore {
                 while (candidates != 0) {
                     long run = lowestRun(candidates);
                     candidates &= ~run;
-                    long claimed = block.claimFree(run);
-                    long exact = purgeable(block, claimed, now, delay);
-                    if (exact != claimed) {
-                        block.giveBack(claimed & ~exact);
-                    }
-                    while (exact != 0) {
-                        long bits = lowestRun(exact);
-                        exact &= ~bits;
-                        purgeSliceRun(block, bits);
+                    purgeSequence++; // odd: the purger holds slices
+                    try {
+                        long claimed = block.claimFree(run);
+                        long exact = purgeable(block, claimed, now, delay);
+                        if (exact != claimed) {
+                            block.giveBack(claimed & ~exact);
+                        }
+                        while (exact != 0) {
+                            long bits = lowestRun(exact);
+                            exact &= ~bits;
+                            purgeSliceRun(block, bits);
+                        }
+                    } finally {
+                        purgeSequence++;
                     }
                 }
             }
