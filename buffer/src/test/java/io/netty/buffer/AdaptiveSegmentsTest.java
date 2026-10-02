@@ -632,7 +632,10 @@ public class AdaptiveSegmentsTest {
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         assertNotNull(chunkOf(buf).segment);
         assertEquals(regions, chunkOf(buf).segment.region != null);
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
+        // With shared slices, the chunk's slices: 128 KiB for 1 KiB buffers.
+        long directUsed = AdaptiveByteBufAllocatorTest.directSharesSlices(allocator) ? 128 * 1024 :
+                PageStoreConfig.SEGMENT_SIZE_BYTES;
+        assertEquals(directUsed, allocator.metric().usedDirectMemory());
         assumeTrue(AdaptivePoolingAllocator.HEAP_SEGMENTS, "heap segments turned off");
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
         int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
@@ -646,7 +649,7 @@ public class AdaptiveSegmentsTest {
         assertEquals(heapSegmentSize, allocator.metric().usedHeapMemory());
         buf.release();
         heap.release();
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory(),
+        assertEquals(directUsed, allocator.metric().usedDirectMemory(),
                 "the segment stays with the chunk its size class keeps");
     }
 

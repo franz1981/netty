@@ -185,6 +185,77 @@ public class PageStoreJfrTest {
     }
 
     /**
+     * Shared slices: the takes and give-backs are slice runs, the purge purges slices, and the periodic state event
+     * maps the region slice by slice.
+     */
+    @SuppressWarnings("Since15")
+    @Test
+    public void sharedSliceEventsFollowTheirRuns() throws Exception {
+        assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
+        final CountDownLatch stateSeen = new CountDownLatch(1);
+        final CountDownLatch unmapped = new CountDownLatch(1);
+        final String thread = Thread.currentThread().getName();
+        final int slice = PageStoreConfig.SLICE_SIZE_BYTES;
+        final long out = 8L * slice + SEGMENT_SIZE;
+        CountingRegionSource regions = new CountingRegionSource();
+        try (RecordingStream stream = new RecordingStream()) {
+            stream.setReuse(false);
+            for (String name : new String[] {PageStorePurgeEvent.NAME, SegmentTakeEvent.NAME,
+                    SegmentGiveBackEvent.NAME}) {
+                stream.enable(name);
+                stream.onEvent(name, event -> add(event, thread));
+            }
+            stream.enable(PageStoreUnmapEvent.NAME);
+            stream.onEvent(PageStoreUnmapEvent.NAME, event -> {
+                add(event, thread);
+                unmapped.countDown();
+            });
+            stream.enable(PageStoreStateEvent.NAME).withPeriod(Duration.ofMillis(50));
+            stream.startAsync();
+            AdaptivePoolingAllocator allocator = PageStoreTestSupport.newSharedAllocator(new CountingSegmentSource(),
+                    regions, REGION_SIZE, INTERVAL);
+            PageStore store = allocator.pageStore;
+            final int id = System.identityHashCode(allocator);
+            stream.onEvent(PageStoreStateEvent.NAME, event -> {
+                if (event.getInt("store") == id && event.getInt("region") == 0 && event.getLong("outBytes") == out) {
+                    events.add(event);
+                    stateSeen.countDown();
+                }
+            });
+            ByteBuf span = allocator.allocate(512 * 1024, 512 * 1024); // a span of 8 slices
+            ByteBuf oneShot = allocator.allocate(3 * MIB, 3 * MIB); // a whole block
+            base = store.region(0).buffer.memoryAddress();
+            assertTrue(stateSeen.await(10, TimeUnit.SECONDS), "a periodic state event with 8 slices and a block out");
+            span.release();
+            oneShot.release();
+            store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
+            store.close();
+            assertTrue(unmapped.await(10, TimeUnit.SECONDS), "the unmap event");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (named(SegmentTakeEvent.NAME).size() < 2 && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+        }
+        List<String> taken = sources(SegmentTakeEvent.NAME, "source");
+        assertEquals(2, taken.size(), taken.toString());
+        for (String source : taken) {
+            assertEquals(PageStore.SHARED_SLICES, source, taken.toString());
+        }
+        List<String> givenBack = sources(SegmentGiveBackEvent.NAME, "destination");
+        assertEquals(2, givenBack.size(), givenBack.toString());
+        long purged = 0;
+        for (RecordedEvent purge : named(PageStorePurgeEvent.NAME)) {
+            assertEquals("slices", purge.getString("unit"));
+            assertEquals(0, purge.getInt("errno"));
+            purged += purge.getLong("length");
+        }
+        assertEquals(out, purged, "the span's slices and the block's");
+        RecordedEvent state = named(PageStoreStateEvent.NAME).get(0);
+        assertEquals(REGION_SIZE, state.getLong("length"));
+        assertEquals(REGION_SIZE - out, state.getLong("untouchedBytes"));
+    }
+
+    /**
      * The segments allocated on their own are tracked for the periodic state event only while that event is enabled:
      * with JFR available but no recording, the store keeps no reference to them.
      */

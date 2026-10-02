@@ -115,7 +115,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /**
      * Direct size-class chunks are spans of a segment, which is the memory accounted: the first buffer takes a whole
-     * segment, and the chunk of the next size class is another span of it.
+     * segment, and the chunk of the next size class is another span of it. With shared slices, the memory accounted
+     * is the chunks' slices.
      */
     @Override
     @Test
@@ -126,22 +127,23 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int segmentSize = directSegmentSize(allocator);
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
         long unit = directPageStoreUnit(allocator);
+        boolean perSegment = segmentSize > 0 && !directSharesSlices(allocator);
         try {
             int capacity = buffer.capacity();
-            long first = segmentSize > 0 ? unit : expectedUsedMemory(allocator, capacity);
+            long first = perSegment ? unit : expectedUsedMemory(allocator, capacity);
             assertEquals(first, metric.usedDirectMemory());
 
             // Double the size of the buffer
             buffer.capacity(capacity << 1);
             capacity = buffer.capacity();
             // This is a new size class, and a new magazine with a new chunk: another span of the same segment.
-            long both = segmentSize > 0 ? unit : 2 * expectedUsedMemory(allocator, capacity);
+            long both = perSegment ? unit : 2 * expectedUsedMemory(allocator, capacity);
             assertEquals(both, metric.usedDirectMemory(), buffer.toString());
         } finally {
             buffer.release();
         }
         // Memory is still held by the magazines
-        assertEquals(segmentSize > 0 ? unit : 2 * 128 * 1024, metric.usedDirectMemory());
+        assertEquals(perSegment ? unit : 2 * 128 * 1024, metric.usedDirectMemory());
     }
 
     static AdaptivePoolingAllocator direct(AdaptiveByteBufAllocator allocator) {
@@ -164,6 +166,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     static boolean directRegions(AdaptiveByteBufAllocator allocator) {
         PageStore store = direct(allocator).pageStore;
         return store != null && store.regionSource != null;
+    }
+
+    /** Whether the direct allocator's chunks are runs of its regions' shared slices. */
+    static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
+        PageStore store = direct(allocator).pageStore;
+        return directRegions(allocator) && store.config.sharesSlices;
     }
 
     /**

@@ -258,8 +258,14 @@ public class JfrEventsTest {
         assertTrue(segments[0] > 0, "segments are announced");
         assertEquals(Collections.emptyList(), otherSegmentEvents, "segment events are on the workload threads");
         long unit = segmentSize;
+        boolean shared = direct && AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
         for (int capacity : units) {
-            assertEquals(unit, capacity, "segment events have the size of a segment");
+            if (shared) {
+                // With shared slices, each event is the slices a claim committed.
+                assertEquals(0, capacity % PageStoreConfig.SLICE_SIZE_BYTES, "page store events are whole slices");
+            } else {
+                assertEquals(unit, capacity, "segment events have the size of a segment");
+            }
         }
         // The 512 KiB buffers are spans of the heaps' segments. The segment-sized one takes a slot of a region, or,
         // without regions, is a one-shot of its own exact size.
@@ -510,7 +516,9 @@ public class JfrEventsTest {
             // A direct size class takes a segment and carves its chunk out of it: the segment is the event, a
             // region's or not.
             int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
-            assertEquals(segmentSize > 0 ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
+            // With shared slices, the event is the chunk's slices.
+            boolean perSegment = segmentSize > 0 && !AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
+            assertEquals(perSegment ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
                     allocate.getInt("capacity"));
             assertEquals(segmentSize > 0, allocate.getBoolean("segment"));
             assertTrue(allocate.getBoolean("pooled"));
@@ -592,13 +600,16 @@ public class JfrEventsTest {
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools no 512 KiB buffers");
         final int size = 512 * 1024;
         AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+        // With shared slices the page store's event is the span's own slices, and the span's chunk is the block's,
+        // which belongs to no heap.
+        final boolean shared = AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
         Callable<Void> allocateAndRelease = () -> {
             try (RecordingStream stream = new RecordingStream()) {
                 CompletableFuture<RecordedEvent> chunkFuture = new CompletableFuture<>();
                 CompletableFuture<RecordedEvent> bufferFuture = new CompletableFuture<>();
                 stream.enable(AllocateChunkEvent.class);
                 stream.onEvent(AllocateChunkEvent.NAME, e -> {
-                    if (e.getInt("capacity") > size) {
+                    if (shared ? e.getBoolean("segment") && e.getInt("capacity") == size : e.getInt("capacity") > size) {
                         chunkFuture.complete(e);
                     }
                 });
@@ -613,7 +624,8 @@ public class JfrEventsTest {
                 alloc.directBuffer(size, size).release();
 
                 assertTrue(chunkFuture.get(10, TimeUnit.SECONDS).getBoolean("threadLocal"), "the chunk event");
-                assertTrue(bufferFuture.get(10, TimeUnit.SECONDS).getBoolean("chunkThreadLocal"), "the buffer event");
+                assertEquals(!shared, bufferFuture.get(10, TimeUnit.SECONDS).getBoolean("chunkThreadLocal"),
+                        "the buffer event");
                 return null;
             }
         };
