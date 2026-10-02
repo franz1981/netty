@@ -20,10 +20,10 @@ import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.parallel.Isolated;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -33,10 +33,13 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Shared slices: a claim and a purge that hold the same run.
+ * Shared slices: a claim and a purge that hold the same run. Isolated: the claim waits for the purger a bounded time,
+ * which other tests' threads must not eat.
  */
+@Isolated("The claim's wait for the purger is bounded in time")
 final class SharedSlicePurgeWaitTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
@@ -64,11 +67,11 @@ final class SharedSlicePurgeWaitTest {
         store.freeRun(region, blocks - 1, 1);
         final CountDownLatch purging = new CountDownLatch(1);
         final AtomicReference<String> failure = new AtomicReference<String>();
-        final AtomicBoolean claimed = new AtomicBoolean();
         regions.onPurge = () -> {
             purging.countDown();
-            // Hold the run until the claim waits for it, or returned without waiting.
-            while (store.purgeWaits == 0 && !claimed.get()) {
+            // Hold the run until the claim waits for it, or long enough to see that it does not.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (store.purgeWaits == 0 && System.nanoTime() - deadline < 0) {
                 Thread.yield();
             }
         };
@@ -77,18 +80,11 @@ final class SharedSlicePurgeWaitTest {
                 store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
             } catch (Throwable t) {
                 failure.compareAndSet(null, t.toString());
-            } finally {
-                purging.countDown();
             }
         });
         purger.start();
-        purging.await();
-        long run;
-        try {
-            run = store.claimSlices(9, 0, false);
-        } finally {
-            claimed.set(true);
-        }
+        assertTrue(purging.await(10, TimeUnit.SECONDS));
+        long run = store.claimSlices(9, 0, false);
         purger.join();
         assertNull(failure.get());
         assertEquals(1, store.purgeWaits);
