@@ -62,8 +62,8 @@ final class PageStore {
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final Region[] NO_REGIONS = new Region[0];
     /**
-     * The calls a purge pass makes at most (see {@link #purge}). Measured with {@code mmap}, 1 GiB freed at once: 8 make
-     * a pass of about 3 ms and give the GiB back in about a minute; one pass of all of it took 130 to 145 ms.
+     * The calls a purge pass makes at most (see {@link #purge}). Measured with {@code mmap}, 1 GiB freed at once: 8
+     * make a pass of about 3 ms and give the GiB back in about a minute; one pass of all of it took 130 to 145 ms.
      */
     static final int PURGE_CALLS = 8;
 
@@ -485,9 +485,9 @@ final class PageStore {
 
     /**
      * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, at most
-     * {@link #PURGE_CALLS} calls ({@code madvise} or region releases); one that stops short arms the purge again, due at
-     * once, and the next pass, after the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a pass
-     * by arenas purged instead, a quarter of them plus one, from an arena chosen by the thread's sequence
+     * {@link #PURGE_CALLS} calls ({@code madvise} or region releases); one that stops short arms the purge again, due
+     * at once, and the next pass, after the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a
+     * pass by arenas purged instead, a quarter of them plus one, from an arena chosen by the thread's sequence
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2433-L2450); one region of ours can need
      * thousands of calls.
      */
