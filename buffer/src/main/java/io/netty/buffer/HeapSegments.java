@@ -94,16 +94,8 @@ final class HeapSegments {
     /** Returns the segment of the span; {@link #claimedStart()} is its first slice. Scans the heap's segments once. */
     Segment claim(int slices) {
         assert inOwnerContext() && !freed;
-        if (sharesSlices) {
-            long run = store.claimSlices(slices, seq, kind());
-            if (run >= 0) {
-                int perBlock = store.config.slicesPerSegment();
-                int slice = (int) run;
-                claimedStart = slice % perBlock;
-                return store.region((int) (run >>> 32)).block(slice / perBlock);
-            }
-            // No region can be mapped: segments of the heap's own.
-        }
+        // With shared slices, the heap has segments of its own only once no region could be mapped: those it holds
+        // come first, then the shared slices, then a reserved or new segment of its own.
         Segment best = null;
         int bestFree = Integer.MAX_VALUE;
         Segment[] segments = this.segments;
@@ -117,6 +109,15 @@ final class HeapSegments {
                 if (freeSlices == slices) {
                     break;
                 }
+            }
+        }
+        if (best == null && sharesSlices) {
+            long run = store.claimSlices(slices, seq, kind());
+            if (run >= 0) {
+                int perBlock = store.config.slicesPerSegment();
+                int slice = (int) run;
+                claimedStart = slice % perBlock;
+                return store.region((int) (run >>> 32)).block(slice / perBlock);
             }
         }
         if (best == null) {
