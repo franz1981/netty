@@ -20,7 +20,6 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -57,10 +56,6 @@ final class PageStore {
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
     private static final AtomicLongFieldUpdater<PageStore> SLICES_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
-    private static final AtomicLongFieldUpdater<PageStore> PURGE_WAITS =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "purgeWaits");
-    /** The longest a claim waits for the purger to give back the run it holds: see {@link #awaitPurgedRun}. */
-    private static final long PURGE_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
@@ -87,13 +82,6 @@ final class PageStore {
     // Read by tests and dumps.
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
-    /** Shared slices: claims that found no fit while the purger held slices, and waited for it. */
-    volatile long purgeWaits;
-    /**
-     * Shared slices, written by the purger only: odd while it holds slices it claimed for their purge, incremented
-     * again when it gave them back.
-     */
-    private volatile long purgeSequence;
     /** The next heap's sequence: see {@link #nextHeapSequence}. */
     private volatile int heapSequence;
     // Written by the purger only.
@@ -228,9 +216,7 @@ final class PageStore {
      * {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, int seq, boolean threadLocal) {
-        boolean rescanned = false;
         for (;;) {
-            long purgeSeen = purgeSequence;
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
@@ -240,10 +226,6 @@ final class PageStore {
                     commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, threadLocal);
                     return (long) i << 32 | slice;
                 }
-            }
-            if (!rescanned && awaitPurgedRun(purgeSeen)) {
-                rescanned = true;
-                continue;
             }
             long run = addRegion(regions, threadLocal, slices, 0);
             if (run >= 0) {
@@ -260,13 +242,11 @@ final class PageStore {
      * Every slice is committed; give them back with {@link #freeRun}.
      */
     long takeRun(int blocks) {
-        boolean rescanned = false;
         for (;;) {
             if (blocks > regionBlocks) {
                 // Since regions are one block each.
                 return -1;
             }
-            long purgeSeen = purgeSequence;
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
@@ -276,35 +256,12 @@ final class PageStore {
                     return (long) i << 32 | first;
                 }
             }
-            if (!rescanned && awaitPurgedRun(purgeSeen)) {
-                rescanned = true;
-                continue;
-            }
             long run = addRegion(regions, false, 0, blocks);
             if (run >= 0) {
                 commitBlocks(this.regions[(int) (run >>> 32)], (int) run, blocks);
                 return run;
             }
         }
-    }
-
-    /**
-     * Before a claim that found no fit maps a region: whether the purger held slices while the claim scanned (its
-     * sequence moved since {@code seen}, or is odd), in which case this waits, by yields and at most
-     * {@link #PURGE_WAIT_NANOS}, until it holds none, so that the caller scans once more instead of mapping a region
-     * for slices that were only out for their purge.
-     */
-    private boolean awaitPurgedRun(long seen) {
-        long current = purgeSequence;
-        if (current == seen && (current & 1) == 0) {
-            return false;
-        }
-        PURGE_WAITS.incrementAndGet(this);
-        long start = System.nanoTime();
-        while ((purgeSequence & 1) != 0 && System.nanoTime() - start < PURGE_WAIT_NANOS) {
-            Thread.yield();
-        }
-        return true;
     }
 
     private void commitBlocks(Region region, int first, int blocks) {
@@ -477,7 +434,10 @@ final class PageStore {
      * and as its {@code _mi_bitmap_forall_setc_ranges}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1466-L1509), a run never
      * spans more than one bitmap word (a block): the purger holds at most one block's run at a time, and a claim
-     * meanwhile finds every other free slice (see {@link #awaitPurgedRun}).
+     * meanwhile finds every other free slice. A claim never waits for the purger: one that finds no fit maps a region,
+     * as mimalloc v3's claim fails on slices its purge holds
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L246) and reserves a new arena
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L548-L564).
      */
     private void purgeSharedSlices(long now) {
         long delay = config.purgeDelayNanos;
@@ -491,20 +451,15 @@ final class PageStore {
                 while (candidates != 0) {
                     long run = lowestRun(candidates);
                     candidates &= ~run;
-                    purgeSequence++; // odd: the purger holds slices
-                    try {
-                        long claimed = block.claimFree(run);
-                        long exact = purgeable(block, claimed, now, delay);
-                        if (exact != claimed) {
-                            block.giveBack(claimed & ~exact);
-                        }
-                        while (exact != 0) {
-                            long bits = lowestRun(exact);
-                            exact &= ~bits;
-                            purgeSliceRun(block, bits);
-                        }
-                    } finally {
-                        purgeSequence++;
+                    long claimed = block.claimFree(run);
+                    long exact = purgeable(block, claimed, now, delay);
+                    if (exact != claimed) {
+                        block.giveBack(claimed & ~exact);
+                    }
+                    while (exact != 0) {
+                        long bits = lowestRun(exact);
+                        exact &= ~bits;
+                        purgeSliceRun(block, bits);
                     }
                 }
             }
@@ -524,21 +479,16 @@ final class PageStore {
             if (region.purgesSlices || region.released || !idle(region, now, delay, false)) {
                 continue;
             }
-            purgeSequence++; // odd: the purger holds slices
-            try {
-                int claimed = 0;
-                while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
-                    claimed++;
-                }
-                if (claimed == region.slots && idle(region, now, delay, true) && release(region)) {
-                    continue;
-                }
-                for (int slot = 0; slot < claimed; slot++) {
-                    Segment block = region.blocks[slot];
-                    block.giveBack(block.allFree);
-                }
-            } finally {
-                purgeSequence++;
+            int claimed = 0;
+            while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
+                claimed++;
+            }
+            if (claimed == region.slots && idle(region, now, delay, true) && release(region)) {
+                continue;
+            }
+            for (int slot = 0; slot < claimed; slot++) {
+                Segment block = region.blocks[slot];
+                block.giveBack(block.allFree);
             }
         }
     }

@@ -20,10 +20,10 @@ import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
-import org.junit.jupiter.api.parallel.Isolated;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -32,15 +32,14 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Shared slices: a claim and a purge that hold the same run. Isolated: the claim waits for the purger a bounded time,
- * which other tests' threads must not eat.
+ * Shared slices: a claim racing a purge that holds the only free run.
  */
-@Isolated("The claim's wait for the purger is bounded in time")
-final class SharedSlicePurgeWaitTest {
+final class SharedSlicePurgeRaceTest {
     private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
 
     @RegisterExtension
@@ -50,49 +49,54 @@ final class SharedSlicePurgeWaitTest {
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /**
-     * A claim that finds no fit while the purger holds the only free run waits for it to give the run back and takes
-     * it, instead of mapping a region; the purge itself holds one block's run at most.
+     * The purge holds its run until the claim returned: a claim that waited for the purger would never return, and
+     * fail by the timeout, which runs the test in its own thread for that. The claim maps one region at most, and the
+     * purged run is free again once the purge gave it back.
      */
     @Test
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void aClaimWaitsForThePurgersRunInsteadOfMappingARegion() throws Exception {
+    @Timeout(value = 60, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void aClaimRacingAPurgeNeverWaitsAndMapsOneRegionAtMost() throws Exception {
         final PageStore store = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL)).pageStore;
         int blocks = REGION_SIZE / SEGMENT_SIZE;
+        int purgedBlock = (blocks - 1) * PER_BLOCK;
         assertEquals(0, (int) store.takeRun(blocks), "the whole region");
         Region region = store.regions[0];
         store.freeRun(region, blocks - 1, 1); // the last block is the only free memory
-        // A first purge, so that the one under test does not pay for the first call's linking.
-        store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
-        assertEquals(blocks - 1, (int) store.takeRun(1));
-        store.freeRun(region, blocks - 1, 1);
         final CountDownLatch purging = new CountDownLatch(1);
+        final AtomicBoolean claimed = new AtomicBoolean();
         final AtomicReference<String> failure = new AtomicReference<String>();
         regions.onPurge = () -> {
             purging.countDown();
-            // Hold the run until the claim waits for it, or long enough to see that it does not.
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (store.purgeWaits == 0 && System.nanoTime() - deadline < 0) {
+            while (!claimed.get()) {
                 Thread.yield();
             }
         };
         Thread purger = new Thread(() -> {
             try {
-                store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
+                store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
             } catch (Throwable t) {
                 failure.compareAndSet(null, t.toString());
+            } finally {
+                purging.countDown();
             }
         });
         purger.start();
-        assertTrue(purging.await(10, TimeUnit.SECONDS));
-        long run = store.claimSlices(9, 0, false);
+        purging.await();
+        long run;
+        try {
+            run = store.claimSlices(9, 0, false);
+        } finally {
+            claimed.set(true);
+        }
         purger.join();
         assertNull(failure.get());
-        assertEquals(1, store.purgeWaits);
-        assertEquals((blocks - 1) * PER_BLOCK, (int) run, "the purged block");
-        assertEquals(1, store.regionCount(), "no region mapped for slices out for their purge");
-        assertEquals(2, regions.purgeCalls());
-        assertArrayEquals(new int[] {(blocks - 1) * SEGMENT_SIZE, SEGMENT_SIZE}, regions.purges.get(1));
+        assertEquals(1, regions.purgeCalls());
+        assertArrayEquals(new int[] {(blocks - 1) * SEGMENT_SIZE, SEGMENT_SIZE}, regions.purges.get(0));
+        assertNotEquals((long) purgedBlock, run, "the run the purger held");
+        assertTrue(store.regionCount() <= 2, store.regionCount() + " regions");
+        int regionsMapped = store.regionCount();
+        assertEquals(purgedBlock, (int) store.claimSlices(9, 0, false), "the purged block, given back");
+        assertEquals(regionsMapped, store.regionCount());
         store.close();
     }
-
 }
