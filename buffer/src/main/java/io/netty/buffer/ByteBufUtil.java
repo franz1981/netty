@@ -90,6 +90,9 @@ public final class ByteBufUtil {
         } else if ("adaptive".equals(allocType)) {
             alloc = new AdaptiveByteBufAllocator();
             logger.debug("-Dio.netty.allocator.type: {}", allocType);
+        } else if ("mimalloc".equals(allocType)) {
+            alloc = new io.github.neoionet.netty.mimalloc.MiByteBufAllocator();
+            logger.debug("-Dio.netty.allocator.type: {}", allocType);
         } else {
             alloc = PooledByteBufAllocator.DEFAULT;
             logger.debug("-Dio.netty.allocator.type: pooled (unknown: {})", allocType);
