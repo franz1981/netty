@@ -31,6 +31,20 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
+ * The units, largest first, and their names in the code:
+ * <pre>
+ * region      256 MiB, one mmap; shared by all heaps' chunks      {@link Region}
+ *  block      4 MiB, one 64-bit free bitmap                       {@link Segment}; a region's "slot"
+ *   slice     64 KiB, one bit of its block's bitmap
+ *    chunk    a run of slices serving one size class              SizeClassedChunk
+ *     slot    one buffer's place in a chunk                       SizeClassedChunk's "segment", segmentSize
+ *    span     a run of slices holding one buffer above the sizes  SpanMagazine, SharedSpanChunk
+ * heap        a thread-local heap or a stripe                     {@link HeapSegments}
+ * reserve     the wholly free blocks a heap keeps                 {@link HeapSegments#reserve}
+ * </pre>
+ * With shared slices off, a heap takes whole blocks of the regions instead, and carves its chunks in them. Without
+ * regions, each block is an allocation of its own; for heap memory, one {@code byte[]} (4032 KiB).
+ * <p>
  * Where an allocator's heaps take their segments from and give them back to: free slots of its {@link Region}s, or,
  * without a {@link RegionSource}, one allocation per segment. Slow paths only: once per segment taken or given back,
  * and the heaps' decays.
