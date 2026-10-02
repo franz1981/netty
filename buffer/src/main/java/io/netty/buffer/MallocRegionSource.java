@@ -16,12 +16,12 @@
 package io.netty.buffer;
 
 /**
- * Regions of one block each, plain direct buffers of a {@link AdaptivePoolingAllocator.ChunkAllocator}: libc
- * {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}, charged to the direct memory limit by their
- * allocation, as mimalloc's Java port allocates its 4 MiB segments. No part of a block can go back; a wholly idle one
- * goes back by its release ({@code free}), and whether that returns memory to the OS is the libc allocator's business.
- * For the direct allocator where {@code mmap} regions cannot be had (before Java 22, without native access) or are
- * turned off.
+ * Regions of one block each, one allocation of a {@link AdaptivePoolingAllocator.ChunkAllocator} per block, as
+ * mimalloc's Java port allocates its 4 MiB segments. No part of a block can go back; a wholly idle one goes back by
+ * its release. Direct: libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}, charged to the direct
+ * memory limit by the allocation, for where {@code mmap} regions cannot be had (before Java 22, without native access)
+ * or are turned off; whether a {@code free} returns memory to the OS is the libc allocator's business. Heap: a
+ * {@code byte[]}, which the GC reclaims once released.
  */
 final class MallocRegionSource implements RegionSource {
     private final AdaptivePoolingAllocator.ChunkAllocator allocator;
@@ -30,7 +30,7 @@ final class MallocRegionSource implements RegionSource {
         this.allocator = allocator;
     }
 
-    /** {@code alignment} is not honoured: libc's own. */
+    /** {@code alignment} is not honoured: the allocator's own. */
     @Override
     public AbstractByteBuf allocateRegion(int size, int alignment) {
         return allocator.allocate(size, size);
@@ -43,6 +43,6 @@ final class MallocRegionSource implements RegionSource {
 
     @Override
     public void purge(AbstractByteBuf region, int offset, int length) {
-        throw new UnsupportedOperationException("a malloc'd region goes back whole only");
+        throw new UnsupportedOperationException("a region of this source goes back whole only");
     }
 }

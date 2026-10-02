@@ -613,10 +613,9 @@ public class AdaptiveSegmentsTest {
 
     /**
      * The defaults: 4 MiB segments in 64-segment regions; 2 MiB segments in low-memory mode, where the single stripe
-     * carves its chunks out of segments too. Regions wherever they can be mapped, for direct memory only. The memory
-     * accounted is a segment, with regions or not, direct or heap. Heap segments are cut under G1 (see
-     * {@link PageStoreConfig#heapSegmentSizeOf}); a heap reserves up to 8 of them, as a direct heap does without
-     * regions.
+     * carves its chunks out of segments too. {@code mmap} regions wherever they can be mapped, for direct memory only;
+     * else regions of one block, as heap memory always has. The memory accounted is a segment, direct or heap. Heap
+     * segments are cut under G1 (see {@link PageStoreConfig#heapSegmentSizeOf}).
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
@@ -640,11 +639,11 @@ public class AdaptiveSegmentsTest {
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
         int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
         assertEquals(heapSegmentSize, heapStore.config.segmentSize);
-        assertNull(heapStore.regionSource);
-        assertEquals(PageStoreConfig.HEAP_RESERVED_SEGMENTS, heapStore.reserveLimit());
+        assertTrue(heapStore.regionSource instanceof MallocRegionSource);
+        assertEquals(heapSegmentSize, heapStore.config.regionSize);
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNotNull(chunkOf(heap).segment);
-        assertNull(chunkOf(heap).segment.region);
+        assertSame(chunkOf(heap).segment.region.buffer, chunkOf(heap).segment.buffer);
         assertSame(chunkOf(heap).segment.buffer.array(), heap.array());
         assertEquals(heapSegmentSize, allocator.metric().usedHeapMemory());
         buf.release();

@@ -219,22 +219,33 @@ final class SharedSlicesTest {
 
     /**
      * Threads claim runs and whole blocks, write their slices, check them and release them, while a purger purges
-     * every free slice it can ({@code mmap}), or gives back every wholly free region ({@code malloc}): no slice is
-     * ever claimed twice, none in use is purged or given back (its owner would see zeroes or freed memory, and the
-     * source itself checks), the memory accounting holds after, and every slice is free.
+     * every free slice it can ({@code mmap}), or gives back every wholly free region ({@code malloc}, and
+     * {@code heap}: one {@code byte[]} block of the heap allocator's size, 63 slices): no slice is ever claimed twice,
+     * none in use is purged or given back (its owner would see zeroes or freed memory, and the source itself checks),
+     * the memory accounting holds after, and every slice is free.
      */
-    @ParameterizedTest(name = "malloc: {0}")
-    @ValueSource(booleans = {false, true})
+    @ParameterizedTest(name = "source: {0}")
+    @ValueSource(strings = {"mmap", "malloc", "heap"})
     @Timeout(value = 120, unit = TimeUnit.SECONDS)
-    void concurrentClaimsReleasesAndPurges(boolean malloc) throws Exception {
+    void concurrentClaimsReleasesAndPurges(String kind) throws Exception {
         final int threads = 8;
         final int maxRegions = 256;
+        final boolean mmap = "mmap".equals(kind);
         final AtomicIntegerArray owners = new AtomicIntegerArray(maxRegions * PER_REGION);
         final AtomicReference<String> failure = new AtomicReference<String>();
-        final CheckingRegionSource source = new CheckingRegionSource(malloc ? new CountingRegionSource(true) : regions,
-                owners, failure);
-        // malloc'd regions are one block each, as the direct allocator's.
-        final PageStore store = newSharedAllocator(segments, source, malloc ? SEGMENT_SIZE : REGION_SIZE, 1).pageStore;
+        final CheckingRegionSource source = new CheckingRegionSource(mmap ? regions :
+                new CountingRegionSource(true, "heap".equals(kind)), owners, failure);
+        // malloc'd and byte[] regions are one block each, as the direct and heap allocators'.
+        final boolean heap = "heap".equals(kind);
+        final CountingSegmentSource segments = heap ? new CountingSegmentSource(true) : this.segments;
+        final PageStore store;
+        if (heap) {
+            int block = PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES;
+            store = new AdaptivePoolingAllocator(segments, true, segments, source,
+                    new PageStoreConfig(block, SLICE, 1, 0, 0, block).withMallocRegions()).pageStore;
+        } else {
+            store = newSharedAllocator(segments, source, mmap ? REGION_SIZE : SEGMENT_SIZE, 1).pageStore;
+        }
         source.store = store;
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         final CountDownLatch start = new CountDownLatch(1);
@@ -274,8 +285,10 @@ final class SharedSlicesTest {
         assertTrue(store.regionCount() <= maxRegions);
         assertTrue(operations.get() > 1000, "too few claims to mean anything: " + operations.get());
         assertEquals(0, store.sliceCounts()[0], "a slice is still claimed");
+        assertEquals(0, segments.segmentsAllocated());
+        assertEquals(heap, source.delegate.regions.get(0).hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);
-        if (malloc) {
+        if (!mmap) {
             // All free and idle now: every region goes back.
             store.purgeIfDue(System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             assertEquals(0, countLive(store), "a wholly free region stayed");
@@ -337,12 +350,14 @@ final class SharedSlicesTest {
         private final AtomicReference<String> failure;
         private final int id;
         private final SplittableRandom random;
+        private final int perBlock;
         /** Held runs: {region, first slice, slices, whole blocks (0 or 1)}. */
         private final List<int[]> held = new ArrayList<int[]>();
         private long stamp;
 
         Worker(PageStore store, AtomicIntegerArray owners, AtomicReference<String> failure, int id) {
             this.store = store;
+            perBlock = store.config.slicesPerSegment();
             this.owners = owners;
             this.failure = failure;
             this.id = id;
@@ -369,7 +384,7 @@ final class SharedSlicesTest {
                 int blocks = 1 + random.nextInt(Math.min(2, store.config.segmentsPerRegion()));
                 long taken = store.takeRun(blocks);
                 assertTrue(taken >= 0);
-                run = new int[] {(int) (taken >>> 32), (int) taken * PER_BLOCK, blocks * PER_BLOCK, 1};
+                run = new int[] {(int) (taken >>> 32), (int) taken * perBlock, blocks * perBlock, 1};
             } else {
                 int n = SIZES[random.nextInt(SIZES.length)];
                 long claimed = store.claimSlices(n, id, PageStore.NO_HEAP);
@@ -406,9 +421,9 @@ final class SharedSlicesTest {
             }
             Region region = store.region(run[0]);
             if (run[3] == 1) {
-                store.freeRun(region, run[1] / PER_BLOCK, run[2] / PER_BLOCK);
+                store.freeRun(region, run[1] / perBlock, run[2] / perBlock);
             } else {
-                store.releaseSlices(region.block(run[1] / PER_BLOCK), run[1] % PER_BLOCK, run[2]);
+                store.releaseSlices(region.block(run[1] / perBlock), run[1] % perBlock, run[2]);
             }
         }
     }

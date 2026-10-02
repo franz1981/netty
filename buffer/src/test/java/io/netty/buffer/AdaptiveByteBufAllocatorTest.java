@@ -288,11 +288,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Whether the allocator takes buffers above half a segment from its page store: only direct memory in regions;
-     * without them such a buffer is a one-shot of its own.
+     * Whether the allocator takes buffers above half a segment from its page store: in regions, outside low-memory
+     * mode; else such a buffer is a one-shot of its own.
      */
     private static boolean storeOneShots(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
-        return direct && directRegions(allocator) && !isLowMemory();
+        PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
+        return store != null && store.regionSource != null && !isLowMemory();
     }
 
     /**
@@ -318,7 +319,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int grown = (int) unit;
         buffer.capacity(grown);
         assertEquals(grown, buffer.capacity());
-        boolean regions = direct && directRegions(allocator);
+        boolean regions = storeOneShots(allocator, direct);
         // The first segment went back: a region slot stays committed, a segment of its own is freed.
         assertEquals(regions ? 2 * unit : unit, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
         assertEquals(0x0123456789ABCDEFL, buffer.getLong(0));
@@ -493,13 +494,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Idle memory above the size classes is bounded in bytes, whatever the size of the chunks, and the bound is
-     * applied by the releases: after a burst of large buffers is released, no more than the idle bound plus the
-     * chunk the magazine allocates from is held, without any further allocation.
+     * Idle memory above the size classes is bounded in bytes, whatever the size of the chunks: after a burst of large
+     * buffers is released, no more than the idle bound plus the chunk the magazine allocates from is held, without
+     * any further allocation, once the page store purged what stayed free for its delay.
      */
     @Test
     void idleBuddyMemoryIsBoundedInBytes() {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
+        PageStore store = heap(allocator).pageStore;
         int size = 1024 * 1024; // the largest pooled size: the largest chunks
         ByteBuf first = allocator.heapBuffer(size, size);
         long chunkSize = allocator.usedHeapMemory();
@@ -514,8 +516,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        // No allocation follows: a heap that goes quiet must not keep the burst. The releases themselves apply the
-        // bound (nothing else holds the stripe lock here, so every release acts in place).
+        // No allocation follows: a heap that goes quiet must not keep the burst. Without a page store the releases
+        // themselves apply the bound (nothing else holds the stripe lock here, so every release acts in place).
+        if (store != null) {
+            store.purgeIfDue(System.nanoTime() + 2 * store.config.purgeDelayNanos);
+        }
         long settled = allocator.usedHeapMemory();
         long bound = AdaptivePoolingAllocator.CHUNK_REUSE_QUEUE_BYTES;
         assertTrue(settled <= bound + chunkSize, "peak " + peak + ", settled " + settled + ", bound " + bound);

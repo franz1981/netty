@@ -82,10 +82,8 @@ import java.util.function.IntConsumer;
  * {@link SizeClassChunkRecycler} so a chunk of another size class can be built from the same memory.
  * <p>
  * The size classes do not allocate their chunks one by one: every chunk is a run of 64 KiB slices of the allocator's
- * {@link PageStore}. For direct memory the slices are shared by all heaps ({@code mmap} or {@code malloc}'d regions):
- * a chunk given up frees its run at once, for any heap. For heap memory each heap carves its chunks out of
- * {@code byte[]} blocks of its own (see {@link HeapSegments}), keeps the emptied ones in a reserve and gives idle ones
- * back by halves.
+ * {@link PageStore}, shared by all heaps ({@code mmap}'d regions, {@code malloc}'d blocks, or {@code byte[]} blocks for
+ * heap memory): a chunk given up frees its run at once, for any heap.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -766,12 +764,12 @@ final class AdaptivePoolingAllocator {
      * As {@link #chunkBufferAllocated}, for {@code bytes} of a region's shared slices from {@code address} that the
      * {@link PageStore} just committed: allocates nothing unless a JFR event is committed.
      */
-    void storeBytesCommitted(long address, int bytes, boolean threadLocal) {
+    void storeBytesCommitted(long address, int bytes, boolean direct, boolean threadLocal) {
         chunkRegistry.add(bytes);
         if (PlatformDependent.isJfrEnabled() && AllocateChunkEvent.isEventEnabled()) {
             AllocateChunkEvent event = new AllocateChunkEvent();
             if (event.shouldCommit()) {
-                event.fill(new StoreBytes(address, bytes), AdaptiveByteBufAllocator.class);
+                event.fill(new StoreBytes(address, bytes, direct), AdaptiveByteBufAllocator.class);
                 event.pooled = true;
                 event.threadLocal = threadLocal;
                 event.segment = true;
@@ -781,12 +779,12 @@ final class AdaptivePoolingAllocator {
     }
 
     /** As {@link #chunkBufferFreed}, for {@code bytes} of shared slices whose memory the {@link PageStore} purged. */
-    void storeBytesReleased(long address, int bytes) {
+    void storeBytesReleased(long address, int bytes, boolean direct) {
         chunkRegistry.remove(bytes);
         if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
             FreeChunkEvent event = new FreeChunkEvent();
             if (event.shouldCommit()) {
-                event.fill(new StoreBytes(address, bytes), AdaptiveByteBufAllocator.class);
+                event.fill(new StoreBytes(address, bytes, direct), AdaptiveByteBufAllocator.class);
                 event.pooled = true;
                 event.segment = true;
                 event.commit();
@@ -794,14 +792,16 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    /** Shared slices of a region, for the JFR chunk events only. */
+    /** Shared slices or a whole region, for the JFR chunk events only. */
     private static final class StoreBytes implements ChunkInfo {
         private final long address;
         private final int bytes;
+        private final boolean direct;
 
-        StoreBytes(long address, int bytes) {
+        StoreBytes(long address, int bytes, boolean direct) {
             this.address = address;
             this.bytes = bytes;
+            this.direct = direct;
         }
 
         @Override
@@ -811,7 +811,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public boolean isDirect() {
-            return true;
+            return direct;
         }
 
         @Override

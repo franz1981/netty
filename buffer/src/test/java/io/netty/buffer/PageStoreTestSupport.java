@@ -134,6 +134,7 @@ final class PageStoreTestSupport {
         final MmapRegionSource mmap;
         /** Whether this stands for {@link MallocRegionSource}: whole regions only, charged by their allocation. */
         final boolean malloc;
+        final boolean heap;
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
         /** Regions given back, in call order. */
         final List<AbstractByteBuf> released = new ArrayList<AbstractByteBuf>();
@@ -145,7 +146,14 @@ final class PageStoreTestSupport {
         }
 
         CountingRegionSource(boolean malloc) {
+            this(malloc, false);
+        }
+
+        /** {@code heap}: whole regions only, each a {@code byte[]}, as the heap allocator's. */
+        CountingRegionSource(boolean malloc, boolean heap) {
+            assert malloc || !heap;
             this.malloc = malloc;
+            this.heap = heap;
             mmap = !malloc && MmapRegionSource.isAvailable() ? new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) :
                     null;
         }
@@ -197,6 +205,7 @@ final class PageStoreTestSupport {
         @Override
         public synchronized AbstractByteBuf allocateRegion(int size, int alignment) {
             AbstractByteBuf region = mmap != null ? mmap.allocateRegion(size, alignment) :
+                    heap ? new UnpooledHeapByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size) :
                     UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size);
             regions.add(region);
             return region;

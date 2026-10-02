@@ -96,7 +96,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
-    /** Heap chunk buffers, and the segments the size classes carve their chunks out of: one {@code byte[]} each. */
+    /** Heap chunk buffers, and the blocks the size classes carve their chunks out of: one {@code byte[]} each. */
     private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
         private final ByteBufAllocator allocator;
 
@@ -119,6 +119,12 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         @Override
         public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
             return segment;
+        }
+
+        /** Regions of one block each, one {@code byte[]} per block. */
+        @Override
+        public RegionSource mallocRegionSource() {
+            return new MallocRegionSource(this);
         }
     }
 

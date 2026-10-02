@@ -51,13 +51,13 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * <p>
  * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})
  * purge the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
- * memory behind it to its purge; {@code malloc}'d regions ({@link MallocRegionSource}) are charged and counted whole by
- * their allocation, and go back whole once all of them stayed free for the delay. One purger at a time, driven by the
- * heaps' ticks: see {@link #purgeIfDue}.
+ * memory behind it to its purge; regions of one block ({@link MallocRegionSource}: a {@code malloc}'d 4 MiB, or a
+ * {@code byte[]} of 4032 KiB for heap memory) are charged and counted whole by their allocation, and go back whole once
+ * all of them stayed free for the delay. One purger at a time, driven by the heaps' ticks: see {@link #purgeIfDue}.
  * <p>
- * Without a region source (heap memory, a {@code byte[]} of 4032 KiB per block), or once no region can be mapped, a
- * heap allocates blocks of its own, carves its chunks in them and keeps a reserve of wholly free ones (see
- * {@link HeapSegments}); each is counted and, for direct memory, charged by its allocation.
+ * Without a region source, or once no region can be mapped, a heap allocates blocks of its own, carves its chunks in
+ * them and keeps a reserve of wholly free ones (see {@link HeapSegments}); each is counted and, for direct memory,
+ * charged by its allocation.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -253,9 +253,9 @@ final class PageStore {
             if (event != null) {
                 AbstractPageStoreCallEvent.end(event, 0, config.regionSize, seen.length, e);
             }
-            if (e instanceof OutOfDirectMemoryError) {
-                // The direct memory limit, charged by a malloc'd region's allocation: this allocation fails, the
-                // next region may well fit.
+            if (e instanceof OutOfDirectMemoryError || !purgesSlices) {
+                // A block of its own (malloc, byte[]) that cannot be had, or the direct memory limit it is charged
+                // to: this allocation fails, the next region may well fit.
                 throw e;
             }
             mapsRegions = false;
@@ -270,7 +270,8 @@ final class PageStore {
         Region region = sharedRegion(buffer);
         if (!purgesSlices) {
             // Charged by its allocation, counted whole from now on.
-            allocator.storeBytesCommitted(buffer._memoryAddress(), config.regionSize, heap == THREAD_LOCAL);
+            allocator.storeBytesCommitted(buffer._memoryAddress(), config.regionSize, buffer.isDirect(),
+                    heap == THREAD_LOCAL);
         }
         int index = 0;
         while (index < seen.length && !seen[index].released) {
@@ -432,7 +433,7 @@ final class PageStore {
                     }
                 }
                 SLICES_COMMITTED.addAndGet(this, fresh);
-                allocator.storeBytesCommitted(address, fresh * sliceSize, heap == THREAD_LOCAL);
+                allocator.storeBytesCommitted(address, fresh * sliceSize, block.isDirect(), heap == THREAD_LOCAL);
                 // A memory event, as the purge's give-back: from the run's start, for the slices committed now.
                 taken(address, (long) fresh * sliceSize, 0, region.index, SHARED_SLICES, heap);
             }
@@ -517,7 +518,8 @@ final class PageStore {
             if (purgesSlices) {
                 closeSlices(region);
             } else {
-                allocator.storeBytesReleased(region.buffer._memoryAddress(), config.regionSize);
+                allocator.storeBytesReleased(region.buffer._memoryAddress(), config.regionSize,
+                        region.buffer.isDirect());
             }
             long address = region.buffer._memoryAddress();
             Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
@@ -550,7 +552,7 @@ final class PageStore {
             }
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
-                allocator.storeBytesReleased(block.memoryAddress(), committed * sliceSize);
+                allocator.storeBytesReleased(block.memoryAddress(), committed * sliceSize, block.isDirect());
             }
         }
     }
@@ -687,7 +689,7 @@ final class PageStore {
         }
         long address = region.buffer._memoryAddress();
         region.released = true;
-        allocator.storeBytesReleased(address, config.regionSize);
+        allocator.storeBytesReleased(address, config.regionSize, region.buffer.isDirect());
         Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
                 PageStoreUnmapEvent.start() : null;
         Throwable failure = null;
@@ -760,7 +762,7 @@ final class PageStore {
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     long address = region.buffer._memoryAddress() + offset;
-                    allocator.storeBytesReleased(address, length);
+                    allocator.storeBytesReleased(address, length, block.isDirect());
                     givenBack(address, length, 0, region.index, PURGED_SLICES, NO_HEAP);
                 }
             } finally {

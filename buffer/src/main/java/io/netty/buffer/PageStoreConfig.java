@@ -196,10 +196,10 @@ final class PageStoreConfig {
                 mallocRegionSize);
     }
 
-    /** The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. */
+    /** Regions of one block, one {@code byte[]} each (see {@link MallocRegionSource}): nothing to map nor purge. */
     static PageStoreConfig heapDefaults() {
         return new PageStoreConfig(HEAP_SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
-                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), HEAP_RESERVED_SEGMENTS);
+                TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), 0, 0, HEAP_SEGMENT_SIZE_BYTES);
     }
 
     /**
