@@ -1807,8 +1807,11 @@ final class AdaptivePoolingAllocator {
          * other chunk that empties goes to the heap's {@link SizeClassChunkRecycler}, whose byte budget bounds idle
          * memory. One chunk, or four when chunks are spans of segments: there, at one, 89% of the chunks made were
          * made again within 10 ms of an eviction of their class (lao's harness, API_GATEWAY, 1024 live), each a chunk
-         * object of garbage; mimalloc too keeps up to 3 empty pages of a small size class before freeing them
-         * (MI_RETIRE_MAX_PAGES in https://github.com/microsoft/mimalloc/blob/main/src/page.c).
+         * object of garbage; mimalloc too keeps up to 3 empty pages of a small size class before freeing them:
+         * {@code MI_RETIRE_MAX_PAGES} and {@code _mi_page_retire},
+         * https://github.com/microsoft/mimalloc/blob/31d034d/src/page.c#L596-L638, as does the
+         * Java port's {@code pageRetire} (https://github.com/neoionet/netty-allocator at 397e933,
+         * MiMallocByteBufAllocator.java lines 1745-1768).
          */
         private boolean atOrBelowFloor() {
             return exhausted.size + reusable.size <= floor;
@@ -3006,7 +3009,7 @@ final class AdaptivePoolingAllocator {
         private static final int COUNT_SHIFT = 5;
         private static final long OWNER_STAMP = 1;
         private static final int COLOUR_SHIFT = 6;
-        /** 4032 bytes at most, as mimalloc's large-allocation colours. */
+        /** 4032 bytes at most, as mimalloc's large colours: https://github.com/microsoft/mimalloc/pull/1339 */
         private static final int MAX_COLOURS = 64;
 
         final AdaptivePoolingAllocator allocator;

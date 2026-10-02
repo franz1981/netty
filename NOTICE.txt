@@ -263,6 +263,22 @@ decompression for Java., which can be obtained at:
   * HOMEPAGE:
     * https://github.com/hyperxpro/Brotli4j
 
+This product contains a modified portion of 'mimalloc', a compact general purpose
+allocator, which can be obtained at:
+
+  * LICENSE:
+    * license/LICENSE.mimalloc.txt (MIT License)
+  * HOMEPAGE:
+    * https://github.com/microsoft/mimalloc
+
+This product contains a modified portion of 'netty-allocator', a Java port of
+mimalloc for Netty, which can be obtained at:
+
+  * LICENSE:
+    * LICENSE.txt (Apache License 2.0)
+  * HOMEPAGE:
+    * https://github.com/neoionet/netty-allocator
+
 This product is statically linked against Quiche.
 
  * LICENSE:

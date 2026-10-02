@@ -25,7 +25,8 @@ import java.util.concurrent.locks.StampedLock;
  * reserve, whole: taken again, it costs no allocation. The reserve holds {@link PageStore#reserveLimit} segments at
  * most: when full, its oldest goes back to the store. Each {@link #decay} gives back, oldest first, half (rounded up)
  * of the segments that stayed in the reserve since the previous one, as mimalloc does with its per-heap segment
- * reserve.
+ * reserve; taken from the Java port of mimalloc in https://github.com/neoionet/netty-allocator at 397e933:
+ * MiMallocByteBufAllocator.java lines 1015-1027 (the reserve) and 2275-2283 (its halving decay).
  * <p>
  * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim}),
  * chunk deallocation ({@link #release}) and decays only. After {@link #markFreed}, releases may come from any thread:

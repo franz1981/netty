@@ -104,10 +104,13 @@ final class Region {
      * returns its first slice in the region, or -1 when no block has such a run. Lock-free: one CAS on the block's
      * bitmap, again only if another thread changed it meanwhile.
      * <p>
-     * As mimalloc v3's {@code mi_bbitmap_try_find_and_clear_generic} (bitmap.c): the blocks claimed in so far are
-     * visited from {@code seq} modulo their count, wrapping around, so that heaps with different sequences start in
-     * different blocks, then the blocks never claimed in, in order; within a block, the lowest fitting run (first fit,
-     * as {@code mi_bchunk_try_find_and_clearNX}). A run never crosses a block.
+     * As mimalloc v3's {@code mi_bbitmap_try_find_and_clear_generic}
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884): the blocks
+     * claimed in so far are visited from {@code seq} modulo their count, wrapping around, so that heaps with different
+     * sequences start in different blocks, then the blocks never claimed in, in order; within a block, the lowest
+     * fitting run (first fit, as {@code mi_bchunk_try_find_and_clearNX},
+     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849). A run never
+     * crosses a block.
      */
     int claimSlices(int n, int seq) {
         Segment[] blocks = segments;
@@ -130,8 +133,9 @@ final class Region {
 
     /**
      * Shared slices, any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
-     * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk: from the start, whole blocks
-     * only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
+     * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1950-L1997): from the
+     * start, whole blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
      */
     int claimBlocks(int n) {
         Segment[] blocks = segments;

@@ -51,10 +51,11 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * its allocation.
  * <p>
  * Shared slices ({@link PageStoreConfig#sharesSlices}), as mimalloc v3 claims a page's slices straight from its
- * arena's bitmap: each slot of a region is a block of slices whose free bitmap any thread claims runs in by CAS (see
- * {@link Region#claimSlices}), and a size-class chunk, a large-buffer span or a one-shot buffer is such a run, given
- * back by CAS from whichever thread frees it ({@link #releaseSlices}): no heap holds a region segment, and a hole one
- * heap leaves is reused by any. Used memory and the direct memory limit then count slices: from the claim that finds
+ * arena's bitmap (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246): each slot of a
+ * region is a block of slices whose free bitmap any thread claims runs in by CAS (see {@link Region#claimSlices}),
+ * and a size-class chunk, a large-buffer span or a one-shot buffer is such a run, given back by CAS from whichever
+ * thread frees it ({@link #releaseSlices}): no heap holds a region segment, and a hole one heap leaves is reused by
+ * any. Used memory and the direct memory limit then count slices: from the claim that finds
  * no memory behind a slice to the purge of its memory (or the close). The purge works on the free slices, as on
  * the free slots: see {@link #purgeIfDue}. When no region can be mapped, a heap falls back to segments of its own.
  */
@@ -81,7 +82,10 @@ final class PageStore {
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
-    /** mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments. */
+    /**
+     * mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments, as in the Java port of mimalloc in
+     * https://github.com/neoionet/netty-allocator at 397e933, MiMallocByteBufAllocator.java line 367.
+     */
     private static final int RESERVE_BYTES = 32 * 1024 * 1024;
     private static final int MAX_RESERVED_SEGMENTS = 8;
     // The heap a segment is taken or given back for, in the JFR events.
@@ -727,10 +731,12 @@ final class PageStore {
     /**
      * Shared slices: purges the free slices with memory behind them freed {@link PageStoreConfig#purgeDelayNanos} ago
      * or earlier, one call per run of contiguous ones within a block. As mimalloc v3's {@code mi_arena_try_purge_range}
-     * (arena.c): a run's slices are claimed by CAS first, so that no claim can take them while their memory goes, and
-     * given back after; and as its {@code _mi_bitmap_forall_setc_ranges} (bitmap.c), a run never spans more than one
-     * bitmap word (a block): the purger holds at most one block's run at a time, and a claim meanwhile finds every
-     * other free slice (see {@link #awaitPurgedRun}).
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2345-L2359): a run's
+     * slices are claimed by CAS first, so that no claim can take them while their memory goes, and given back after;
+     * and as its {@code _mi_bitmap_forall_setc_ranges}
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1466-L1509), a run never
+     * spans more than one bitmap word (a block): the purger holds at most one block's run at a time, and a claim
+     * meanwhile finds every other free slice (see {@link #awaitPurgedRun}).
      */
     private void purgeSharedSlices(long now) {
         long delay = config.purgeDelayNanos;
