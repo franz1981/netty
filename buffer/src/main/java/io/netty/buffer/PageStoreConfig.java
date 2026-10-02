@@ -111,7 +111,7 @@ final class PageStoreConfig {
     /**
      * How often, at most, the store runs a purge pass: a quarter of the delay, so that free memory goes back between
      * one delay and a delay and a quarter after it was freed, while the heaps allocate (see
-     * {@link PageStore#purgeIfDue}).
+     * {@link PageStore#purgeIfDue}), unless more is due than passes of {@link PageStore#PURGE_CALLS} calls take.
      */
     final long purgeCheckNanos;
     /**

@@ -87,8 +87,8 @@ final class PageStore {
     private volatile int purging;
     /** Set by tests. */
     volatile long lastPurgeNanos = System.nanoTime();
-    // Read by every run release, written by the release that arms and by the purger: on this object's lines with
-    // regions and slicesCommitted, which every claim reads.
+    // Read by every run release, written once per arming by a release and by the purger. HotSpot packs this object's
+    // fields into about 150 bytes, so these share lines with regions, slicesCommitted and the purger's counters.
     /** 1 once a run was released since the purger last disarmed: see {@link #armPurge}. */
     private volatile int armed;
     /** When {@link #armed} was set, as {@link System#nanoTime()}: a pass waits the purge delay from then. */
