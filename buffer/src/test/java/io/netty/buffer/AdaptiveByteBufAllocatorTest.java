@@ -258,7 +258,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Buffers above the largest pooled size, and above half a segment with a page store, get a one-shot chunk of
+     * Buffers above the largest pooled size, without a page store or in low-memory mode, get a one-shot chunk of
      * their own, of their exact size: accounted while the buffer lives, replaced on growth with the content kept, and
      * freed as soon as the buffer is released.
      */
@@ -266,9 +266,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ValueSource(booleans = {true, false})
     void oneShotChunkIsFreedWithItsBuffer(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeFalse(storeOneShots(allocator, direct), "see oneShotBuffersTakeWholeSegments");
+        assumeFalse(spansUpToABlock(allocator, direct), "see buffersUpToABlockAreSpans");
         ByteBufAllocatorMetric metric = allocator.metric();
-        int size = 2200000; // above half of a 4 MiB or 4032 KiB segment
+        int size = 2200000; // above the largest pooled size
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
         assertEquals(size, buffer.capacity());
@@ -287,46 +287,46 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
     }
 
-    /**
-     * Whether the allocator takes buffers above half a segment from its page store: in regions, outside low-memory
-     * mode; else such a buffer is a one-shot of its own.
-     */
-    private static boolean storeOneShots(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
+    /** Whether the allocator's page store holds the buffers above the size classes, up to a block, as spans. */
+    private static boolean spansUpToABlock(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
         PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
-        return store != null && store.regionSource != null && !isLowMemory();
+        return store != null && !isLowMemory();
     }
 
     /**
-     * With regions, a buffer above half a segment and up to a segment takes a whole slot, given back to its region
-     * when it is released, where it stays committed, counted, until a purge.
+     * With a page store, a buffer above half a block and up to a block is a span of whole slices: counted by its
+     * slices in {@code mmap}'d regions, by its whole block in regions of one block. Grown to a whole block, it moves
+     * to another block; the first span goes back free and stays counted, as the second does once released, until a
+     * purge.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void oneShotBuffersTakeWholeSegments(boolean direct) throws Exception {
+    void buffersUpToABlockAreSpans(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeTrue(storeOneShots(allocator, direct), "no regions for buffers above half a segment");
-        long unit = direct ? directPageStoreUnit(allocator) : heapSegmentSize(allocator);
-        int size = (int) (unit / 4 * 3); // above half a segment
-        assumeTrue(size > 1024 * 1024, "one-shots are above 1 MiB: segments of " + unit + " hold none");
+        assumeTrue(spansUpToABlock(allocator, direct), "low-memory mode: no spans above the size classes");
+        PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
+        int block = store.config.segmentSize;
+        int slice = store.config.sliceSize;
+        int size = block / 4 * 3; // above half a block
+        long span = (size + slice - 1) / slice * (long) slice;
+        boolean perSlice = store.regionSource.canPurgeSlices();
         ByteBufAllocatorMetric metric = allocator.metric();
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
         assertEquals(size, buffer.capacity());
-        assertEquals(unit, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        assertEquals(perSlice ? span : block, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
         buffer.writeLong(0x0123456789ABCDEFL);
         buffer.setLong(size - 8, 0xFEDCBA9876543210L);
 
-        int grown = (int) unit;
-        buffer.capacity(grown);
-        assertEquals(grown, buffer.capacity());
-        boolean regions = storeOneShots(allocator, direct);
-        // The first segment went back: a region slot stays committed, a segment of its own is freed.
-        assertEquals(regions ? 2 * unit : unit, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        buffer.capacity(block);
+        assertEquals(block, buffer.capacity());
+        long both = perSlice ? span + block : 2L * block;
+        assertEquals(both, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
         assertEquals(0x0123456789ABCDEFL, buffer.getLong(0));
         assertEquals(0xFEDCBA9876543210L, buffer.getLong(size - 8));
 
         assertTrue(buffer.release());
-        assertEquals(regions ? 2 * unit : 0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
+        assertEquals(both, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
     }
 
     @Test

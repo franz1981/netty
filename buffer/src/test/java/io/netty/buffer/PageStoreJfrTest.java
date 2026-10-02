@@ -33,7 +33,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
-import static io.netty.buffer.PageStoreTestSupport.MIB;
 import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
@@ -127,11 +126,11 @@ public class PageStoreJfrTest {
                 }
             });
             ByteBuf span = allocator.allocate(512 * 1024, 512 * 1024); // a span of 8 slices
-            ByteBuf oneShot = allocator.allocate(3 * MIB, 3 * MIB); // a whole block
+            ByteBuf whole = allocator.allocate(SEGMENT_SIZE, SEGMENT_SIZE); // a span of a whole block
             base = store.region(0).buffer.memoryAddress();
             assertTrue(stateSeen.await(10, TimeUnit.SECONDS), "a periodic state event with 8 slices and a block out");
             span.release();
-            oneShot.release();
+            whole.release();
             allocator.allocate(512 * 1024, 512 * 1024).release(); // committed already: no event
             store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
             store.close();

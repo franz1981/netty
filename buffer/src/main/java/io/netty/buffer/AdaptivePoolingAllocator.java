@@ -296,8 +296,8 @@ final class AdaptivePoolingAllocator {
     /** {@code null} when this allocator carves no chunk out of segments. */
     final PageStore pageStore;
     /**
-     * With a page store, outside low-memory mode: the largest buffer that is a span of its shared slices, half a
-     * segment as mimalloc's largest large page; above it a buffer takes whole segments. Else 0.
+     * With a page store, outside low-memory mode: the largest buffer that is a span of its shared slices, a whole
+     * block; above it a buffer takes a run of whole blocks. Else 0.
      */
     private final int largeSpanLimit;
 
@@ -351,7 +351,7 @@ final class AdaptivePoolingAllocator {
             ObjectUtil.checkNotNull(config, "config");
             checkSizeClassSpansFit(config);
             pageStore = new PageStore(this, config, segmentSource, regionSource);
-            largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize >>> 1;
+            largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         } else {
             pageStore = null;
             largeSpanLimit = 0;
@@ -587,7 +587,7 @@ final class AdaptivePoolingAllocator {
 
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
         if (size > MAX_POOLED_BUF_SIZE && size <= largeSpanLimit) {
-            // Above the pooled sizes, up to half a segment: a span of shared slices, as smaller large buffers.
+            // Above the pooled sizes, up to a block: a span of shared slices, as smaller large buffers.
             AdaptiveByteBuf spanned = allocateLargeSpan(size, maxCapacity, buf);
             if (spanned != null) {
                 return spanned;
@@ -2884,10 +2884,10 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * Buffers above the size classes when the allocator has a {@link PageStore}: each one is a span of whole slices of
-     * the store's shared slices (see {@link PageStore#claimSlices}), sized to the buffer rounded up to slices, as
-     * mimalloc's large pages. No block of a chunk, nothing kept for reuse: a release, from any thread, gives the span
-     * back to the store at once (see {@link SharedSpanChunk}).
+     * Buffers above the size classes, up to a block, when the allocator has a {@link PageStore}: each one is a span of
+     * whole slices of the store's shared slices (see {@link PageStore#claimSlices}), sized to the buffer rounded up to
+     * slices, as mimalloc's large pages. No block of a chunk, nothing kept for reuse: a release, from any thread,
+     * gives the span back to the store at once (see {@link SharedSpanChunk}).
      * <p>
      * The heap's owner (the stripe lock holder, or the thread of a thread-local heap) claims the spans.
      */

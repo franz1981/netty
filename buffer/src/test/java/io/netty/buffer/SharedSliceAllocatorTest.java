@@ -129,7 +129,7 @@ final class SharedSliceAllocatorTest {
             for (int i = 0; i < 300; i++) {
                 bufs.add(allocator.allocate(1024, 1024));
             }
-            for (int size : new int[] {32, 16896, 135168, 200 * 1024, MIB + 1, 2 * MIB}) {
+            for (int size : new int[] {32, 16896, 135168, 200 * 1024, MIB + 1, 2 * MIB, 3 * MIB, SEGMENT_SIZE}) {
                 bufs.add(allocator.allocate(size, size));
             }
         }, failure);
@@ -142,19 +142,22 @@ final class SharedSliceAllocatorTest {
         assertSharedAccounted(segments, allocator);
     }
 
-    /** Above half a segment, one-shot buffers: a whole block up to a segment, contiguous blocks above. */
+    /** Up to a block, a span of whole slices, which a block shares with others; above, contiguous whole blocks. */
     @ParameterizedTest(name = "malloc: {0}")
     @ValueSource(booleans = {false, true})
-    void oneShotBuffersAreWholeBlocks(boolean malloc) {
+    void spansUpToABlockAndWholeBlocksAbove(boolean malloc) {
         use(malloc);
-        ByteBuf block = allocator.allocate(3 * MIB, 3 * MIB);
+        ByteBuf span = allocator.allocate(3 * MIB, 3 * MIB);
+        ByteBuf small = allocator.allocate(MIB, MIB);
         ByteBuf blocks = allocator.allocate(SEGMENT_SIZE + 1, SEGMENT_SIZE + 1);
-        assertEquals(0, regionOffset(block) % SEGMENT_SIZE);
+        assertTrue(adaptive(span).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
+        assertEquals(regionOffset(span) / SEGMENT_SIZE, regionOffset(small) / SEGMENT_SIZE, "one block holds both");
         assertEquals(0, regionOffset(blocks) % SEGMENT_SIZE);
-        assertEquals(3 * (SEGMENT_SIZE / SLICE), allocator.pageStore.sliceCounts()[0]);
+        assertEquals((3 * MIB + MIB) / SLICE + 2 * (SEGMENT_SIZE / SLICE), allocator.pageStore.sliceCounts()[0]);
         assertEquals(0, segments.segmentsAllocated());
         assertSame(allocator.pageStore.region(0), allocator.pageStore.regions[0]);
-        block.release();
+        span.release();
+        small.release();
         blocks.release();
         assertEquals(0, allocator.pageStore.sliceCounts()[0]);
         assertSharedAccounted(segments, allocator);

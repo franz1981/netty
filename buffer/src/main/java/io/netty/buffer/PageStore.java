@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link #releaseSlices}), as mimalloc v3
  * claims a page's slices straight from its arena's bitmap
  * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
- * A buffer above half a block takes whole blocks ({@link #takeWhole}, {@link #takeRun}). A new region is added under
+ * A buffer above a block takes a run of whole blocks ({@link #takeRun}). A new region is added under
  * this store's monitor, the only lock, when no region has a fit.
  * <p>
  * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})

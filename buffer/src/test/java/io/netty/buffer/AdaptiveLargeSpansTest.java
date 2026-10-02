@@ -22,6 +22,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -47,9 +48,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
- * Buffers above the size classes as spans of shared slices (see {@code SpanMagazine}): sized to whole slices, one
- * chunk object per block, released by any thread at once, also once the heap is gone. On regions of one block
- * (direct or heap, as without {@code mmap}) or of many.
+ * Buffers above the size classes, up to a whole block, as spans of shared slices (see {@code SpanMagazine}): sized to
+ * whole slices, one chunk object per block, released by any thread at once, also once the heap is gone. On regions of
+ * one block (direct or heap, as without {@code mmap}) or of many.
  */
 final class AdaptiveLargeSpansTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
@@ -62,10 +63,13 @@ final class AdaptiveLargeSpansTest {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
     }
 
+    /** The heap allocator's block: one slice less than a direct one, 63 slices. */
+    private static final int HEAP_BLOCK = PageStoreConfig.heapSegmentSizeOf(SEGMENT_SIZE - SLICE);
+
     /** On regions of one heap block: one {@code byte[]} each. */
     private AdaptivePoolingAllocator heapAllocator() {
         segments = new CountingSegmentSource(true);
-        return newAllocator(segments, SEGMENT_SIZE);
+        return newAllocator(segments, HEAP_BLOCK);
     }
 
     private AdaptivePoolingAllocator allocator(boolean withRegions) {
@@ -73,16 +77,28 @@ final class AdaptiveLargeSpansTest {
                 : newAllocator(segments, SEGMENT_SIZE);
     }
 
+    enum Mode { DIRECT, DIRECT_REGIONS, HEAP }
+
+    private AdaptivePoolingAllocator allocator(Mode mode) {
+        return mode == Mode.HEAP ? heapAllocator() : allocator(mode == Mode.DIRECT_REGIONS);
+    }
+
     private static AdaptivePoolingAllocator.AdaptiveByteBuf adaptive(ByteBuf buf) {
         return (AdaptivePoolingAllocator.AdaptiveByteBuf) (buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ?
                 buf : buf.unwrap());
     }
 
-    /** Up to half a segment: a span of whole slices; above: a one-shot that takes a whole block. */
-    @Test
-    void spansAreSizedToWholeSlicesUpToHalfASegment() {
-        AdaptivePoolingAllocator allocator = allocator(false);
-        int[] sizes = {140 * 1024, 192 * 1024, 600 * 1024, MIB + 1, 3 * MIB / 2, SEGMENT_SIZE / 2};
+    /**
+     * Up to a whole block, 64 slices direct and 63 heap: a span of whole slices, sharing its block's chunk, nothing
+     * allocated per buffer. Above, on regions of one block: a buffer of its own.
+     */
+    @ParameterizedTest
+    @EnumSource(Mode.class)
+    void spansAreSizedToWholeSlicesUpToABlock(Mode mode) {
+        AdaptivePoolingAllocator allocator = allocator(mode);
+        int block = allocator.pageStore.config.segmentSize;
+        int[] sizes = {140 * 1024, 192 * 1024, 600 * 1024, MIB + 1, 3 * MIB / 2, block / 2, block / 2 + 1,
+                block - SLICE - 1, block - SLICE + 1, block - 1, block};
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int size : sizes) {
             ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
@@ -93,16 +109,23 @@ final class AdaptiveLargeSpansTest {
             assertTrue(fast >= size && fast <= wholeSlices && (wholeSlices - fast) % 64 == 0
                     && wholeSlices - fast <= Math.min(4032, wholeSlices - size),
                     "a span of whole slices, less its colour, for " + size + ": " + fast);
-            assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk, "a span for " + size);
+            assertSame(segmentOf(buf).sharedSpans, adaptive(buf).chunk, "a span for " + size);
+            buf.setByte(size - 1, 42);
         }
-        ByteBuf own = allocator.allocate(SEGMENT_SIZE / 2 + 1, SEGMENT_SIZE / 2 + 1);
-        assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk), "above half a segment");
-        assertEquals(0, segments.chunks.size(), "no buffer of its own: a whole block");
-        own.release();
+        assertEquals(0, segments.chunks.size(), "nothing allocated per buffer");
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertAccounted(segments, allocator);
+        assertEquals(0, allocator.pageStore.sliceCounts()[0], "every slice is back");
+        if (mode != Mode.DIRECT_REGIONS) {
+            ByteBuf own = allocator.allocate(block + 1, block + 1);
+            assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk), "above a block");
+            assertEquals(1, segments.chunks.size(), "above a block of a one-block region: its own allocation");
+            own.release();
+            assertAccounted(segments, allocator);
+        } else {
+            assertAccounted(segments, regions, allocator);
+        }
     }
 
     private static Segment segmentOf(ByteBuf buf) {
@@ -246,7 +269,7 @@ final class AdaptiveLargeSpansTest {
                 try {
                     List<ByteBuf> mine = new ArrayList<ByteBuf>();
                     for (int i = 0; i < 64; i++) {
-                        int size = 136 * 1024 + random.nextInt(SEGMENT_SIZE / 2 - 136 * 1024);
+                        int size = 136 * 1024 + random.nextInt(SEGMENT_SIZE + 1 - 136 * 1024);
                         ByteBuf buf = allocator.allocate(size, size);
                         stamp(buf);
                         if (random.nextBoolean()) {

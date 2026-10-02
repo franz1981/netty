@@ -27,6 +27,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
@@ -39,14 +40,16 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Buffers above the size classes in an allocator with a page store: up to half a block each is a span of the shared
- * slices; above, a whole block, or a run of blocks where regions hold more than one. Nothing comes from the chunk
- * allocator but buffers larger than what the store hands out. Three modes: direct regions of one block (as
+ * Buffers above the size classes in an allocator with a page store: up to a whole block each is a span of the shared
+ * slices; above, a run of blocks where regions hold more than one. Nothing comes from the chunk allocator but buffers
+ * larger than what the store hands out. Three modes: direct regions of one block (as
  * {@code malloc}'d ones), direct regions of many (as {@code mmap}'d ones), and heap regions of one block (one
  * {@code byte[]} each).
  */
@@ -222,38 +225,38 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     /**
-     * Above half a segment and up to a segment, on regions of one block: a whole block, given back to the shared
-     * slices on release, and with its region once idle for the purge delay.
+     * Above half a block and up to a whole one: a span of whole slices as the smaller ones, so a block holds it next
+     * to other spans, and a whole block's span takes another block. Released, the slices go back at once; regions of
+     * one block go back once idle for the purge delay, the slices of the others are purged.
      */
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void oneShotsUpToASegmentTakeABlockOfOneBlockRegions(boolean heap) {
-        AdaptivePoolingAllocator allocator = withoutRegions(heap);
-        int size = 2200000;
-        ByteBuf buf = allocate(allocator, size, 1).get(0);
-        assertEquals(1, segments.segmentsAllocated());
-        assertEquals(0, segments.chunks.size());
-        assertEquals(PER_BLOCK, claimed(allocator));
-        assertEquals(SEGMENT_SIZE, allocator.usedMemory());
-        assertAccounted(segments, allocator);
-        buf.release();
+    @EnumSource(Mode.class)
+    void spansUpToAWholeBlock(Mode mode) {
+        AdaptivePoolingAllocator allocator = allocator(mode);
+        int large = 2200000;
+        int largeSlices = (large + PageStoreConfig.SLICE_SIZE_BYTES - 1) / PageStoreConfig.SLICE_SIZE_BYTES;
+        ByteBuf first = allocate(allocator, large, 1).get(0);
+        ByteBuf second = allocate(allocator, 3 * MIB / 2, 1).get(0);
+        assertSame(blockOf(first), blockOf(second), "one block holds both");
+        assertEquals(largeSlices + 24, claimed(allocator));
+        ByteBuf whole = allocate(allocator, SEGMENT_SIZE, 1).get(0);
+        assertNotSame(blockOf(first), blockOf(whole));
+        assertEquals(largeSlices + 24 + PER_BLOCK, claimed(allocator));
+        assertEquals(0, segments.chunks.size(), "nothing from the chunk allocator");
+        assertEquals(mode == Mode.DIRECT_REGIONS ? 0 : 2, segments.segmentsAllocated(), "blocks of their own");
+        assertAccountedIn(allocator);
+        release(Arrays.asList(first, second, whole));
         assertEquals(0, claimed(allocator));
         allocator.pageStore.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
+        assertEquals(0, committed(allocator), "purged");
         assertEquals(0, allocator.usedMemory());
-        assertAccounted(segments, allocator);
+        assertAccountedIn(allocator);
     }
 
-    /** With regions, a one-shot up to a block takes a whole block, given back to the shared slices on release. */
-    @Test
-    void oneShotsUpToASegmentTakeABlockWithRegions() {
-        AdaptivePoolingAllocator allocator = withRegions();
-        ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
-        assertInRegion(buf);
-        assertEquals(PER_BLOCK, claimed(allocator));
-        assertEquals(0, segments.segmentsAllocated() + segments.chunks.size());
-        buf.release();
-        assertEquals(0, claimed(allocator));
-        assertAccounted(segments, regions, allocator);
+    private static Segment blockOf(ByteBuf buf) {
+        AdaptivePoolingAllocator.AdaptiveByteBuf adaptive = (AdaptivePoolingAllocator.AdaptiveByteBuf)
+                (buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap());
+        return ((AdaptivePoolingAllocator.SharedSpanChunk) adaptive.chunk).block;
     }
 
     /**
@@ -310,9 +313,9 @@ final class AdaptiveLargeSegmentsTest {
         AdaptivePoolingAllocator allocator = withRegions();
         PageStore store = allocator.pageStore;
         List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // spans over two blocks
-        bufs.addAll(allocate(allocator, 3 * MIB, 1)); // above half a block: a block
+        bufs.addAll(allocate(allocator, 3 * MIB, 1)); // a span of 48 slices
         bufs.addAll(allocate(allocator, SEGMENT_SIZE + 1, 1)); // two blocks
-        int slices = (PER_CHUNK + 1) * SPAN_SLICES + 3 * PER_BLOCK;
+        int slices = (PER_CHUNK + 1) * SPAN_SLICES + 3 * MIB / PageStoreConfig.SLICE_SIZE_BYTES + 2 * PER_BLOCK;
         assertEquals(slices, committed(allocator));
         assertEquals(base + regionCharge + (long) slices * PageStoreConfig.SLICE_SIZE_BYTES,
                 PlatformDependent.usedDirectMemory());
