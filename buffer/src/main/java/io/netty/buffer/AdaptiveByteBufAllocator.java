@@ -95,8 +95,11 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
 
     /** As {@link AdaptivePoolingAllocator#close()}, for both allocators: no live buffer of either. */
     void close() {
-        direct.close();
-        heap.close();
+        try {
+            direct.close();
+        } finally {
+            heap.close();
+        }
     }
 
     /** Heap chunk buffers, and the blocks the size classes carve their chunks out of: one {@code byte[]} each. */
