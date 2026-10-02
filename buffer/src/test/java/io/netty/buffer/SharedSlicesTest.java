@@ -130,13 +130,12 @@ final class SharedSlicesTest {
         assertEquals(2 * PER_BLOCK, slice(store.claimSlices(1, 0, PageStore.NO_HEAP)), "blocks 0 and 1 are taken");
         long second = store.takeRun(2);
         assertEquals(3, (int) second, "block 2 has a slice claimed");
-        Segment whole = store.takeWhole();
-        assertEquals(5, whole.slot);
+        assertEquals(5, (int) store.takeRun(1));
         Region region = store.region(0);
         store.freeRun(region, 0, 2);
         assertEquals(0, (int) store.takeRun(2), "free again");
-        store.free(whole);
-        assertEquals(5, store.takeWhole().slot);
+        store.freeRun(region, 5, 1);
+        assertEquals(5, (int) store.takeRun(1));
         // Blocks 0, 1, 3, 4 and 5, and a slice of block 2.
         assertArrayEquals(new int[] {5 * PER_BLOCK + 1, 0, PER_REGION - 5 * PER_BLOCK - 1}, store.sliceCounts());
     }

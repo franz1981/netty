@@ -153,16 +153,6 @@ final class PageStore {
     }
 
     /**
-     * Any thread. A wholly free block of the regions, for a buffer that uses it whole, given back with {@link #free}
-     * from any thread.
-     */
-    Segment takeWhole() {
-        long run = takeBlocks(1, NO_HEAP);
-        assert run >= 0 : "a region holds a block at least";
-        return region((int) (run >>> 32)).block((int) run);
-    }
-
-    /**
      * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
      * allocation for a region of one block. When a region cannot be had, switches to {@link #fallbackSource} if there
      * is one, and makes no region: the caller scans again.
@@ -261,13 +251,12 @@ final class PageStore {
     }
 
     /**
-     * Shared slices, any thread: claims {@code blocks} contiguous wholly free blocks of one region, for a one-shot
-     * buffer (see {@link Region#claimBlocks}), mapping a new region when none has them. Returns the region's index in
-     * the high half and the first block in the low half, or -1 when new regions hold fewer blocks. Every slice is
-     * committed; give each block back with
-     * {@link #releaseSlices}.
+     * Any thread: claims {@code blocks} contiguous wholly free blocks of one region, for a buffer larger than a block
+     * (see {@link Region#claimBlocks}), mapping a new region when none has them. Returns the region's index in
+     * {@link #regions} in the high half and the first block in the low half, or -1 when new regions hold fewer blocks.
+     * Every slice is committed; give them back with {@link #freeRun}.
      */
-    private long takeBlocks(int blocks, String heap) {
+    long takeRun(int blocks) {
         boolean rescanned = false;
         for (;;) {
             if (blocks > regionBlocks) {
@@ -280,7 +269,7 @@ final class PageStore {
                 Region region = regions[i];
                 int first = region.claimBlocks(blocks);
                 if (first >= 0) {
-                    commitBlocks(region, first, blocks, heap);
+                    commitBlocks(region, first, blocks);
                     return (long) i << 32 | first;
                 }
             }
@@ -288,7 +277,7 @@ final class PageStore {
                 rescanned = true;
                 continue;
             }
-            addRegion(regions, heap);
+            addRegion(regions, NO_HEAP);
         }
     }
 
@@ -311,12 +300,12 @@ final class PageStore {
         return true;
     }
 
-    private void commitBlocks(Region region, int first, int blocks, String heap) {
+    private void commitBlocks(Region region, int first, int blocks) {
         int committed = 0;
         try {
             for (; committed < blocks; committed++) {
                 Segment block = region.block(first + committed);
-                commitSlices(block, 0, block.slices, heap);
+                commitSlices(block, 0, block.slices, NO_HEAP);
             }
         } finally {
             if (committed < blocks) {
@@ -392,15 +381,6 @@ final class PageStore {
         block.releaseRun(start, n, System.nanoTime());
     }
 
-    /**
-     * Any thread. {@code slots} contiguous wholly free blocks of one region, for a buffer larger than a block: returns
-     * the region's index in {@link #regions} in the high half and the first block in the low half, or -1 when
-     * {@code slots} is more than a new region holds. Give them back with {@link #freeRun}.
-     */
-    long takeRun(int slots) {
-        return takeBlocks(slots, NO_HEAP);
-    }
-
     /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */
     void freeRun(Region region, int start, int slots) {
         long now = System.nanoTime();
@@ -412,11 +392,6 @@ final class PageStore {
 
     Region region(int index) {
         return regions[index];
-    }
-
-    /** Any thread: the block {@link #takeWhole} returned goes back to the shared slices. */
-    void free(Segment segment) {
-        releaseSlices(segment, 0, segment.slices);
     }
 
     /**

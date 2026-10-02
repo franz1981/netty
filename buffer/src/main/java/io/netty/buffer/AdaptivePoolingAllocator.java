@@ -601,9 +601,8 @@ final class AdaptivePoolingAllocator {
         if (buf == null) {
             buf = newFallbackBuffer();
         }
-        // Create a one-shot chunk for this allocation.
-        BuddyChunk chunk = pageStore != null && size > MAX_POOLED_BUF_SIZE && !IS_LOW_MEM ?
-                newStoreOneShot(size) : null;
+        // Create a one-shot chunk for this allocation: above a span, a run of the store's blocks if one fits.
+        BuddyChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
         if (chunk == null) {
             AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);
             chunk = new BuddyChunk(innerChunk, this);
@@ -632,27 +631,14 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A one-shot chunk from the page store: a whole block up to its size, above a run of blocks. {@code null} when
-     * no run fits: a buffer larger than a new region.
+     * A one-shot chunk from the page store for a buffer above a block: a run of whole blocks. {@code null} when no run
+     * fits: a buffer larger than a new region.
      */
     private BuddyChunk newStoreOneShot(int size) {
         PageStore store = pageStore;
         // The heaps' decays drive the store's purge; these buffers count toward no heap's, so they drive it too.
         store.purgeIfDue(System.nanoTime());
         int segmentSize = store.config.segmentSize;
-        if (size <= segmentSize) {
-            Segment segment = store.takeWhole();
-            boolean made = false;
-            try {
-                BuddyChunk chunk = new BuddyChunk(segment, this);
-                made = true;
-                return chunk;
-            } finally {
-                if (!made) {
-                    store.free(segment);
-                }
-            }
-        }
         int slots = (int) ((size + (long) segmentSize - 1) / segmentSize);
         long run = store.takeRun(slots);
         if (run < 0) {
@@ -3541,9 +3527,9 @@ final class AdaptivePoolingAllocator {
      * allocations that are not pooled. It belongs to no magazine, is never cached, and is freed when its buffer
      * is released.
      * <p>
-     * With a {@link PageStore}, only one-shot chunks exist: one whole {@link Segment} of it, or a run of region blocks
-     * for a buffer larger than a segment. Whichever thread drops the last reference gives it back to the store, which
-     * takes it from any thread.
+     * With a {@link PageStore}, only one-shot chunks exist: a run of region blocks for a buffer larger than a block, or
+     * its own allocation. Whichever thread drops the last reference gives the run back to the store, which takes it
+     * from any thread.
      */
     private static final class BuddyChunk extends Chunk implements IntConsumer {
         private static final int MIN_BUDDY_SIZE = BuddyTree.MIN_BLOCK_SIZE;
@@ -3562,8 +3548,6 @@ final class AdaptivePoolingAllocator {
         private final BuddyMagazine owner;
         /** The magazine's decay count when this chunk was last filed wholly free; see {@link BuddyMagazine#decay}. */
         int whollyFreeSince;
-        /** The store segment this chunk is, whole, or {@code null}. */
-        private final Segment segment;
         /** The region whose blocks {@link #runStart} to {@link #runStart} + {@link #runSlots} this is, or null. */
         private final Region region;
         private final int runStart;
@@ -3574,28 +3558,22 @@ final class AdaptivePoolingAllocator {
          * must {@link #release()} it once {@link #readInitOneShot} returned.
          */
         BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
-            this(delegate, allocator, null, 0, null, null, 0, 0);
-        }
-
-        /** A one-shot chunk over a whole store segment. */
-        BuddyChunk(Segment segment, AdaptivePoolingAllocator allocator) {
-            this(segment.buffer, allocator, null, 0, segment, null, 0, 0);
+            this(delegate, allocator, null, 0, null, 0, 0);
         }
 
         /** A one-shot chunk over {@code slots} region blocks from {@code start}, {@code delegate} being their view. */
         BuddyChunk(AbstractByteBuf delegate, Region region, int start, int slots, AdaptivePoolingAllocator allocator) {
-            this(delegate, allocator, null, 0, null, region, start, slots);
+            this(delegate, allocator, null, 0, region, start, slots);
         }
 
         BuddyChunk(AbstractByteBuf delegate, BuddyMagazine owner) {
-            this(delegate, owner.allocator, owner, delegate.capacity(), null, null, 0, 0);
+            this(delegate, owner.allocator, owner, delegate.capacity(), null, 0, 0);
         }
 
         private BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, BuddyMagazine owner,
-                           int capacity, Segment segment, Region region, int runStart, int runSlots) {
+                           int capacity, Region region, int runStart, int runSlots) {
             super(delegate, allocator, owner != null);
             this.owner = owner;
-            this.segment = segment;
             this.region = region;
             this.runStart = runStart;
             this.runSlots = runSlots;
@@ -3708,9 +3686,7 @@ final class AdaptivePoolingAllocator {
         /** Any thread, on the last reference: the store's memory goes back to the store, the rest is freed. */
         @Override
         protected void deallocate() {
-            if (segment != null) {
-                allocator.pageStore.free(segment);
-            } else if (region != null) {
+            if (region != null) {
                 allocator.pageStore.freeRun(region, runStart, runSlots);
             } else {
                 super.deallocate();
