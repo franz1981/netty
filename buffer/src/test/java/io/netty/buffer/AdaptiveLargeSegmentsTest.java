@@ -44,10 +44,11 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Buffers above the size classes in an allocator with a page store: up to half a block each is a span of slices (of
- * the regions' shared slices, or of its heap's blocks without regions); above, with regions, a whole block or a run of
- * blocks. Nothing comes from the chunk allocator but buffers larger than what the store hands out. Three modes:
- * direct blocks allocated one by one, direct regions, and heap blocks (one {@code byte[]} each, no regions).
+ * Buffers above the size classes in an allocator with a page store: up to half a block each is a span of the shared
+ * slices; above, a whole block, or a run of blocks where regions hold more than one. Nothing comes from the chunk
+ * allocator but buffers larger than what the store hands out. Three modes: direct regions of one block (as
+ * {@code malloc}'d ones), direct regions of many (as {@code mmap}'d ones), and heap regions of one block (one
+ * {@code byte[]} each).
  */
 @Isolated("Reads PlatformDependent's direct memory counter, which concurrent tests move")
 final class AdaptiveLargeSegmentsTest {
@@ -65,6 +66,7 @@ final class AdaptiveLargeSegmentsTest {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
     }
 
+    /** Regions of one block, from {@link #segments}. */
     private AdaptivePoolingAllocator withoutRegions() {
         return newAllocator(segments, SEGMENT_SIZE);
     }
@@ -85,11 +87,7 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     private void assertAccountedIn(AdaptivePoolingAllocator allocator) {
-        if (allocator.pageStore.regionSource != null) {
-            assertAccounted(segments, regions, allocator);
-        } else {
-            assertAccounted(segments, allocator);
-        }
+        assertAccounted(segments, regions, allocator);
     }
 
     private static List<ByteBuf> allocate(AdaptivePoolingAllocator allocator, int size, int count) {
@@ -141,7 +139,7 @@ final class AdaptiveLargeSegmentsTest {
         return result.get();
     }
 
-    /** Without regions spans fill segments of their own; one wholly free waits in the heap's reserve for reuse. */
+    /** On regions of one block spans fill blocks, which stay until idle for the purge delay: a round reuses them. */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void spansFillSegmentsKeptInTheHeapReserveWithoutRegions(boolean heap) {
@@ -152,7 +150,7 @@ final class AdaptiveLargeSegmentsTest {
             assertEquals(0, segments.chunks.size(), "nothing from the chunk allocator");
             assertAccounted(segments, allocator);
             release(bufs);
-            assertEquals(3, segments.segmentsLive(), "all three in the reserve");
+            assertEquals(3, segments.segmentsLive(), "all three kept");
             assertAccounted(segments, allocator);
         }
     }
@@ -177,8 +175,8 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     /**
-     * Spans of a thread-local heap released by another thread are applied at the owner's next large allocation, which
-     * empties their segment and takes it again from the heap's reserve.
+     * Spans of a thread-local heap released by another thread are free at once: the owner's next large allocations
+     * take their slices again.
      */
     @ParameterizedTest
     @EnumSource(Mode.class)
@@ -204,42 +202,43 @@ final class AdaptiveLargeSegmentsTest {
         } else {
             assertEquals(2, taken, "the first segment was taken again");
         }
-        assertEquals(0, withRegions ? claimed(allocator) : segments.segmentsLive(),
-                "the dead heap gave everything back");
+        assertEquals(0, claimed(allocator), "the dead heap gave everything back");
         assertAccountedIn(allocator);
     }
 
     /**
-     * A buffer outliving its thread-local heap keeps its segment; releasing it from another thread gives the segment
-     * straight back to the store.
+     * A buffer outliving its thread-local heap keeps its slices; releasing it from another thread gives them straight
+     * back to the store.
      */
     @ParameterizedTest
     @EnumSource(Mode.class)
     void lastReleaseOnAnotherThreadGivesTheSegmentToTheStore(Mode mode) throws Exception {
-        final boolean withRegions = mode == Mode.DIRECT_REGIONS;
         final AdaptivePoolingAllocator allocator = allocator(mode);
         ByteBuf survivor = onThreadLocalHeap(() -> allocator.allocate(POOLED, POOLED));
-        assertEquals(withRegions ? SPAN_SLICES : 1, withRegions ? claimed(allocator) : segments.segmentsLive());
+        assertEquals(SPAN_SLICES, claimed(allocator));
         survivor.release();
-        assertEquals(0, withRegions ? claimed(allocator) : segments.segmentsLive());
+        assertEquals(0, claimed(allocator));
         assertAccountedIn(allocator);
     }
 
     /**
-     * Above half a segment and up to a segment, without regions: a buffer of its own, of its exact size, as before
-     * the page store, not a whole segment charged up to twice the buffer's size.
+     * Above half a segment and up to a segment, on regions of one block: a whole block, given back to the shared
+     * slices on release, and with its region once idle for the purge delay.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void oneShotsUpToASegmentAreTheirOwnAllocationWithoutRegions(boolean heap) {
+    void oneShotsUpToASegmentTakeABlockOfOneBlockRegions(boolean heap) {
         AdaptivePoolingAllocator allocator = withoutRegions(heap);
         int size = 2200000;
         ByteBuf buf = allocate(allocator, size, 1).get(0);
-        assertEquals(0, segments.segmentsAllocated());
-        assertEquals(1, segments.chunks.size());
-        assertEquals(size, allocator.usedMemory());
+        assertEquals(1, segments.segmentsAllocated());
+        assertEquals(0, segments.chunks.size());
+        assertEquals(PER_BLOCK, claimed(allocator));
+        assertEquals(SEGMENT_SIZE, allocator.usedMemory());
         assertAccounted(segments, allocator);
         buf.release();
+        assertEquals(0, claimed(allocator));
+        allocator.pageStore.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
         assertEquals(0, allocator.usedMemory());
         assertAccounted(segments, allocator);
     }
@@ -284,7 +283,7 @@ final class AdaptiveLargeSegmentsTest {
         assertAccounted(segments, regions, allocator);
     }
 
-    /** Without regions a buffer above a segment is its own allocation, as before the page store. */
+    /** On regions of one block a buffer above a segment is its own allocation, as before the page store. */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void buffersAboveASegmentAreTheirOwnAllocationWithoutRegions(boolean heap) {

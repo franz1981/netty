@@ -33,8 +33,7 @@ final class SegmentTakeEvent extends AbstractPageStoreEvent {
 
     @Description("Segments of the range: 1, or the slots of a run")
     public int segments;
-    @Description("Where it came from: fresh-slot (never used), committed-slot (free, memory behind it), purged-slot "
-            + "(free, purged: will page-fault), heap-reserve, own-allocation, slot-run")
+    @Description("Where it came from: shared-slices (free slices of a region without memory behind them)")
     public String source;
     @Description("The heap on whose behalf: stripe, thread-local, or none (a buffer of its own, or any thread)")
     public String heap;

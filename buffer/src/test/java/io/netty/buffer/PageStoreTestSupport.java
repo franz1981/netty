@@ -52,17 +52,33 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Direct or heap segments counted as they are allocated and freed; also the chunk allocator of the allocator under
-     * test, for the chunks that are not carved from segments. The heap one does what the heap allocator's does: a
-     * {@code byte[]} per segment or chunk, and a span is the segment itself.
+     * Direct or heap blocks counted as they are allocated and freed, as the regions of one block of
+     * {@link #mallocRegionSource()} unless {@link #fallback} is set; also the chunk allocator of the allocator under
+     * test, for the chunks that are not carved from blocks. The heap one does what the heap allocator's does: a
+     * {@code byte[]} per block or chunk, and a span is the block itself.
      */
     static final class CountingSegmentSource
             implements SegmentSource, AdaptivePoolingAllocator.ChunkAllocator {
         final boolean heap;
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
-        /** What {@link #mallocRegionSource()} returns. */
-        RegionSource fallback;
+        /** What {@link #mallocRegionSource()} returns: by default, this source's blocks, one per region. */
+        RegionSource fallback = new RegionSource() {
+            @Override
+            public AbstractByteBuf allocateRegion(int size, int alignment) {
+                return allocateSegment(size);
+            }
+
+            @Override
+            public boolean canPurgeSlices() {
+                return false;
+            }
+
+            @Override
+            public void purge(AbstractByteBuf region, int offset, int length) {
+                throw new UnsupportedOperationException();
+            }
+        };
 
         CountingSegmentSource() {
             this(false);
@@ -118,6 +134,15 @@ final class PageStoreTestSupport {
                 }
             }
             return live;
+        }
+
+        /** The chunk buffers handed out and not released. */
+        synchronized long unreleasedChunkBytes() {
+            long bytes = 0;
+            for (AbstractByteBuf buf : chunks) {
+                bytes += buf.refCnt() > 0 ? buf.capacity() : 0;
+            }
+            return bytes;
         }
 
         /** What the allocator holds, seen from outside: every buffer handed out and not released. */
@@ -240,9 +265,10 @@ final class PageStoreTestSupport {
         return buf.memoryAddress() - segment.memoryAddress();
     }
 
+    /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {
         return new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL));
+                new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL, 0, 0, segmentSize));
     }
 
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource segments, CountingRegionSource regions,
@@ -263,8 +289,8 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Shared slices: the used memory is the segments allocated on their own plus the committed slices of the regions
-     * that purge them, plus the other regions whole, from their allocation to their release.
+     * The used memory is the chunk buffers allocated on their own, plus the committed slices of the regions that purge
+     * them, plus the other regions whole, from their allocation to their release.
      */
     static void assertSharedAccounted(CountingSegmentSource segments, AdaptivePoolingAllocator allocator) {
         PageStore store = allocator.pageStore;
@@ -274,7 +300,7 @@ final class PageStoreTestSupport {
                 stored += region.purgesSlices ? committedSlices(region) * (long) SLICE_SIZE_BYTES : region.length;
             }
         }
-        assertEquals(segments.unreleasedBytes() + stored, allocator.usedMemory(),
+        assertEquals(segments.unreleasedChunkBytes() + stored, allocator.usedMemory(),
                 "usedMemory() and the committed slices disagree");
     }
 
@@ -291,15 +317,6 @@ final class PageStoreTestSupport {
             }
         }
         return committed;
-    }
-
-    /** Gives {@code segment}'s one span back, then its heap's only reserved one with two decays: back to the store. */
-    static void giveBack(HeapSegments heap, Segment segment, int start, int slices) {
-        heap.release(segment, start, slices);
-        heap.decay(0);
-        heap.decay(0);
-        assertEquals(0, heap.reserved);
-        assertNull(segment.owner);
     }
 
     static void assertAccounted(CountingSegmentSource source, AdaptivePoolingAllocator allocator) {

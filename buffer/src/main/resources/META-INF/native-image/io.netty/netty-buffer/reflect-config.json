@@ -133,14 +133,6 @@
     ]
   },
   {
-    "name": "io.netty.buffer.AdaptivePoolingAllocator$SpanChunk",
-    "fields": [
-      {
-        "name": "draining"
-      }
-    ]
-  },
-  {
     "name": "io.netty.buffer.Segment",
     "fields": [
       {

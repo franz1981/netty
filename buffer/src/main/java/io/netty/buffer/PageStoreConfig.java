@@ -108,9 +108,9 @@ final class PageStoreConfig {
     /** How long free memory stays before it is purged: see {@link #PURGE_DELAY_MILLIS}. */
     final long purgeDelayNanos;
     /**
-     * How often, at most, a heap looks for memory to purge, and the store runs a purge pass: a quarter of the delay,
-     * so that free memory goes back between one delay and a delay and a quarter after it was freed, while the heaps
-     * allocate (see {@link HeapSegments#purgeTick}).
+     * How often, at most, the store runs a purge pass: a quarter of the delay, so that free memory goes back between
+     * one delay and a delay and a quarter after it was freed, while the heaps allocate (see
+     * {@link PageStore#purgeIfDue}).
      */
     final long purgeCheckNanos;
     /** 2 to {@link Long#SIZE} whole segments, or 0: one allocation per segment. */

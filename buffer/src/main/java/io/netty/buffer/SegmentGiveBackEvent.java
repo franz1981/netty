@@ -33,8 +33,7 @@ final class SegmentGiveBackEvent extends AbstractPageStoreEvent {
 
     @Description("Segments of the range: 1, or the slots of a run")
     public int segments;
-    @Description("Where it went: free-slot (its region, purged after the purge delay), heap-reserve, own-freed "
-            + "(its own allocation, freed), slot-run")
+    @Description("Where it went: purged-slices (free slices of a region, purged)")
     public String destination;
     @Description("The heap on whose behalf: stripe, thread-local, or none (a buffer of its own, or any thread)")
     public String heap;

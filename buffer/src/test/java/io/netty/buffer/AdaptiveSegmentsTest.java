@@ -40,6 +40,7 @@ import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -50,7 +51,8 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
  * The page store inside an {@link AdaptivePoolingAllocator}, of direct or heap memory: size-class chunks as spans of
- * the heaps' segments, reused across size classes, given back by the heaps' decays, and the defaults per memory mode.
+ * its shared slices, here of regions of one block, reused across size classes, freed by the heaps' decays and given
+ * back by the purge, and the defaults per memory mode.
  */
 public class AdaptiveSegmentsTest {
     private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
@@ -124,6 +126,23 @@ public class AdaptiveSegmentsTest {
 
     private static IdleDecay idleDecay(Object heap) throws Exception {
         return (IdleDecay) field(heap, "idleDecay");
+    }
+
+    /** The slices claimed in the block of region {@code index}, a region of one block. */
+    private static int usedSlices(AdaptivePoolingAllocator allocator, int index) {
+        Region region = allocator.pageStore.region(index);
+        assertFalse(region.released);
+        return region.block(0).usedSlices();
+    }
+
+    /** The slices claimed in all regions. */
+    private static int usedSlices(AdaptivePoolingAllocator allocator) {
+        return allocator.pageStore.sliceCounts()[0];
+    }
+
+    /** A purge as of {@code now}, after which every region idle for the purge delay is gone. */
+    private static void purge(AdaptivePoolingAllocator allocator, long now) {
+        allocator.pageStore.purgeIfDue(now + 2 * allocator.pageStore.config.purgeDelayNanos);
     }
 
     /** Run a forced decay of a stripe under its lock, as its allocations would. */
@@ -227,12 +246,7 @@ public class AdaptiveSegmentsTest {
             }
             assertEquals(chunks, seen.size());
             stripe = usedStripe(allocator);
-            HeapSegments heapSegments = idleDecay(stripe).heapSegments;
-            int usedSlices = 0;
-            for (int i = 0; i < heapSegments.count; i++) {
-                usedSlices += heapSegments.segments[i].usedSlices();
-            }
-            assertEquals(chunks * slices, usedSlices, "each chunk claimed its slices, no more");
+            assertEquals(chunks * slices, usedSlices(allocator), "each chunk claimed its slices, no more");
             if (round == 0) {
                 for (int i = 0; i < chunks; i++) {
                     // Every buffer of every chunk is out: the lowest offset is where the chunk's buffers start.
@@ -250,7 +264,8 @@ public class AdaptiveSegmentsTest {
         for (int decay = 1; decay <= 8; decay++) {
             decayStripe(stripe, now += INTERVAL);
         }
-        assertEquals(0, idleDecay(stripe).heapSegments.count, "every span went back whole");
+        assertEquals(0, usedSlices(allocator), "every span went back whole");
+        purge(allocator, now);
         assertEquals(0, source.segmentsLive());
         assertAccounted(source, allocator);
     }
@@ -305,7 +320,7 @@ public class AdaptiveSegmentsTest {
             for (int decay = 1; decay <= 8; decay++) {
                 idleDecay(heap).decay(now += INTERVAL);
             }
-            assertEquals(0, idleDecay(heap).heapSegments.count, "every span went back whole");
+            assertEquals(0, usedSlices(allocator), "every span went back whole");
             return null;
         });
         assertAccounted(source, allocator);
@@ -395,9 +410,9 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * Chunks given up by one size class free their spans, which other classes of the same heap reuse, of any chunk
-     * size: no new segment. Then decays give everything back: an idle class gives up its chunks, an emptied segment
-     * goes to the heap's reserve, and the decays give the reserve back by halves.
+     * Chunks given up by one size class free their spans, which other classes reuse, of any chunk size: no new block.
+     * Then decays free everything (an idle class gives up its chunks), and the purge gives back the blocks idle for
+     * its delay.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -410,31 +425,27 @@ public class AdaptiveSegmentsTest {
         for (int i = 0; i < 12 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
         }
-        // 12 chunks of 8 slices: the first segment is filled (8 of them), then a second one.
+        // 12 chunks of 8 slices: the first block is filled (8 of them), then a second one.
         assertEquals(2, source.segmentsAllocated());
         Object stripe = usedStripe(allocator);
-        HeapSegments heapSegments = idleDecay(stripe).heapSegments;
-        assertEquals(2, heapSegments.count);
-        assertEquals(64, heapSegments.segments[0].usedSlices());
-        assertEquals(32, heapSegments.segments[1].usedSlices());
+        assertEquals(64, usedSlices(allocator, 0));
+        assertEquals(32, usedSlices(allocator, 1));
         for (ByteBuf buf : bufs) {
             buf.release();
         }
         bufs.clear();
         assertAccounted(source, allocator);
         // Every chunk ran out of segments, so none is active; the class keeps the last four to empty (its floor), in
-        // the second segment. The first segment emptied and went to the heap's reserve.
-        assertEquals(1, heapSegments.count);
-        assertEquals(32, heapSegments.segments[0].usedSlices());
-        assertEquals(1, heapSegments.reserved);
+        // the second block. The first block's slices are free, the block stays until it is idle for the purge delay.
+        assertEquals(0, usedSlices(allocator, 0));
+        assertEquals(32, usedSlices(allocator, 1));
+        assertEquals(2, source.segmentsLive());
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 2-slice chunks
         for (int i = 0; i < 16 * expectedBuffers(other); i++) {
             bufs.add(allocator.allocate(other, other));
         }
         assertEquals(2, source.segmentsAllocated(), "32 slices fit in the free ones");
-        assertEquals(1, heapSegments.count, "the fullest segment with room, not the reserved one");
-        assertEquals(1, heapSegments.reserved);
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -446,10 +457,9 @@ public class AdaptiveSegmentsTest {
             now += INTERVAL;
             decayStripe(stripe, now);
             assertAccounted(source, allocator);
-            assertEquals(heapSegments.count + heapSegments.reserved, source.segmentsLive());
         }
-        assertEquals(0, heapSegments.count, "every segment left the heap");
-        assertEquals(0, heapSegments.reserved, "and the reserve went back");
+        assertEquals(0, usedSlices(allocator), "every chunk was given up");
+        purge(allocator, now);
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
         assertEquals(2, source.segmentsAllocated());
@@ -457,7 +467,7 @@ public class AdaptiveSegmentsTest {
 
     /**
      * On a thread-local heap every other thread's release is a note. The chunks such releases empty are applied by
-     * the owner's decays: an idle class gives them up, and the segment they emptied goes to the heap's reserve.
+     * the owner's decays: an idle class gives them up, and their slices are free.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -473,8 +483,7 @@ public class AdaptiveSegmentsTest {
                 bufs.add(allocator.allocate(size, size));
             }
             Object heap = threadLocalHeap(allocator);
-            HeapSegments heapSegments = idleDecay(heap).heapSegments;
-            assertEquals(1, heapSegments.count);
+            assertEquals(24, usedSlices(allocator));
             Thread releaser = new Thread(() -> {
                 for (ByteBuf buf : bufs) {
                     buf.release();
@@ -482,15 +491,13 @@ public class AdaptiveSegmentsTest {
             });
             releaser.start();
             releaser.join();
-            // Nothing applied yet: the segment still holds its three spans.
-            assertEquals(24, heapSegments.segments[0].usedSlices());
-            assertEquals(0, heapSegments.reserved);
+            // Nothing applied yet: the block still holds the three spans.
+            assertEquals(24, usedSlices(allocator));
             long now = System.nanoTime();
             idleDecay(heap).decay(now + INTERVAL); // the class allocated since the last decay: not idle yet
-            assertEquals(1, heapSegments.count);
+            assertEquals(24, usedSlices(allocator));
             idleDecay(heap).decay(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
-            assertEquals(0, heapSegments.count);
-            assertEquals(1, heapSegments.reserved);
+            assertEquals(0, usedSlices(allocator));
             assertAccounted(source, allocator);
             return null;
         });
@@ -499,64 +506,8 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * A decay frees the chunks that hold no buffer and alone keep a sparse segment in use, when the fullest segment
-     * has room for them: their classes make their next chunk there, and the emptied segment goes to the reserve. A
-     * chunk with a buffer out stays, and so does everything when the other segments have no room.
-     */
-    @Test
-    void decaysMoveEmptyChunksOutOfSparseSegments() throws Exception {
-        CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, SEGMENT_SIZE);
-        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
-        int perChunk = expectedBuffers(size);
-        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
-        for (int i = 0; i < 8 * perChunk; i++) {
-            bufs.add(allocator.allocate(size, size));
-        }
-        ByteBuf small = allocator.allocate(1024, 1024); // a 2-slice chunk: the first segment is full
-        Object stripe = usedStripe(allocator);
-        HeapSegments heapSegments = idleDecay(stripe).heapSegments;
-        assertEquals(2, heapSegments.count);
-        Segment sparse = chunkOf(small).segment;
-        assertSame(heapSegments.segments[1], sparse);
-        long now = System.nanoTime();
-
-        // The full segment has no room for the small chunk: it stays, emptied or not.
-        small.release();
-        decayStripe(stripe, now += INTERVAL);
-        assertEquals(2, heapSegments.count);
-        assertEquals(2, sparse.usedSlices());
-
-        // Two chunks of the full segment empty and go (above the class's floor): now there is room.
-        for (int i = 0; i < 2 * perChunk; i++) {
-            bufs.remove(0).release();
-        }
-        assertEquals(48, heapSegments.segments[0].usedSlices());
-        small = allocator.allocate(1024, 1024);
-        assertSame(sparse, chunkOf(small).segment, "the class keeps its chunk");
-        // A buffer out pins the chunk.
-        decayStripe(stripe, now += INTERVAL);
-        assertEquals(2, heapSegments.count);
-        small.release();
-        allocator.allocate(1024, 1024).release(); // the class stays in use: its decay does not give the chunk up
-        decayStripe(stripe, now += INTERVAL);
-        assertEquals(1, heapSegments.count, "the sparse segment emptied");
-        assertEquals(1, heapSegments.reserved);
-        assertTrue(sparse.isWhollyFree());
-        small = allocator.allocate(1024, 1024);
-        assertSame(heapSegments.segments[0], chunkOf(small).segment, "the next chunk is made in the fullest");
-        assertEquals(50, heapSegments.segments[0].usedSlices());
-        assertEquals(2, source.segmentsAllocated(), "no segment allocated to move it");
-        small.release();
-        for (ByteBuf buf : bufs) {
-            buf.release();
-        }
-        assertAccounted(source, allocator);
-    }
-
-    /**
-     * A thread-local heap freed (its thread ended) while buffers are still out: its segments stay accounted, and the
-     * release of the last buffer of a segment, on another thread, gives the segment back.
+     * A thread-local heap freed (its thread ended) while buffers are still out: their slices stay claimed, and the
+     * releases, on another thread, free them; the block goes back once idle for the purge delay.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -580,12 +531,11 @@ public class AdaptiveSegmentsTest {
         assertEquals(SEGMENT_SIZE, allocator.usedMemory());
         assertEquals(1, source.segmentsLive(), "spans are still out");
         Segment segment = chunkOf(bufs.get(0)).segment;
-        assertNotNull(segment.owner, "still the ended heap's");
         for (ByteBuf buf : bufs) {
             buf.release();
         }
         assertTrue(segment.isWhollyFree());
-        assertNull(segment.owner);
+        purge(allocator, System.nanoTime());
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
         assertAccounted(source, allocator);
@@ -659,7 +609,7 @@ public class AdaptiveSegmentsTest {
     void chunkSizesFollowTheInstanceSliceSize() {
         CountingSegmentSource source = new CountingSegmentSource();
         AdaptivePoolingAllocator small = new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, INTERVAL));
+                new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, INTERVAL, 0, 0, 2 * 1024 * 1024));
         AdaptivePoolingAllocator large = newAllocator(source, SEGMENT_SIZE);
         ByteBuf a = small.allocate(4352, 4352);
         ByteBuf b = large.allocate(4352, 4352);
@@ -677,37 +627,13 @@ public class AdaptiveSegmentsTest {
         }
     }
 
-    /**
-     * A configured reserve bounds the wholly free segments a heap keeps after a burst: one, over the segment the
-     * class's floor chunk keeps, where mimalloc's rule keeps eight.
-     */
-    @ParameterizedTest
-    @ValueSource(ints = {1, 2, 8})
-    void aBurstLeavesAtMostTheConfiguredReserve(int reserve) throws Exception {
-        CountingSegmentSource source = new CountingSegmentSource(true);
-        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, reserve));
-        assertEquals(reserve, allocator.pageStore.reserveLimit());
-        int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks
-        List<ByteBuf> bufs = new ArrayList<ByteBuf>();
-        // Exactly 96 chunks of 8 slices: 12 segments. Buffers per chunk as colouring leaves them (31 for 16 KiB).
-        for (int i = 0; i < 12 * 8 * expectedBuffers(size); i++) {
-            bufs.add(allocator.allocate(size, size));
-        }
-        assertEquals(12, source.segmentsAllocated());
-        for (ByteBuf buf : bufs) {
-            buf.release();
-        }
-        assertEquals(1 + reserve, source.segmentsLive(), "the floor chunk's segment and the reserve");
-        assertAccounted(source, allocator);
-    }
-
     /** The allocator rejects a page store whose segments cannot hold a buffer of its largest size class. */
     @Test
     void segmentsMustHoldTheLargestSizeClass() {
         final CountingSegmentSource source = new CountingSegmentSource();
         assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true, source,
-                new PageStoreConfig(2 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL)), "132 KiB takes 3 slices");
+                new PageStoreConfig(2 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL, 0, 0, 2 * SLICE_SIZE_BYTES)),
+                "132 KiB takes 3 slices");
     }
 
     /**

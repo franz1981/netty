@@ -29,22 +29,20 @@ import jdk.jfr.Name;
 import jdk.jfr.Period;
 
 import java.lang.ref.WeakReference;
-import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Where every {@link PageStore}'s memory is, periodically, on the JFR periodic thread: one event per region, with the
- * address ranges of its slices claimed, free with memory behind them, purged, and never used; and one event per
- * store (region -1) with the segments in the heaps' reserves and those allocated on their own. Read racily, without
- * locks: a slice or reserve that changes meanwhile may be reported in either state.
+ * address ranges of its slices claimed, free with memory behind them, purged, and never used. Read racily, without
+ * locks: a slice that changes meanwhile may be reported in either state.
  */
 @Enabled(false)
 @Category("Netty")
 @Period("1 s")
 @Name(PageStoreStateEvent.NAME)
 @Label("Page Store State")
-@Description("Periodic map of a page store's memory: region slices by state, heap reserves, own segments")
+@Description("Periodic map of a page store's memory: region slices by state")
 @SuppressWarnings("Since15")
 final class PageStoreStateEvent extends Event {
     static final String NAME = "io.netty.PageStoreState";
@@ -66,7 +64,7 @@ final class PageStoreStateEvent extends Event {
 
     @Description("Identity of the page store (its allocator's)")
     public int store;
-    @Description("Index of the region, or -1 for the store's heap reserves and own segments")
+    @Description("Index of the region")
     public int region;
     @Description("Start of the region")
     @MemoryAddress
@@ -86,22 +84,12 @@ final class PageStoreStateEvent extends Event {
     @DataAmount
     @Description("Bytes of slices never used")
     public long untouchedBytes;
-    @DataAmount
-    @Description("Bytes of the segments in the heaps' reserves")
-    public long reserveBytes;
-    @DataAmount
-    @Description("Bytes of the segments allocated on their own that are out")
-    public long ownBytes;
     @Description("Address ranges of the slices claimed, as start-end in hex, comma separated")
     public String out;
     @Description("Address ranges of the free slices with memory behind them")
     public String freeCommitted;
     @Description("Address ranges of the purged free slices")
     public String purged;
-    @Description("Address ranges of the reserved segments, each prefixed by its heap kind")
-    public String reserve;
-    @Description("Address ranges of the segments allocated on their own")
-    public String own;
 
     private static final PageStoreStateEvent INSTANCE = new PageStoreStateEvent();
 
@@ -157,15 +145,15 @@ final class PageStoreStateEvent extends Event {
                         switch (runState) {
                             case OUT:
                                 event.outBytes += bytes;
-                                range(out, "", start, bytes);
+                                range(out, start, bytes);
                                 break;
                             case COMMITTED:
                                 event.freeCommittedBytes += bytes;
-                                range(committed, "", start, bytes);
+                                range(committed, start, bytes);
                                 break;
                             case PURGED:
                                 event.purgedBytes += bytes;
-                                range(purged, "", start, bytes);
+                                range(purged, start, bytes);
                                 break;
                             default:
                                 event.untouchedBytes += bytes;
@@ -180,37 +168,6 @@ final class PageStoreStateEvent extends Event {
             event.purged = purged.toString();
             event.commit();
         }
-        PageStoreStateEvent event = new PageStoreStateEvent();
-        event.store = id;
-        event.region = -1;
-        StringBuilder reserve = new StringBuilder();
-        if (store.heaps != null) {
-            for (Iterator<WeakReference<HeapSegments>> it = store.heaps.iterator(); it.hasNext();) {
-                HeapSegments heap = it.next().get();
-                if (heap == null || heap.isFreed()) {
-                    it.remove();
-                    continue;
-                }
-                Segment[] segments = heap.reserve;
-                for (int i = 0, n = Math.min(heap.reserved, segments.length); i < n; i++) {
-                    Segment segment = segments[i];
-                    if (segment != null) {
-                        event.reserveBytes += segment.capacity();
-                        range(reserve, heap.kind() + ':', segment.memoryAddress(), segment.capacity());
-                    }
-                }
-            }
-        }
-        StringBuilder own = new StringBuilder();
-        if (store.ownSegments != null) {
-            for (Segment segment : store.ownSegments) {
-                event.ownBytes += segment.capacity();
-                range(own, "", segment.memoryAddress(), segment.capacity());
-            }
-        }
-        event.reserve = reserve.toString();
-        event.own = own.toString();
-        event.commit();
     }
 
     private static final int OUT = 0;
@@ -230,10 +187,10 @@ final class PageStoreStateEvent extends Event {
         return region.sliceEverCommitted[slice] ? PURGED : UNTOUCHED;
     }
 
-    private static void range(StringBuilder ranges, String prefix, long start, long bytes) {
+    private static void range(StringBuilder ranges, long start, long bytes) {
         if (ranges.length() != 0) {
             ranges.append(',');
         }
-        ranges.append(prefix).append(Long.toHexString(start)).append('-').append(Long.toHexString(start + bytes));
+        ranges.append(Long.toHexString(start)).append('-').append(Long.toHexString(start + bytes));
     }
 }

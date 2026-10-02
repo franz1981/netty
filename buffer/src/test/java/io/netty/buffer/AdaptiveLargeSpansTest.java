@@ -33,7 +33,6 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.StampedLock;
 
 import static io.netty.buffer.PageStoreTestSupport.MIB;
 import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
@@ -43,15 +42,14 @@ import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
- * Buffers above the size classes as spans of their heap's segments (see {@code SpanMagazine}): sized to whole
- * slices, one chunk object per segment, released by the owner at once and by other threads through the owner, and by
- * anyone once the heap is gone.
+ * Buffers above the size classes as spans of shared slices (see {@code SpanMagazine}): sized to whole slices, one
+ * chunk object per block, released by any thread at once, also once the heap is gone. On regions of one block
+ * (direct or heap, as without {@code mmap}) or of many.
  */
 final class AdaptiveLargeSpansTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
@@ -64,7 +62,7 @@ final class AdaptiveLargeSpansTest {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
     }
 
-    /** Without regions, on heap segments: one {@code byte[]} each. */
+    /** On regions of one heap block: one {@code byte[]} each. */
     private AdaptivePoolingAllocator heapAllocator() {
         segments = new CountingSegmentSource(true);
         return newAllocator(segments, SEGMENT_SIZE);
@@ -80,7 +78,7 @@ final class AdaptiveLargeSpansTest {
                 buf : buf.unwrap());
     }
 
-    /** Up to half a segment: a span of whole slices; above, without regions: a one-shot of its own exact size. */
+    /** Up to half a segment: a span of whole slices; above: a one-shot that takes a whole block. */
     @Test
     void spansAreSizedToWholeSlicesUpToHalfASegment() {
         AdaptivePoolingAllocator allocator = allocator(false);
@@ -95,14 +93,11 @@ final class AdaptiveLargeSpansTest {
             assertTrue(fast >= size && fast <= wholeSlices && (wholeSlices - fast) % 64 == 0
                     && wholeSlices - fast <= Math.min(4032, wholeSlices - size),
                     "a span of whole slices, less its colour, for " + size + ": " + fast);
-            assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SpanChunk, "a span for " + size);
+            assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk, "a span for " + size);
         }
-        int segmentsBefore = segments.segmentsAllocated();
         ByteBuf own = allocator.allocate(SEGMENT_SIZE / 2 + 1, SEGMENT_SIZE / 2 + 1);
-        assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SpanChunk), "above half a segment");
-        assertEquals(segmentsBefore, segments.segmentsAllocated(), "no segment for it");
-        assertEquals(1, segments.chunks.size(), "a buffer of its own");
-        assertEquals(SEGMENT_SIZE / 2 + 1, segments.chunks.get(0).capacity());
+        assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk), "above half a segment");
+        assertEquals(0, segments.chunks.size(), "no buffer of its own: a whole block");
         own.release();
         for (ByteBuf buf : bufs) {
             buf.release();
@@ -111,7 +106,7 @@ final class AdaptiveLargeSpansTest {
     }
 
     private static Segment segmentOf(ByteBuf buf) {
-        return ((AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk).segment;
+        return ((AdaptivePoolingAllocator.SharedSpanChunk) adaptive(buf).chunk).block;
     }
 
     private static long colourOf(ByteBuf buf) {
@@ -179,7 +174,7 @@ final class AdaptiveLargeSpansTest {
         assertEquals(fast, buf.capacity());
         assertEquals(4, segment.usedSlices());
         buf.writeByte(1);
-        assertTrue(!(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SpanChunk)
+        assertTrue(!(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk)
                 || segmentOf(buf) != segment || offsetIn(buf, segment) != offset, "beyond its span: moved");
         buf.release();
         assertEquals(0, segment.usedSlices(), "the old span went back whole");
@@ -187,10 +182,8 @@ final class AdaptiveLargeSpansTest {
     }
 
     /**
-     * The spans of one segment share one chunk    /**
-     * The spans of one block share one chunk: a region block's, for every stripe (or every thread-local heap); a
-     * heap's own block's, for as long as the block stays in the heap, its reserve included. Allocating and releasing
-     * large buffers makes no chunk, even when each release empties the block.
+     * The spans of one block share one chunk, for every stripe (or every thread-local heap), on regions of one block
+     * or of many. Allocating and releasing large buffers makes no chunk, even when each release empties the block.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -198,42 +191,19 @@ final class AdaptiveLargeSpansTest {
         AdaptivePoolingAllocator allocator = allocator(withRegions);
         ByteBuf first = allocator.allocate(256 * 1024, 256 * 1024);
         AdaptivePoolingAllocator.Chunk chunk = adaptive(first).chunk;
-        assertEquals(withRegions, chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
+        assertTrue(chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
         first.release();
         for (int i = 0; i < 1000; i++) {
             ByteBuf buf = allocator.allocate(512 * 1024, 512 * 1024);
             assertSame(chunk, adaptive(buf).chunk, "the block keeps its chunk");
             buf.release();
         }
-        if (!withRegions) {
-            Segment segment = ((AdaptivePoolingAllocator.SpanChunk) chunk).segment;
-            assertSame(chunk, segment.spanChunk);
-        }
         allocator.pageStore.close();
-    }
-
-    /** When the heap gives its own block back to the store, its chunk is retired and the block forgets it. */
-    @Test
-    void theChunkEndsWithTheSegmentsStayInTheHeap() throws Exception {
-        final AdaptivePoolingAllocator allocator = allocator(false);
-        final AtomicReference<AdaptivePoolingAllocator.SpanChunk> chunk =
-                new AtomicReference<AdaptivePoolingAllocator.SpanChunk>();
-        Thread owner = new FastThreadLocalThread(() -> {
-            ByteBuf buf = allocator.allocate(256 * 1024, 256 * 1024);
-            chunk.set((AdaptivePoolingAllocator.SpanChunk) adaptive(buf).chunk);
-            buf.release();
-        });
-        owner.start();
-        owner.join();
-        // The thread-local heap died: its reserve went back to the store.
-        assertTrue(chunk.get().retired);
-        assertNull(chunk.get().segment.spanChunk);
-        assertNull(chunk.get().segment.owner);
     }
 
     /**
      * Heaps that die while other threads still hold, and release, their buffers: every span comes back exactly once
-     * (a second release of a slice throws), and every segment goes back to the store or its source, none pinned.
+     * (a second release of a slice throws), and every slice goes back to the store, none pinned.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -318,19 +288,9 @@ final class AdaptiveLargeSpansTest {
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
         }
-        // A stripe applies the notes other threads left at its next allocation or decay: here, now.
-        drainStripes(allocator);
-        if (withRegions) {
-            // No heap holds blocks: every slice is back.
-            assertEquals(0, allocator.pageStore.sliceCounts()[0], "slices claimed");
-            assertAccounted(segments, regions, allocator);
-        } else {
-            assertEquals(stripesHoldingSegments(allocator), segments.segmentsLive(),
-                    "segments live: only the stripes' reserves");
-            assertAccounted(segments, allocator);
-        }
-        // What the stripes still hold is only their reserves: no span is out, no segment is in a heap's list.
-        assertEquals(0, segmentsInStripeLists(allocator));
+        // No heap holds blocks: every slice is back.
+        assertEquals(0, allocator.pageStore.sliceCounts()[0], "slices claimed");
+        assertAccounted(segments, regions, allocator);
     }
 
     /**
@@ -347,60 +307,5 @@ final class AdaptiveLargeSpansTest {
         long id = System.identityHashCode(buf) ^ (long) buf.memoryAddress() << 20;
         assertEquals(id, buf.getLong(0), "the start of a live span was overwritten");
         assertEquals(~id, buf.getLong(buf.capacity() - 8), "the end of a live span was overwritten");
-    }
-
-    private static void drainStripes(AdaptivePoolingAllocator allocator) throws Exception {
-        java.lang.reflect.Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        for (Object stripe : (Object[]) stripesField.get(allocator)) {
-            java.lang.reflect.Field lockField = stripe.getClass().getDeclaredField("lock");
-            java.lang.reflect.Field magField = stripe.getClass().getDeclaredField("spanMagazine");
-            lockField.setAccessible(true);
-            magField.setAccessible(true);
-            StampedLock lock = (StampedLock) lockField.get(stripe);
-            long stamp = lock.writeLock();
-            try {
-                Object mag = magField.get(stripe);
-                if (mag != null) {
-                    java.lang.reflect.Method drain = mag.getClass().getDeclaredMethod("drainPending");
-                    drain.setAccessible(true);
-                    drain.invoke(mag);
-                }
-            } finally {
-                lock.unlockWrite(stamp);
-            }
-        }
-    }
-
-    private static int stripesHoldingSegments(AdaptivePoolingAllocator allocator) throws Exception {
-        int n = 0;
-        for (HeapSegments heap : stripeHeapSegments(allocator)) {
-            n += heap.reserved;
-        }
-        return n;
-    }
-
-    private static int segmentsInStripeLists(AdaptivePoolingAllocator allocator) throws Exception {
-        int n = 0;
-        for (HeapSegments heap : stripeHeapSegments(allocator)) {
-            n += heap.count;
-        }
-        return n;
-    }
-
-    private static List<HeapSegments> stripeHeapSegments(AdaptivePoolingAllocator allocator) throws Exception {
-        java.lang.reflect.Field stripesField = AdaptivePoolingAllocator.class.getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        Object[] stripes = (Object[]) stripesField.get(allocator);
-        List<HeapSegments> heaps = new ArrayList<HeapSegments>();
-        for (Object stripe : stripes) {
-            java.lang.reflect.Field f = stripe.getClass().getDeclaredField("heapSegments");
-            f.setAccessible(true);
-            HeapSegments heap = (HeapSegments) f.get(stripe);
-            if (heap != null) {
-                heaps.add(heap);
-            }
-        }
-        return heaps;
     }
 }

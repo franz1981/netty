@@ -29,7 +29,6 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
-import static io.netty.buffer.PageStoreTestSupport.giveBack;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -66,9 +65,9 @@ final class PageStoreTest {
     }
 
     /**
-     * Several heaps claiming and releasing at random, with their decays driving the purge: at every step the
-     * allocator's used memory is exactly the blocks allocated on their own and not freed plus the committed slices;
-     * once the heaps are freed and the store closed, nothing is left.
+     * Several heaps claiming and releasing at random, with their ticks driving the purge, on regions of many blocks or
+     * of one: at every step the allocator's used memory is exactly the committed slices, or the regions of one block
+     * not given back; once the store is closed, nothing is left.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -92,7 +91,7 @@ final class PageStoreTest {
         for (int op = 0; op < 10_000; op++) {
             int dice = random.nextInt(16);
             if (dice == 0) {
-                heaps[random.nextInt(heaps.length)].decay(now += INTERVAL / 2);
+                store.purgeIfDue(now += INTERVAL / 2);
             } else if (live == capacity || live > 0 && dice < 8) {
                 int k = random.nextInt(live);
                 owners[k].release(spans[k], starts[k], lengths[k]);
@@ -110,33 +109,23 @@ final class PageStoreTest {
                 lengths[live] = n;
                 live++;
             }
-            assertAccounted(allocator, withRegions);
+            assertSharedAccounted(segments, allocator);
         }
         while (live > 0) {
             live--;
             owners[live].release(spans[live], starts[live], lengths[live]);
         }
-        for (HeapSegments heap : heaps) {
-            assertEquals(0, heap.count, "no span out: reserved segments at most");
-            heap.markFreed();
-            heap.afterFree();
-        }
-        assertEquals(0, segments.segmentsLive());
+        assertEquals(0, store.sliceCounts()[0], "no span out");
         assertEquals(withRegions, !regions.regions.isEmpty());
-        assertEquals(withRegions, store.slicesPurged > 0, "the decays drove the purge of idle slices");
-        assertAccounted(allocator, withRegions);
+        assertEquals(withRegions, store.slicesPurged > 0, "the ticks drove the purge of idle slices");
+        assertEquals(!withRegions, store.regionsReleased > 0, "and gave back idle regions of one block");
+        store.purgeIfDue(now + 2 * INTERVAL);
+        assertEquals(0, segments.segmentsLive());
+        assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());
         assertEquals(0, regions.live(), "the close unmaps every region");
         assertEquals(0, store.regionCount());
-    }
-
-    private void assertAccounted(AdaptivePoolingAllocator allocator, boolean withRegions) {
-        if (withRegions) {
-            assertSharedAccounted(segments, allocator);
-        } else {
-            PageStoreTestSupport.assertAccounted(segments, allocator);
-        }
     }
 
     /** The close unmaps every region, with runs still claimed, and accounts all of them as freed. */
@@ -218,28 +207,13 @@ final class PageStoreTest {
         assertEquals(0, allocator.usedMemory());
     }
 
-    /**
-     * Regions off, by a config without them or without a region source: one allocation per block, freed when it is
-     * given back.
-     */
+    /** A page store needs regions: a config without them, or no region source, is rejected. */
     @Test
-    void withoutRegionsSegmentsAreAllocatedOneByOne() {
-        AdaptivePoolingAllocator noRegions = newAllocator(segments, regions, 0, 0);
-        assertNull(noRegions.pageStore.regionSource);
-        AdaptivePoolingAllocator noSource = new AdaptivePoolingAllocator(segments, true, segments, null,
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT));
-        assertNull(noSource.pageStore.regionSource);
-        for (AdaptivePoolingAllocator allocator : new AdaptivePoolingAllocator[] {noRegions, noSource}) {
-            HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
-            Segment segment = heap.claim(10);
-            assertNull(segment.region);
-            assertNotNull(segment.buffer);
-            assertEquals(SEGMENT_SIZE, allocator.usedMemory());
-            giveBack(heap, segment, 0, 10);
-            assertEquals(0, allocator.usedMemory());
-        }
-        assertEquals(2, segments.segmentsAllocated());
-        assertEquals(0, segments.segmentsLive());
+    void withoutRegionsThereIsNoPageStore() {
+        assertThrows(IllegalArgumentException.class, () -> newAllocator(segments, regions, 0, 0));
+        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(segments, true, segments,
+                null, new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT)));
+        assertEquals(0, segments.segmentsAllocated());
         assertEquals(0, regions.regions.size());
     }
 }

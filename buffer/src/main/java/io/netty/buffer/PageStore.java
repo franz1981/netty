@@ -19,13 +19,7 @@ import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.lang.ref.WeakReference;
 import java.util.Arrays;
-import java.util.Iterator;
-import java.util.Queue;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -55,9 +49,6 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * all of them stayed free for the delay. Once an {@code mmap} region cannot be mapped, new regions are one
  * {@code malloc}'d block each, next to the regions mapped so far. One purger at a time, driven by the heaps' ticks: see
  * {@link #purgeIfDue}.
- * <p>
- * Without a region source, a heap allocates blocks of its own, carves its chunks in them and keeps a reserve of wholly
- * free ones (see {@link HeapSegments}); each is counted and, for direct memory, charged by its allocation.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -72,30 +63,18 @@ final class PageStore {
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
-    /**
-     * mimalloc's per-heap segment reserve: 32 MiB, 1 to 8 segments, as in the Java port of mimalloc in
-     * https://github.com/neoionet/netty-allocator at 397e933, MiMallocByteBufAllocator.java line 367.
-     */
-    private static final int RESERVE_BYTES = 32 * 1024 * 1024;
-    private static final int MAX_RESERVED_SEGMENTS = 8;
     // The heap a segment is taken or given back for, in the JFR events.
     static final String STRIPE = "stripe";
     static final String THREAD_LOCAL = "thread-local";
     static final String NO_HEAP = "none";
-    // Where a segment comes from, or goes to, in the JFR events.
-    static final String HEAP_RESERVE = "heap-reserve";
-    static final String OWN_ALLOCATION = "own-allocation";
-    static final String OWN_FREED = "own-freed";
+    // Where memory comes from, or goes to, in the JFR events.
     static final String SHARED_SLICES = "shared-slices";
     static final String PURGED_SLICES = "purged-slices";
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
     final SegmentSource segmentSource;
-    /**
-     * Where new regions come from; {@code null} when every segment is an allocation of its own. Replaced once, under
-     * this store's monitor, by {@link #fallbackSource}.
-     */
+    /** Where new regions come from. Replaced once, under this store's monitor, by {@link #fallbackSource}. */
     volatile RegionSource regionSource;
     /** The blocks of a new region, and where it starts: replaced with {@link #regionSource}. */
     private volatile int regionBlocks;
@@ -132,58 +111,30 @@ final class PageStore {
     long slicesPurged;
     /** Regions given back whole: see {@link #releaseIdleRegions}. */
     long regionsReleased;
-    /**
-     * With JFR available, for {@link PageStoreStateEvent} only, else {@code null}: the segments allocated on their own
-     * while that event was enabled that are out, and the heaps, weakly.
-     */
-    final Set<Segment> ownSegments;
-    final Queue<WeakReference<HeapSegments>> heaps;
 
-    /** Without {@code regionSource}, or without regions in {@code config}, every segment is allocated on its own. */
+    /** {@code config} must have regions, and {@code regionSource} make them. */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
               RegionSource regionSource) {
+        if (config.regionSize == 0 || regionSource == null) {
+            throw new IllegalArgumentException("a page store needs regions: " + config.regionSize + ", "
+                    + regionSource);
+        }
         this.allocator = allocator;
         this.config = config;
         this.segmentSource = segmentSource;
-        this.regionSource = config.regionSize > 0 ? regionSource : null;
+        this.regionSource = regionSource;
         regionBlocks = config.segmentsPerRegion();
         regionAlignment = config.regionAlignment;
-        fallbackSource = this.regionSource != null && config.mallocRegionSize > 0
-                && config.regionSize != config.mallocRegionSize ? segmentSource.mallocRegionSource() : null;
+        fallbackSource = config.mallocRegionSize > 0 && config.regionSize != config.mallocRegionSize ?
+                segmentSource.mallocRegionSource() : null;
         if (PlatformDependent.isJfrEnabled()) {
-            ownSegments = ConcurrentHashMap.newKeySet();
-            heaps = new ConcurrentLinkedQueue<WeakReference<HeapSegments>>();
             PageStoreStateEvent.register(this);
-        } else {
-            ownSegments = null;
-            heaps = null;
         }
     }
 
     /** As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. */
     int nextHeapSequence() {
         return HEAP_SEQUENCE.getAndIncrement(this) & Integer.MAX_VALUE;
-    }
-
-    /** For {@link PageStoreStateEvent}: once per heap. */
-    void registerHeap(HeapSegments heap) {
-        Queue<WeakReference<HeapSegments>> heaps = this.heaps;
-        if (heaps != null) {
-            heaps.add(new WeakReference<HeapSegments>(heap));
-        }
-    }
-
-    /** When {@code heap} is freed: it and the heaps collected meanwhile leave {@link #heaps}. */
-    void unregisterHeap(HeapSegments heap) {
-        Queue<WeakReference<HeapSegments>> heaps = this.heaps;
-        if (heaps != null) {
-            for (Iterator<WeakReference<HeapSegments>> it = heaps.iterator(); it.hasNext();) {
-                HeapSegments registered = it.next().get();
-                if (registered == null || registered == heap) {
-                    it.remove();
-                }
-            }
-        }
     }
 
     static void taken(long address, long length, int segments, int region, String source, String heap) {
@@ -199,37 +150,13 @@ final class PageStore {
     }
 
     /**
-     * A segment of its own for {@code heap}, which owns it from now on: a new allocation. Heaps hold segments only
-     * without regions (heap memory), or once no region can be mapped.
-     */
-    Segment take(HeapSegments heap) {
-        Segment segment = allocateSegment(heap.kind());
-        segment.owner = heap;
-        return segment;
-    }
-
-    /**
-     * Any thread. A block for a buffer that uses it whole, owned by no heap, given back with {@link #free} from any
-     * thread: a wholly free block of the regions, else a new allocation.
+     * Any thread. A wholly free block of the regions, for a buffer that uses it whole, given back with {@link #free}
+     * from any thread.
      */
     Segment takeWhole() {
-        if (regionSource != null) {
-            long run = takeBlocks(1, NO_HEAP);
-            if (run >= 0) {
-                return region((int) (run >>> 32)).block((int) run);
-            }
-        }
-        return allocateSegment(NO_HEAP);
-    }
-
-    private Segment allocateSegment(String heap) {
-        Segment segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
-        allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
-        if (ownSegments != null && PageStoreStateEvent.isEventEnabled()) {
-            ownSegments.add(segment);
-        }
-        taken(segment.memoryAddress(), config.segmentSize, 1, -1, OWN_ALLOCATION, heap);
-        return segment;
+        long run = takeBlocks(1, NO_HEAP);
+        assert run >= 0 : "a region holds a block at least";
+        return region((int) (run >>> 32)).block((int) run);
     }
 
     /**
@@ -454,13 +381,10 @@ final class PageStore {
 
     /**
      * Any thread. {@code slots} contiguous wholly free blocks of one region, for a buffer larger than a block: returns
-     * the region's index in {@link #regions} in the high half and the first block in the low half, or -1 without
-     * regions, or when {@code slots} is more than a new region holds. Give them back with {@link #freeRun}.
+     * the region's index in {@link #regions} in the high half and the first block in the low half, or -1 when
+     * {@code slots} is more than a new region holds. Give them back with {@link #freeRun}.
      */
     long takeRun(int slots) {
-        if (regionSource == null) {
-            return -1;
-        }
         return takeBlocks(slots, NO_HEAP);
     }
 
@@ -477,29 +401,9 @@ final class PageStore {
         return regions[index];
     }
 
-    /**
-     * {@code segment}, wholly free and owned by no heap, goes back to its region's free slots, or to its source,
-     * which may return memory to the OS.
-     */
+    /** Any thread: the block {@link #takeWhole} returned goes back to the shared slices. */
     void free(Segment segment) {
-        free(segment, NO_HEAP);
-    }
-
-    /** As {@link #free(Segment)}, on behalf of {@code heap}: {@link #STRIPE}, {@link #THREAD_LOCAL} or none. */
-    void free(Segment segment, String heap) {
-        if (segment.sharedSpans != null) {
-            // A whole block of shared slices, taken by takeWhole.
-            releaseSlices(segment, 0, segment.slices);
-            return;
-        }
-        assert segment.isWhollyFree() && segment.owner == null;
-        long address = segment.memoryAddress();
-        if (ownSegments != null) {
-            ownSegments.remove(segment);
-        }
-        allocator.chunkBufferFreed(segment, true);
-        segment.buffer.release();
-        givenBack(address, config.segmentSize, 1, -1, OWN_FREED, heap);
+        releaseSlices(segment, 0, segment.slices);
     }
 
     /**
@@ -556,13 +460,13 @@ final class PageStore {
     }
 
     /**
-     * Any thread, from a heap's purge tick (see {@link HeapSegments#purgeTick}). At most once per
+     * Any thread, from a heap's purge tick (see {@code IdleDecay#count}) or a one-shot buffer. At most once per
      * {@link PageStoreConfig#purgeCheckNanos}, and by one thread at a time (a try-guard: a caller that finds a purge
      * running returns at once), gives back to the OS the memory of the free slots that stayed free for
      * {@link PageStoreConfig#purgeDelayNanos} at least.
      */
     void purgeIfDue(long now) {
-        if (regionSource == null || now - lastPurgeNanos < config.purgeCheckNanos
+        if (now - lastPurgeNanos < config.purgeCheckNanos
                 || !PURGING.compareAndSet(this, 0, 1)) {
             return;
         }
@@ -792,17 +696,6 @@ final class PageStore {
         } else {
             logger.debug("Cannot purge free slices ({} failures).", purgeFailures, cause);
         }
-    }
-
-    /**
-     * The most wholly free segments a heap of its own segments keeps (see {@link HeapSegments}): taking one allocates
-     * a buffer, a {@link Segment} and later its span views, which mimalloc's reserve of 32 MiB, from 1 to 8 segments,
-     * avoids.
-     */
-    int reserveLimit() {
-        int configured = config.maxReservedSegments;
-        return configured > 0 ? configured
-                : Math.min(Math.max(1, RESERVE_BYTES / config.segmentSize), MAX_RESERVED_SEGMENTS);
     }
 
     /**

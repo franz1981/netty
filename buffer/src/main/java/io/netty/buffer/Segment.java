@@ -60,11 +60,6 @@ final class Segment implements ChunkInfo {
     /** Whether the owner frees its chunks here that hold no buffer, which empties this segment. */
     boolean evacuate;
     /**
-     * The chunk of the large-buffer spans made here since the segment joined its heap, or {@code null}: set by the
-     * owner, dropped by whichever thread gives the segment back to the store (see {@link HeapSegments#dispose}).
-     */
-    AdaptivePoolingAllocator.SpanChunk spanChunk;
-    /**
      * A block of shared slices only, else {@code null}: the chunk of every large-buffer span a stripe claimed in it.
      * Set before its region is published.
      */
