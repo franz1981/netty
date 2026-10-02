@@ -174,12 +174,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** Whether the direct allocator's regions are mmap'd: their slices count from their first claim. */
     static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
-        return directRegions(allocator) && direct(allocator).pageStore.purgesSlices;
+        return directRegions(allocator) && direct(allocator).pageStore.regionSource.canPurgeSlices();
     }
 
     /** Whether the direct allocator's regions are malloc'd: counted whole, from their allocation. */
     static boolean directMallocRegions(AdaptiveByteBufAllocator allocator) {
-        return directRegions(allocator) && !direct(allocator).pageStore.purgesSlices;
+        return directRegions(allocator) && !direct(allocator).pageStore.regionSource.canPurgeSlices();
     }
 
     /**

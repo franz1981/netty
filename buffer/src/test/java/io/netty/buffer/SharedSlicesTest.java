@@ -180,44 +180,6 @@ final class SharedSlicesTest {
     }
 
     /**
-     * Once no region can be mapped, a heap takes segments of its own, and fills the ones it holds before it claims
-     * shared slices again.
-     */
-    @Test
-    void withoutNewRegionsAHeapFillsItsOwnSegmentsFirst() {
-        RegionSource oneRegion = new RegionSource() {
-            @Override
-            public AbstractByteBuf allocateRegion(int size, int alignment) {
-                if (!regions.regions.isEmpty()) {
-                    throw new OutOfMemoryError("test: no second region");
-                }
-                return regions.allocateRegion(size, alignment);
-            }
-
-            @Override
-            public void purge(AbstractByteBuf region, int offset, int length) {
-                regions.purge(region, offset, length);
-            }
-        };
-        PageStore store = newSharedAllocator(segments, oneRegion, REGION_SIZE, INTERVAL).pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        int blocks = REGION_SIZE / SEGMENT_SIZE;
-        Segment[] shared = new Segment[blocks];
-        for (int b = 0; b < blocks; b++) {
-            shared[b] = heap.claim(PER_BLOCK);
-            assertTrue(shared[b].sharedSpans != null);
-        }
-        Segment own = heap.claim(9);
-        assertNull(own.region, "the region is full and no other can be mapped");
-        assertEquals(1, segments.segmentsAllocated());
-        heap.release(shared[0], 0, PER_BLOCK);
-        assertSame(own, heap.claim(9), "its own segment first");
-        Segment again = heap.claim(PER_BLOCK);
-        assertSame(shared[0], again, "then the shared slices");
-        assertEquals(1, segments.segmentsAllocated());
-    }
-
-    /**
      * Threads claim runs and whole blocks, write their slices, check them and release them, while a purger purges
      * every free slice it can ({@code mmap}), or gives back every wholly free region ({@code malloc}, and
      * {@code heap}: one {@code byte[]} block of the heap allocator's size, 63 slices): no slice is ever claimed twice,

@@ -35,6 +35,7 @@ import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Real memory sources that count what they hand out, and allocators built on them: the page store's accounting goes
@@ -60,6 +61,8 @@ final class PageStoreTestSupport {
         final boolean heap;
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
+        /** What {@link #mallocRegionSource()} returns. */
+        RegionSource fallback;
 
         CountingSegmentSource() {
             this(false);
@@ -89,6 +92,11 @@ final class PageStoreTestSupport {
         public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
             return heap ? segment :
                     AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, segment, offset, length);
+        }
+
+        @Override
+        public RegionSource mallocRegionSource() {
+            return fallback;
         }
 
         @Override
@@ -254,38 +262,34 @@ final class PageStoreTestSupport {
         return new AdaptivePoolingAllocator(segments, true, segments, regions, config);
     }
 
-    /** Shared slices: the used memory is the segments allocated on their own plus the committed slices. */
+    /**
+     * Shared slices: the used memory is the segments allocated on their own plus the committed slices of the regions
+     * that purge them, plus the other regions whole, from their allocation to their release.
+     */
     static void assertSharedAccounted(CountingSegmentSource segments, AdaptivePoolingAllocator allocator) {
         PageStore store = allocator.pageStore;
         long stored = 0;
-        if (store.purgesSlices) {
-            stored = committedSlices(store) * (long) SLICE_SIZE_BYTES;
-        } else {
-            // malloc'd regions count whole, from their allocation to their release.
-            for (Region region : store.regions) {
-                stored += region.released ? 0 : store.config.regionSize;
+        for (Region region : store.regions) {
+            if (!region.released) {
+                stored += region.purgesSlices ? committedSlices(region) * (long) SLICE_SIZE_BYTES : region.length;
             }
         }
         assertEquals(segments.unreleasedBytes() + stored, allocator.usedMemory(),
                 "usedMemory() and the committed slices disagree");
     }
 
-    static int committedSlices(PageStore store) {
-        int[] counts = store.sliceCounts();
-        int committed = counts[0] + counts[1];
-        // A claimed slice always has memory behind it.
-        int behind = 0;
-        for (Region region : store.regions) {
-            if (region.released) {
-                continue;
-            }
-            for (int slot = 0; slot < region.slots; slot++) {
-                for (long freedAt : region.block(slot).freedAt) {
-                    behind += freedAt != Region.UNCOMMITTED ? 1 : 0;
-                }
+    /** The slices of {@code region} with memory behind them; a claimed one always has. */
+    private static int committedSlices(Region region) {
+        int committed = 0;
+        for (int slot = 0; slot < region.slots; slot++) {
+            Segment block = region.block(slot);
+            long free = block.free;
+            for (int i = 0; i < block.slices; i++) {
+                boolean behind = block.freedAt[i] != Region.UNCOMMITTED;
+                assertTrue(behind || (free & 1L << i) != 0, "a claimed slice without memory behind it");
+                committed += behind ? 1 : 0;
             }
         }
-        assertEquals(committed, behind, "a claimed slice without memory behind it");
         return committed;
     }
 

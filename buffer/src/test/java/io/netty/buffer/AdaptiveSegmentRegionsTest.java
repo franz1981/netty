@@ -97,7 +97,7 @@ public class AdaptiveSegmentRegionsTest {
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         PageStore store = AdaptiveByteBufAllocatorTest.direct(allocator).pageStore;
         assertTrue(store.regionSource instanceof MallocRegionSource);
-        assertFalse(store.purgesSlices);
+        assertFalse(store.regionSource.canPurgeSlices());
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         ByteBuf adaptive = buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap();
         Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk)

@@ -32,6 +32,7 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -154,7 +155,7 @@ final class DirectMemoryChargeTest {
         charge(filler);
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, PageStore.NO_HEAP));
-            assertTrue(store.mapsRegions, "regions are still made");
+            assertSame(malloc, store.regionSource, "regions are still made");
             assertEquals(0, store.regionCount());
         } finally {
             credit(filler);

@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.internal.OutOfDirectMemoryError;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -53,11 +52,12 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * purge the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
  * memory behind it to its purge; regions of one block ({@link MallocRegionSource}: a {@code malloc}'d 4 MiB, or a
  * {@code byte[]} of 4032 KiB for heap memory) are charged and counted whole by their allocation, and go back whole once
- * all of them stayed free for the delay. One purger at a time, driven by the heaps' ticks: see {@link #purgeIfDue}.
+ * all of them stayed free for the delay. Once an {@code mmap} region cannot be mapped, new regions are one
+ * {@code malloc}'d block each, next to the regions mapped so far. One purger at a time, driven by the heaps' ticks: see
+ * {@link #purgeIfDue}.
  * <p>
- * Without a region source, or once no region can be mapped, a heap allocates blocks of its own, carves its chunks in
- * them and keeps a reserve of wholly free ones (see {@link HeapSegments}); each is counted and, for direct memory,
- * charged by its allocation.
+ * Without a region source, a heap allocates blocks of its own, carves its chunks in them and keeps a reserve of wholly
+ * free ones (see {@link HeapSegments}); each is counted and, for direct memory, charged by its allocation.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -92,19 +92,19 @@ final class PageStore {
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
     final SegmentSource segmentSource;
-    /** {@code null} when every segment is an allocation of its own. */
-    final RegionSource regionSource;
     /**
-     * Whether the source gives back part of a region ({@code mmap}): idle free slices are purged, and a slice is
-     * charged and counted from the claim that commits it. Else ({@code malloc}) a region is charged and counted
-     * whole, by its allocation, and goes back whole once all of it stayed free for the purge delay.
+     * Where new regions come from; {@code null} when every segment is an allocation of its own. Replaced once, under
+     * this store's monitor, by {@link #fallbackSource}.
      */
-    final boolean purgesSlices;
+    volatile RegionSource regionSource;
+    /** The blocks of a new region, and where it starts: replaced with {@link #regionSource}. */
+    private volatile int regionBlocks;
+    private int regionAlignment;
     /**
-     * Cleared for good when a region cannot be mapped: from then on a claim that finds no fit in the regions mapped
-     * so far falls back to a block of its own.
+     * Regions of one block to make from when a region of {@link #regionSource} cannot be had, or {@code null}. Under
+     * this store's monitor.
      */
-    volatile boolean mapsRegions;
+    private RegionSource fallbackSource;
     /** Replaced under this store's monitor, one longer or with a released region's place taken; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
@@ -146,8 +146,10 @@ final class PageStore {
         this.config = config;
         this.segmentSource = segmentSource;
         this.regionSource = config.regionSize > 0 ? regionSource : null;
-        mapsRegions = this.regionSource != null;
-        purgesSlices = this.regionSource == null || this.regionSource.canPurgeSlices();
+        regionBlocks = config.segmentsPerRegion();
+        regionAlignment = config.regionAlignment;
+        fallbackSource = this.regionSource != null && config.mallocRegionSize > 0
+                && config.regionSize != config.mallocRegionSize ? segmentSource.mallocRegionSource() : null;
         if (PlatformDependent.isJfrEnabled()) {
             ownSegments = ConcurrentHashMap.newKeySet();
             heaps = new ConcurrentLinkedQueue<WeakReference<HeapSegments>>();
@@ -231,47 +233,50 @@ final class PageStore {
     }
 
     /**
-     * Maps a new region, unless one was added since {@code seen} was read. Three system calls. Returns false, and
-     * maps no region ever again, if it cannot.
+     * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
+     * allocation for a region of one block. When a region cannot be had, switches to {@link #fallbackSource} if there
+     * is one, and makes no region: the caller scans again.
      */
-    private synchronized boolean addRegion(Region[] seen, String heap) {
+    private synchronized void addRegion(Region[] seen, String heap) {
         if (closed) {
             throw new IllegalStateException("closed");
         }
         if (regions != seen) {
-            return true;
+            return;
         }
-        if (!mapsRegions) {
-            return false;
-        }
+        RegionSource source = regionSource;
+        int blocks = regionBlocks;
+        int size = blocks * config.segmentSize;
         AbstractByteBuf buffer;
         Object event = PlatformDependent.isJfrEnabled() && PageStoreMapEvent.isEventEnabled() ?
                 PageStoreMapEvent.start() : null;
         try {
-            buffer = regionSource.allocateRegion(config.regionSize, config.regionAlignment);
+            buffer = source.allocateRegion(size, regionAlignment);
         } catch (OutOfMemoryError | RuntimeException e) {
             if (event != null) {
-                AbstractPageStoreCallEvent.end(event, 0, config.regionSize, seen.length, e);
+                AbstractPageStoreCallEvent.end(event, 0, size, seen.length, e);
             }
-            if (e instanceof OutOfDirectMemoryError || !purgesSlices) {
-                // A block of its own (malloc, byte[]) that cannot be had, or the direct memory limit it is charged
-                // to: this allocation fails, the next region may well fit.
+            RegionSource fallback = fallbackSource;
+            if (fallback == null) {
+                // A block (malloc, byte[]) that cannot be had, or the direct memory limit it is charged to: this
+                // allocation fails, the next region may well fit.
                 throw e;
             }
-            mapsRegions = false;
-            logger.warn("Cannot map a region of {} bytes: segments are allocated one by one from now on.",
-                    config.regionSize, e);
-            return false;
+            fallbackSource = null;
+            regionBlocks = 1;
+            regionAlignment = 0;
+            regionSource = fallback;
+            logger.warn("Cannot map a region of {} bytes: regions are one block each from now on.", size, e);
+            return;
         }
-        assert buffer.capacity() == config.regionSize;
+        assert buffer.capacity() == size;
         if (event != null) {
-            AbstractPageStoreCallEvent.end(event, buffer._memoryAddress(), config.regionSize, seen.length, null);
+            AbstractPageStoreCallEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
         }
-        Region region = sharedRegion(buffer);
-        if (!purgesSlices) {
+        Region region = sharedRegion(buffer, source, blocks);
+        if (!region.purgesSlices) {
             // Charged by its allocation, counted whole from now on.
-            allocator.storeBytesCommitted(buffer._memoryAddress(), config.regionSize, buffer.isDirect(),
-                    heap == THREAD_LOCAL);
+            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), heap == THREAD_LOCAL);
         }
         int index = 0;
         while (index < seen.length && !seen[index].released) {
@@ -282,12 +287,11 @@ final class PageStore {
         region.index = index;
         grown[index] = region;
         regions = grown;
-        return true;
     }
 
-    /** A malloc'd region has memory behind all of it, free since now. */
-    private Region sharedRegion(AbstractByteBuf buffer) {
-        Region region = new Region(buffer, config.segmentsPerRegion(), segmentSource, config, !purgesSlices,
+    /** A region charged whole has memory behind all of it, free since now. */
+    private Region sharedRegion(AbstractByteBuf buffer, RegionSource source, int blocks) {
+        Region region = new Region(buffer, source, blocks, segmentSource, config, !source.canPurgeSlices(),
                 System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.block(slot);
@@ -301,8 +305,8 @@ final class PageStore {
      * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block, the first
      * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, mapping a new
      * region when none has. Returns the region's index in the high half and the run's first slice in the region in
-     * the low half, or -1 when no region has such a run and none can be mapped. The run's slices are committed (see
-     * {@link #commitSlices}); give it back with {@link #releaseSlices}, from any thread.
+     * the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
+     * {@link #releaseSlices}, from any thread.
      */
     long claimSlices(int slices, int seq, String heap) {
         boolean rescanned = false;
@@ -318,28 +322,28 @@ final class PageStore {
                     return (long) i << 32 | slice;
                 }
             }
-            if (!mapsRegions) {
-                return -1;
-            }
             if (!rescanned && awaitPurgedRun(purgeSeen)) {
                 rescanned = true;
                 continue;
             }
-            if (!addRegion(regions, heap)) {
-                return -1;
-            }
+            addRegion(regions, heap);
         }
     }
 
     /**
      * Shared slices, any thread: claims {@code blocks} contiguous wholly free blocks of one region, for a one-shot
      * buffer (see {@link Region#claimBlocks}), mapping a new region when none has them. Returns the region's index in
-     * the high half and the first block in the low half, or -1. Every slice is committed; give each block back with
+     * the high half and the first block in the low half, or -1 when new regions hold fewer blocks. Every slice is
+     * committed; give each block back with
      * {@link #releaseSlices}.
      */
     private long takeBlocks(int blocks, String heap) {
         boolean rescanned = false;
         for (;;) {
+            if (blocks > regionBlocks) {
+                // Since regions are one block each.
+                return -1;
+            }
             long purgeSeen = purgeSequence;
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
@@ -350,16 +354,11 @@ final class PageStore {
                     return (long) i << 32 | first;
                 }
             }
-            if (!mapsRegions) {
-                return -1;
-            }
             if (!rescanned && awaitPurgedRun(purgeSeen)) {
                 rescanned = true;
                 continue;
             }
-            if (!addRegion(regions, heap)) {
-                return -1;
-            }
+            addRegion(regions, heap);
         }
     }
 
@@ -456,10 +455,10 @@ final class PageStore {
     /**
      * Any thread. {@code slots} contiguous wholly free blocks of one region, for a buffer larger than a block: returns
      * the region's index in {@link #regions} in the high half and the first block in the low half, or -1 without
-     * regions, or when {@code slots} is more than a region holds. Give them back with {@link #freeRun}.
+     * regions, or when {@code slots} is more than a new region holds. Give them back with {@link #freeRun}.
      */
     long takeRun(int slots) {
-        if (regionSource == null || slots > config.segmentsPerRegion()) {
+        if (regionSource == null) {
             return -1;
         }
         return takeBlocks(slots, NO_HEAP);
@@ -515,24 +514,23 @@ final class PageStore {
             if (region.released) {
                 continue;
             }
-            if (purgesSlices) {
+            if (region.purgesSlices) {
                 closeSlices(region);
             } else {
-                allocator.storeBytesReleased(region.buffer._memoryAddress(), config.regionSize,
-                        region.buffer.isDirect());
+                allocator.storeBytesReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect());
             }
             long address = region.buffer._memoryAddress();
             Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
                     PageStoreUnmapEvent.start() : null;
             Throwable failure = null;
             try {
-                regionSource.releaseRegion(region.buffer);
+                region.source.releaseRegion(region.buffer);
             } catch (RuntimeException | Error e) {
                 failure = e;
                 throw e;
             } finally {
                 if (event != null) {
-                    AbstractPageStoreCallEvent.end(event, address, config.regionSize, region.index, failure);
+                    AbstractPageStoreCallEvent.end(event, address, region.length, region.index, failure);
                 }
             }
         }
@@ -585,11 +583,8 @@ final class PageStore {
      */
     private void purge(long now) {
         purges++;
-        if (purgesSlices) {
-            purgeSharedSlices(now);
-        } else {
-            releaseIdleRegions(now);
-        }
+        purgeSharedSlices(now);
+        releaseIdleRegions(now);
     }
 
     /**
@@ -605,6 +600,9 @@ final class PageStore {
     private void purgeSharedSlices(long now) {
         long delay = config.purgeDelayNanos;
         for (Region region : regions) {
+            if (!region.purgesSlices) {
+                continue;
+            }
             for (int slot = 0; slot < region.slots; slot++) {
                 Segment block = region.block(slot);
                 long candidates = purgeable(block, block.free, now, delay);
@@ -641,7 +639,7 @@ final class PageStore {
     private void releaseIdleRegions(long now) {
         long delay = config.purgeDelayNanos;
         for (Region region : regions) {
-            if (region.released || !idle(region, now, delay, false)) {
+            if (region.purgesSlices || region.released || !idle(region, now, delay, false)) {
                 continue;
             }
             purgeSequence++; // odd: the purger holds slices
@@ -689,19 +687,19 @@ final class PageStore {
         }
         long address = region.buffer._memoryAddress();
         region.released = true;
-        allocator.storeBytesReleased(address, config.regionSize, region.buffer.isDirect());
+        allocator.storeBytesReleased(address, region.length, region.buffer.isDirect());
         Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
                 PageStoreUnmapEvent.start() : null;
         Throwable failure = null;
         try {
-            regionSource.releaseRegion(region.buffer);
+            region.source.releaseRegion(region.buffer);
             regionsReleased++;
         } catch (RuntimeException | Error e) {
             failure = e;
             throw e;
         } finally {
             if (event != null) {
-                AbstractPageStoreCallEvent.end(event, address, config.regionSize, region.index, failure);
+                AbstractPageStoreCallEvent.end(event, address, region.length, region.index, failure);
             }
         }
         return true;
@@ -741,7 +739,7 @@ final class PageStore {
                     PageStorePurgeEvent.start() : null;
             Throwable failure = null;
             try {
-                regionSource.purge(region.buffer, offset, length);
+                region.source.purge(region.buffer, offset, length);
                 purged = true;
             } catch (Throwable t) {
                 failure = t;

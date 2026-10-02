@@ -31,7 +31,16 @@ final class Region {
     static final long UNCOMMITTED = Long.MIN_VALUE;
 
     final AbstractByteBuf buffer;
+    /** Where {@link #buffer} comes from, and goes back to. */
+    final RegionSource source;
+    /**
+     * Whether {@link #source} purges idle free slices in place; else the region is charged and counted whole, and
+     * goes back whole once wholly idle.
+     */
+    final boolean purgesSlices;
     final int slots;
+    /** {@link #slots} blocks, in bytes. */
+    final int length;
     private final Segment[] blocks;
     /**
      * Per slice of the region, slice owner only: whether memory was ever behind it, so that a slice with none now was
@@ -46,15 +55,18 @@ final class Region {
     private volatile int maxAccessed = -1;
 
     /** Every block made now, all slices free; uncommitted unless {@code committedAt}, their release time, is set. */
-    Region(AbstractByteBuf buffer, int slots, SegmentSource source, PageStoreConfig config, boolean committed,
-           long committedAt) {
+    Region(AbstractByteBuf buffer, RegionSource source, int slots, SegmentSource views, PageStoreConfig config,
+           boolean committed, long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
         this.buffer = buffer;
+        this.source = source;
+        purgesSlices = source.canPurgeSlices();
         this.slots = slots;
-        blocks = new Segment[slots];
         int size = config.segmentSize;
+        length = slots * size;
+        blocks = new Segment[slots];
         for (int slot = 0; slot < slots; slot++) {
-            Segment block = new Segment(source.span(buffer, slot * size, size), config.sliceSize, this, slot);
+            Segment block = new Segment(views.span(buffer, slot * size, size), config.sliceSize, this, slot);
             Arrays.fill(block.freedAt, committed ? committedAt : UNCOMMITTED);
             blocks[slot] = block;
         }

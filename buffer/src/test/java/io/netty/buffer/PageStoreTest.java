@@ -157,11 +157,11 @@ final class PageStoreTest {
     }
 
     /**
-     * A region that cannot be mapped turns the mapping off for good: the free slices of the regions mapped so far are
-     * still claimed, a heap's own blocks first once it has some, then blocks are allocated on their own.
+     * A region that cannot be mapped switches the store to regions of one block from its fallback source, for good:
+     * the free slices of the regions mapped so far are still claimed first, a run of blocks no longer fits.
      */
     @Test
-    void aRegionThatCannotBeMappedFallsBackToOneAllocationPerBlock() {
+    void aRegionThatCannotBeMappedFallsBackToOneBlockRegions() {
         final int[] calls = new int[1];
         RegionSource failing = new RegionSource() {
             @Override
@@ -177,31 +177,43 @@ final class PageStoreTest {
                 regions.purge(region, offset, length);
             }
         };
+        CountingRegionSource malloc = new CountingRegionSource(true);
+        segments.fallback = malloc;
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(segments, true, segments, failing,
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT));
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT,
+                        SEGMENT_SIZE));
         PageStore store = allocator.pageStore;
-        // A heap's own block cannot be claimed whole: spans of all slices but one.
         HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
         Segment[] blocks = new Segment[SLOTS];
         for (int i = 0; i < SLOTS; i++) {
             blocks[i] = heap.claim(SPAN);
-            assertNotNull(blocks[i].region);
+            assertSame(failing, blocks[i].region.source);
         }
-        Segment own = heap.claim(SPAN);
-        assertNull(own.region, "no region: allocated on its own");
+        Segment first = heap.claim(SPAN);
         assertEquals(2, calls[0]);
-        assertFalse(store.mapsRegions);
+        assertSame(malloc, store.regionSource);
+        assertSame(malloc, first.region.source);
+        assertEquals(1, first.region.slots, "a region of one block");
         heap.release(blocks[4], 0, SPAN);
         assertSame(blocks[4], heap.claim(SPAN), "the free slices of the mapped region");
-        Segment ownAgain = heap.claim(SPAN);
-        assertNull(ownAgain.region);
+        Segment second = heap.claim(SPAN);
+        assertSame(malloc, second.region.source);
         assertEquals(2, calls[0], "never tried again");
-        assertEquals(1, store.regionCount());
-        assertEquals(2, segments.segmentsAllocated());
+        assertEquals(3, store.regionCount());
+        assertEquals(2, malloc.regions.size());
+        assertEquals(-1, store.takeRun(2), "new regions hold one block");
+        assertEquals(0, segments.segmentsAllocated());
         assertSharedAccounted(segments, allocator);
-        giveBack(heap, own, 0, SPAN);
-        giveBack(heap, ownAgain, 0, SPAN);
-        assertEquals(0, segments.segmentsLive());
+        for (Segment block : new Segment[] {first, second}) {
+            heap.release(block, 0, SPAN);
+        }
+        for (Segment block : blocks) {
+            heap.release(block, 0, SPAN);
+        }
+        store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
+        assertEquals(2, store.regionsReleased, "the idle one-block regions went back, the mapped one stays");
+        assertEquals(0, malloc.live());
+        assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());
     }
