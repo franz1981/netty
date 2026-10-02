@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.extension.AfterEachCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;
 
@@ -23,7 +24,7 @@ import java.util.List;
 
 /**
  * Closes the allocators a test made once it ended, after its {@code @AfterEach} methods: never left to the finalizer,
- * which would free them at any time, under another test.
+ * which would free them at any time, under another test. Each is closed even when an earlier one fails to.
  */
 final class AllocatorCloser implements AfterEachCallback {
     private final List<Runnable> closes = new ArrayList<Runnable>();
@@ -40,9 +41,21 @@ final class AllocatorCloser implements AfterEachCallback {
 
     @Override
     public synchronized void afterEach(ExtensionContext context) {
+        Throwable failure = null;
         for (Runnable close : closes) {
-            close.run();
+            try {
+                close.run();
+            } catch (Throwable t) {
+                if (failure == null) {
+                    failure = t;
+                } else {
+                    failure.addSuppressed(t);
+                }
+            }
         }
         closes.clear();
+        if (failure != null) {
+            PlatformDependent.throwException(failure);
+        }
     }
 }
