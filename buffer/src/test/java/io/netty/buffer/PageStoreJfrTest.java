@@ -75,18 +75,9 @@ public class PageStoreJfrTest {
         return address >= base && address < base + REGION_SIZE;
     }
 
-    private List<String> sources(String name, String field) {
-        List<String> values = new ArrayList<String>();
-        for (RecordedEvent event : named(name)) {
-            values.add(event.getString(field));
-        }
-        return values;
-    }
-
     /**
-     * Shared slices: the takes and give-backs are memory events, a take per claim that commits slices and a give-back
-     * per purged run (none per claim or release of committed slices); the purge purges slices, and the periodic state
-     * event maps the region slice by slice.
+     * Shared slices: the purge purges the slices of each idle run with one call, and the periodic state event maps the
+     * region slice by slice.
      */
     @SuppressWarnings("Since15")
     @Test
@@ -100,11 +91,8 @@ public class PageStoreJfrTest {
         CountingRegionSource regions = new CountingRegionSource();
         try (RecordingStream stream = new RecordingStream()) {
             stream.setReuse(false);
-            for (String name : new String[] {PageStorePurgeEvent.NAME, SegmentTakeEvent.NAME,
-                    SegmentGiveBackEvent.NAME}) {
-                stream.enable(name);
-                stream.onEvent(name, event -> add(event, thread));
-            }
+            stream.enable(PageStorePurgeEvent.NAME);
+            stream.onEvent(PageStorePurgeEvent.NAME, event -> add(event, thread));
             stream.enable(PageStoreUnmapEvent.NAME);
             stream.onEvent(PageStoreUnmapEvent.NAME, event -> {
                 add(event, thread);
@@ -128,26 +116,14 @@ public class PageStoreJfrTest {
             assertTrue(stateSeen.await(10, TimeUnit.SECONDS), "a periodic state event with 8 slices and a block out");
             span.release();
             whole.release();
-            allocator.allocate(512 * 1024, 512 * 1024).release(); // committed already: no event
+            allocator.allocate(512 * 1024, 512 * 1024).release(); // committed already
             store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
             store.close();
             assertTrue(unmapped.await(10, TimeUnit.SECONDS), "the unmap event");
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            while (named(SegmentTakeEvent.NAME).size() < 2 && System.nanoTime() < deadline) {
+            while (named(PageStorePurgeEvent.NAME).size() < 2 && System.nanoTime() < deadline) {
                 Thread.sleep(10);
             }
-        }
-        List<String> taken = sources(SegmentTakeEvent.NAME, "source");
-        assertEquals(2, taken.size(), taken.toString());
-        for (String source : taken) {
-            assertEquals(PageStore.SHARED_SLICES, source, taken.toString());
-        }
-        assertEquals(8L * slice, named(SegmentTakeEvent.NAME).get(0).getLong("length"));
-        assertEquals(SEGMENT_SIZE, named(SegmentTakeEvent.NAME).get(1).getLong("length"));
-        List<String> givenBack = sources(SegmentGiveBackEvent.NAME, "destination");
-        assertEquals(2, givenBack.size(), givenBack.toString());
-        for (String destination : givenBack) {
-            assertEquals(PageStore.PURGED_SLICES, destination, givenBack.toString());
         }
         long purged = 0;
         for (RecordedEvent purge : named(PageStorePurgeEvent.NAME)) {

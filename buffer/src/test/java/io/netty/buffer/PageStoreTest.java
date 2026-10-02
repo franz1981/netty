@@ -55,7 +55,7 @@ final class PageStoreTest {
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         PageStore store = allocator.pageStore;
         for (int i = 0; i < 3; i++) {
-            long run = store.claimSlices(63, 0, PageStore.NO_HEAP);
+            long run = store.claimSlices(63, 0, false);
             assertEquals(0, store.start(run));
             assertEquals(0, store.block(run).buffer.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
         }
@@ -95,7 +95,7 @@ final class PageStoreTest {
                 lengths[k] = lengths[live];
             } else {
                 int n = 1 + random.nextInt(16);
-                long run = store.claimSlices(n, random.nextInt(heaps), PageStore.NO_HEAP);
+                long run = store.claimSlices(n, random.nextInt(heaps), false);
                 spans[live] = store.block(run);
                 starts[live] = store.start(run);
                 lengths[live] = n;
@@ -126,14 +126,14 @@ final class PageStoreTest {
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         PageStore store = allocator.pageStore;
         for (int i = 0; i < SLOTS + 2; i++) {
-            store.claimSlices(PER_BLOCK, 0, PageStore.NO_HEAP);
+            store.claimSlices(PER_BLOCK, 0, false);
         }
         assertEquals(2, regions.live());
         assertEquals((SLOTS + 2L) * SEGMENT_SIZE, allocator.usedMemory());
         store.close();
         assertEquals(0, regions.live());
         assertEquals(0, allocator.usedMemory());
-        assertThrows(IllegalStateException.class, () -> store.claimSlices(1, 0, PageStore.NO_HEAP));
+        assertThrows(IllegalStateException.class, () -> store.claimSlices(1, 0, false));
     }
 
     /**
@@ -199,7 +199,7 @@ final class PageStoreTest {
 
     /** The block of a run of {@code n} slices claimed from its start. */
     private static Segment claim(PageStore store, int n) {
-        long run = store.claimSlices(n, 0, PageStore.NO_HEAP);
+        long run = store.claimSlices(n, 0, false);
         assertEquals(0, store.start(run));
         return store.block(run);
     }

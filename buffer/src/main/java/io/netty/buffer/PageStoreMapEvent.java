@@ -23,7 +23,7 @@ import jdk.jfr.Name;
 @Name(PageStoreMapEvent.NAME)
 @Label("Page Store Map")
 @Description("A region of the page store was mapped: one mmap, plus the munmap calls trimming it to its alignment")
-final class PageStoreMapEvent extends AbstractPageStoreCallEvent {
+final class PageStoreMapEvent extends AbstractPageStoreEvent {
     static final String NAME = "io.netty.PageStoreMap";
     private static final PageStoreMapEvent INSTANCE = new PageStoreMapEvent();
 

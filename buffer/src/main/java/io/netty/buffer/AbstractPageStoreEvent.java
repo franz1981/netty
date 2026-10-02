@@ -23,8 +23,8 @@ import jdk.jfr.Event;
 import jdk.jfr.MemoryAddress;
 
 /**
- * An event of the adaptive allocator's {@link PageStore}, on its slow paths only: a system call, or a segment taken
- * or given back.
+ * A system call of the adaptive allocator's {@link PageStore}: the event's duration is the call's. Begun before the
+ * call, committed after.
  */
 @Enabled(false)
 @Category("Netty")
@@ -38,4 +38,19 @@ abstract class AbstractPageStoreEvent extends Event {
     public long length;
     @Description("Index of the page store region the range is in, or -1")
     public int region;
+    @Description("errno of the failed call, 0 when it succeeded, -1 when it failed with no errno")
+    public int errno;
+
+    /** {@code event} is one of this class, begun: fill and commit it. */
+    static void end(Object event, long address, long length, int region, Throwable failure) {
+        AbstractPageStoreEvent e = (AbstractPageStoreEvent) event;
+        e.end();
+        if (e.shouldCommit()) {
+            e.address = address;
+            e.length = length;
+            e.region = region;
+            e.errno = failure == null ? 0 : MmapRegionSource.errnoOf(failure);
+            e.commit();
+        }
+    }
 }

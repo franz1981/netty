@@ -80,7 +80,7 @@ final class SharedSlicePurgeWaitTest {
         });
         purger.start();
         assertTrue(purging.await(10, TimeUnit.SECONDS));
-        long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        long run = store.claimSlices(9, 0, false);
         purger.join();
         assertNull(failure.get());
         assertEquals(1, store.purgeWaits);

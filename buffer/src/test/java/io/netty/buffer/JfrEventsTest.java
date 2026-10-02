@@ -154,7 +154,7 @@ public class JfrEventsTest {
 
     @SuppressWarnings("Since15")
     private static boolean isPageStore(RecordedEvent event) {
-        return event.getBoolean("segment");
+        return event.getBoolean("pooled");
     }
 
     private static List<ByteBuf> allocateMany(ByteBufAllocator alloc, boolean direct, int size, int count) {
@@ -395,7 +395,6 @@ public class JfrEventsTest {
             boolean perSegment = !AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
             assertEquals(perSegment ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
                     allocate.getInt("capacity"));
-            assertEquals(segmentSize > 0, allocate.getBoolean("segment"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
             assertTrue(allocate.getBoolean("direct"));
@@ -484,7 +483,7 @@ public class JfrEventsTest {
                 stream.enable(AllocateChunkEvent.class);
                 stream.onEvent(AllocateChunkEvent.NAME, e -> {
                     int capacity = e.getInt("capacity");
-                    if (shared ? e.getBoolean("segment") && capacity == size : capacity > size) {
+                    if (shared ? e.getBoolean("pooled") && capacity == size : capacity > size) {
                         chunkFuture.complete(e);
                     }
                 });

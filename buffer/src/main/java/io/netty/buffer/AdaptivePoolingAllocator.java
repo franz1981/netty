@@ -601,7 +601,6 @@ final class AdaptivePoolingAllocator {
                 event.address = address;
                 event.pooled = true;
                 event.threadLocal = threadLocal;
-                event.segment = true;
                 event.commit();
             }
         }
@@ -618,7 +617,6 @@ final class AdaptivePoolingAllocator {
                 event.direct = direct;
                 event.address = address;
                 event.pooled = true;
-                event.segment = true;
                 event.commit();
             }
         }
@@ -1774,7 +1772,7 @@ final class AdaptivePoolingAllocator {
             PageStore store = magazine.allocator.pageStore;
             int slices = chunkSize / store.config.sliceSize;
             long run = store.claimSlices(slices, magazine.seq,
-                    magazine.ownerThread != null ? PageStore.THREAD_LOCAL : PageStore.STRIPE);
+                    magazine.ownerThread != null);
             Segment segment = store.block(run);
             int start = store.start(run);
             try {
@@ -2116,7 +2114,7 @@ final class AdaptivePoolingAllocator {
                 return;
             }
             PageStore store = allocator.pageStore;
-            long run = store.claimSlices(slices, seq, ownerThread != null ? PageStore.THREAD_LOCAL : PageStore.STRIPE);
+            long run = store.claimSlices(slices, seq, ownerThread != null);
             Segment segment = store.block(run);
             int start = store.start(run);
             // Colour, as the size classes' spans (see SizeClassChunkController) and as mimalloc does for its large

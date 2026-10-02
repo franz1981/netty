@@ -38,7 +38,4 @@ final class AllocateChunkEvent extends AbstractChunkEvent {
     public boolean pooled;
     @Description("Is this chunk part of a thread-local magazine or arena?")
     public boolean threadLocal;
-    @Description("Is this chunk a segment of the adaptive allocator's page store, whose size-class chunks are "
-            + "spans of it that fire no chunk events of their own?")
-    public boolean segment;
 }

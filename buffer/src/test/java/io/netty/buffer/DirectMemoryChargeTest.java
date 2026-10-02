@@ -66,18 +66,18 @@ final class DirectMemoryChargeTest {
         long base = used();
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
-        long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        long run = store.claimSlices(9, 0, false);
         assertEquals(base + regionCharge + 9L * SLICE, used(), "the region is not charged, the slices are");
         Segment block = store.regions[0].blocks[0];
         block.releaseRun(0, 9, System.nanoTime());
-        assertEquals(run, store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(run, store.claimSlices(9, 0, false));
         assertEquals(base + regionCharge + 9L * SLICE, used(), "committed already: not charged again");
         block.releaseRun(3, 6, System.nanoTime());
         long now = System.nanoTime();
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(6, store.slicesPurged);
         assertEquals(base + regionCharge + 3L * SLICE, used(), "the purge credits them");
-        assertEquals(3, (int) store.claimSlices(6, 0, PageStore.NO_HEAP));
+        assertEquals(3, (int) store.claimSlices(6, 0, false));
         assertEquals(base + regionCharge + 9L * SLICE, used(), "purged: charged again");
         assertEquals(15, store.slicesCommitted);
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
@@ -94,21 +94,21 @@ final class DirectMemoryChargeTest {
         long base = used();
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
-        store.claimSlices(9, 0, PageStore.NO_HEAP);
+        store.claimSlices(9, 0, false);
         Segment block = store.regions[0].blocks[0];
         long filler = PlatformDependent.maxDirectMemory() - used() - 4L * SLICE;
         charge(filler);
         try {
-            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, PageStore.NO_HEAP));
+            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, false));
             assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
             assertEquals(Region.UNCOMMITTED, block.freedAt[9]);
             assertEquals(9, store.slicesCommitted);
             block.releaseRun(0, 9, System.nanoTime());
-            assertEquals(0, (int) store.claimSlices(9, 0, PageStore.NO_HEAP), "committed: nothing to charge");
+            assertEquals(0, (int) store.claimSlices(9, 0, false), "committed: nothing to charge");
         } finally {
             credit(filler);
         }
-        assertEquals(9, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(9, (int) store.claimSlices(9, 0, false));
         assertEquals(base + regionCharge + 18L * SLICE, used());
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
@@ -125,12 +125,12 @@ final class DirectMemoryChargeTest {
         CountingRegionSource malloc = new CountingRegionSource(true);
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
-        long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        long run = store.claimSlices(9, 0, false);
         assertEquals(base + REGION_SIZE, used(), "the region, whole");
         store.takeRun(SLOTS); // a second region, whole
         assertEquals(base + 2L * REGION_SIZE, used());
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
-        assertEquals((int) run, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals((int) run, (int) store.claimSlices(9, 0, false));
         assertEquals(base + 2L * REGION_SIZE, used(), "nothing per slice");
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
@@ -153,13 +153,13 @@ final class DirectMemoryChargeTest {
         long filler = PlatformDependent.maxDirectMemory() - used() - REGION_SIZE / 2;
         charge(filler);
         try {
-            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, PageStore.NO_HEAP));
+            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, false));
             assertSame(malloc, store.regionSource, "regions are still made");
             assertEquals(0, store.regionCount());
         } finally {
             credit(filler);
         }
-        assertEquals(0, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(0, (int) store.claimSlices(9, 0, false));
         assertEquals(1, store.regionCount());
         store.close();
     }

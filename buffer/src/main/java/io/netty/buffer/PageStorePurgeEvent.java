@@ -24,7 +24,7 @@ import jdk.jfr.Name;
 @Label("Page Store Purge")
 @Description("One madvise(MADV_DONTNEED) call of the page store: a run of free slots, or of idle free slices of a "
         + "segment a heap holds")
-final class PageStorePurgeEvent extends AbstractPageStoreCallEvent {
+final class PageStorePurgeEvent extends AbstractPageStoreEvent {
     static final String NAME = "io.netty.PageStorePurge";
     private static final PageStorePurgeEvent INSTANCE = new PageStorePurgeEvent();
 
@@ -35,10 +35,10 @@ final class PageStorePurgeEvent extends AbstractPageStoreCallEvent {
     @Description("What the range is: slots (free segments of a region) or slices (free slices of a held segment)")
     public String unit;
 
-    /** As {@link AbstractPageStoreCallEvent#end}, with the {@link #unit}. */
+    /** As {@link AbstractPageStoreEvent#end}, with the {@link #unit}. */
     static void end(Object event, String unit, long address, long length, int region, Throwable failure) {
         ((PageStorePurgeEvent) event).unit = unit;
-        AbstractPageStoreCallEvent.end(event, address, length, region, failure);
+        AbstractPageStoreEvent.end(event, address, length, region, failure);
     }
 
     /** A begun event, as an {@link Object} so that callers need not name this class outside a guarded branch. */

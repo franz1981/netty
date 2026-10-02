@@ -63,13 +63,6 @@ final class PageStore {
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
-    // The heap a segment is taken or given back for, in the JFR events.
-    static final String STRIPE = "stripe";
-    static final String THREAD_LOCAL = "thread-local";
-    static final String NO_HEAP = "none";
-    // Where memory comes from, or goes to, in the JFR events.
-    static final String SHARED_SLICES = "shared-slices";
-    static final String PURGED_SLICES = "purged-slices";
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -151,24 +144,12 @@ final class PageStore {
         return HEAP_SEQUENCE.getAndIncrement(this) & Integer.MAX_VALUE;
     }
 
-    static void taken(long address, long length, int segments, int region, String source, String heap) {
-        if (PlatformDependent.isJfrEnabled() && SegmentTakeEvent.isEventEnabled()) {
-            SegmentTakeEvent.commit(address, length, segments, region, source, heap);
-        }
-    }
-
-    static void givenBack(long address, long length, int segments, int region, String destination, String heap) {
-        if (PlatformDependent.isJfrEnabled() && SegmentGiveBackEvent.isEventEnabled()) {
-            SegmentGiveBackEvent.commit(address, length, segments, region, destination, heap);
-        }
-    }
-
     /**
      * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
      * allocation for a region of one block. When a region cannot be had, switches to {@link #fallbackSource} if there
      * is one, and makes no region: the caller scans again.
      */
-    private synchronized void addRegion(Region[] seen, String heap) {
+    private synchronized void addRegion(Region[] seen, boolean threadLocal) {
         if (closed) {
             throw new IllegalStateException("closed");
         }
@@ -185,7 +166,7 @@ final class PageStore {
             buffer = source.allocateRegion(size, regionAlignment);
         } catch (OutOfMemoryError | RuntimeException e) {
             if (event != null) {
-                AbstractPageStoreCallEvent.end(event, 0, size, seen.length, e);
+                AbstractPageStoreEvent.end(event, 0, size, seen.length, e);
             }
             RegionSource fallback = fallbackSource;
             if (fallback == null) {
@@ -202,12 +183,12 @@ final class PageStore {
         }
         assert buffer.capacity() == size;
         if (event != null) {
-            AbstractPageStoreCallEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
+            AbstractPageStoreEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
         }
         Region region = sharedRegion(buffer, source, blocks);
         if (!region.purgesSlices) {
             // Charged by its allocation, counted whole from now on.
-            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), heap == THREAD_LOCAL);
+            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
         }
         int index = 0;
         while (index < seen.length && !seen[index].released) {
@@ -239,7 +220,7 @@ final class PageStore {
      * the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
      * {@link Segment#releaseRun}, from any thread.
      */
-    long claimSlices(int slices, int seq, String heap) {
+    long claimSlices(int slices, int seq, boolean threadLocal) {
         boolean rescanned = false;
         for (;;) {
             long purgeSeen = purgeSequence;
@@ -249,7 +230,7 @@ final class PageStore {
                 int slice = region.claimSlices(slices, seq);
                 if (slice >= 0) {
                     int perBlock = config.slicesPerSegment();
-                    commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, heap);
+                    commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, threadLocal);
                     return (long) i << 32 | slice;
                 }
             }
@@ -257,7 +238,7 @@ final class PageStore {
                 rescanned = true;
                 continue;
             }
-            addRegion(regions, heap);
+            addRegion(regions, threadLocal);
         }
     }
 
@@ -288,7 +269,7 @@ final class PageStore {
                 rescanned = true;
                 continue;
             }
-            addRegion(regions, NO_HEAP);
+            addRegion(regions, false);
         }
     }
 
@@ -316,7 +297,7 @@ final class PageStore {
         try {
             for (; committed < blocks; committed++) {
                 Segment block = region.blocks[first + committed];
-                commitSlices(block, 0, block.slices, NO_HEAP);
+                commitSlices(block, 0, block.slices, false);
             }
         } finally {
             if (committed < blocks) {
@@ -339,7 +320,7 @@ final class PageStore {
      * are charged to the direct memory limit and counted in the used memory, all at once. On failure the run goes back,
      * any slice charged meanwhile staying charged and free, until it is purged.
      */
-    private void commitSlices(Segment block, int start, int n, String heap) {
+    private void commitSlices(Segment block, int start, int n, boolean threadLocal) {
         Region region = block.region;
         int sliceSize = block.sliceSize;
         long[] freedAt = block.freedAt;
@@ -362,10 +343,7 @@ final class PageStore {
                     }
                 }
                 SLICES_COMMITTED.addAndGet(this, fresh);
-                allocator.storeBytesCommitted(address, fresh * sliceSize, block.buffer.isDirect(),
-                        heap == THREAD_LOCAL);
-                // A memory event, as the purge's give-back: from the run's start, for the slices committed now.
-                taken(address, (long) fresh * sliceSize, 0, region.index, SHARED_SLICES, heap);
+                allocator.storeBytesCommitted(address, fresh * sliceSize, block.buffer.isDirect(), threadLocal);
             }
             committed = true;
         } finally {
@@ -422,7 +400,7 @@ final class PageStore {
                 throw e;
             } finally {
                 if (event != null) {
-                    AbstractPageStoreCallEvent.end(event, address, region.length, region.index, failure);
+                    AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
                 }
             }
         }
@@ -592,7 +570,7 @@ final class PageStore {
             throw e;
         } finally {
             if (event != null) {
-                AbstractPageStoreCallEvent.end(event, address, region.length, region.index, failure);
+                AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
             }
         }
         return true;
@@ -654,7 +632,6 @@ final class PageStore {
                     PlatformDependent.decrementMemoryCounter(length);
                     long address = region.buffer._memoryAddress() + offset;
                     allocator.storeBytesReleased(address, length, block.buffer.isDirect());
-                    givenBack(address, length, 0, region.index, PURGED_SLICES, NO_HEAP);
                 }
             } finally {
                 block.giveBack(bits);
