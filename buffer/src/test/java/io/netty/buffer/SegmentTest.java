@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -22,6 +23,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.Random;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
+import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,8 +32,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * The slice bitmap of a {@link Segment}: first-fit claims, releases that merge with free neighbours, and span buffers.
  */
 final class SegmentTest {
+    /** The block of a region of one, whose releases arm a page store's purge. */
     private static Segment segment(int slices) {
-        return new Segment((AbstractByteBuf) Unpooled.buffer(slices * SLICE_SIZE_BYTES), SLICE_SIZE_BYTES, null, 0);
+        int size = slices * SLICE_SIZE_BYTES;
+        CountingSegmentSource source = new CountingSegmentSource(true);
+        PageStore store = newAllocator(source, size).pageStore;
+        return new Region(store, source.allocateSegment(size), source.fallback, 1, source, store.config, true, 0)
+                .blocks[0];
     }
 
     /** Every length and every start of a lone span in an empty segment, both segment sizes. */

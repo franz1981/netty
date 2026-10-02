@@ -58,6 +58,8 @@ final class PageStore {
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
+    private static final AtomicIntegerFieldUpdater<PageStore> ARMED =
+            AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final Region[] NO_REGIONS = new Region[0];
 
     final AdaptivePoolingAllocator allocator;
@@ -79,6 +81,12 @@ final class PageStore {
     /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
     private volatile long lastPurgeNanos = System.nanoTime();
+    // Read by every run release, written by the release that arms and by the purger: on this object's lines with
+    // regions and slicesCommitted, which every claim reads.
+    /** 1 once a run was released since the purger last disarmed: see {@link #armPurge}. */
+    private volatile int armed;
+    /** When {@link #armed} was set, as {@link System#nanoTime()}: a pass waits the purge delay from then. */
+    private volatile long armedAt;
     // Read by tests and dumps.
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
@@ -93,6 +101,9 @@ final class PageStore {
     long slicesPurged;
     /** Regions given back whole: see {@link #releaseIdleRegions}. */
     long regionsReleased;
+    /** Whether the pass left free slices that were not idle for the delay yet, and the longest any of them waited. */
+    private boolean skipped;
+    private long longestWait;
 
     /**
      * @param regionSource where the regions come from, or {@code null} for {@code segmentSource}'s: {@code mmap} where
@@ -193,12 +204,16 @@ final class PageStore {
         int first = blocks != 0 ? region.claimBlocks(blocks) : region.claimSlices(slices, 0);
         grown[index] = region;
         regions = grown;
+        if (!region.purgesSlices) {
+            // Its free slices have memory behind them, all of them if the claim failed.
+            armPurge(System.nanoTime());
+        }
         return first < 0 ? -1 : (long) index << 32 | first;
     }
 
     /** A region charged whole has memory behind all of it, free since now. */
     private Region sharedRegion(AbstractByteBuf buffer, RegionSource source, int blocks) {
-        Region region = new Region(buffer, source, blocks, segmentSource, config, !source.canPurgeSlices(),
+        Region region = new Region(this, buffer, source, blocks, segmentSource, config, !source.canPurgeSlices(),
                 System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];
@@ -283,6 +298,7 @@ final class PageStore {
                     Segment block = region.blocks[first + slot];
                     block.giveBack(block.allFree);
                 }
+                armPurge(now);
             }
         }
     }
@@ -399,19 +415,34 @@ final class PageStore {
     }
 
     /**
+     * Any thread, after it released a run at {@code now}: arms the purge, unless armed. The common case reads one
+     * shared field; only the release that finds it disarmed writes, unlike mimalloc v3, which sets its arena's purge
+     * expiry by CAS on every free (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2325). A purger
+     * that sees {@link #armed} before {@link #armedAt} is written may run a pass early: it finds the run not idle yet
+     * and arms again for it.
+     */
+    void armPurge(long now) {
+        if (armed == 0 && ARMED.compareAndSet(this, 0, 1)) {
+            armedAt = now;
+        }
+    }
+
+    /**
      * Any thread, from a heap's purge tick (see {@code IdleDecay#count}) or a one-shot buffer. At most once per
-     * {@link PageStoreConfig#purgeCheckNanos}, and by one thread at a time (a try-guard: a caller that finds a purge
-     * running returns at once), gives back to the OS the memory of the free slices, or of the regions of one block,
-     * that stayed free for {@link PageStoreConfig#purgeDelayNanos} at least.
+     * {@link PageStoreConfig#purgeCheckNanos}, only once the purge was armed {@link PageStoreConfig#purgeDelayNanos}
+     * ago (see {@link #armPurge}), and by one thread at a time (a try-guard: a caller that finds a purge running
+     * returns at once), gives back to the OS the memory of the free slices, or of the regions of one block, that
+     * stayed free for the delay at least. The pass disarms the purge before it scans, so that a release during the
+     * pass arms it again, and arms it again itself for the free slices it found not idle long enough yet.
      */
     void purgeIfDue(long now) {
-        if (now - lastPurgeNanos < config.purgeCheckNanos
-                || !PURGING.compareAndSet(this, 0, 1)) {
+        if (!isDue(now) || !PURGING.compareAndSet(this, 0, 1)) {
             return;
         }
         try {
-            if (now - lastPurgeNanos >= config.purgeCheckNanos) {
+            if (isDue(now)) {
                 lastPurgeNanos = now;
+                armed = 0;
                 purge(now);
             }
         } finally {
@@ -419,11 +450,39 @@ final class PageStore {
         }
     }
 
+    private boolean isDue(long now) {
+        return now - lastPurgeNanos >= config.purgeCheckNanos && armed != 0
+                && now - armedAt >= config.purgeDelayNanos;
+    }
+
+    /**
+     * Purger: arms the purge as if armed {@code waited} before {@code now}, unless armed to be due sooner. Racy against
+     * a release that arms meanwhile: either arming stands, and a pass that finds slices not idle yet arms again.
+     */
+    private void rearm(long now, long waited) {
+        if (armed == 0 || now - armedAt < waited) {
+            armedAt = now - waited;
+            armed = 1;
+        }
+    }
+
+    /** Purger: free slices, or a region, free for {@code waited}, short of the delay, are left for a later pass. */
+    private void skip(long waited) {
+        if (!skipped || waited > longestWait) {
+            skipped = true;
+            longestWait = waited;
+        }
+    }
+
     /** See {@link #purgeSharedSlices} and {@link #releaseIdleRegions}. */
     private void purge(long now) {
         purges++;
+        skipped = false;
         purgeSharedSlices(now);
         releaseIdleRegions(now);
+        if (skipped) {
+            rearm(now, longestWait);
+        }
     }
 
     /**
@@ -476,14 +535,19 @@ final class PageStore {
     private void releaseIdleRegions(long now) {
         long delay = config.purgeDelayNanos;
         for (Region region : regions) {
-            if (region.purgesSlices || region.released || !idle(region, now, delay, false)) {
+            if (region.purgesSlices || region.released || !whollyFree(region)) {
+                continue;
+            }
+            long waited = shortestWait(region, now);
+            if (waited < delay) {
+                skip(waited);
                 continue;
             }
             int claimed = 0;
             while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
                 claimed++;
             }
-            if (claimed == region.slots && idle(region, now, delay, true) && release(region)) {
+            if (claimed == region.slots && shortestWait(region, now) >= delay && release(region)) {
                 continue;
             }
             for (int slot = 0; slot < claimed; slot++) {
@@ -493,23 +557,28 @@ final class PageStore {
         }
     }
 
-    /**
-     * Whether every slice of {@code region} is free, or claimed by the caller ({@code claimed}), and was freed
-     * {@code delay} before {@code now} or earlier. Racy unless the caller claimed every block.
-     */
-    private static boolean idle(Region region, long now, long delay, boolean claimed) {
-        for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.blocks[slot];
-            if (!claimed && !block.isWhollyFree()) {
+    /** Racy: whether every slice of {@code region} is free. */
+    private static boolean whollyFree(Region region) {
+        for (Segment block : region.blocks) {
+            if (!block.isWhollyFree()) {
                 return false;
-            }
-            for (long freed : block.freedAt) {
-                if (now - freed < delay) {
-                    return false;
-                }
             }
         }
         return true;
+    }
+
+    /**
+     * How long, at {@code now}, the slice of {@code region} freed last has been free: the region is idle once this
+     * reaches the delay. Racy unless the caller claimed every block.
+     */
+    private static long shortestWait(Region region, long now) {
+        long shortest = Long.MAX_VALUE;
+        for (Segment block : region.blocks) {
+            for (long freed : block.freedAt) {
+                shortest = Math.min(shortest, now - freed);
+            }
+        }
+        return shortest;
     }
 
     /** {@code region}, which the purger holds whole, goes back to its source, unless the store was closed. */
@@ -538,17 +607,24 @@ final class PageStore {
     }
 
     /**
-     * Free slices with memory behind them of {@code slices}, freed {@code delay} before {@code now} or earlier. Racy
-     * for slices the caller does not own, exact for those it does.
+     * Free slices with memory behind them of {@code slices}, freed {@code delay} before {@code now} or earlier; the
+     * others with memory behind them are skipped (see {@link #skip}). Racy for slices the caller does not own, exact
+     * for those it does.
      */
-    private static long purgeable(Segment block, long slices, long now, long delay) {
+    private long purgeable(Segment block, long slices, long now, long delay) {
         long purgeable = 0;
         long[] freedAt = block.freedAt;
         for (long bits = slices; bits != 0; bits &= bits - 1) {
             int slice = Long.numberOfTrailingZeros(bits);
             long freed = freedAt[slice];
-            if (freed != Region.UNCOMMITTED && now - freed >= delay) {
+            if (freed == Region.UNCOMMITTED) {
+                continue;
+            }
+            long waited = now - freed;
+            if (waited >= delay) {
                 purgeable |= 1L << slice;
+            } else {
+                skip(waited);
             }
         }
         return purgeable;
@@ -582,6 +658,8 @@ final class PageStore {
             }
             if (failure != null) {
                 purgeFailed(failure);
+                // Still purgeable: the next pass tries again.
+                skip(config.purgeDelayNanos);
             }
         } finally {
             try {

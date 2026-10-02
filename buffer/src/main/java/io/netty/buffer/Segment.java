@@ -114,7 +114,8 @@ final class Segment {
 
     /**
      * The run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
-     * slices with memory behind them stamped with {@code now} first. Throws if any of them is free already.
+     * slices with memory behind them stamped with {@code now} first, and the store's purge armed after (see
+     * {@link PageStore#armPurge}). Throws if any of them is free already.
      */
     void releaseRun(int start, int n, long now) {
         long[] freedAt = this.freedAt;
@@ -124,6 +125,7 @@ final class Segment {
             }
         }
         giveBack(n == slices ? allFree : mask(start, n));
+        region.store.armPurge(now);
     }
 
     /** The slices of {@code bits}, which the caller claimed, are free again, unstamped. */

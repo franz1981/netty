@@ -30,6 +30,7 @@ final class Region {
     /** No memory behind the slice: never claimed since the region was mapped, or purged since. */
     static final long UNCOMMITTED = Long.MIN_VALUE;
 
+    final PageStore store;
     final AbstractByteBuf buffer;
     /** Where {@link #buffer} comes from, and goes back to. */
     final RegionSource source;
@@ -55,9 +56,10 @@ final class Region {
     private volatile int maxAccessed = -1;
 
     /** Every block made now, all slices free; uncommitted unless {@code committedAt}, their release time, is set. */
-    Region(AbstractByteBuf buffer, RegionSource source, int slots, SegmentSource views, PageStoreConfig config,
-           boolean committed, long committedAt) {
+    Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots, SegmentSource views,
+           PageStoreConfig config, boolean committed, long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
+        this.store = store;
         this.buffer = buffer;
         this.source = source;
         purgesSlices = source.canPurgeSlices();
@@ -138,6 +140,7 @@ final class Region {
                 Segment block = blocks[first + i];
                 block.giveBack(block.allFree);
             }
+            store.armPurge(System.nanoTime());
             first += claimed + 1;
         }
         return -1;
