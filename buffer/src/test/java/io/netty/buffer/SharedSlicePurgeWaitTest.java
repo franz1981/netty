@@ -41,10 +41,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Isolated("The claim's wait for the purger is bounded in time")
 final class SharedSlicePurgeWaitTest {
+    private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
+
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
-
-    private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

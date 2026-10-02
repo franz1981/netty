@@ -42,13 +42,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 public class SizeClassChunkRecyclerTest {
-    @RegisterExtension
-    final AllocatorCloser closer = new AllocatorCloser();
-
     // 2048 and 4096 share the MIN_CHUNK_SIZE pool; 8192 has a chunk size of its own (asserted below).
     private static final int SMALL = AdaptivePoolingAllocator.sizeClassIndexOf(2048);
     private static final int SMALL2 = AdaptivePoolingAllocator.sizeClassIndexOf(4096);
     private static final int LARGE = AdaptivePoolingAllocator.sizeClassIndexOf(8192);
+
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
 
     private static int chunkSize(int sizeClassIndex) {
         return AdaptivePoolingAllocator.chunkSizeOf(AdaptivePoolingAllocator.getSizeClasses()[sizeClassIndex],

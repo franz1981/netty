@@ -55,10 +55,10 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * back by the purge, and the defaults per memory mode.
  */
 public class AdaptiveSegmentsTest {
+    private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
+
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
-
-    private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
 
     /** Slices of the chunk of each size class, as the page-store plan's table has them. */
     private static int expectedSlices(int sizeClass) {

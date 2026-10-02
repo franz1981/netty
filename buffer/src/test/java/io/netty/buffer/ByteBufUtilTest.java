@@ -45,10 +45,10 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 public class ByteBufUtilTest {
+    private static final String PARAMETERIZED_NAME = "bufferType = {0}";
+
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
-
-    private static final String PARAMETERIZED_NAME = "bufferType = {0}";
     private final AdaptiveByteBufAllocator adaptiveByteBufAllocator = closer.add(new AdaptiveByteBufAllocator());
 
     private enum BufferType {

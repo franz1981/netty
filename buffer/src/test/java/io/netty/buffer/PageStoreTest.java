@@ -42,12 +42,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * regions.
  */
 final class PageStoreTest {
-    @RegisterExtension
-    final AllocatorCloser closer = new AllocatorCloser();
-
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
     private static final int PER_BLOCK = SEGMENT_SIZE / SLICE_SIZE_BYTES;
     private static final int SPAN = PER_BLOCK - 1;
+
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

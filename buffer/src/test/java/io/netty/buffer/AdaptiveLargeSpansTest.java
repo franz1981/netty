@@ -54,10 +54,10 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * one block (direct or heap, as without {@code mmap}) or of many.
  */
 final class AdaptiveLargeSpansTest {
+    private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
+
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
-
-    private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

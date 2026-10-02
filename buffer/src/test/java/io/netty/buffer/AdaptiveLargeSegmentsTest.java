@@ -52,14 +52,14 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * {@code byte[]} each).
  */
 final class AdaptiveLargeSegmentsTest {
-    @RegisterExtension
-    final AllocatorCloser closer = new AllocatorCloser();
-
     /** Eight spans of 512 KiB fill one 4 MiB segment. */
     private static final int POOLED = 512 * 1024;
     private static final int PER_CHUNK = SEGMENT_SIZE / POOLED;
     private static final int SPAN_SLICES = POOLED / PageStoreConfig.SLICE_SIZE_BYTES;
     private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
+
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
 
     private CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

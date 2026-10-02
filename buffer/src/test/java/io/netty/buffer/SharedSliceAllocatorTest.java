@@ -47,10 +47,10 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * thread, after their heap died too, give their slices back.
  */
 final class SharedSliceAllocatorTest {
+    private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
+
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
-
-    private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

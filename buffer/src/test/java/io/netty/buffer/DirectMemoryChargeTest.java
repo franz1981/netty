@@ -47,11 +47,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @Isolated("Fills PlatformDependent's direct memory counter past its limit, which concurrent allocations would hit")
 final class DirectMemoryChargeTest {
-    @RegisterExtension
-    final AllocatorCloser closer = new AllocatorCloser();
-
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
+
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();

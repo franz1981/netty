@@ -49,12 +49,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * free idle slices, coalesced across blocks. Then all of it at once from many threads.
  */
 final class SharedSlicesTest {
-    @RegisterExtension
-    final AllocatorCloser closer = new AllocatorCloser();
-
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
     private static final int PER_BLOCK = SEGMENT_SIZE / SLICE;
     private static final int PER_REGION = REGION_SIZE / SLICE;
+
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
