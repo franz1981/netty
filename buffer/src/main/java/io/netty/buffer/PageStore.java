@@ -98,6 +98,7 @@ final class PageStore {
     static final String FREE_SLOT = "free-slot";
     static final String OWN_FREED = "own-freed";
     static final String SHARED_SLICES = "shared-slices";
+    static final String PURGED_SLICES = "purged-slices";
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -489,8 +490,9 @@ final class PageStore {
                 }
                 SLICES_COMMITTED.addAndGet(this, fresh);
                 allocator.storeBytesCommitted(address, fresh * sliceSize, heap == THREAD_LOCAL);
+                // A memory event, as the purge's give-back: from the run's start, for the slices committed now.
+                taken(address, (long) fresh * sliceSize, 0, region.index, SHARED_SLICES, heap);
             }
-            taken(address, (long) n * sliceSize, 0, region.index, SHARED_SLICES, heap);
             committed = true;
         } finally {
             if (!committed) {
@@ -505,8 +507,6 @@ final class PageStore {
      */
     void releaseSlices(Segment block, int start, int n) {
         block.releaseRun(start, n, System.nanoTime());
-        givenBack(block.memoryAddress() + (long) start * block.sliceSize, (long) n * block.sliceSize, 0,
-                block.region.index, SHARED_SLICES, NO_HEAP);
     }
 
     /**
@@ -572,8 +572,6 @@ final class PageStore {
                 Segment block = region.block(slot);
                 block.releaseRun(0, block.slices, now);
             }
-            givenBack(region.buffer._memoryAddress() + (long) start * config.segmentSize,
-                    (long) slots * config.segmentSize, slots, region.index, SHARED_SLICES, NO_HEAP);
             return;
         }
         for (int slot = start; slot < start + slots; slot++) {
@@ -816,7 +814,9 @@ final class PageStore {
                     bytesPurged += length;
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
-                    allocator.storeBytesReleased(region.buffer._memoryAddress() + offset, length);
+                    long address = region.buffer._memoryAddress() + offset;
+                    allocator.storeBytesReleased(address, length);
+                    givenBack(address, length, 0, region.index, PURGED_SLICES, NO_HEAP);
                 }
             } finally {
                 block.giveBack(bits);
