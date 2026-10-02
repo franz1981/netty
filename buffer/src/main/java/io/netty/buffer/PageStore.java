@@ -20,7 +20,6 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.Arrays;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
@@ -58,8 +57,6 @@ final class PageStore {
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
     private static final AtomicLongFieldUpdater<PageStore> PURGE_WAITS =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "purgeWaits");
-    /** The longest a claim waits for the purger to give back the run it holds: see {@link #awaitPurgedRun}. */
-    private static final long PURGE_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
     private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final Region[] NO_REGIONS = new Region[0];
@@ -86,7 +83,9 @@ final class PageStore {
     // Read by tests and dumps.
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
-    /** Shared slices: claims that found no fit while the purger held slices, and waited for it. */
+    /**
+     * Shared slices: claims that found no fit while the purger held slices, and scanned again once it gave them back.
+     */
     volatile long purgeWaits;
     /**
      * Shared slices, written by the purger only: odd while it holds slices it claimed for their purge, incremented
@@ -275,9 +274,11 @@ final class PageStore {
 
     /**
      * Before a claim that found no fit maps a region: whether the purger held slices while the claim scanned (its
-     * sequence moved since {@code seen}, or is odd), in which case this waits, by yields and at most
-     * {@link #PURGE_WAIT_NANOS}, until it holds none, so that the caller scans once more instead of mapping a region
-     * for slices that were only out for their purge.
+     * sequence moved since {@code seen}, or is odd), in which case the caller scans once more instead of mapping a
+     * region for slices that were only out for their purge. If the purger holds a run now, this first yields until it
+     * gave that run back: the purge of one run within a block, or one region claimed whole, then released or given
+     * back. No time bound, so that a slow purge does not cost a region; nothing the purger does while it holds a run
+     * waits for a claim.
      */
     private boolean awaitPurgedRun(long seen) {
         long current = purgeSequence;
@@ -285,9 +286,10 @@ final class PageStore {
             return false;
         }
         PURGE_WAITS.incrementAndGet(this);
-        long start = System.nanoTime();
-        while ((purgeSequence & 1) != 0 && System.nanoTime() - start < PURGE_WAIT_NANOS) {
-            Thread.yield();
+        if ((current & 1) != 0) {
+            while (purgeSequence == current) {
+                Thread.yield();
+            }
         }
         return true;
     }
@@ -476,6 +478,8 @@ final class PageStore {
                 while (candidates != 0) {
                     long run = lowestRun(candidates);
                     candidates &= ~run;
+                    long failures = purgeFailures;
+                    Throwable failure = null;
                     purgeSequence++; // odd: the purger holds slices
                     try {
                         long claimed = block.claimFree(run);
@@ -486,10 +490,15 @@ final class PageStore {
                         while (exact != 0) {
                             long bits = lowestRun(exact);
                             exact &= ~bits;
-                            purgeSliceRun(block, bits);
+                            Throwable t = purgeSliceRun(block, bits);
+                            failure = failure == null ? t : failure;
                         }
                     } finally {
                         purgeSequence++;
+                    }
+                    if (failure != null) {
+                        // Logged once the run is back: a claim waits for it, and a logger may allocate.
+                        purgeFailed(failure, failures == 0);
                     }
                 }
             }
@@ -591,9 +600,10 @@ final class PageStore {
 
     /**
      * Purges the contiguous slices {@code bits} of {@code block}, which the purger claimed, with one call, then gives
-     * them back. A run whose call fails keeps its memory, and stays purgeable.
+     * them back. A run whose call fails keeps its memory, and stays purgeable: returns the failure, counted, for the
+     * caller to log, else {@code null}.
      */
-    private void purgeSliceRun(Segment block, long bits) {
+    private Throwable purgeSliceRun(Segment block, long bits) {
         Region region = block.region;
         int sliceSize = block.sliceSize;
         int start = Long.numberOfTrailingZeros(bits);
@@ -601,10 +611,10 @@ final class PageStore {
         int offset = block.slot * config.segmentSize + start * sliceSize;
         int length = n * sliceSize;
         boolean purged = false;
+        Throwable failure = null;
         try {
             Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
                     PageStorePurgeEvent.start() : null;
-            Throwable failure = null;
             try {
                 region.source.purge(region.buffer, offset, length);
                 purged = true;
@@ -616,7 +626,7 @@ final class PageStore {
                         failure);
             }
             if (failure != null) {
-                purgeFailed(failure);
+                purgeFailures++;
             }
         } finally {
             try {
@@ -636,6 +646,7 @@ final class PageStore {
                 block.giveBack(bits);
             }
         }
+        return failure;
     }
 
     /** The lowest run of contiguous set bits of {@code bits}, which is not 0. */
@@ -645,8 +656,8 @@ final class PageStore {
         return length == Long.SIZE ? -1L : (1L << length) - 1 << start;
     }
 
-    private void purgeFailed(Throwable cause) {
-        if (purgeFailures++ == 0) {
+    private void purgeFailed(Throwable cause, boolean first) {
+        if (first) {
             logger.warn("Cannot purge free slices: their memory stays committed. Further failures are logged at "
                     + "debug level.", cause);
         } else {
