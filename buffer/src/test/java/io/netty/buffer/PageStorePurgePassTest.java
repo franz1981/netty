@@ -17,6 +17,7 @@ package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -170,6 +171,30 @@ final class PageStorePurgePassTest {
         assertEquals(3, store.purges);
         store.purgeIfDue(now + 10 * DELAY);
         assertEquals(3, store.purges, "the last pass finished: disarmed");
+    }
+
+    /**
+     * A release stamped {@link Long#MIN_VALUE}, a {@link System#nanoTime()} like any other: its slices keep their
+     * memory, so that the next claim of them charges nothing, and are purged once free for the delay.
+     */
+    @Test
+    void aReleaseStampedLongMinValueKeepsItsMemory() {
+        long released = Long.MIN_VALUE;
+        PageStore store = store(released - DELAY, 1);
+        AdaptivePoolingAllocator allocator = store.allocator;
+        long used = allocator.usedMemory();
+        block(store, 0).releaseRun(0, 4, released);
+        assertEquals(0, (int) store.claimSlices(4, 0, false));
+        assertEquals(PER_BLOCK, store.slicesCommitted, "not charged again");
+        assertEquals(used, allocator.usedMemory());
+        block(store, 0).releaseRun(0, 4, released);
+        store.purgeIfDue(released + DELAY - 1);
+        assertEquals(0, store.purges, "not due");
+        store.purgeIfDue(released + DELAY);
+        assertEquals(1, regions.purgeCalls());
+        assertEquals(4 * SLICE, regions.purges.get(0)[1]);
+        assertEquals(used - 4L * SLICE, allocator.usedMemory());
+        PageStoreTestSupport.assertSharedAccounted(segments, allocator);
     }
 
     /** {@code n} single slices of {@code block} from {@code start}, one free and one claimed. */

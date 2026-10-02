@@ -34,7 +34,6 @@ import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Real memory sources that count what they hand out, and allocators built on them: the page store's accounting goes
@@ -323,12 +322,9 @@ final class PageStoreTestSupport {
         int committed = 0;
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];
-            long free = block.free;
-            for (int i = 0; i < block.slices; i++) {
-                boolean behind = block.freedAt[i] != Region.UNCOMMITTED;
-                assertTrue(behind || (free & 1L << i) != 0, "a claimed slice without memory behind it");
-                committed += behind ? 1 : 0;
-            }
+            long behind = block.committed;
+            assertEquals(0, ~block.free & ~behind & block.allFree, "a claimed slice without memory behind it");
+            committed += Long.bitCount(behind);
         }
         return committed;
     }

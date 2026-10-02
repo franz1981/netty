@@ -123,7 +123,7 @@ final class DirectMemoryChargeTest {
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, false));
             assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
-            assertEquals(Region.UNCOMMITTED, block.freedAt[9]);
+            assertEquals(0, block.committed & block.bits(9, 9), "no memory behind the slices that went back");
             assertEquals(9, store.slicesCommitted);
             block.releaseRun(0, 9, System.nanoTime());
             assertEquals(0, (int) store.claimSlices(9, 0, false), "committed: nothing to charge");

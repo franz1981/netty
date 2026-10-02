@@ -181,7 +181,7 @@ final class PageStoreStateEvent extends Event {
         if ((block.free & 1L << i) == 0) {
             return OUT;
         }
-        if (block.freedAt[i] != Region.UNCOMMITTED) {
+        if ((block.committed & 1L << i) != 0) {
             return COMMITTED;
         }
         return region.sliceEverCommitted[slice] ? PURGED : UNTOUCHED;

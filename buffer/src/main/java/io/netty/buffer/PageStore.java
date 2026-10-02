@@ -320,24 +320,17 @@ final class PageStore {
     private void commitSlices(Segment block, int start, int n, boolean threadLocal) {
         Region region = block.region;
         int sliceSize = block.sliceSize;
-        long[] freedAt = block.freedAt;
-        int fresh = 0;
-        for (int i = start; i < start + n; i++) {
-            if (freedAt[i] == Region.UNCOMMITTED) {
-                fresh++;
-            }
-        }
+        long bits = block.bits(start, n) & ~block.committed;
+        int fresh = Long.bitCount(bits);
         long address = block.buffer._memoryAddress() + (long) start * sliceSize;
         boolean committed = false;
         try {
             if (fresh != 0) {
                 PlatformDependent.incrementMemoryCounter(fresh * sliceSize);
+                block.commit(bits);
                 int base = block.slot * block.slices;
-                for (int i = start; i < start + n; i++) {
-                    if (freedAt[i] == Region.UNCOMMITTED) {
-                        freedAt[i] = 0;
-                        region.sliceEverCommitted[base + i] = true;
-                    }
+                for (; bits != 0; bits &= bits - 1) {
+                    region.sliceEverCommitted[base + Long.numberOfTrailingZeros(bits)] = true;
                 }
                 SLICES_COMMITTED.addAndGet(this, fresh);
                 allocator.storeBytesCommitted(address, fresh * sliceSize, block.buffer.isDirect(), threadLocal);
@@ -408,13 +401,8 @@ final class PageStore {
         int sliceSize = config.sliceSize;
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];
-            int committed = 0;
-            for (int i = 0; i < block.slices; i++) {
-                if (block.freedAt[i] != Region.UNCOMMITTED) {
-                    block.freedAt[i] = Region.UNCOMMITTED;
-                    committed++;
-                }
-            }
+            int committed = Long.bitCount(block.committed);
+            block.committed = 0;
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
                 allocator.storeBytesReleased(block.buffer._memoryAddress(), committed * sliceSize,
@@ -646,18 +634,15 @@ final class PageStore {
     /**
      * Free slices with memory behind them of {@code slices}, freed {@code delay} before {@code now} or earlier; the
      * others with memory behind them are skipped (see {@link #skip}). Racy for slices the caller does not own, exact
-     * for those it does.
+     * for those it does. {@code slices} is read from {@link Segment#free} before {@link Segment#committed}: a free bit
+     * seen set shows the committed bit its releaser left.
      */
     private long purgeable(Segment block, long slices, long now, long delay) {
         long purgeable = 0;
         long[] freedAt = block.freedAt;
-        for (long bits = slices; bits != 0; bits &= bits - 1) {
+        for (long bits = slices & block.committed; bits != 0; bits &= bits - 1) {
             int slice = Long.numberOfTrailingZeros(bits);
-            long freed = freedAt[slice];
-            if (freed == Region.UNCOMMITTED) {
-                continue;
-            }
-            long waited = now - freed;
+            long waited = now - freedAt[slice];
             if (waited >= delay) {
                 purgeable |= 1L << slice;
             } else {
@@ -701,9 +686,7 @@ final class PageStore {
         } finally {
             try {
                 if (purged) {
-                    for (int i = start; i < start + n; i++) {
-                        block.freedAt[i] = Region.UNCOMMITTED;
-                    }
+                    block.uncommit(bits);
                     // Credited before a claim can find the slices uncommitted and charge them again.
                     purgeCalls++;
                     bytesPurged += length;
@@ -747,15 +730,10 @@ final class PageStore {
             for (int slot = 0; slot < region.slots; slot++) {
                 Segment block = region.blocks[slot];
                 long free = block.free;
-                for (int i = 0; i < block.slices; i++) {
-                    if ((free & 1L << i) == 0) {
-                        counts[0]++;
-                    } else if (block.freedAt[i] != Region.UNCOMMITTED) {
-                        counts[1]++;
-                    } else {
-                        counts[2]++;
-                    }
-                }
+                long committed = block.committed;
+                counts[0] += Long.bitCount(~free & block.allFree);
+                counts[1] += Long.bitCount(free & committed);
+                counts[2] += Long.bitCount(free & ~committed);
             }
         }
         return counts;

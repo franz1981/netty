@@ -27,9 +27,6 @@ final class Region {
     private static final AtomicIntegerFieldUpdater<Region> MAX_ACCESSED =
             AtomicIntegerFieldUpdater.newUpdater(Region.class, "maxAccessed");
 
-    /** No memory behind the slice: never claimed since the region was mapped, or purged since. */
-    static final long UNCOMMITTED = Long.MIN_VALUE;
-
     final PageStore store;
     final AbstractByteBuf buffer;
     /** Where {@link #buffer} comes from, and goes back to. */
@@ -55,7 +52,7 @@ final class Region {
     /** The highest block a run was claimed in, -1 before the first. */
     private volatile int maxAccessed = -1;
 
-    /** Every block made now, all slices free; uncommitted unless {@code committedAt}, their release time, is set. */
+    /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
     Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots, SegmentSource views,
            PageStoreConfig config, boolean committed, long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -69,7 +66,10 @@ final class Region {
         blocks = new Segment[slots];
         for (int slot = 0; slot < slots; slot++) {
             Segment block = new Segment(views.span(buffer, slot * size, size), config.sliceSize, this, slot);
-            Arrays.fill(block.freedAt, committed ? committedAt : UNCOMMITTED);
+            if (committed) {
+                block.committed = block.allFree;
+                Arrays.fill(block.freedAt, committedAt);
+            }
             blocks[slot] = block;
         }
         sliceEverCommitted = new boolean[slots * config.slicesPerSegment()];

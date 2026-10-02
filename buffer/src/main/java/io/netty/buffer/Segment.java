@@ -25,11 +25,14 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * <p>
  * A block of a {@link Region} has no owner: any thread claims and releases runs of its slices by CAS
  * ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it, which alone
- * touches that slice's {@link #freedAt}; the CAS that sets the bit again publishes it.
+ * touches that slice's bit of {@link #committed} and its {@link #freedAt}; the CAS that sets the bit again publishes
+ * them.
  */
 final class Segment {
     private static final AtomicLongFieldUpdater<Segment> FREE =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
+    private static final AtomicLongFieldUpdater<Segment> COMMITTED =
+            AtomicLongFieldUpdater.newUpdater(Segment.class, "committed");
 
     final AbstractByteBuf buffer;
     final int sliceSize;
@@ -37,12 +40,14 @@ final class Segment {
     final long allFree;
     /** Bit {@code i} set when slice {@code i} is free. */
     volatile long free;
+    /**
+     * Bit {@code i} set when slice {@code i} has memory behind it. Each holder changes its own bits only, by CAS: the
+     * holders of other runs of the block change theirs meanwhile.
+     */
+    volatile long committed;
     final Region region;
     final int slot;
-    /**
-     * Per slice, slice owner only: {@link Region#UNCOMMITTED}, else the {@link System#nanoTime()} of its last
-     * release.
-     */
+    /** Per slice, slice owner only: the {@link System#nanoTime()} of its last release. */
     final long[] freedAt;
     /** The chunk of every large-buffer span a stripe claimed in it. Set before its region is published. */
     AdaptivePoolingAllocator.Chunk sharedSpans;
@@ -77,6 +82,11 @@ final class Segment {
     private static long mask(int start, int n) {
         assert n > 0 && n < Long.SIZE && start >= 0 && start + n <= Long.SIZE;
         return (1L << n) - 1 << start;
+    }
+
+    /** The bits of the run of {@code n} slices from {@code start}. */
+    long bits(int start, int n) {
+        return n == slices ? allFree : mask(start, n);
     }
 
     /** Any thread: claims the lowest run of {@code n} free slices. Returns its first slice, or -1. */
@@ -114,17 +124,15 @@ final class Segment {
 
     /**
      * The run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
-     * slices with memory behind them stamped with {@code now} first, and the store's purge armed after (see
-     * {@link PageStore#armPurge}). Throws if any of them is free already.
+     * slices stamped with {@code now} first, and the store's purge armed after (see {@link PageStore#armPurge}).
+     * Throws if any of them is free already.
      */
     void releaseRun(int start, int n, long now) {
         long[] freedAt = this.freedAt;
         for (int i = start; i < start + n; i++) {
-            if (freedAt[i] != Region.UNCOMMITTED) {
-                freedAt[i] = now;
-            }
+            freedAt[i] = now;
         }
-        giveBack(n == slices ? allFree : mask(start, n));
+        giveBack(bits(start, n));
         region.store.armPurge(now);
     }
 
@@ -136,6 +144,26 @@ final class Segment {
                 throw new IllegalStateException("slices " + Long.toHexString(current & bits) + " are already free");
             }
             if (FREE.compareAndSet(this, current, current | bits)) {
+                return;
+            }
+        }
+    }
+
+    /** The caller's claimed slices of {@code bits} have memory behind them now. */
+    void commit(long bits) {
+        for (;;) {
+            long current = committed;
+            if (COMMITTED.compareAndSet(this, current, current | bits)) {
+                return;
+            }
+        }
+    }
+
+    /** The caller's claimed slices of {@code bits} have no memory behind them any more. */
+    void uncommit(long bits) {
+        for (;;) {
+            long current = committed;
+            if (COMMITTED.compareAndSet(this, current, current & ~bits)) {
                 return;
             }
         }
