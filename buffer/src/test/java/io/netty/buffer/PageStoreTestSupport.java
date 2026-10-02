@@ -263,6 +263,22 @@ final class PageStoreTestSupport {
         return buf.memoryAddress() - segment.buffer.memoryAddress();
     }
 
+    /**
+     * Purge passes from {@code now} on, a cadence floor apart, as long as one is due: all a pass of
+     * {@link PageStore#PURGE_CALLS} calls at most leaves to the next ones.
+     */
+    static void purgeUntilDone(PageStore store, long now) {
+        for (int i = 0; i < 10000; i++) {
+            long passes = store.purges;
+            store.purgeIfDue(now);
+            if (store.purges == passes) {
+                return;
+            }
+            now += store.config.purgeCheckNanos;
+        }
+        throw new AssertionError("the purge never stops");
+    }
+
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {
         return new AdaptivePoolingAllocator(source, true, source, null,

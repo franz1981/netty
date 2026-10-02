@@ -39,6 +39,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
+import static io.netty.buffer.PageStoreTestSupport.purgeUntilDone;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -255,8 +256,8 @@ final class SharedSlicesTest {
         assertEquals(heap, source.delegate.regions.get(0).hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);
         if (!mmap) {
-            // All free and idle now: every region goes back.
-            store.purgeIfDue(System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+            // All free and idle now: every region goes back, in passes of a budget each.
+            purgeUntilDone(store, System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             assertEquals(0, countLive(store), "a wholly free region stayed");
             assertEquals(source.mapped(), store.regionsReleased, "every region mapped went back");
             assertEquals(0, store.allocator.usedMemory());

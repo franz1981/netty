@@ -31,6 +31,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
+import static io.netty.buffer.PageStoreTestSupport.purgeUntilDone;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -193,7 +194,8 @@ final class PageStoreTest {
         for (Segment block : blocks) {
             block.releaseRun(0, SPAN, System.nanoTime());
         }
-        store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
+        // More purge calls than a pass makes: the mapped region's blocks, then the one-block regions.
+        purgeUntilDone(store, System.nanoTime() + 4 * INTERVAL);
         assertEquals(2, store.regionsReleased, "the idle one-block regions went back, the mapped one stays");
         assertEquals(0, malloc.live());
         assertSharedAccounted(segments, allocator);

@@ -61,6 +61,11 @@ final class PageStore {
     private static final AtomicIntegerFieldUpdater<PageStore> ARMED =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final Region[] NO_REGIONS = new Region[0];
+    /**
+     * The calls a purge pass makes at most (see {@link #purge}). Measured with {@code mmap}, 1 GiB freed at once: 8 make
+     * a pass of about 3 ms and give the GiB back in about a minute; one pass of all of it took 130 to 145 ms.
+     */
+    static final int PURGE_CALLS = 8;
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -80,7 +85,8 @@ final class PageStore {
     private boolean closed;
     /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
-    private volatile long lastPurgeNanos = System.nanoTime();
+    /** Set by tests. */
+    volatile long lastPurgeNanos = System.nanoTime();
     // Read by every run release, written by the release that arms and by the purger: on this object's lines with
     // regions and slicesCommitted, which every claim reads.
     /** 1 once a run was released since the purger last disarmed: see {@link #armPurge}. */
@@ -99,11 +105,14 @@ final class PageStore {
     long purgeFailures;
     /** Shared slices purged. */
     long slicesPurged;
-    /** Regions given back whole: see {@link #releaseIdleRegions}. */
+    /** Regions given back whole: see {@link #releaseIfIdle}. */
     long regionsReleased;
     /** Whether the pass left free slices that were not idle for the delay yet, and the longest any of them waited. */
     private boolean skipped;
     private long longestWait;
+    /** Where the next pass starts: a region's index in {@link #regions}, and a block in it. */
+    private int nextRegion;
+    private int nextBlock;
 
     /**
      * @param regionSource where the regions come from, or {@code null} for {@code segmentSource}'s: {@code mmap} where
@@ -474,20 +483,50 @@ final class PageStore {
         }
     }
 
-    /** See {@link #purgeSharedSlices} and {@link #releaseIdleRegions}. */
+    /**
+     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, at most
+     * {@link #PURGE_CALLS} calls ({@code madvise} or region releases); one that stops short arms the purge again, due at
+     * once, and the next pass, after the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a pass
+     * by arenas purged instead, a quarter of them plus one, from an arena chosen by the thread's sequence
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2433-L2450); one region of ours can need
+     * thousands of calls.
+     */
     private void purge(long now) {
         purges++;
         skipped = false;
-        purgeSharedSlices(now);
-        releaseIdleRegions(now);
+        Region[] regions = this.regions;
+        int count = regions.length;
+        int first = nextRegion < count ? nextRegion : 0;
+        int from = first == nextRegion ? nextBlock : 0;
+        int budget = PURGE_CALLS;
+        // Region first from block from on, every other region, then region first up to block from.
+        for (int k = 0; k <= count && count != 0; k++) {
+            int index = first + k < count ? first + k : first + k - count;
+            Region region = regions[index];
+            int start = k == 0 ? from : 0;
+            // A region given back whole is visited once, as its first block.
+            int end = Math.min(k < count ? region.slots : from, region.purgesSlices ? region.slots : 1);
+            for (int slot = start; slot < end && !region.released; slot++) {
+                budget -= region.purgesSlices ? purgeBlock(region.blocks[slot], now, budget) :
+                        releaseIfIdle(region, now);
+                if (budget == 0) {
+                    // This block may have more.
+                    nextRegion = index;
+                    nextBlock = slot;
+                    rearm(now, config.purgeDelayNanos);
+                    return;
+                }
+            }
+        }
         if (skipped) {
             rearm(now, longestWait);
         }
     }
 
     /**
-     * Shared slices: purges the free slices with memory behind them freed {@link PageStoreConfig#purgeDelayNanos} ago
-     * or earlier, one call per run of contiguous ones within a block. As mimalloc v3's {@code mi_arena_try_purge_range}
+     * Shared slices: purges the free slices of {@code block} with memory behind them freed
+     * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, at most
+     * {@code budget} calls, and returns the calls made. As mimalloc v3's {@code mi_arena_try_purge_range}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2345-L2359): a run's
      * slices are claimed by CAS first, so that no claim can take them while their memory goes, and given back after;
      * and as its {@code _mi_bitmap_forall_setc_ranges}
@@ -498,63 +537,61 @@ final class PageStore {
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L246) and reserves a new arena
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L548-L564).
      */
-    private void purgeSharedSlices(long now) {
+    private int purgeBlock(Segment block, long now, int budget) {
         long delay = config.purgeDelayNanos;
-        for (Region region : regions) {
-            if (!region.purgesSlices) {
-                continue;
+        int calls = 0;
+        long candidates = purgeable(block, block.free, now, delay);
+        while (candidates != 0 && calls < budget) {
+            long run = lowestRun(candidates);
+            candidates &= ~run;
+            long claimed = block.claimFree(run);
+            long exact = purgeable(block, claimed, now, delay);
+            if (exact != claimed) {
+                block.giveBack(claimed & ~exact);
             }
-            for (int slot = 0; slot < region.slots; slot++) {
-                Segment block = region.blocks[slot];
-                long candidates = purgeable(block, block.free, now, delay);
-                while (candidates != 0) {
-                    long run = lowestRun(candidates);
-                    candidates &= ~run;
-                    long claimed = block.claimFree(run);
-                    long exact = purgeable(block, claimed, now, delay);
-                    if (exact != claimed) {
-                        block.giveBack(claimed & ~exact);
-                    }
-                    while (exact != 0) {
-                        long bits = lowestRun(exact);
-                        exact &= ~bits;
-                        purgeSliceRun(block, bits);
-                    }
+            while (exact != 0) {
+                if (calls == budget) {
+                    block.giveBack(exact);
+                    break;
                 }
+                long bits = lowestRun(exact);
+                exact &= ~bits;
+                purgeSliceRun(block, bits);
+                calls++;
             }
         }
+        return calls;
     }
 
     /**
-     * Shared slices of a source that cannot purge part of a region: gives back each region all of whose slices stayed
-     * free for the purge delay. Its blocks are claimed whole by CAS first, as a purge claims its run, so that no claim
-     * can take a slice of it meanwhile; a region that is no longer wholly free and idle once claimed goes back to use.
-     * A released region keeps its blocks claimed, so that a claim that still sees it finds nothing there, and its
-     * place in {@link #regions} is taken by the next region mapped.
+     * Gives back {@code region}, of a source that cannot purge part of a region, if all its slices stayed free for the
+     * purge delay, and returns the calls made: 1 if it did. Its blocks are claimed whole by CAS first, as a purge
+     * claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer wholly free and
+     * idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that still sees
+     * it finds nothing there, and its place in {@link #regions} is taken by the next region mapped.
      */
-    private void releaseIdleRegions(long now) {
+    private int releaseIfIdle(Region region, long now) {
         long delay = config.purgeDelayNanos;
-        for (Region region : regions) {
-            if (region.purgesSlices || region.released || !whollyFree(region)) {
-                continue;
-            }
-            long waited = shortestWait(region, now);
-            if (waited < delay) {
-                skip(waited);
-                continue;
-            }
-            int claimed = 0;
-            while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
-                claimed++;
-            }
-            if (claimed == region.slots && shortestWait(region, now) >= delay && release(region)) {
-                continue;
-            }
-            for (int slot = 0; slot < claimed; slot++) {
-                Segment block = region.blocks[slot];
-                block.giveBack(block.allFree);
-            }
+        if (!whollyFree(region)) {
+            return 0;
         }
+        long waited = shortestWait(region, now);
+        if (waited < delay) {
+            skip(waited);
+            return 0;
+        }
+        int claimed = 0;
+        while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
+            claimed++;
+        }
+        if (claimed == region.slots && shortestWait(region, now) >= delay && release(region)) {
+            return 1;
+        }
+        for (int slot = 0; slot < claimed; slot++) {
+            Segment block = region.blocks[slot];
+            block.giveBack(block.allFree);
+        }
+        return 0;
     }
 
     /** Racy: whether every slice of {@code region} is free. */
