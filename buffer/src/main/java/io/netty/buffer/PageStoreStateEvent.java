@@ -131,21 +131,26 @@ final class PageStoreStateEvent extends Event {
 
     private static void emit(PageStore store) {
         int id = System.identityHashCode(store.allocator);
-        long segmentSize = store.config.segmentSize;
+        boolean shared = store.config.sharesSlices;
+        // With shared slices, the units are slices, of each block; else slots.
+        long segmentSize = shared ? store.config.sliceSize : store.config.segmentSize;
+        int perBlock = store.config.slicesPerSegment();
         for (Region region : store.regions) {
+            int units = shared ? region.slots * perBlock : region.slots;
             PageStoreStateEvent event = new PageStoreStateEvent();
             event.store = id;
             event.region = region.index;
             event.base = region.buffer._memoryAddress();
-            event.length = region.slots * segmentSize;
+            event.length = region.slots * (long) store.config.segmentSize;
             StringBuilder out = new StringBuilder();
             StringBuilder committed = new StringBuilder();
             StringBuilder purged = new StringBuilder();
             long free = region.free;
             int runStart = 0;
             int runState = -1;
-            for (int slot = 0; slot <= region.slots; slot++) {
-                int state = slot == region.slots ? -1 : stateOf(region, free, slot);
+            for (int slot = 0; slot <= units; slot++) {
+                int state = slot == units ? -1 : shared ? sliceStateOf(region, slot, perBlock) :
+                        stateOf(region, free, slot);
                 if (state != runState) {
                     if (runState >= 0) {
                         long bytes = (slot - runStart) * segmentSize;
@@ -222,6 +227,18 @@ final class PageStoreStateEvent extends Event {
             return COMMITTED;
         }
         return region.everCommitted[slot] ? PURGED : UNTOUCHED;
+    }
+
+    private static int sliceStateOf(Region region, int slice, int perBlock) {
+        Segment block = region.block(slice / perBlock);
+        int i = slice % perBlock;
+        if ((block.free & 1L << i) == 0) {
+            return OUT;
+        }
+        if (block.freedAt[i] != Region.UNCOMMITTED) {
+            return COMMITTED;
+        }
+        return region.sliceEverCommitted[slice] ? PURGED : UNTOUCHED;
     }
 
     private static void range(StringBuilder ranges, String prefix, long start, long bytes) {

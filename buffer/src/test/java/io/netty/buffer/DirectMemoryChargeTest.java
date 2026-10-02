@@ -31,6 +31,8 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
+import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -45,6 +47,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 @Isolated("Reads and fills PlatformDependent's direct memory counter, which concurrent tests move")
 final class DirectMemoryChargeTest {
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
+    private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
@@ -119,6 +122,36 @@ final class DirectMemoryChargeTest {
         assertEquals(2, store.segmentsCommitted);
         assertEquals(base + regionCharge + 2L * SEGMENT_SIZE, used());
         assertAccounted(segments, regions, allocator);
+        store.close();
+        assertEquals(base, used());
+    }
+
+    /**
+     * Shared slices: a claim that would pass the limit throws, its slices free again with no memory behind them; a
+     * claim of committed slices needs no charge.
+     */
+    @Test
+    void aSharedClaimPastTheLimitGivesItsSlicesBack() {
+        long base = used();
+        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
+        PageStore store = allocator.pageStore;
+        store.claimSlices(9, 0, PageStore.NO_HEAP);
+        Segment block = store.region(0).block(0);
+        long filler = PlatformDependent.maxDirectMemory() - used() - 4L * SLICE;
+        charge(filler);
+        try {
+            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, PageStore.NO_HEAP));
+            assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
+            assertEquals(Region.UNCOMMITTED, block.freedAt[9]);
+            assertEquals(9, store.slicesCommitted);
+            store.releaseSlices(block, 0, 9);
+            assertEquals(0, (int) store.claimSlices(9, 0, PageStore.NO_HEAP), "committed: nothing to charge");
+        } finally {
+            credit(filler);
+        }
+        assertEquals(9, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(base + regionCharge + 18L * SLICE, used());
+        PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(base, used());
     }

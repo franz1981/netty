@@ -30,6 +30,10 @@ import java.util.concurrent.locks.StampedLock;
  * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim}),
  * chunk deallocation ({@link #release}) and decays only. After {@link #markFreed}, releases may come from any thread:
  * the release that empties a segment gives it back to the store, and the list is no longer touched.
+ * <p>
+ * With shared slices ({@link PageStoreConfig#sharesSlices}) the heap holds no region segment: {@link #claim} takes
+ * a run of the store's shared slices, and {@link #release} gives it back from any thread, heap freed or not. Only when
+ * no region can be mapped does the heap take segments of its own, as without regions.
  */
 final class HeapSegments {
     private final PageStore store;
@@ -38,6 +42,9 @@ final class HeapSegments {
     private final Thread ownerThread;
     /** Where this heap starts looking among the store's regions: spreads equally full regions over the heaps. */
     int regionOffset = System.identityHashCode(this) & Integer.MAX_VALUE;
+    /** Shared slices: where this heap starts looking among a region's blocks, as mimalloc's thread sequence. */
+    final int seq;
+    private final boolean sharesSlices;
     // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;
@@ -62,6 +69,8 @@ final class HeapSegments {
         this.ownerThread = ownerThread;
         reserve = new Segment[store.maxReserveLimit()];
         purgesSlices = store.regionSource != null;
+        sharesSlices = store.config.sharesSlices && store.regionSource != null;
+        seq = store.nextHeapSequence();
         store.registerHeap(this);
     }
 
@@ -85,6 +94,16 @@ final class HeapSegments {
     /** Returns the segment of the span; {@link #claimedStart()} is its first slice. Scans the heap's segments once. */
     Segment claim(int slices) {
         assert inOwnerContext() && !freed;
+        if (sharesSlices) {
+            long run = store.claimSlices(slices, seq, kind());
+            if (run >= 0) {
+                int perBlock = store.config.slicesPerSegment();
+                int slice = (int) run;
+                claimedStart = slice % perBlock;
+                return store.region((int) (run >>> 32)).block(slice / perBlock);
+            }
+            // No region can be mapped: segments of the heap's own.
+        }
         Segment best = null;
         int bestFree = Integer.MAX_VALUE;
         Segment[] segments = this.segments;
@@ -114,8 +133,12 @@ final class HeapSegments {
         return claimedStart;
     }
 
-    /** Owner only until {@link #markFreed}, then any thread. */
+    /** Owner only until {@link #markFreed}, then any thread; any thread for shared slices. */
     void release(Segment segment, int start, int slices) {
+        if (segment.sharedSpans != null) {
+            store.releaseSlices(segment, start, slices);
+            return;
+        }
         long free = segment.release(start, slices);
         if (free != segment.allFree) {
             return;

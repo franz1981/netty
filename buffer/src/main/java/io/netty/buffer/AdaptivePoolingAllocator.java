@@ -741,6 +741,64 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
+     * As {@link #chunkBufferAllocated}, for {@code bytes} of a region's shared slices from {@code address} that the
+     * {@link PageStore} just committed: allocates nothing unless a JFR event is committed.
+     */
+    void storeBytesCommitted(long address, int bytes, boolean threadLocal) {
+        chunkRegistry.add(bytes);
+        if (PlatformDependent.isJfrEnabled() && AllocateChunkEvent.isEventEnabled()) {
+            AllocateChunkEvent event = new AllocateChunkEvent();
+            if (event.shouldCommit()) {
+                event.fill(new StoreBytes(address, bytes), AdaptiveByteBufAllocator.class);
+                event.pooled = true;
+                event.threadLocal = threadLocal;
+                event.segment = true;
+                event.commit();
+            }
+        }
+    }
+
+    /** As {@link #chunkBufferFreed}, for {@code bytes} of shared slices whose memory the {@link PageStore} purged. */
+    void storeBytesReleased(long address, int bytes) {
+        chunkRegistry.remove(bytes);
+        if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
+            FreeChunkEvent event = new FreeChunkEvent();
+            if (event.shouldCommit()) {
+                event.fill(new StoreBytes(address, bytes), AdaptiveByteBufAllocator.class);
+                event.pooled = true;
+                event.segment = true;
+                event.commit();
+            }
+        }
+    }
+
+    /** Shared slices of a region, for the JFR chunk events only. */
+    private static final class StoreBytes implements ChunkInfo {
+        private final long address;
+        private final int bytes;
+
+        StoreBytes(long address, int bytes) {
+            this.address = address;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public int capacity() {
+            return bytes;
+        }
+
+        @Override
+        public boolean isDirect() {
+            return true;
+        }
+
+        @Override
+        public long memoryAddress() {
+            return address;
+        }
+    }
+
+    /**
      * As {@link #chunkBufferFreed}, for a buffer a {@link SizeClassChunkRecycler} held: allocates nothing unless a
      * JFR event is committed.
      */
@@ -2998,12 +3056,11 @@ final class AdaptivePoolingAllocator {
             // past the buffer, so it costs no memory. A release rounds its capacity up to whole slices again.
             int colours = Math.min(MAX_COLOURS, (int) (((long) slices << sliceShift) - size >>> COLOUR_SHIFT) + 1);
             int colour = colours == 1 ? 0 : (nextColour++ & Integer.MAX_VALUE) % colours << COLOUR_SHIFT;
-            SpanChunk chunk = segment.spanChunk;
+            // A block of shared slices has one chunk for every heap's spans; a segment of the heap's own, its own.
+            Chunk chunk = segment.sharedSpans;
             if (chunk == null) {
-                chunk = new SpanChunk(segment, this);
-                segment.spanChunk = chunk;
+                chunk = spanChunkOf(segment);
             }
-            assert chunk.magazine == this && !chunk.retired;
             boolean initialized = false;
             try {
                 buf.init(segment.buffer, chunk, 0, 0, (start << sliceShift) + colour, size,
@@ -3015,6 +3072,16 @@ final class AdaptivePoolingAllocator {
                 }
             }
             idleDecay.count(size >>> COUNT_SHIFT);
+        }
+
+        private SpanChunk spanChunkOf(Segment segment) {
+            SpanChunk chunk = segment.spanChunk;
+            if (chunk == null) {
+                chunk = new SpanChunk(segment, this);
+                segment.spanChunk = chunk;
+            }
+            assert chunk.magazine == this && !chunk.retired;
+            return chunk;
         }
 
         /** Owner only: apply the spans other threads released. One volatile read when there are none. */
@@ -3172,6 +3239,37 @@ final class AdaptivePoolingAllocator {
         @Override
         public String toString() {
             return "SpanChunk[" + segment + ", queued: " + released.size() + ']';
+        }
+    }
+
+    /**
+     * The chunk of every large-buffer span of one block of a region's shared slices, whichever heap claimed it (see
+     * {@link PageStore#claimSlices}): a release, from any thread, gives the span's slices back to the store at once.
+     * Made with its region; nothing is queued, nothing is owned.
+     */
+    static final class SharedSpanChunk extends Chunk {
+        private final PageStore store;
+        private final Segment block;
+        private final int sliceShift;
+
+        SharedSpanChunk(Segment block, PageStore store) {
+            super(block.buffer, store.allocator, true);
+            this.store = store;
+            this.block = block;
+            assert (block.sliceSize & block.sliceSize - 1) == 0 : "slices of a power of two";
+            sliceShift = Integer.numberOfTrailingZeros(block.sliceSize);
+        }
+
+        /** Any thread: the span of {@code length} bytes at {@code offset}, colour included, is free. */
+        @Override
+        void releaseSegment(int offset, int length) {
+            int shift = sliceShift;
+            store.releaseSlices(block, offset >>> shift, length + (1 << shift) - 1 >>> shift);
+        }
+
+        @Override
+        public String toString() {
+            return "SharedSpanChunk[" + block + ']';
         }
     }
 

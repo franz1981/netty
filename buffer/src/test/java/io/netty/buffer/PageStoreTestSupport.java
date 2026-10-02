@@ -198,6 +198,35 @@ final class PageStoreTestSupport {
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 
+    /** With shared slices: every chunk is a run of the regions' shared slices (see {@link PageStore}). */
+    static AdaptivePoolingAllocator newSharedAllocator(CountingSegmentSource segments, RegionSource regions,
+                                                       int regionSize, long purgeDelayNanos) {
+        return new AdaptivePoolingAllocator(segments, true, segments, regions, new PageStoreConfig(SEGMENT_SIZE,
+                SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT, true));
+    }
+
+    /** Shared slices: the used memory is the segments allocated on their own plus the committed slices. */
+    static void assertSharedAccounted(CountingSegmentSource segments, AdaptivePoolingAllocator allocator) {
+        assertEquals(segments.unreleasedBytes() + committedSlices(allocator.pageStore) * (long) SLICE_SIZE_BYTES,
+                allocator.usedMemory(), "usedMemory() and the committed slices disagree");
+    }
+
+    static int committedSlices(PageStore store) {
+        int[] counts = store.sliceCounts();
+        int committed = counts[0] + counts[1];
+        // A claimed slice always has memory behind it.
+        int behind = 0;
+        for (Region region : store.regions) {
+            for (int slot = 0; slot < region.slots; slot++) {
+                for (long freedAt : region.block(slot).freedAt) {
+                    behind += freedAt != Region.UNCOMMITTED ? 1 : 0;
+                }
+            }
+        }
+        assertEquals(committed, behind, "a claimed slice without memory behind it");
+        return committed;
+    }
+
     /** Gives {@code segment}'s one span back, then its heap's only reserved one with two decays: back to the store. */
     static void giveBack(HeapSegments heap, Segment segment, int start, int slices) {
         heap.release(segment, start, slices);
