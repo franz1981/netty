@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
@@ -134,50 +133,8 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
 
         @Override
         public AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
-            if (mmap) {
-                return PlatformDependent.hasUnsafe() ?
-                        new MmapUnsafeDirectChunkByteBuf(allocator, initialCapacity, maxCapacity) :
-                        new MmapDirectChunkByteBuf(allocator, initialCapacity, maxCapacity);
-            }
-            return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity);
-        }
-    }
-
-    /**
-     * A chunk buffer over its own {@code mmap(2)}: {@link #deallocate()} cleans it, which is {@code munmap(2)}.
-     */
-    static final class MmapUnsafeDirectChunkByteBuf extends UnpooledUnsafeDirectByteBuf {
-        MmapUnsafeDirectChunkByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
-            super(alloc, initialCapacity, maxCapacity, true);
-        }
-
-        @Override
-        protected CleanableDirectBuffer allocateDirectBuffer(int capacity) {
-            return PlatformDependent.allocateDirectMmap(capacity);
-        }
-
-        @Override
-        CleanableDirectBuffer allocateDirectBuffer(int capacity, boolean permitExpensiveClean) {
-            return PlatformDependent.allocateDirectMmap(capacity);
-        }
-    }
-
-    /**
-     * As {@link MmapUnsafeDirectChunkByteBuf}, without {@code sun.misc.Unsafe}.
-     */
-    static final class MmapDirectChunkByteBuf extends UnpooledDirectByteBuf {
-        MmapDirectChunkByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
-            super(alloc, initialCapacity, maxCapacity, true);
-        }
-
-        @Override
-        protected CleanableDirectBuffer allocateDirectBuffer(int capacity) {
-            return PlatformDependent.allocateDirectMmap(capacity);
-        }
-
-        @Override
-        CleanableDirectBuffer allocateDirectBuffer(int capacity, boolean permitExpensiveClean) {
-            return PlatformDependent.allocateDirectMmap(capacity);
+            // The same buffer class either way, so the class profile at the AdaptiveByteBuf accessors is the same.
+            return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity, mmap);
         }
     }
 }

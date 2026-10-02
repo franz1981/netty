@@ -662,6 +662,23 @@ public final class PlatformDependent {
     }
 
     /**
+     * Reallocate a buffer from {@link #allocateDirectMmap(int)}: map the new capacity, copy, and unmap the old one.
+     * The old buffer is invalidated and must not be used after this call.
+     *
+     * @param buffer The old buffer to reallocate.
+     * @param newCapacity The desired new capacity.
+     * @return The new {@link CleanableDirectBuffer} with the given capacity.
+     * @throws UnsupportedOperationException if {@link #hasDirectMmap()} is {@code false}.
+     */
+    public static CleanableDirectBuffer reallocateDirectMmap(CleanableDirectBuffer buffer, int newCapacity) {
+        MmapCleaner cleaner = MmapCleaner.INSTANCE;
+        if (cleaner == null) {
+            throw new UnsupportedOperationException("mmap(2) direct buffers are not available");
+        }
+        return cleaner.reallocate(buffer, newCapacity);
+    }
+
+    /**
      * Reallocate a direct buffer with the given new capacity.
      * The old buffer is invalidated and must not be used after this call.
      *

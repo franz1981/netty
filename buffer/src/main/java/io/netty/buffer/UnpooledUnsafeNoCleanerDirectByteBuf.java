@@ -25,13 +25,18 @@ class UnpooledUnsafeNoCleanerDirectByteBuf extends UnpooledUnsafeDirectByteBuf {
         super(alloc, initialCapacity, maxCapacity);
     }
 
+    UnpooledUnsafeNoCleanerDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity, boolean mmap) {
+        super(alloc, initialCapacity, maxCapacity, false, mmap);
+    }
+
     @Override
     protected ByteBuffer allocateDirect(int initialCapacity) {
         throw new UnsupportedOperationException();
     }
 
     CleanableDirectBuffer reallocateDirect(CleanableDirectBuffer oldBuffer, int newCapacity) {
-        return PlatformDependent.reallocateDirect(oldBuffer, newCapacity);
+        return mmap ? PlatformDependent.reallocateDirectMmap(oldBuffer, newCapacity) :
+                PlatformDependent.reallocateDirect(oldBuffer, newCapacity);
     }
 
     @Override

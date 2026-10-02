@@ -45,6 +45,11 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
     private ByteBuffer tmpNioBuf;
     private int capacity;
     private boolean doNotFree;
+    /**
+     * Whether {@link #allocateDirectBuffer} maps its memory with {@link PlatformDependent#allocateDirectMmap(int)}
+     * instead of taking it from {@link PlatformDependent#allocateDirect(int, boolean)}. Only read when allocating.
+     */
+    final boolean mmap;
 
     /**
      * Creates a new direct buffer.
@@ -57,6 +62,11 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
     }
 
     UnpooledDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity, boolean permitExpensiveClean) {
+        this(alloc, initialCapacity, maxCapacity, permitExpensiveClean, false);
+    }
+
+    UnpooledDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity, boolean permitExpensiveClean,
+                          boolean mmap) {
         super(maxCapacity);
         ObjectUtil.checkNotNull(alloc, "alloc");
         checkPositiveOrZero(initialCapacity, "initialCapacity");
@@ -67,6 +77,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         }
 
         this.alloc = alloc;
+        this.mmap = mmap;
         setByteBuffer(allocateDirectBuffer(initialCapacity, permitExpensiveClean), false);
     }
 
@@ -98,6 +109,7 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
         }
 
         this.alloc = alloc;
+        mmap = false;
         doNotFree = !doFree;
         setByteBuffer((slice ? initialBuffer.slice() : initialBuffer).order(ByteOrder.BIG_ENDIAN), false);
         writerIndex(initialCapacity);
@@ -122,11 +134,12 @@ public class UnpooledDirectByteBuf extends AbstractReferenceCountedByteBuf {
     }
 
     protected CleanableDirectBuffer allocateDirectBuffer(int capacity) {
-        return PlatformDependent.allocateDirect(capacity, false);
+        return mmap ? PlatformDependent.allocateDirectMmap(capacity) : PlatformDependent.allocateDirect(capacity, false);
     }
 
     CleanableDirectBuffer allocateDirectBuffer(int capacity, boolean permitExpensiveClean) {
-        return PlatformDependent.allocateDirect(capacity, permitExpensiveClean);
+        return mmap ? PlatformDependent.allocateDirectMmap(capacity) :
+                PlatformDependent.allocateDirect(capacity, permitExpensiveClean);
     }
 
     void setByteBuffer(CleanableDirectBuffer cleanableDirectBuffer, boolean tryFree) {

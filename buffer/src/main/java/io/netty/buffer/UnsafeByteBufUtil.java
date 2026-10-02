@@ -727,13 +727,22 @@ final class UnsafeByteBufUtil {
      * @return The {@link UnpooledDirectByteBuf} with the chunk memory.
      */
     static UnpooledDirectByteBuf newDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity) {
+        return newDirectByteBuf(alloc, initialCapacity, maxCapacity, false);
+    }
+
+    /**
+     * As {@link #newDirectByteBuf(ByteBufAllocator, int, int)}, with the same class for the same platform; with
+     * {@code mmap}, its memory comes from {@link PlatformDependent#allocateDirectMmap(int)}.
+     */
+    static UnpooledDirectByteBuf newDirectByteBuf(ByteBufAllocator alloc, int initialCapacity, int maxCapacity,
+                                                  boolean mmap) {
         if (PlatformDependent.hasUnsafe()) {
             if (PlatformDependent.useDirectBufferNoCleaner()) {
-                return new UnpooledUnsafeNoCleanerDirectByteBuf(alloc, initialCapacity, maxCapacity);
+                return new UnpooledUnsafeNoCleanerDirectByteBuf(alloc, initialCapacity, maxCapacity, mmap);
             }
-            return new UnpooledUnsafeDirectByteBuf(alloc, initialCapacity, maxCapacity, true);
+            return new UnpooledUnsafeDirectByteBuf(alloc, initialCapacity, maxCapacity, true, mmap);
         }
-        return new UnpooledDirectByteBuf(alloc, initialCapacity, maxCapacity, true);
+        return new UnpooledDirectByteBuf(alloc, initialCapacity, maxCapacity, true, mmap);
     }
 
     private UnsafeByteBufUtil() { }

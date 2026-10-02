@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -61,6 +62,7 @@ public class AdaptiveByteBufAllocatorMmapChunksTest {
         try {
             AbstractByteBuf chunk = chunkBuffer(buffer);
             assertTrue(isMmapChunk(chunk), chunk.getClass().getName());
+            assertSame(nonMmapChunkClass(), chunk.getClass(), "the same chunk class as without mmap");
             assertEquals(128 * 1024, allocator.usedDirectMemory(), "one minimum-size chunk");
             assertEquals(128 * 1024, chunk.capacity());
             assertTrue(chunk.hasMemoryAddress());
@@ -93,6 +95,7 @@ public class AdaptiveByteBufAllocatorMmapChunksTest {
         ByteBuf buffer = allocator.directBuffer(size, Integer.MAX_VALUE);
         AbstractByteBuf chunk = chunkBuffer(buffer);
         assertTrue(isMmapChunk(chunk), chunk.getClass().getName());
+        assertSame(nonMmapChunkClass(), chunk.getClass(), "the same chunk class as without mmap");
         assertEquals(size, allocator.usedDirectMemory());
         long address = chunk.memoryAddress();
         assertEquals(address, buffer.memoryAddress());
@@ -115,6 +118,49 @@ public class AdaptiveByteBufAllocatorMmapChunksTest {
         assertFalse(isMapped(grownAddress), "the chunk is unmapped when its buffer is released");
     }
 
+    /**
+     * The buffer's own {@link ByteBuf#capacity(int)} (not used by the allocator for chunks, but reachable): the
+     * grown buffer is mapped too, and the old mapping is unmapped.
+     */
+    @Test
+    void mappedBufferGrowsIntoANewMapping() throws IOException {
+        assumeTrue(PlatformDependent.hasDirectMmap());
+        UnpooledDirectByteBuf buffer = UnsafeByteBufUtil.newDirectByteBuf(
+                UnpooledByteBufAllocator.DEFAULT, 4096, Integer.MAX_VALUE, true);
+        ByteBuf plain = UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, 0, 0);
+        try {
+            assertSame(plain.getClass(), buffer.getClass(), "the same class as without mmap");
+        } finally {
+            plain.release();
+        }
+        try {
+            assertTrue(isMmapChunk(buffer));
+            long address = buffer.memoryAddress();
+            assertTrue(isMapped(address));
+            buffer.setLong(4088, 0x0123456789ABCDEFL);
+            buffer.capacity(3 * 4096 + 1);
+            assertTrue(isMmapChunk(buffer), "grown into a new mapping");
+            assertEquals(3 * 4096 + 1, buffer.capacity());
+            assertEquals(0x0123456789ABCDEFL, buffer.getLong(4088));
+            assertEquals(0, buffer.memoryAddress() % 4096);
+            assertTrue(isMapped(buffer.memoryAddress()));
+            assertFalse(isMapped(address), "the old mapping is unmapped");
+        } finally {
+            long address = buffer.memoryAddress();
+            buffer.release();
+            assertFalse(isMapped(address), "unmapped on release");
+        }
+    }
+
+    private static Class<?> nonMmapChunkClass() {
+        ByteBuf buffer = new AdaptiveByteBufAllocator(true, false, false).directBuffer(1024);
+        try {
+            return chunkBuffer(buffer).getClass();
+        } finally {
+            buffer.release();
+        }
+    }
+
     private static AbstractByteBuf chunkBuffer(ByteBuf buffer) {
         if (buffer instanceof WrappedByteBuf) {
             // Leak detection wraps what the allocator returns.
@@ -124,9 +170,19 @@ public class AdaptiveByteBufAllocatorMmapChunksTest {
         return ((AdaptivePoolingAllocator.AdaptiveByteBuf) buffer).chunk.delegate;
     }
 
+    /**
+     * Whether the memory of {@code chunk} comes from {@code MmapCleaner}: the buffer class is the same either way.
+     */
     private static boolean isMmapChunk(AbstractByteBuf chunk) {
-        return chunk instanceof AdaptiveByteBufAllocator.MmapUnsafeDirectChunkByteBuf ||
-                chunk instanceof AdaptiveByteBufAllocator.MmapDirectChunkByteBuf;
+        if (!(chunk instanceof UnpooledDirectByteBuf)) {
+            return false;
+        }
+        UnpooledDirectByteBuf direct = (UnpooledDirectByteBuf) chunk;
+        boolean mapped = direct.cleanable != null &&
+                "io.netty.util.internal.MmapCleaner".equals(direct.cleanable.getClass().getEnclosingClass() == null ?
+                        null : direct.cleanable.getClass().getEnclosingClass().getName());
+        assertEquals(direct.mmap, mapped, "the mmap flag and the memory source must agree");
+        return mapped;
     }
 
     /**
