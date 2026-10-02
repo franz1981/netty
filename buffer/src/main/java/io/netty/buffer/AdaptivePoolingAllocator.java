@@ -127,9 +127,9 @@ final class AdaptivePoolingAllocator {
     /**
      * {@code io.netty.allocator.chunkPurgeInterval}: how often a size-class magazine gives up idle chunks, counted in
      * chunks' worth of allocations. After this many times the segments of one of its chunks have been allocated,
-     * the magazine applies the notes left by other threads and gives its wholly free chunks, except the one each
-     * size class in use keeps, to its heap's {@link SizeClassChunkRecycler}, and does the same for every other size
-     * class of its heap, including the idle ones that no longer allocate. Default: 4. Read from
+     * the magazine applies the notes left by other threads and gives up its wholly free chunks, except the ones each
+     * size class in use keeps, and does the same for every other size class of its heap, including the idle ones that
+     * no longer allocate. Default: 4. Read from
      * {@code io.netty.allocator.chunkPurgePollsThreadLocal} when only that, its former name, is set.
      */
     static final long CHUNK_PURGE_INTERVAL = Math.max(1, SystemPropertyUtil.getLong(
@@ -152,9 +152,11 @@ final class AdaptivePoolingAllocator {
         warnIfSet("io.netty.allocator.chunkPurgeThreshold",
                 "has no effect: see -Dio.netty.allocator.chunkPurgeInterval");
         warnIfSet("io.netty.allocator.threadLocalChunkCacheMaxBytes",
-                "has no effect: a size class in use keeps one idle chunk, see -Dio.netty.allocator.recycledChunkBytes");
+                "has no effect: a size class in use keeps up to four empty chunks");
         warnIfSet("io.netty.allocator.threadLocalChunkCacheMinBytes",
-                "has no effect: a size class in use keeps one idle chunk, see -Dio.netty.allocator.recycledChunkBytes");
+                "has no effect: a size class in use keeps up to four empty chunks");
+        warnIfSet("io.netty.allocator.chunkReuseQueueCapacity",
+                "has no effect: buffers above the size classes are spans of the page store, which keeps no chunks");
     }
 
     private static void warnIfSet(String property, String what) {
