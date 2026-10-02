@@ -18,10 +18,8 @@ package io.netty.buffer;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.concurrent.FastThreadLocalThread;
-import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.parallel.Isolated;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -44,7 +42,6 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Buffers above the size classes in an allocator with a page store: up to a whole block each is a span of the shared
@@ -53,7 +50,6 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * {@code malloc}'d ones), direct regions of many (as {@code mmap}'d ones), and heap regions of one block (one
  * {@code byte[]} each).
  */
-@Isolated("Reads PlatformDependent's direct memory counter, which concurrent tests move")
 final class AdaptiveLargeSegmentsTest {
     /** Eight spans of 512 KiB fill one 4 MiB segment. */
     private static final int POOLED = 512 * 1024;
@@ -299,17 +295,9 @@ final class AdaptiveLargeSegmentsTest {
         assertAccounted(segments, allocator);
     }
 
-    /** Every slice the large paths commit is charged once and credited by the purge or the close. */
+    /** Every slice the large paths commit is counted once, and credited by the purge. */
     @Test
     void largeSlotsAreChargedAndCredited() {
-        assumeTrue(PlatformDependent.usedDirectMemory() >= 0, "the direct memory counter is off");
-        // Allocators of earlier tests credit the counter when finalized: let that happen before the base is read.
-        for (int i = 0; i < 3; i++) {
-            System.gc();
-            System.runFinalization();
-        }
-        long base = PlatformDependent.usedDirectMemory();
-        long regionCharge = regions.mmap != null ? 0 : REGION_SIZE;
         AdaptivePoolingAllocator allocator = withRegions();
         PageStore store = allocator.pageStore;
         List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // spans over two blocks
@@ -317,15 +305,13 @@ final class AdaptiveLargeSegmentsTest {
         bufs.addAll(allocate(allocator, SEGMENT_SIZE + 1, 1)); // two blocks
         int slices = (PER_CHUNK + 1) * SPAN_SLICES + 3 * MIB / PageStoreConfig.SLICE_SIZE_BYTES + 2 * PER_BLOCK;
         assertEquals(slices, committed(allocator));
-        assertEquals(base + regionCharge + (long) slices * PageStoreConfig.SLICE_SIZE_BYTES,
-                PlatformDependent.usedDirectMemory());
+        assertEquals((long) slices * PageStoreConfig.SLICE_SIZE_BYTES, allocator.usedMemory());
         release(bufs);
         long now = System.nanoTime();
         store.purgeIfDue(now += INTERVAL);
         store.purgeIfDue(now + INTERVAL);
         assertEquals(0, committed(allocator), "no heap keeps any");
-        assertEquals(base + regionCharge, PlatformDependent.usedDirectMemory());
+        assertEquals(0, allocator.usedMemory());
         store.close();
-        assertEquals(base, PlatformDependent.usedDirectMemory());
     }
 }

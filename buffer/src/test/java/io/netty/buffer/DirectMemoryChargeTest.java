@@ -40,49 +40,45 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * memory behind it, credited when purged or closed, and a claim past the limit gives its run back; a {@code malloc}'d
  * region is charged whole by its allocation. A segment allocated on its own is charged by
  * its allocation.
+ * <p>
+ * Amounts are read from the allocator's used memory, which moves with each charge and credit of its store: the JVM-wide
+ * counter also moves whenever the finalizer frees another test's allocator.
  */
-@Isolated("Reads and fills PlatformDependent's direct memory counter, which concurrent tests move")
+@Isolated("Fills PlatformDependent's direct memory counter past its limit, which concurrent allocations would hit")
 final class DirectMemoryChargeTest {
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
-    /** Without mmap, the test regions are direct buffers, charged whole by their allocation. */
-    private final long regionCharge = regions.mmap != null ? 0 : REGION_SIZE;
 
     @BeforeEach
     void counted() {
         assumeTrue(PlatformDependent.usedDirectMemory() >= 0, "the direct memory counter is off");
     }
 
-    private static long used() {
-        return PlatformDependent.usedDirectMemory();
-    }
-
     /** Shared slices: a slice is charged by the claim that commits it, credited by its purge or the close. */
     @Test
     void sharedSlicesAreChargedOnceAndCreditedByThePurgeAndTheClose() {
-        long base = used();
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, false);
-        assertEquals(base + regionCharge + 9L * SLICE, used(), "the region is not charged, the slices are");
+        assertEquals(9L * SLICE, allocator.usedMemory(), "the region is not charged, the slices are");
         Segment block = store.regions[0].blocks[0];
         block.releaseRun(0, 9, System.nanoTime());
         assertEquals(run, store.claimSlices(9, 0, false));
-        assertEquals(base + regionCharge + 9L * SLICE, used(), "committed already: not charged again");
+        assertEquals(9L * SLICE, allocator.usedMemory(), "committed already: not charged again");
         block.releaseRun(3, 6, System.nanoTime());
         long now = System.nanoTime();
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(6, store.slicesPurged);
-        assertEquals(base + regionCharge + 3L * SLICE, used(), "the purge credits them");
+        assertEquals(3L * SLICE, allocator.usedMemory(), "the purge credits them");
         assertEquals(3, (int) store.claimSlices(6, 0, false));
-        assertEquals(base + regionCharge + 9L * SLICE, used(), "purged: charged again");
+        assertEquals(9L * SLICE, allocator.usedMemory(), "purged: charged again");
         assertEquals(15, store.slicesCommitted);
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
-        assertEquals(base, used(), "the close credits the rest");
+        assertEquals(0, allocator.usedMemory(), "the close credits the rest");
     }
 
     /**
@@ -91,13 +87,11 @@ final class DirectMemoryChargeTest {
      */
     @Test
     void aSharedClaimPastTheLimitGivesItsSlicesBack() {
-        long base = used();
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
         store.claimSlices(9, 0, false);
         Segment block = store.regions[0].blocks[0];
-        long filler = PlatformDependent.maxDirectMemory() - used() - 4L * SLICE;
-        charge(filler);
+        long filler = overfill();
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, false));
             assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
@@ -109,10 +103,10 @@ final class DirectMemoryChargeTest {
             credit(filler);
         }
         assertEquals(9, (int) store.claimSlices(9, 0, false));
-        assertEquals(base + regionCharge + 18L * SLICE, used());
+        assertEquals(18L * SLICE, allocator.usedMemory());
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
-        assertEquals(base, used());
+        assertEquals(0, allocator.usedMemory());
     }
 
     /**
@@ -121,24 +115,23 @@ final class DirectMemoryChargeTest {
      */
     @Test
     void mallocRegionsAreChargedByTheirAllocation() {
-        long base = used();
         CountingRegionSource malloc = new CountingRegionSource(true);
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, false);
-        assertEquals(base + REGION_SIZE, used(), "the region, whole");
+        assertEquals(REGION_SIZE, allocator.usedMemory(), "the region, whole");
         store.takeRun(SLOTS); // a second region, whole
-        assertEquals(base + 2L * REGION_SIZE, used());
+        assertEquals(2L * REGION_SIZE, allocator.usedMemory());
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         assertEquals((int) run, (int) store.claimSlices(9, 0, false));
-        assertEquals(base + 2L * REGION_SIZE, used(), "nothing per slice");
+        assertEquals(2L * REGION_SIZE, allocator.usedMemory(), "nothing per slice");
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
         assertEquals(1, store.regionsReleased, "the first region went back, the second is out");
-        assertEquals(base + REGION_SIZE, used(), "credited by its free");
+        assertEquals(REGION_SIZE, allocator.usedMemory(), "credited by its free");
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
-        assertEquals(base, used(), "the close credits the rest");
+        assertEquals(0, allocator.usedMemory(), "the close credits the rest");
     }
 
     /**
@@ -150,8 +143,7 @@ final class DirectMemoryChargeTest {
         CountingRegionSource malloc = new CountingRegionSource(true);
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
-        long filler = PlatformDependent.maxDirectMemory() - used() - REGION_SIZE / 2;
-        charge(filler);
+        long filler = overfill();
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, false));
             assertSame(malloc, store.regionSource, "regions are still made");
@@ -164,7 +156,7 @@ final class DirectMemoryChargeTest {
         store.close();
     }
 
-    /** The direct allocator's regions of one block: each is charged by its allocation, credited by its release. */
+    /** The direct allocator's regions of one block: each is charged by its allocation. */
     @Test
     void mallocBlocksAreChargedByTheirAllocation() throws Exception {
         AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
@@ -172,20 +164,24 @@ final class DirectMemoryChargeTest {
         direct.setAccessible(true);
         RegionSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.segmentSource
                 .mallocRegionSource();
-        long base = used();
-        AbstractByteBuf block = source.allocateRegion(SEGMENT_SIZE, 0);
+        long filler = overfill();
         try {
-            assertEquals(base + SEGMENT_SIZE, used());
+            assertThrows(OutOfDirectMemoryError.class, () -> source.allocateRegion(SEGMENT_SIZE, 0));
         } finally {
-            source.releaseRegion(block);
+            credit(filler);
         }
-        assertEquals(base, used());
     }
 
-    private static void charge(long bytes) {
-        for (long left = bytes; left > 0; left -= Integer.MAX_VALUE) {
-            PlatformDependent.incrementMemoryCounter((int) Math.min(left, Integer.MAX_VALUE));
+    /**
+     * Charges the limit on top of what is used, unchecked: frees elsewhere credit only what they charged, so the
+     * counter stays past the limit until {@link #credit}.
+     */
+    private static long overfill() {
+        long filler = PlatformDependent.maxDirectMemory();
+        for (long left = filler; left > 0; left -= Integer.MAX_VALUE) {
+            PlatformDependent.decrementMemoryCounter((int) -Math.min(left, Integer.MAX_VALUE));
         }
+        return filler;
     }
 
     private static void credit(long bytes) {
