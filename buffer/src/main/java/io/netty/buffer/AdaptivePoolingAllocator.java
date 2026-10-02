@@ -182,16 +182,6 @@ final class AdaptivePoolingAllocator {
     private static final int MAGAZINE_BUFFER_QUEUE_CAPACITY = SystemPropertyUtil.getInt(
             "io.netty.allocator.magazineBufferQueueCapacity", 1024);
 
-    /**
-     * {@code io.netty.allocator.directSegments}: whether the size classes of a direct allocator carve their chunks out
-     * of {@link Segment}s (see {@link HeapSegments}) instead of allocating each chunk on its own. Default: true.
-     */
-    private static final boolean DIRECT_SEGMENTS =
-            SystemPropertyUtil.getBoolean("io.netty.allocator.directSegments", true);
-
-    /** {@code io.netty.allocator.heapSegments}: as {@link #DIRECT_SEGMENTS}, for a heap allocator. Default: true. */
-    static final boolean HEAP_SEGMENTS = SystemPropertyUtil.getBoolean("io.netty.allocator.heapSegments", true);
-
     static {
         warnIfSet("io.netty.allocator.chunkPurgePollsThreadLocal",
                 "is deprecated, use -Dio.netty.allocator.chunkPurgeInterval instead");
@@ -313,7 +303,7 @@ final class AdaptivePoolingAllocator {
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
         this(chunkAllocator, useCacheForNonEventLoopThreads,
-                DIRECT_SEGMENTS && chunkAllocator instanceof SegmentSource ? (SegmentSource) chunkAllocator : null,
+                chunkAllocator instanceof SegmentSource ? (SegmentSource) chunkAllocator : null,
                 PageStoreConfig.directDefaults());
     }
 

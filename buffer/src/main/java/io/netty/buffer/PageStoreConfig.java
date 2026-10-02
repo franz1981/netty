@@ -202,14 +202,6 @@ final class PageStoreConfig {
                 TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), 0, 0, HEAP_SEGMENT_SIZE_BYTES);
     }
 
-    /**
-     * {@code io.netty.allocator.heapSegmentReserve}: the most wholly free segments a heap allocator's heap keeps, from
-     * 1 to 8. A reserved {@code byte[]} is live heap that every marking walks: after a burst a heap keeps 4 MiB per
-     * reserved segment. Default: 1.
-     */
-    static final int HEAP_RESERVED_SEGMENTS = Math.max(1, Math.min(8,
-            SystemPropertyUtil.getInt("io.netty.allocator.heapSegmentReserve", 1)));
-
     /** The fewest slices of a heap segment: one buffer of the largest size class, 132 KiB, takes 3. */
     static final int MIN_HEAP_SEGMENT_SLICES = 3;
 

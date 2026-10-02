@@ -54,10 +54,10 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     }
 
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
-        this(preferDirect, useCacheForNonEventLoopThreads, AdaptivePoolingAllocator.HEAP_SEGMENTS);
+        this(preferDirect, useCacheForNonEventLoopThreads, true);
     }
 
-    /** @param heapSegments whether heap chunks are carved out of segments, else allocated one by one */
+    /** @param heapSegments {@code false} for tests of the path without a page store: heap chunks one by one */
     AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads, boolean heapSegments) {
         super(preferDirect);
         direct = new AdaptivePoolingAllocator(new DirectChunkAllocator(this), useCacheForNonEventLoopThreads);

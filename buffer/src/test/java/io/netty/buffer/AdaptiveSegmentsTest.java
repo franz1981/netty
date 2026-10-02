@@ -47,7 +47,6 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The page store inside an {@link AdaptivePoolingAllocator}, of direct or heap memory: size-class chunks as spans of
@@ -635,7 +634,6 @@ public class AdaptiveSegmentsTest {
         long directUsed = AdaptiveByteBufAllocatorTest.directSharesSlices(allocator) ? 128 * 1024 :
                 PageStoreConfig.SEGMENT_SIZE_BYTES;
         assertEquals(directUsed, allocator.metric().usedDirectMemory());
-        assumeTrue(AdaptivePoolingAllocator.HEAP_SEGMENTS, "heap segments turned off");
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
         int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
         assertEquals(heapSegmentSize, heapStore.config.segmentSize);
