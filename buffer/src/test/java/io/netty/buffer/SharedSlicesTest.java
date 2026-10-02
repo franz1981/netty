@@ -139,11 +139,12 @@ final class SharedSlicesTest {
     }
 
     /**
-     * Only free slices idle for the delay are purged; a run of them is one call even across blocks; a purged slice
-     * claimed again is committed again.
+     * Only free slices idle for the delay are purged; a run of them is one call, within a block (a run that goes on in
+     * the next block is two calls, as mimalloc's purge ranges never span two bitmap words); a purged slice claimed
+     * again is committed again.
      */
     @Test
-    void thePurgeTakesIdleFreeSlicesInRunsAcrossBlocks() {
+    void thePurgeTakesIdleFreeSlicesInRunsWithinBlocks() {
         PageStore store = store(INTERVAL);
         long used = store.claimSlices(60, 0, PageStore.NO_HEAP);
         long tail = store.claimSlices(4, 0, PageStore.NO_HEAP);
@@ -157,12 +158,13 @@ final class SharedSlicesTest {
         store.purgeIfDue(now + INTERVAL / 2);
         assertEquals(0, regions.purgeCalls(), "not idle long enough");
         store.purgeIfDue(now + 2 * INTERVAL);
-        assertEquals(1, regions.purgeCalls(), "one run across blocks 0 and 1");
-        assertArrayEquals(new int[] {60 * SLICE, 14 * SLICE}, regions.purges.get(0));
+        assertEquals(2, regions.purgeCalls(), "a run in block 0 and one in block 1");
+        assertArrayEquals(new int[] {60 * SLICE, 4 * SLICE}, regions.purges.get(0));
+        assertArrayEquals(new int[] {64 * SLICE, 10 * SLICE}, regions.purges.get(1));
         assertEquals(14, store.slicesPurged);
         assertArrayEquals(new int[] {60, 0, PER_REGION - 60}, store.sliceCounts());
         store.purgeIfDue(now + 4 * INTERVAL);
-        assertEquals(1, regions.purgeCalls(), "nothing left with memory behind it");
+        assertEquals(2, regions.purgeCalls(), "nothing left with memory behind it");
         long again = store.claimSlices(14, 1, PageStore.NO_HEAP);
         assertEquals(PER_BLOCK, slice(again), "block 1 from its start: block 0 has 4 free");
         assertEquals(88, store.slicesCommitted, "purged slices are committed again");

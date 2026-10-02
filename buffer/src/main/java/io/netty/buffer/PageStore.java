@@ -678,48 +678,32 @@ final class PageStore {
 
     /**
      * Shared slices: purges the free slices with memory behind them freed {@link PageStoreConfig#purgeDelayNanos} ago
-     * or earlier, each run of contiguous ones in a region with one call, across blocks. As mimalloc v3's
-     * {@code mi_arena_try_purge_range}: a run's slices are claimed by CAS first, so that no claim can take them while
-     * their memory goes, and given back after; a claim meanwhile finds every other free slice.
+     * or earlier, one call per run of contiguous ones within a block. As mimalloc v3's {@code mi_arena_try_purge_range}
+     * (arena.c): a run's slices are claimed by CAS first, so that no claim can take them while their memory goes, and
+     * given back after; and as its {@code _mi_bitmap_forall_setc_ranges} (bitmap.c), a run never spans more than one
+     * bitmap word (a block): the purger holds at most one block's run at a time, and a claim meanwhile finds every
+     * other free slice.
      */
     private void purgeSharedSlices(long now) {
         long delay = config.purgeDelayNanos;
         for (Region region : regions) {
-            int perBlock = config.slicesPerSegment();
-            int runStart = -1;
             for (int slot = 0; slot < region.slots; slot++) {
                 Segment block = region.block(slot);
-                long claimed = 0;
                 long candidates = purgeable(block, block.free, now, delay);
-                if (candidates != 0) {
-                    claimed = block.claimFree(candidates);
+                while (candidates != 0) {
+                    long run = lowestRun(candidates);
+                    candidates &= ~run;
+                    long claimed = block.claimFree(run);
                     long exact = purgeable(block, claimed, now, delay);
                     if (exact != claimed) {
                         block.giveBack(claimed & ~exact);
                     }
-                    claimed = exact;
-                }
-                int base = slot * perBlock;
-                if (runStart >= 0 && (claimed & 1) == 0) {
-                    purgeSliceRun(region, runStart, base);
-                    runStart = -1;
-                }
-                while (claimed != 0) {
-                    long run = lowestRun(claimed);
-                    claimed &= ~run;
-                    int start = Long.numberOfTrailingZeros(run);
-                    int end = start + Long.bitCount(run);
-                    if (runStart < 0) {
-                        runStart = base + start;
-                    }
-                    if (end < perBlock) {
-                        purgeSliceRun(region, runStart, base + end);
-                        runStart = -1;
+                    while (exact != 0) {
+                        long bits = lowestRun(exact);
+                        exact &= ~bits;
+                        purgeSliceRun(block, bits);
                     }
                 }
-            }
-            if (runStart >= 0) {
-                purgeSliceRun(region, runStart, region.slots * perBlock);
             }
         }
     }
@@ -742,13 +726,16 @@ final class PageStore {
     }
 
     /**
-     * Purges the region's slices {@code from} to {@code to} (exclusive), which the purger claimed, with one call, then
-     * gives them back. A run whose call fails keeps its memory, and stays purgeable.
+     * Purges the contiguous slices {@code bits} of {@code block}, which the purger claimed, with one call, then gives
+     * them back. A run whose call fails keeps its memory, and stays purgeable.
      */
-    private void purgeSliceRun(Region region, int from, int to) {
-        int sliceSize = config.sliceSize;
-        int offset = from * sliceSize;
-        int length = (to - from) * sliceSize;
+    private void purgeSliceRun(Segment block, long bits) {
+        Region region = block.region;
+        int sliceSize = block.sliceSize;
+        int start = Long.numberOfTrailingZeros(bits);
+        int n = Long.bitCount(bits);
+        int offset = block.slot * config.segmentSize + start * sliceSize;
+        int length = n * sliceSize;
         boolean purged = false;
         try {
             Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
@@ -767,34 +754,19 @@ final class PageStore {
         } finally {
             try {
                 if (purged) {
+                    for (int i = start; i < start + n; i++) {
+                        block.freedAt[i] = Region.UNCOMMITTED;
+                    }
                     // Credited before a claim can find the slices uncommitted and charge them again.
                     purgeCalls++;
                     bytesPurged += length;
-                    slicesPurged += to - from;
+                    slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     allocator.storeBytesReleased(region.buffer._memoryAddress() + offset, length);
                 }
             } finally {
-                giveBackPurged(region, from, to, purged);
+                block.giveBack(bits);
             }
-        }
-    }
-
-    /** The purger's slices {@code from} to {@code to} go back, without memory behind them if {@code purged}. */
-    private void giveBackPurged(Region region, int from, int to, boolean purged) {
-        int perBlock = config.slicesPerSegment();
-        for (int slice = from; slice < to;) {
-            Segment block = region.block(slice / perBlock);
-            int start = slice % perBlock;
-            int end = Math.min(perBlock, start + to - slice);
-            if (purged) {
-                for (int i = start; i < end; i++) {
-                    block.freedAt[i] = Region.UNCOMMITTED;
-                }
-            }
-            int n = end - start;
-            block.giveBack(n == Long.SIZE ? -1L : (1L << n) - 1 << start);
-            slice += n;
         }
     }
 
