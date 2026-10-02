@@ -609,7 +609,8 @@ public class JfrEventsTest {
                 CompletableFuture<RecordedEvent> bufferFuture = new CompletableFuture<>();
                 stream.enable(AllocateChunkEvent.class);
                 stream.onEvent(AllocateChunkEvent.NAME, e -> {
-                    if (shared ? e.getBoolean("segment") && e.getInt("capacity") == size : e.getInt("capacity") > size) {
+                    int capacity = e.getInt("capacity");
+                    if (shared ? e.getBoolean("segment") && capacity == size : capacity > size) {
                         chunkFuture.complete(e);
                     }
                 });
