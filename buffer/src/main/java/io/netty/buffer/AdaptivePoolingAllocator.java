@@ -1734,18 +1734,26 @@ final class AdaptivePoolingAllocator {
             this.chunkRecycler = chunkRecycler;
             this.sizeClassIndex = sizeClassIndex;
             this.stripeLock = stripeLock;
+            floor = chunkRecycler != null && !chunkRecycler.holdsBuffers ? SPAN_CHUNK_FLOOR : 1;
         }
 
+        /** The queued chunks a size class keeps before it evicts one that empties: see {@link #atOrBelowFloor}. */
+        private static final int SPAN_CHUNK_FLOOR = 4;
+        private final int floor;
+
         /**
-         * {@code true} when the two queues hold at most one chunk between them. This is the retention floor:
-         * eviction never takes the last chunk of a size class in use besides the active one, so a size class that
-         * empties and fills again around one chunk does not give it up and allocate it again each time (only a class
-         * idle through a whole decay interval gives it up, see {@link SizeClassMagazine#decayIfIdle}). Every other
-         * chunk that empties goes to the heap's {@link SizeClassChunkRecycler}, whose byte budget bounds idle
-         * memory.
+         * {@code true} when the two queues hold at most {@link #floor} chunks between them. This is the retention
+         * floor: eviction never takes the last chunks of a size class in use besides the active one, so a size class
+         * that empties and fills again around them does not give one up and allocate it again each time (only a
+         * class idle through a whole decay interval gives them up, see {@link SizeClassMagazine#decayIfIdle}). Every
+         * other chunk that empties goes to the heap's {@link SizeClassChunkRecycler}, whose byte budget bounds idle
+         * memory. One chunk, or four when chunks are spans of segments: there, at one, 89% of the chunks made were
+         * made again within 10 ms of an eviction of their class (lao's harness, API_GATEWAY, 1024 live), each a chunk
+         * object of garbage; mimalloc too keeps up to 3 empty pages of a small size class before freeing them
+         * (MI_RETIRE_MAX_PAGES in https://github.com/microsoft/mimalloc/blob/main/src/page.c).
          */
         private boolean atOrBelowFloor() {
-            return exhausted.size + reusable.size <= 1;
+            return exhausted.size + reusable.size <= floor;
         }
 
         // Signal A (see refile): exhausted → reusable

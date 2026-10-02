@@ -408,32 +408,32 @@ public class AdaptiveSegmentsTest {
         int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks either way
         int perChunk = expectedBuffers(size);
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
-        for (int i = 0; i < 10 * perChunk; i++) {
+        for (int i = 0; i < 12 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
         }
-        // 10 chunks of 8 slices: the first segment is filled (8 of them), then a second one.
+        // 12 chunks of 8 slices: the first segment is filled (8 of them), then a second one.
         assertEquals(2, source.segmentsAllocated());
         Object stripe = usedStripe(allocator);
         HeapSegments heapSegments = idleDecay(stripe).heapSegments;
         assertEquals(2, heapSegments.count);
         assertEquals(64, heapSegments.segments[0].usedSlices());
-        assertEquals(16, heapSegments.segments[1].usedSlices());
+        assertEquals(32, heapSegments.segments[1].usedSlices());
         for (ByteBuf buf : bufs) {
             buf.release();
         }
         bufs.clear();
         assertAccounted(source, allocator);
-        // Every chunk ran out of segments, so none is active; the class keeps the last one to empty (its floor), in
+        // Every chunk ran out of segments, so none is active; the class keeps the last four to empty (its floor), in
         // the second segment. The first segment emptied and went to the heap's reserve.
         assertEquals(1, heapSegments.count);
-        assertEquals(8, heapSegments.segments[0].usedSlices());
+        assertEquals(32, heapSegments.segments[0].usedSlices());
         assertEquals(1, heapSegments.reserved);
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 2-slice chunks
-        for (int i = 0; i < 20 * expectedBuffers(other); i++) {
+        for (int i = 0; i < 16 * expectedBuffers(other); i++) {
             bufs.add(allocator.allocate(other, other));
         }
-        assertEquals(2, source.segmentsAllocated(), "40 slices fit in the free ones");
+        assertEquals(2, source.segmentsAllocated(), "32 slices fit in the free ones");
         assertEquals(1, heapSegments.count, "the fullest segment with room, not the reserved one");
         assertEquals(1, heapSegments.reserved);
         for (ByteBuf buf : bufs) {

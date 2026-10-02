@@ -289,11 +289,11 @@ final class RegionPurgeTest {
                         REGION_ALIGNMENT));
         PageStore store = allocator.pageStore;
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
-        for (int i = 0; i < 3 * 32; i++) { // three 8-slice chunks of 16 KiB buffers
+        for (int i = 0; i < 6 * 32; i++) { // six 8-slice chunks of 16 KiB buffers
             bufs.add(allocator.allocate(16384, 16384));
         }
         for (ByteBuf buf : bufs) {
-            buf.release(); // two of the chunks empty above the class's floor: their spans go back to the segment
+            buf.release(); // two of the chunks empty above the class's floor of four: their spans go back
         }
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5); // half a decay interval
         while (store.slicePurgeCalls == 0 && System.nanoTime() < deadline) {
