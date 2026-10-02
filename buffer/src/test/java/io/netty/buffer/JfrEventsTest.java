@@ -376,6 +376,7 @@ public class JfrEventsTest {
         FastThreadLocalThread thread = new FastThreadLocalThread(task);
         thread.start();
         task.get();
+        thread.join();
     }
 
     @SuppressWarnings("Since15")
@@ -510,6 +511,7 @@ public class JfrEventsTest {
         FastThreadLocalThread thread = new FastThreadLocalThread(task);
         thread.start();
         task.get();
+        thread.join(); // it frees its thread-local heap as it ends, before the allocator may close
     }
 
     @SuppressWarnings("Since15")
@@ -586,5 +588,6 @@ public class JfrEventsTest {
         FastThreadLocalThread thread = new FastThreadLocalThread(task);
         thread.start();
         task.get();
+        thread.join(); // it frees its thread-local heap as it ends, before the allocator may close
     }
 }
