@@ -17,92 +17,59 @@ package io.netty.buffer;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
- * One mapping from a {@link RegionSource}, cut into {@link #slots} segments at fixed offsets. Its slots are taken and
- * given back from any thread by a CAS on the {@link #free} bitmap: a cleared bit is owned by exactly one thread (the
- * heap that took the slot, its releaser, or the purger that claimed it), which alone touches the slot's
- * {@link #segments} and {@link #freedAt} entries; the CAS that gives the bit back publishes them to the next owner.
- * A region lives as long as its {@link PageStore}.
- * <p>
- * With shared slices, the slots are blocks made with the region, which nobody takes whole for long: each block's
- * {@link Segment#free} is the free bitmap of its slices, claimed in runs by any thread (see {@link #claimSlices}), and
- * the slot bitmap stays empty. {@link #freedAt} and {@link #everCommitted} are then unused: the blocks keep their own,
- * per slice.
+ * One piece of memory from a {@link RegionSource}, cut into {@link #slots} blocks at fixed offsets, all made with the
+ * region. Each block's {@link Segment#free} is the free bitmap of its slices, claimed in runs and released by CAS from
+ * any thread. A region lives as long as its {@link PageStore}, or until it goes back whole ({@link #released}).
  */
 final class Region {
-    private static final AtomicLongFieldUpdater<Region> FREE = AtomicLongFieldUpdater.newUpdater(Region.class, "free");
     private static final AtomicIntegerFieldUpdater<Region> MAX_ACCESSED =
             AtomicIntegerFieldUpdater.newUpdater(Region.class, "maxAccessed");
 
-    /** No memory behind the slot: never taken since the region was mapped, or purged since. */
+    /** No memory behind the slice: never claimed since the region was mapped, or purged since. */
     static final long UNCOMMITTED = Long.MIN_VALUE;
 
     final AbstractByteBuf buffer;
     final int slots;
-    final long allSlots;
-    /** Bit {@code i} set when slot {@code i} is free: in no heap. */
-    volatile long free;
-    /** The segment of each slot, made the first time it is taken, then reused. Slot owner only. */
-    private final Segment[] segments;
+    private final Segment[] blocks;
     /**
-     * Per slot, slot owner only: {@link #UNCOMMITTED}, else memory is behind it (counted in the used memory) and, once
-     * given back, the {@link System#nanoTime()} it was given back at.
+     * Per slice of the region, slice owner only: whether memory was ever behind it, so that a slice with none now was
+     * purged.
      */
-    final long[] freedAt;
-    /** Per slot, slot owner only: whether memory was ever behind it, so that a slot with none now was purged. */
-    final boolean[] everCommitted;
+    final boolean[] sliceEverCommitted;
     /** Its index in {@link PageStore#regions}, set before it is published there. */
     int index = -1;
     /** Given back to its source whole: every block stays claimed. Set by the purger under the store's monitor. */
     volatile boolean released;
-    /**
-     * Shared slices: per slice of the region, whether memory was ever behind it, so that a slice with none now was
-     * purged; slice owner only. Else {@code null}.
-     */
-    final boolean[] sliceEverCommitted;
-    /** Shared slices: the highest block a run was claimed in, -1 before the first. */
+    /** The highest block a run was claimed in, -1 before the first. */
     private volatile int maxAccessed = -1;
 
-    Region(AbstractByteBuf buffer, int slots) {
+    /** Every block made now, all slices free; uncommitted unless {@code committedAt}, their release time, is set. */
+    Region(AbstractByteBuf buffer, int slots, SegmentSource source, PageStoreConfig config, boolean committed,
+           long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
         this.buffer = buffer;
         this.slots = slots;
-        allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
-        free = allSlots;
-        segments = new Segment[slots];
-        freedAt = new long[slots];
-        everCommitted = new boolean[slots];
-        Arrays.fill(freedAt, UNCOMMITTED);
-        sliceEverCommitted = null;
-    }
-
-    /** With shared slices: every block made now, all slices free and uncommitted, no slot free. */
-    Region(AbstractByteBuf buffer, int slots, SegmentSource source, PageStoreConfig config) {
-        assert slots > 0 && slots <= Long.SIZE;
-        this.buffer = buffer;
-        this.slots = slots;
-        allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
-        segments = new Segment[slots];
-        freedAt = new long[0];
-        everCommitted = new boolean[0];
+        blocks = new Segment[slots];
         int size = config.segmentSize;
         for (int slot = 0; slot < slots; slot++) {
             Segment block = new Segment(source.span(buffer, slot * size, size), config.sliceSize, this, slot);
-            Arrays.fill(block.freedAt, UNCOMMITTED);
-            segments[slot] = block;
+            Arrays.fill(block.freedAt, committed ? committedAt : UNCOMMITTED);
+            blocks[slot] = block;
         }
         sliceEverCommitted = new boolean[slots * config.slicesPerSegment()];
+        if (committed) {
+            Arrays.fill(sliceEverCommitted, true);
+        }
     }
 
-    /** Shared slices: the block of slot {@code slot}. */
     Segment block(int slot) {
-        return segments[slot];
+        return blocks[slot];
     }
 
     /**
-     * Shared slices, any thread: claims the lowest run of {@code n} free slices of one block, at most a block, and
+     * Any thread: claims the lowest run of {@code n} free slices of one block, at most a block, and
      * returns its first slice in the region, or -1 when no block has such a run. Lock-free: one CAS on the block's
      * bitmap, again only if another thread changed it meanwhile.
      * <p>
@@ -115,7 +82,7 @@ final class Region {
      * crosses a block.
      */
     int claimSlices(int n, int seq) {
-        Segment[] blocks = segments;
+        Segment[] blocks = this.blocks;
         int count = blocks.length;
         int cycle = maxAccessed + 1;
         int start = cycle == 0 ? 0 : seq % cycle;
@@ -134,13 +101,13 @@ final class Region {
     }
 
     /**
-     * Shared slices, any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
+     * Any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
      * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1950-L1997): from the
      * start, whole blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
      */
     int claimBlocks(int n) {
-        Segment[] blocks = segments;
+        Segment[] blocks = this.blocks;
         int first = 0;
         while (first + n <= blocks.length) {
             int end = first;
@@ -177,118 +144,8 @@ final class Region {
         }
     }
 
-    /**
-     * Takes the lowest free slot with memory behind it, else the lowest free slot: returns it, or -1 when none is
-     * free. Lock-free. The memory of a free slot is read racily: a slot purged meanwhile only costs page faults.
-     */
-    int takeSlot() {
-        for (;;) {
-            long current = free;
-            if (current == 0) {
-                return -1;
-            }
-            int slot = lowestCommitted(current);
-            if (FREE.compareAndSet(this, current, current & ~(1L << slot))) {
-                return slot;
-            }
-        }
-    }
-
-    private int lowestCommitted(long slots) {
-        for (long bits = slots; bits != 0; bits &= bits - 1) {
-            int slot = Long.numberOfTrailingZeros(bits);
-            if (freedAt[slot] != UNCOMMITTED) {
-                return slot;
-            }
-        }
-        return Long.numberOfTrailingZeros(slots);
-    }
-
-    /** Frees {@code slot}, which the caller owns, stamped with {@code now}. Lock-free. */
-    void giveBack(int slot, long now) {
-        if (freedAt[slot] != UNCOMMITTED) {
-            freedAt[slot] = now;
-        }
-        giveBackAll(1L << slot);
-    }
-
-    /** Takes the lowest run of {@code n} free slots: returns its first slot, or -1 when there is none. Lock-free. */
-    int takeRun(int n) {
-        for (;;) {
-            long current = free;
-            int start = Segment.firstFit(current, n);
-            if (start < 0) {
-                return -1;
-            }
-            if (FREE.compareAndSet(this, current, current & ~run(start, n))) {
-                return start;
-            }
-        }
-    }
-
-    /** Frees the run of {@code n} slots from {@code start}, which the caller owns, stamped with {@code now}. */
-    void giveBackRun(int start, int n, long now) {
-        for (int slot = start; slot < start + n; slot++) {
-            if (freedAt[slot] != UNCOMMITTED) {
-                freedAt[slot] = now;
-            }
-        }
-        giveBackAll(run(start, n));
-    }
-
-    private static long run(int start, int n) {
-        return n == Long.SIZE ? -1L : (1L << n) - 1 << start;
-    }
-
-    /** Frees the slots of {@code bits}, which the caller owns. Lock-free. */
-    void giveBackAll(long bits) {
-        for (;;) {
-            long current = free;
-            if ((current & bits) != 0) {
-                throw new IllegalStateException("slots " + Long.toHexString(current & bits) + " are already free");
-            }
-            if (FREE.compareAndSet(this, current, current | bits)) {
-                return;
-            }
-        }
-    }
-
-    /**
-     * Takes every slot of {@code bits} that is still free: returns them, the caller owns them until
-     * {@link #giveBackAll}. Lock-free.
-     */
-    long claim(long bits) {
-        for (;;) {
-            long current = free;
-            long claimed = current & bits;
-            if (claimed == 0 || FREE.compareAndSet(this, current, current & ~claimed)) {
-                return claimed;
-            }
-        }
-    }
-
-    /** Slot owner only. The slot's segment, made on first use as a view of the region. */
-    Segment segment(int slot, SegmentSource source, PageStoreConfig config) {
-        Segment segment = segments[slot];
-        if (segment == null) {
-            int size = config.segmentSize;
-            segment = new Segment(source.span(buffer, slot * size, size), config.sliceSize, this, slot);
-            segments[slot] = segment;
-        }
-        return segment;
-    }
-
-    /** For the close, when no slot has an owner any more. */
-    Segment segmentOrNull(int slot) {
-        return segments[slot];
-    }
-
-    int freeSlotCount() {
-        return Long.bitCount(free);
-    }
-
     @Override
     public String toString() {
-        return "Region[slots: " + slots + ", free: " + freeSlotCount() + ']';
+        return "Region[" + index + ", blocks: " + slots + (released ? ", released]" : "]");
     }
 }

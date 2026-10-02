@@ -116,7 +116,7 @@ public class AdaptiveSegmentRegionsTest {
         AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
         AdaptivePoolingAllocator direct = AdaptiveByteBufAllocatorTest.direct(adaptive);
         SegmentSource source = direct.pageStore.segmentSource;
-        PageStoreConfig noMmap = PageStoreConfig.sharedSlices(PageStoreConfig.SEGMENT_SIZE_BYTES,
+        PageStoreConfig noMmap = new PageStoreConfig(PageStoreConfig.SEGMENT_SIZE_BYTES,
                 PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
                 PageStoreConfig.SEGMENT_SIZE_BYTES);
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(

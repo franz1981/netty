@@ -15,15 +15,12 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 
 import java.util.Random;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
-import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
-import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
@@ -232,47 +229,6 @@ final class HeapSegmentsTest {
         assertEquals(0, heap.reserved, "a freed heap gives its reserve back");
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
-    }
-
-    /**
-     * With regions, the reserve is one segment, which behaves as the heap's one spare: the newest wholly free
-     * segment is kept and the previous one goes back to its region; it goes back when a decay finds it already seen
-     * by the previous one, and one taken meanwhile starts over.
-     */
-    @Test
-    void withRegionsTheReserveIsOneSpare() {
-        CountingRegionSource regions = new CountingRegionSource();
-        CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator allocator = newAllocator(source, regions, REGION_SIZE, REGION_ALIGNMENT);
-        HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
-        assertEquals(1, allocator.pageStore.reserveLimit());
-        Segment a = heap.claim(63);
-        Segment b = heap.claim(63);
-        Segment c = heap.claim(63);
-        heap.release(a, 0, 63);
-        assertSame(a, heap.reserve[0]);
-        heap.release(b, 0, 63);
-        assertEquals(1, heap.reserved);
-        assertSame(b, heap.reserve[0], "the newest is kept");
-        assertNull(a.owner);
-        assertEquals(REGION_SIZE / SEGMENT_SIZE - 2, a.region.freeSlotCount(), "a went back to its region");
-        long now = System.nanoTime();
-        heap.decay(now);
-        assertSame(b, heap.reserve[0], "seen once");
-        assertSame(b, heap.claim(63), "taken: its age starts over");
-        heap.release(b, 0, 63);
-        heap.decay(now += INTERVAL);
-        assertSame(b, heap.reserve[0]);
-        heap.decay(now += INTERVAL);
-        assertEquals(0, heap.reserved, "unused a whole interval");
-        assertNull(b.owner);
-        heap.release(c, 0, 63);
-        heap.markFreed();
-        heap.afterFree();
-        assertEquals(0, heap.reserved);
-        assertEquals(REGION_SIZE / SEGMENT_SIZE, a.region.freeSlotCount());
-        assertEquals(0, source.segmentsAllocated());
-        assertAccounted(source, regions, allocator);
     }
 
     /**

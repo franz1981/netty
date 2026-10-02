@@ -188,31 +188,34 @@ final class AdaptiveLargeSpansTest {
 
     /**
      * The spans of one segment share one chunk    /**
-     * The spans of one segment share one chunk for as long as the segment stays in the heap, its reserve included:
-     * allocating and releasing large buffers makes no chunk, even when each release empties the segment. The chunk
-     * ends when the segment goes back to the store.
+     * The spans of one block share one chunk: a region block's, for every stripe (or every thread-local heap); a
+     * heap's own block's, for as long as the block stays in the heap, its reserve included. Allocating and releasing
+     * large buffers makes no chunk, even when each release empties the block.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void spansOfASegmentShareItsChunk(boolean withRegions) {
         AdaptivePoolingAllocator allocator = allocator(withRegions);
         ByteBuf first = allocator.allocate(256 * 1024, 256 * 1024);
-        AdaptivePoolingAllocator.SpanChunk chunk = (AdaptivePoolingAllocator.SpanChunk) adaptive(first).chunk;
-        Segment segment = chunk.segment;
+        AdaptivePoolingAllocator.Chunk chunk = adaptive(first).chunk;
+        assertEquals(withRegions, chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
         first.release();
         for (int i = 0; i < 1000; i++) {
             ByteBuf buf = allocator.allocate(512 * 1024, 512 * 1024);
-            assertSame(chunk, adaptive(buf).chunk, "the segment comes back from the reserve with its chunk");
+            assertSame(chunk, adaptive(buf).chunk, "the block keeps its chunk");
             buf.release();
         }
-        assertSame(chunk, segment.spanChunk);
+        if (!withRegions) {
+            Segment segment = ((AdaptivePoolingAllocator.SpanChunk) chunk).segment;
+            assertSame(chunk, segment.spanChunk);
+        }
         allocator.pageStore.close();
     }
 
-    /** When the heap gives the segment back to the store, its chunk is retired and the segment forgets it. */
+    /** When the heap gives its own block back to the store, its chunk is retired and the block forgets it. */
     @Test
     void theChunkEndsWithTheSegmentsStayInTheHeap() throws Exception {
-        final AdaptivePoolingAllocator allocator = allocator(true);
+        final AdaptivePoolingAllocator allocator = allocator(false);
         final AtomicReference<AdaptivePoolingAllocator.SpanChunk> chunk =
                 new AtomicReference<AdaptivePoolingAllocator.SpanChunk>();
         Thread owner = new FastThreadLocalThread(() -> {
@@ -318,9 +321,8 @@ final class AdaptiveLargeSpansTest {
         // A stripe applies the notes other threads left at its next allocation or decay: here, now.
         drainStripes(allocator);
         if (withRegions) {
-            // Stripes live as long as the allocator and keep their reserve of one segment each.
-            assertEquals(stripesHoldingSegments(allocator), allocator.pageStore.slotCounts()[0],
-                    "slots in heaps: only the stripes' reserves");
+            // No heap holds blocks: every slice is back.
+            assertEquals(0, allocator.pageStore.sliceCounts()[0], "slices claimed");
             assertAccounted(segments, regions, allocator);
         } else {
             assertEquals(stripesHoldingSegments(allocator), segments.segmentsLive(),

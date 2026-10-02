@@ -234,14 +234,14 @@ final class PageStoreTestSupport {
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 
-    /** With shared slices: every chunk is a run of the regions' shared slices (see {@link PageStore}). */
+    /** With regions of {@code regionSize} from {@code regions}: every chunk is a run of their shared slices. */
     static AdaptivePoolingAllocator newSharedAllocator(CountingSegmentSource segments, RegionSource regions,
                                                        int regionSize, long purgeDelayNanos) {
         // A region of one block is a malloc'd one's size.
-        PageStoreConfig config = regionSize == SEGMENT_SIZE ? PageStoreConfig.sharedSlices(SEGMENT_SIZE,
-                SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE).withMallocRegions() :
-                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT,
-                        true);
+        PageStoreConfig config = regionSize == SEGMENT_SIZE ?
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE)
+                        .withMallocRegions() :
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT);
         return new AdaptivePoolingAllocator(segments, true, segments, regions, config);
     }
 
@@ -293,23 +293,9 @@ final class PageStoreTestSupport {
         assertEquals(source.unreleasedBytes(), allocator.usedMemory(), "usedMemory() and the segment source disagree");
     }
 
-    /**
-     * The used memory is the segments allocated on their own and not freed, plus the committed slots of the regions:
-     * see {@link PageStore}.
-     */
+    /** As {@link #assertSharedAccounted}: {@code regions} are counted through the store. */
     static void assertAccounted(CountingSegmentSource segments, CountingRegionSource regions,
                                 AdaptivePoolingAllocator allocator) {
-        assertEquals(segments.unreleasedBytes() + committedSlots(allocator.pageStore) * (long) SEGMENT_SIZE,
-                allocator.usedMemory(), "usedMemory() and what the sources handed out disagree");
-    }
-
-    static int committedSlots(PageStore store) {
-        int committed = 0;
-        for (Region region : store.regions) {
-            for (long freedAt : region.freedAt) {
-                committed += freedAt != Region.UNCOMMITTED ? 1 : 0;
-            }
-        }
-        return committed;
+        assertSharedAccounted(segments, allocator);
     }
 }

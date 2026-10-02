@@ -21,220 +21,54 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CyclicBarrier;
-import java.util.concurrent.atomic.AtomicReference;
 
+import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
-import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
-import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
-import static io.netty.buffer.PageStoreTestSupport.committedSlots;
+import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.giveBack;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * {@link PageStore}: where a heap's segments come from (the fullest region, the heap's offset on a tie, a new region),
- * segments as views of committed region slots, slots owned once under contention, the fallback of one allocation per
- * segment, and the accounting through a random workload and the close.
+ * {@link PageStore} as heaps see it: aligned blocks of the regions, accounting through a random workload of several
+ * heaps and the close, the fallback of one allocation per block once no region can be mapped, and no regions at all.
  */
 final class PageStoreTest {
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
+    private static final int PER_BLOCK = SEGMENT_SIZE / SLICE_SIZE_BYTES;
+    private static final int SPAN = PER_BLOCK - 1;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
-    /** A free slot of the fullest region, its lowest; then a new region. */
-    @Test
-    void takesFromTheFullestRegionThenANewRegion() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        Segment a = heap.claim(63);
-        heap.claim(63);
-        giveBack(heap, a, 0, 63);
-        Segment again = store.take(heap);
-        assertSame(a, again, "slot 0 is free again: the lowest");
-        assertSame(heap, again.owner);
-        Segment fromRegion = store.take(heap);
-        assertSame(a.region, fromRegion.region);
-        assertEquals(2, fromRegion.slot, "the lowest free slot of the fullest region");
-        for (int slot = 3; slot < SLOTS; slot++) {
-            assertEquals(slot, store.take(heap).slot);
-        }
-        assertEquals(1, store.regionCount());
-        Segment fresh = store.take(heap);
-        assertNotSame(a.region, fresh.region, "no free slot left: a new region");
-        assertEquals(0, fresh.slot);
-        assertEquals(2, store.regionCount());
-        store.free(releaseOwnership(again));
-        assertAccounted(segments, regions, allocator);
-    }
-
-    /** A segment taken by take() and never claimed from is given back as {@link HeapSegments#afterFree} would. */
-    private static Segment releaseOwnership(Segment segment) {
-        assertTrue(segment.isWhollyFree());
-        assertTrue(Segment.OWNER.compareAndSet(segment, segment.owner, null));
-        return segment;
-    }
-
-    /**
-     * Segments are views of their region at their slot's offset, and no segment is allocated on its own. A slot counts
-     * in the used memory from its first take on, back in the region or not; taking it again adds nothing.
-     */
-    @Test
-    void segmentsAreViewsOfCommittedSlots() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        List<Segment> taken = new ArrayList<Segment>();
-        for (int i = 0; i < SLOTS; i++) {
-            Segment segment = heap.claim(63);
-            taken.add(segment);
-            assertEquals(i, segment.slot);
-            assertSame(taken.get(0).region, segment.region);
-            assertEquals((i + 1L) * SEGMENT_SIZE, allocator.usedMemory());
-        }
-        assertEquals(0, segments.segmentsAllocated(), "no segment of its own");
-        assertEquals(1, regions.regions.size());
-        assertEquals(SLOTS, store.segmentsCommitted);
-        Region region = taken.get(0).region;
-        long base = region.buffer.memoryAddress();
-        for (Segment segment : taken) {
-            assertEquals(base + (long) segment.slot * SEGMENT_SIZE, segment.memoryAddress());
-            segment.buffer.setLong(SEGMENT_SIZE - 8, segment.slot);
-        }
-        for (Segment segment : taken) {
-            assertEquals(segment.slot, region.buffer.getLong(segment.slot * SEGMENT_SIZE + SEGMENT_SIZE - 8));
-        }
-        giveBack(heap, taken.get(3), 0, 63);
-        assertEquals((long) SLOTS * SEGMENT_SIZE, allocator.usedMemory(), "back in its region, still committed");
-        assertSame(taken.get(3), heap.claim(63), "the same segment again");
-        assertEquals(SLOTS, store.segmentsCommitted, "no new commit");
-        assertEquals((long) SLOTS * SEGMENT_SIZE, allocator.usedMemory());
-        assertAccounted(segments, regions, allocator);
-    }
-
-    /** Where regions are mapped, a region starts at a multiple of 2 MiB, and so does each of its (4 MiB) segments. */
+    /** Where regions are mapped, a region starts at a multiple of 2 MiB, and so does each of its (4 MiB) blocks. */
     @Test
     void regionsAreAligned() {
         assumeTrue(regions.mmap != null, "aligned regions need mmap");
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
         for (int i = 0; i < 3; i++) {
-            Segment segment = heap.claim(63);
-            assertEquals(0, segment.memoryAddress() & REGION_ALIGNMENT - 1, "segment " + i);
+            Segment block = heap.claim(63);
+            assertEquals(0, heap.claimedStart());
+            assertEquals(0, block.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
         }
         assertEquals(0, allocator.pageStore.regions[0].buffer.memoryAddress() & REGION_ALIGNMENT - 1);
     }
 
-    /** Equally full regions: each heap starts from its own offset, so two heaps take from different regions. */
-    @Test
-    void equallyFullRegionsSpreadByTheHeapsOffset() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        PageStore store = allocator.pageStore;
-        HeapSegments filler = new HeapSegments(store, null, Thread.currentThread());
-        List<Segment> taken = new ArrayList<Segment>();
-        for (int i = 0; i < 2 * SLOTS; i++) {
-            taken.add(store.take(filler));
-        }
-        assertEquals(2, store.regionCount());
-        store.free(releaseOwnership(taken.get(1)));
-        store.free(releaseOwnership(taken.get(SLOTS + 1)));
-        HeapSegments first = new HeapSegments(store, null, Thread.currentThread());
-        first.regionOffset = 0;
-        HeapSegments second = new HeapSegments(store, null, Thread.currentThread());
-        second.regionOffset = 1;
-        Segment fromFirst = store.take(first);
-        assertSame(store.regions[0], fromFirst.region);
-        store.free(releaseOwnership(fromFirst));
-        assertSame(store.regions[1], store.take(second).region);
-        // A fuller region wins whatever the offset.
-        store.free(releaseOwnership(taken.get(2)));
-        store.free(releaseOwnership(taken.get(3)));
-        store.free(releaseOwnership(taken.get(SLOTS + 2)));
-        assertSame(store.regions[1], store.take(first).region);
-    }
-
     /**
-     * Eight threads take and give back segments of one store, two at most each: a segment is held by one thread at a
-     * time, and since 16 fit in two regions of 9 slots, no third region is ever mapped.
-     */
-    @Test
-    void contendedSegmentsAreOwnedOnce() throws Exception {
-        final AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        final PageStore store = allocator.pageStore;
-        final int threads = 8;
-        final ConcurrentHashMap<Segment, Integer> holders = new ConcurrentHashMap<Segment, Integer>();
-        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
-        final CyclicBarrier start = new CyclicBarrier(threads);
-        List<Thread> workers = new ArrayList<Thread>();
-        for (int t = 0; t < threads; t++) {
-            final int id = t;
-            Thread worker = new Thread(() -> {
-                try {
-                    HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-                    Random random = new Random(id);
-                    Segment[] held = new Segment[2];
-                    int count = 0;
-                    start.await();
-                    for (int r = 0; r < 50_000; r++) {
-                        if (count < held.length && random.nextBoolean()) {
-                            Segment segment = store.take(heap);
-                            Integer previous = holders.putIfAbsent(segment, id);
-                            if (previous != null) {
-                                throw new AssertionError(segment + " taken by " + id + " is held by " + previous);
-                            }
-                            held[count++] = segment;
-                        } else if (count > 0) {
-                            int k = random.nextInt(count);
-                            Segment segment = held[k];
-                            held[k] = held[--count];
-                            holders.remove(segment);
-                            store.free(releaseOwnership(segment));
-                        }
-                    }
-                    while (count > 0) {
-                        Segment segment = held[--count];
-                        holders.remove(segment);
-                        store.free(releaseOwnership(segment));
-                    }
-                } catch (Throwable e) {
-                    failure.compareAndSet(null, e);
-                }
-            });
-            workers.add(worker);
-            worker.start();
-        }
-        for (Thread worker : workers) {
-            worker.join();
-        }
-        assertNull(failure.get());
-        assertTrue(store.regionCount() <= 2, store.regionCount() + " regions");
-        for (Region region : store.regions) {
-            assertEquals(region.allSlots, region.free);
-        }
-        assertAccounted(segments, regions, allocator);
-    }
-
-    /**
-     * Several heaps claiming and releasing at random, with their reserves ageing and idle slots purged: at every step
-     * the allocator's used memory is exactly the segments allocated on their own and not freed plus the committed
-     * slots; once the heaps are freed and the store closed, nothing is left.
+     * Several heaps claiming and releasing at random, with their decays driving the purge: at every step the
+     * allocator's used memory is exactly the blocks allocated on their own and not freed plus the committed slices;
+     * once the heaps are freed and the store closed, nothing is left.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -276,7 +110,7 @@ final class PageStoreTest {
                 lengths[live] = n;
                 live++;
             }
-            assertAccounted(segments, regions, allocator);
+            assertAccounted(allocator, withRegions);
         }
         while (live > 0) {
             live--;
@@ -289,59 +123,45 @@ final class PageStoreTest {
         }
         assertEquals(0, segments.segmentsLive());
         assertEquals(withRegions, !regions.regions.isEmpty());
-        assertEquals(withRegions, store.segmentsPurged > 0, "the decays purged idle slots");
-        assertAccounted(segments, regions, allocator);
+        assertEquals(withRegions, store.slicesPurged > 0, "the decays drove the purge of idle slices");
+        assertAccounted(allocator, withRegions);
         store.close();
         assertEquals(0, allocator.usedMemory());
         assertEquals(0, regions.live(), "the close unmaps every region");
         assertEquals(0, store.regionCount());
     }
 
-    /** The close unmaps every region, with the segments still in heaps, and accounts all of them as freed. */
+    private void assertAccounted(AdaptivePoolingAllocator allocator, boolean withRegions) {
+        if (withRegions) {
+            assertSharedAccounted(segments, allocator);
+        } else {
+            PageStoreTestSupport.assertAccounted(segments, allocator);
+        }
+    }
+
+    /** The close unmaps every region, with runs still claimed, and accounts all of them as freed. */
     @Test
     void closeUnmapsEveryRegion() {
         AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
         PageStore store = allocator.pageStore;
         HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
         for (int i = 0; i < SLOTS + 2; i++) {
-            heap.claim(63);
+            heap.claim(PER_BLOCK);
         }
         assertEquals(2, regions.live());
         assertEquals((SLOTS + 2L) * SEGMENT_SIZE, allocator.usedMemory());
         store.close();
         assertEquals(0, regions.live());
         assertEquals(0, allocator.usedMemory());
-        assertEquals(0, committedSlots(store));
-        assertThrows(IllegalStateException.class, () -> store.take(heap));
+        assertThrows(IllegalStateException.class, () -> heap.claim(1));
     }
 
     /**
-     * A segment of a freed heap emptied by another thread's release goes straight back to its region's free slots, from
-     * that thread.
+     * A region that cannot be mapped turns the mapping off for good: the free slices of the regions mapped so far are
+     * still claimed, a heap's own blocks first once it has some, then blocks are allocated on their own.
      */
     @Test
-    void foreignReleaseGivesTheSlotBack() throws Exception {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        final HeapSegments heap = new HeapSegments(allocator.pageStore, null, Thread.currentThread());
-        final Segment segment = heap.claim(10);
-        heap.markFreed();
-        heap.afterFree();
-        assertEquals(SLOTS - 1, segment.region.freeSlotCount());
-        Thread releaser = new Thread(() -> heap.release(segment, 0, 10));
-        releaser.start();
-        releaser.join();
-        assertNull(segment.owner);
-        assertEquals(SLOTS, segment.region.freeSlotCount());
-        assertAccounted(segments, regions, allocator);
-    }
-
-    /**
-     * A region that cannot be mapped turns the mapping off for good: the free slots of the regions mapped so far are
-     * still taken first, then segments are allocated on their own, and the heaps keep the larger reserve of the
-     * allocations one by one.
-     */
-    @Test
-    void aRegionThatCannotBeMappedFallsBackToOneAllocationPerSegment() {
+    void aRegionThatCannotBeMappedFallsBackToOneAllocationPerBlock() {
         final int[] calls = new int[1];
         RegionSource failing = new RegionSource() {
             @Override
@@ -360,35 +180,34 @@ final class PageStoreTest {
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(segments, true, segments, failing,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT));
         PageStore store = allocator.pageStore;
+        // A heap's own block cannot be claimed whole: spans of all slices but one.
         HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        assertEquals(1, store.reserveLimit());
-        List<Segment> taken = new ArrayList<Segment>();
+        Segment[] blocks = new Segment[SLOTS];
         for (int i = 0; i < SLOTS; i++) {
-            taken.add(store.take(heap));
+            blocks[i] = heap.claim(SPAN);
+            assertNotNull(blocks[i].region);
         }
-        Segment own = store.take(heap);
+        Segment own = heap.claim(SPAN);
         assertNull(own.region, "no region: allocated on its own");
         assertEquals(2, calls[0]);
         assertFalse(store.mapsRegions);
-        assertEquals(8, store.reserveLimit());
-        store.free(releaseOwnership(taken.get(4)));
-        assertSame(taken.get(4), store.take(heap), "the free slot of the mapped region first");
-        Segment ownAgain = store.take(heap);
+        heap.release(blocks[4], 0, SPAN);
+        assertSame(blocks[4], heap.claim(SPAN), "the free slices of the mapped region");
+        Segment ownAgain = heap.claim(SPAN);
         assertNull(ownAgain.region);
         assertEquals(2, calls[0], "never tried again");
         assertEquals(1, store.regionCount());
         assertEquals(2, segments.segmentsAllocated());
-        assertEquals((SLOTS + 2L) * SEGMENT_SIZE, allocator.usedMemory());
-        assertAccounted(segments, regions, allocator);
-        store.free(releaseOwnership(own));
-        store.free(releaseOwnership(ownAgain));
+        assertSharedAccounted(segments, allocator);
+        giveBack(heap, own, 0, SPAN);
+        giveBack(heap, ownAgain, 0, SPAN);
         assertEquals(0, segments.segmentsLive());
         store.close();
         assertEquals(0, allocator.usedMemory());
     }
 
     /**
-     * Regions off, by a config without them or without a region source: one allocation per segment, freed when it is
+     * Regions off, by a config without them or without a region source: one allocation per block, freed when it is
      * given back.
      */
     @Test

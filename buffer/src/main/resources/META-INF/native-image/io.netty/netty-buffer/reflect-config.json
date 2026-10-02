@@ -111,10 +111,16 @@
     "name": "io.netty.buffer.PageStore",
     "fields": [
       {
+        "name": "heapSequence"
+      },
+      {
+        "name": "purgeWaits"
+      },
+      {
         "name": "purging"
       },
       {
-        "name": "segmentsCommitted"
+        "name": "slicesCommitted"
       }
     ]
   },
@@ -122,7 +128,15 @@
     "name": "io.netty.buffer.Region",
     "fields": [
       {
-        "name": "free"
+        "name": "maxAccessed"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.AdaptivePoolingAllocator$SpanChunk",
+    "fields": [
+      {
+        "name": "draining"
       }
     ]
   },

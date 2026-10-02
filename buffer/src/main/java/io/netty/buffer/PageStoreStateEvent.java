@@ -35,16 +35,16 @@ import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Where every {@link PageStore}'s memory is, periodically, on the JFR periodic thread: one event per region, with the
- * address ranges of its slots out to heaps, free with memory behind them, purged, and never used; and one event per
+ * address ranges of its slices claimed, free with memory behind them, purged, and never used; and one event per
  * store (region -1) with the segments in the heaps' reserves and those allocated on their own. Read racily, without
- * locks: a slot or reserve that changes meanwhile may be reported in either state.
+ * locks: a slice or reserve that changes meanwhile may be reported in either state.
  */
 @Enabled(false)
 @Category("Netty")
 @Period("1 s")
 @Name(PageStoreStateEvent.NAME)
 @Label("Page Store State")
-@Description("Periodic map of a page store's memory: region slots by state, heap reserves, own segments")
+@Description("Periodic map of a page store's memory: region slices by state, heap reserves, own segments")
 @SuppressWarnings("Since15")
 final class PageStoreStateEvent extends Event {
     static final String NAME = "io.netty.PageStoreState";
@@ -75,16 +75,16 @@ final class PageStoreStateEvent extends Event {
     @Description("Length of the region")
     public long length;
     @DataAmount
-    @Description("Bytes of slots out to heaps, chunks or buffers")
+    @Description("Bytes of slices claimed by chunks or buffers")
     public long outBytes;
     @DataAmount
-    @Description("Bytes of free slots with memory behind them")
+    @Description("Bytes of free slices with memory behind them")
     public long freeCommittedBytes;
     @DataAmount
-    @Description("Bytes of free slots purged since they were last used")
+    @Description("Bytes of free slices purged since they were last used")
     public long purgedBytes;
     @DataAmount
-    @Description("Bytes of slots never used")
+    @Description("Bytes of slices never used")
     public long untouchedBytes;
     @DataAmount
     @Description("Bytes of the segments in the heaps' reserves")
@@ -92,11 +92,11 @@ final class PageStoreStateEvent extends Event {
     @DataAmount
     @Description("Bytes of the segments allocated on their own that are out")
     public long ownBytes;
-    @Description("Address ranges of the slots out, as start-end in hex, comma separated")
+    @Description("Address ranges of the slices claimed, as start-end in hex, comma separated")
     public String out;
-    @Description("Address ranges of the free slots with memory behind them")
+    @Description("Address ranges of the free slices with memory behind them")
     public String freeCommitted;
-    @Description("Address ranges of the purged free slots")
+    @Description("Address ranges of the purged free slices")
     public String purged;
     @Description("Address ranges of the reserved segments, each prefixed by its heap kind")
     public String reserve;
@@ -131,15 +131,13 @@ final class PageStoreStateEvent extends Event {
 
     private static void emit(PageStore store) {
         int id = System.identityHashCode(store.allocator);
-        boolean shared = store.config.sharesSlices;
-        // With shared slices, the units are slices, of each block; else slots.
-        long segmentSize = shared ? store.config.sliceSize : store.config.segmentSize;
+        long sliceSize = store.config.sliceSize;
         int perBlock = store.config.slicesPerSegment();
         for (Region region : store.regions) {
             if (region.released) {
                 continue;
             }
-            int units = shared ? region.slots * perBlock : region.slots;
+            int units = region.slots * perBlock;
             PageStoreStateEvent event = new PageStoreStateEvent();
             event.store = id;
             event.region = region.index;
@@ -148,16 +146,14 @@ final class PageStoreStateEvent extends Event {
             StringBuilder out = new StringBuilder();
             StringBuilder committed = new StringBuilder();
             StringBuilder purged = new StringBuilder();
-            long free = region.free;
             int runStart = 0;
             int runState = -1;
             for (int slot = 0; slot <= units; slot++) {
-                int state = slot == units ? -1 : shared ? sliceStateOf(region, slot, perBlock) :
-                        stateOf(region, free, slot);
+                int state = slot == units ? -1 : sliceStateOf(region, slot, perBlock);
                 if (state != runState) {
                     if (runState >= 0) {
-                        long bytes = (slot - runStart) * segmentSize;
-                        long start = event.base + runStart * segmentSize;
+                        long bytes = (slot - runStart) * sliceSize;
+                        long start = event.base + runStart * sliceSize;
                         switch (runState) {
                             case OUT:
                                 event.outBytes += bytes;
@@ -221,16 +217,6 @@ final class PageStoreStateEvent extends Event {
     private static final int COMMITTED = 1;
     private static final int PURGED = 2;
     private static final int UNTOUCHED = 3;
-
-    private static int stateOf(Region region, long free, int slot) {
-        if ((free & 1L << slot) == 0) {
-            return OUT;
-        }
-        if (region.freedAt[slot] != Region.UNCOMMITTED) {
-            return COMMITTED;
-        }
-        return region.everCommitted[slot] ? PURGED : UNTOUCHED;
-    }
 
     private static int sliceStateOf(Region region, int slice, int perBlock) {
         Segment block = region.block(slice / perBlock);

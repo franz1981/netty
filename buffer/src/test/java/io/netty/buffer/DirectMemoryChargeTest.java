@@ -26,22 +26,19 @@ import org.junit.jupiter.api.parallel.Isolated;
 import java.lang.reflect.Field;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
-import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
-import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
-import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Region memory against Netty's direct memory limit: a slot is charged when taken with no memory behind it, credited
- * when purged or closed, and a take past the limit gives its slot back. A segment allocated on its own is charged by
+ * Region memory against Netty's direct memory limit: an {@code mmap} region's slice is charged when claimed with no
+ * memory behind it, credited when purged or closed, and a claim past the limit gives its run back; a {@code malloc}'d
+ * region is charged whole by its allocation. A segment allocated on its own is charged by
  * its allocation.
  */
 @Isolated("Reads and fills PlatformDependent's direct memory counter, which concurrent tests move")
@@ -61,69 +58,6 @@ final class DirectMemoryChargeTest {
 
     private static long used() {
         return PlatformDependent.usedDirectMemory();
-    }
-
-    private static Segment releaseOwnership(Segment segment) {
-        assertTrue(Segment.OWNER.compareAndSet(segment, segment.owner, null));
-        return segment;
-    }
-
-    @Test
-    void committedSlotsAreChargedOnceAndCreditedByThePurgeAndTheClose() {
-        long base = used();
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        store.take(heap);
-        assertEquals(base + regionCharge + SEGMENT_SIZE, used(), "the region is not charged, its first slot is");
-        Segment second = store.take(heap);
-        assertEquals(base + regionCharge + 2L * SEGMENT_SIZE, used());
-        store.free(releaseOwnership(second));
-        assertSame(second, store.take(heap));
-        assertEquals(base + regionCharge + 2L * SEGMENT_SIZE, used(), "committed already: not charged again");
-        store.free(releaseOwnership(second));
-        long now = System.nanoTime();
-        store.purgeIfDue(now += INTERVAL);
-        store.purgeIfDue(now += INTERVAL);
-        assertEquals(1, store.segmentsPurged);
-        assertEquals(base + regionCharge + SEGMENT_SIZE, used(), "the purge credits it");
-        assertAccounted(segments, regions, allocator);
-        store.close();
-        assertEquals(base, used(), "the close credits the rest");
-    }
-
-    /**
-     * A take that would pass the limit throws, and its slot is free again with no memory behind it; a slot with
-     * memory behind it is still taken, and once there is room again the same slot is committed.
-     */
-    @Test
-    void aTakePastTheLimitGivesItsSlotBack() {
-        long base = used();
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
-        PageStore store = allocator.pageStore;
-        HeapSegments heap = new HeapSegments(store, null, Thread.currentThread());
-        Segment first = store.take(heap);
-        Region region = first.region;
-        long filler = PlatformDependent.maxDirectMemory() - used() - SEGMENT_SIZE / 2;
-        charge(filler);
-        try {
-            assertThrows(OutOfDirectMemoryError.class, () -> store.take(heap));
-            assertEquals(SLOTS - 1, region.freeSlotCount(), "the slot went back");
-            assertEquals(Region.UNCOMMITTED, region.freedAt[1]);
-            assertEquals(1, store.segmentsCommitted);
-            assertEquals(SEGMENT_SIZE, allocator.usedMemory());
-            store.free(releaseOwnership(first));
-            assertSame(first, store.take(heap), "committed: nothing to charge");
-        } finally {
-            credit(filler);
-        }
-        Segment second = store.take(heap);
-        assertEquals(1, second.slot);
-        assertEquals(2, store.segmentsCommitted);
-        assertEquals(base + regionCharge + 2L * SEGMENT_SIZE, used());
-        assertAccounted(segments, regions, allocator);
-        store.close();
-        assertEquals(base, used());
     }
 
     /** Shared slices: a slice is charged by the claim that commits it, credited by its purge or the close. */
@@ -193,7 +127,7 @@ final class DirectMemoryChargeTest {
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
         assertEquals(base + REGION_SIZE, used(), "the region, whole");
-        store.takeRun(SLOTS, 0); // a second region, whole
+        store.takeRun(SLOTS); // a second region, whole
         assertEquals(base + 2L * REGION_SIZE, used());
         store.releaseSlices(store.region(0).block(0), 0, 9);
         assertEquals((int) run, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));

@@ -81,12 +81,11 @@ import java.util.function.IntConsumer;
  * Chunks that are given up are kept for reuse, bounded per heap, and freed beyond that. Their buffers go to a
  * {@link SizeClassChunkRecycler} so a chunk of another size class can be built from the same memory.
  * <p>
- * The size classes do not allocate their chunks one by one: each heap takes uniform {@link Segment}s (4 MiB) and
- * carves every size-class chunk out of one as a span of 64 KiB slices (see {@link HeapSegments}); a chunk given up
- * frees its span at once, for any chunk size of the heap, and a segment that empties is kept whole in its heap's
- * reserve, or given back to the allocator's {@link PageStore}; the heap's decays give idle reserved segments back by
- * halves. For direct memory, where they can be mapped, segments are slots of {@code mmap} regions, whose idle slots
- * the decays purge. For heap memory a segment is one {@code byte[]}, given back to the GC.
+ * The size classes do not allocate their chunks one by one: every chunk is a run of 64 KiB slices of the allocator's
+ * {@link PageStore}. For direct memory the slices are shared by all heaps ({@code mmap} or {@code malloc}'d regions):
+ * a chunk given up frees its run at once, for any heap. For heap memory each heap carves its chunks out of
+ * {@code byte[]} blocks of its own (see {@link HeapSegments}), keeps the emptied ones in a reserve and gives idle ones
+ * back by halves.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -333,7 +332,7 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Where the regions come from: {@code mmap} where the config has regions and the segment source can map them,
-     * else, with shared slices, {@code malloc}'d regions of the config's other size; else none.
+     * else {@code malloc}'d regions of the config's other size where the source has them; else none.
      */
     private static final class Regions {
         final RegionSource source;
@@ -341,7 +340,7 @@ final class AdaptivePoolingAllocator {
 
         Regions(SegmentSource segmentSource, PageStoreConfig config) {
             RegionSource source = segmentSource != null && config.regionSize > 0 ? segmentSource.regionSource() : null;
-            if (source == null && segmentSource != null && config.sharesSlices && config.mallocRegionSize > 0) {
+            if (source == null && segmentSource != null && config.mallocRegionSize > 0) {
                 source = segmentSource.mallocRegionSource();
                 if (source != null) {
                     config = config.withMallocRegions();
@@ -645,10 +644,9 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * With regions, a one-shot chunk from the page store: a whole segment up to its size, above a run of slots.
-     * {@code null} without regions, where a whole segment would charge the buffer up to twice its size, or when
-     * neither fits: a buffer larger than a region. The buffer is charged the whole segment or run, and its slots stay
-     * committed until the store purges them.
+     * With regions, a one-shot chunk from the page store: a whole block up to its size, above a run of blocks.
+     * {@code null} without regions, where a whole block would charge the buffer up to twice its size, or when
+     * neither fits: a buffer larger than a region.
      */
     private BuddyChunk newStoreOneShot(int size) {
         PageStore store = pageStore;
@@ -658,9 +656,8 @@ final class AdaptivePoolingAllocator {
         // The heaps' decays drive the store's purge; these buffers count toward no heap's, so they drive it too.
         store.purgeIfDue(System.nanoTime());
         int segmentSize = store.config.segmentSize;
-        int hint = threadIndex(Thread.currentThread()) & Integer.MAX_VALUE;
         if (size <= segmentSize) {
-            Segment segment = store.takeWhole(hint);
+            Segment segment = store.takeWhole();
             boolean made = false;
             try {
                 BuddyChunk chunk = new BuddyChunk(segment, this);
@@ -673,7 +670,7 @@ final class AdaptivePoolingAllocator {
             }
         }
         int slots = (int) ((size + (long) segmentSize - 1) / segmentSize);
-        long run = store.takeRun(slots, hint);
+        long run = store.takeRun(slots);
         if (run < 0) {
             return null;
         }
@@ -719,8 +716,8 @@ final class AdaptivePoolingAllocator {
      * {@link PageStore#segmentSource} to the moment it is freed, wherever it is in between (a heap, reserved or not, or
      * a heap that was freed while spans were still out): the events are per
      * segment, and the size-class chunks carved out of a segment as spans fire none, since their memory never leaves
-     * the allocator. With {@link PageStore#regions}, a segment is a slot of a region, counted from the first time it
-     * is taken to the close: see {@link PageStore}.
+     * the allocator. With {@link PageStore#regions}, the regions' committed slices or whole regions count: see
+     * {@link PageStore}.
      */
     long usedMemory() {
         return chunkRegistry.totalCapacity();
@@ -1137,11 +1134,10 @@ final class AdaptivePoolingAllocator {
      * A heap that keeps allocating keeps what it reuses and gives back by halves what it stopped needing; a heap that
      * stops allocating keeps its memory until it is freed.
      * <p>
-     * With segments (the default), a size class that gives up its chunks frees their spans at once, and a segment
+     * With a page store, a size class that gives up its chunks frees their runs at once. Without regions, a segment
      * they empty goes to the heap's reserve, whose decays give back half, rounded up, of what stayed unused through the
-     * whole interval (see {@link HeapSegments#decay}). With regions, the heap's decay ticks also purge the memory of
-     * its segments' free slices and of the store's free slots that stayed free for the page store's own delay,
-     * shorter than a decay interval (see {@link HeapSegments#purgeTick}).
+     * whole interval (see {@link HeapSegments#decay}). With regions, the heap's decay ticks drive the store's purge
+     * of what stayed free for its own delay, shorter than a decay interval (see {@link HeapSegments#purgeTick}).
      * <p>
      * What a heap keeps idle is bounded: up to {@link SizeClassChunkRecycler#RECYCLED_BYTES_BUDGET} in its recycler,
      * up to {@link #CHUNK_REUSE_QUEUE_BYTES} of wholly free large-buffer chunks, the large-buffer chunk it allocates
@@ -3855,7 +3851,7 @@ final class AdaptivePoolingAllocator {
      * allocations that are not pooled. It belongs to no magazine, is never cached, and is freed when its buffer
      * is released.
      * <p>
-     * With a {@link PageStore}, only one-shot chunks exist: one whole {@link Segment} of it, or a run of region slots
+     * With a {@link PageStore}, only one-shot chunks exist: one whole {@link Segment} of it, or a run of region blocks
      * for a buffer larger than a segment. Whichever thread drops the last reference gives it back to the store, which
      * takes it from any thread.
      */
@@ -3878,7 +3874,7 @@ final class AdaptivePoolingAllocator {
         int whollyFreeSince;
         /** The store segment this chunk is, whole, or {@code null}. */
         private final Segment segment;
-        /** The region whose slots {@link #runStart} to {@link #runStart} + {@link #runSlots} this chunk is, or null. */
+        /** The region whose blocks {@link #runStart} to {@link #runStart} + {@link #runSlots} this is, or null. */
         private final Region region;
         private final int runStart;
         private final int runSlots;
@@ -3896,7 +3892,7 @@ final class AdaptivePoolingAllocator {
             this(segment.buffer, allocator, null, 0, segment, null, 0, 0);
         }
 
-        /** A one-shot chunk over {@code slots} region slots from {@code start}, {@code delegate} being their view. */
+        /** A one-shot chunk over {@code slots} region blocks from {@code start}, {@code delegate} being their view. */
         BuddyChunk(AbstractByteBuf delegate, Region region, int start, int slots, AdaptivePoolingAllocator allocator) {
             this(delegate, allocator, null, 0, null, region, start, slots);
         }
@@ -4023,10 +4019,6 @@ final class AdaptivePoolingAllocator {
         @Override
         protected void deallocate() {
             if (segment != null) {
-                if (segment.sharedSpans == null) {
-                    // A shared block's release stamps its own slices.
-                    segment.releasedWhole(System.nanoTime());
-                }
                 allocator.pageStore.free(segment);
             } else if (region != null) {
                 allocator.pageStore.freeRun(region, runStart, runSlots);

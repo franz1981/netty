@@ -37,7 +37,6 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
-import static io.netty.buffer.PageStoreTestSupport.committedSlots;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -45,16 +44,18 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Buffers above the size classes in an allocator with a page store: up to half a segment each is a span of its heap's
- * segments; above, a whole segment or, with regions, a run of slots. Nothing comes from the chunk allocator but
- * buffers larger than what the store hands out. Three modes: direct segments allocated one by one, direct regions,
- * and heap segments (one {@code byte[]} each, no regions).
+ * Buffers above the size classes in an allocator with a page store: up to half a block each is a span of slices (of
+ * the regions' shared slices, or of its heap's blocks without regions); above, with regions, a whole block or a run of
+ * blocks. Nothing comes from the chunk allocator but buffers larger than what the store hands out. Three modes:
+ * direct blocks allocated one by one, direct regions, and heap blocks (one {@code byte[]} each, no regions).
  */
 @Isolated("Reads PlatformDependent's direct memory counter, which concurrent tests move")
 final class AdaptiveLargeSegmentsTest {
     /** Eight spans of 512 KiB fill one 4 MiB segment. */
     private static final int POOLED = 512 * 1024;
     private static final int PER_CHUNK = SEGMENT_SIZE / POOLED;
+    private static final int SPAN_SLICES = POOLED / PageStoreConfig.SLICE_SIZE_BYTES;
+    private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
 
     private CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
@@ -112,8 +113,13 @@ final class AdaptiveLargeSegmentsTest {
         assertTrue(buf.memoryAddress() >= base && buf.memoryAddress() + buf.capacity() <= base + REGION_SIZE);
     }
 
-    private static int slotsInHeaps(AdaptivePoolingAllocator allocator) {
-        return allocator.pageStore.slotCounts()[0];
+    private static int claimed(AdaptivePoolingAllocator allocator) {
+        return allocator.pageStore.sliceCounts()[0];
+    }
+
+    private static int committed(AdaptivePoolingAllocator allocator) {
+        int[] counts = allocator.pageStore.sliceCounts();
+        return counts[0] + counts[1];
     }
 
     /** Runs {@code task} on a thread with its own thread-local heap, which is freed when the thread ends. */
@@ -151,23 +157,21 @@ final class AdaptiveLargeSegmentsTest {
         }
     }
 
-    /**
-     * With regions spans fill region slots; a wholly free one goes back to the region beyond the heap's reserve of one,
-     * where it stays committed and is taken again first.
-     */
+    /** With regions spans are runs of the shared slices, given back at once and claimed again, committed. */
     @Test
-    void spansFillRegionSlotsGivenBackToTheStore() {
+    void spansAreSharedSlicesGivenBackAtOnce() {
         AdaptivePoolingAllocator allocator = withRegions();
+        int spans = 2 * PER_CHUNK + 1;
         for (int round = 0; round < 3; round++) {
-            List<ByteBuf> bufs = allocate(allocator, POOLED, 2 * PER_CHUNK + 1);
+            List<ByteBuf> bufs = allocate(allocator, POOLED, spans);
             for (ByteBuf buf : bufs) {
                 assertInRegion(buf);
             }
-            assertEquals(3, slotsInHeaps(allocator));
-            assertEquals(3, committedSlots(allocator.pageStore), "the same slots, whatever the round");
+            assertEquals(spans * SPAN_SLICES, claimed(allocator));
+            assertEquals(spans * SPAN_SLICES, committed(allocator), "the same slices, whatever the round");
             assertEquals(0, segments.segmentsAllocated() + segments.chunks.size());
             release(bufs);
-            assertEquals(1, slotsInHeaps(allocator), "only the heap's reserve keeps its slot");
+            assertEquals(0, claimed(allocator), "nothing kept by a heap");
             assertAccounted(segments, regions, allocator);
         }
     }
@@ -190,12 +194,17 @@ final class AdaptiveLargeSegmentsTest {
             releaser.join();
             // Fill the second segment and one more: the claims apply the notes, which empty the first segment.
             second.addAll(allocate(allocator, POOLED, PER_CHUNK));
-            int held = withRegions ? committedSlots(allocator.pageStore) : segments.segmentsAllocated();
+            int held = withRegions ? committed(allocator) : segments.segmentsAllocated();
             release(second);
             return held;
         });
-        assertEquals(2, taken, "the first segment was taken again");
-        assertEquals(0, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive(),
+        if (withRegions) {
+            // The first spans' slices were free at once: taken again, within the two blocks claimed in.
+            assertTrue(taken <= 2 * PER_BLOCK, taken + " slices committed");
+        } else {
+            assertEquals(2, taken, "the first segment was taken again");
+        }
+        assertEquals(0, withRegions ? claimed(allocator) : segments.segmentsLive(),
                 "the dead heap gave everything back");
         assertAccountedIn(allocator);
     }
@@ -210,9 +219,9 @@ final class AdaptiveLargeSegmentsTest {
         final boolean withRegions = mode == Mode.DIRECT_REGIONS;
         final AdaptivePoolingAllocator allocator = allocator(mode);
         ByteBuf survivor = onThreadLocalHeap(() -> allocator.allocate(POOLED, POOLED));
-        assertEquals(1, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive());
+        assertEquals(withRegions ? SPAN_SLICES : 1, withRegions ? claimed(allocator) : segments.segmentsLive());
         survivor.release();
-        assertEquals(0, withRegions ? slotsInHeaps(allocator) : segments.segmentsLive());
+        assertEquals(0, withRegions ? claimed(allocator) : segments.segmentsLive());
         assertAccountedIn(allocator);
     }
 
@@ -235,43 +244,43 @@ final class AdaptiveLargeSegmentsTest {
         assertAccounted(segments, allocator);
     }
 
-    /** With regions, a one-shot up to a segment takes a whole slot, given back to the region on release. */
+    /** With regions, a one-shot up to a block takes a whole block, given back to the shared slices on release. */
     @Test
-    void oneShotsUpToASegmentTakeASlotWithRegions() {
+    void oneShotsUpToASegmentTakeABlockWithRegions() {
         AdaptivePoolingAllocator allocator = withRegions();
         ByteBuf buf = allocate(allocator, 3 * MIB, 1).get(0);
         assertInRegion(buf);
-        assertEquals(1, slotsInHeaps(allocator));
+        assertEquals(PER_BLOCK, claimed(allocator));
         assertEquals(0, segments.segmentsAllocated() + segments.chunks.size());
         buf.release();
-        assertEquals(0, slotsInHeaps(allocator));
+        assertEquals(0, claimed(allocator));
         assertAccounted(segments, regions, allocator);
     }
 
     /**
-     * Above a segment, with regions: a run of contiguous slots, given back on release and purged by the store like any
-     * free slot. Above a region: a buffer of its own from the chunk allocator.
+     * Above a block, with regions: a run of contiguous blocks, given back on release and purged by the store like any
+     * free slice. Above a region: a buffer of its own from the chunk allocator.
      */
     @Test
-    void buffersAboveASegmentTakeRunsOfSlots() {
+    void buffersAboveASegmentTakeRunsOfBlocks() {
         AdaptivePoolingAllocator allocator = withRegions();
         PageStore store = allocator.pageStore;
         ByteBuf run = allocate(allocator, 2 * SEGMENT_SIZE + 1, 1).get(0);
         assertInRegion(run);
-        assertEquals(3, slotsInHeaps(allocator));
-        assertEquals(3, committedSlots(store));
+        assertEquals(3 * PER_BLOCK, claimed(allocator));
+        assertEquals(3 * PER_BLOCK, committed(allocator));
         ByteBuf huge = allocate(allocator, REGION_SIZE + 1, 1).get(0);
         assertEquals(1, segments.chunks.size(), "larger than a region: its own allocation");
         assertAccounted(segments, regions, allocator);
         run.release();
         huge.release();
-        assertEquals(0, slotsInHeaps(allocator));
+        assertEquals(0, claimed(allocator));
         assertAccounted(segments, regions, allocator);
         long now = System.nanoTime();
         store.purgeIfDue(now += INTERVAL);
         store.purgeIfDue(now + INTERVAL);
-        assertEquals(3, store.segmentsPurged, "free a whole interval: purged");
-        assertEquals(0, committedSlots(store));
+        assertEquals(3 * PER_BLOCK, store.slicesPurged, "free a whole interval: purged");
+        assertEquals(0, committed(allocator));
         assertAccounted(segments, regions, allocator);
     }
 
@@ -288,7 +297,7 @@ final class AdaptiveLargeSegmentsTest {
         assertAccounted(segments, allocator);
     }
 
-    /** Every slot the large paths commit is charged once and credited by the purge or the close. */
+    /** Every slice the large paths commit is charged once and credited by the purge or the close. */
     @Test
     void largeSlotsAreChargedAndCredited() {
         assumeTrue(PlatformDependent.usedDirectMemory() >= 0, "the direct memory counter is off");
@@ -301,18 +310,19 @@ final class AdaptiveLargeSegmentsTest {
         long regionCharge = regions.mmap != null ? 0 : REGION_SIZE;
         AdaptivePoolingAllocator allocator = withRegions();
         PageStore store = allocator.pageStore;
-        List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // spans over two segments
-        bufs.addAll(allocate(allocator, 3 * MIB, 1)); // above half a segment: a segment
-        bufs.addAll(allocate(allocator, SEGMENT_SIZE + 1, 1)); // two slots
-        assertEquals(5, committedSlots(store));
-        assertEquals(base + regionCharge + 5L * SEGMENT_SIZE, PlatformDependent.usedDirectMemory());
+        List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // spans over two blocks
+        bufs.addAll(allocate(allocator, 3 * MIB, 1)); // above half a block: a block
+        bufs.addAll(allocate(allocator, SEGMENT_SIZE + 1, 1)); // two blocks
+        int slices = (PER_CHUNK + 1) * SPAN_SLICES + 3 * PER_BLOCK;
+        assertEquals(slices, committed(allocator));
+        assertEquals(base + regionCharge + (long) slices * PageStoreConfig.SLICE_SIZE_BYTES,
+                PlatformDependent.usedDirectMemory());
         release(bufs);
         long now = System.nanoTime();
         store.purgeIfDue(now += INTERVAL);
         store.purgeIfDue(now + INTERVAL);
-        int left = committedSlots(store);
-        assertEquals(1, left, "the heap's reserve keeps one segment");
-        assertEquals(base + regionCharge + (long) left * SEGMENT_SIZE, PlatformDependent.usedDirectMemory());
+        assertEquals(0, committed(allocator), "no heap keeps any");
+        assertEquals(base + regionCharge, PlatformDependent.usedDirectMemory());
         store.close();
         assertEquals(base, PlatformDependent.usedDirectMemory());
     }

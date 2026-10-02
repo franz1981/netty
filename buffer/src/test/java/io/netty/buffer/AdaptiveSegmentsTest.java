@@ -690,7 +690,7 @@ public class AdaptiveSegmentsTest {
         CountingSegmentSource source = new CountingSegmentSource(true);
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(source, true, source,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, reserve));
-        assertEquals(reserve, allocator.pageStore.maxReserveLimit());
+        assertEquals(reserve, allocator.pageStore.reserveLimit());
         int size = isLowMemory() ? 16384 : 65536; // 8-slice chunks
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         // Exactly 96 chunks of 8 slices: 12 segments. Buffers per chunk as colouring leaves them (31 for 16 KiB).

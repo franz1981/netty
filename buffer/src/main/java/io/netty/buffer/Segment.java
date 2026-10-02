@@ -15,22 +15,22 @@
  */
 package io.netty.buffer;
 
-import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
- * Memory cut into equal slices (at most {@link Long#SIZE}), claimed and released as spans of contiguous slices. The
- * state is one bit per slice in {@link #free}, none in the memory: claims are first fit from the lowest slice, and a
- * released span merges with its free neighbours by construction.
+ * A block: memory cut into equal slices (at most {@link Long#SIZE}), claimed and released as runs of contiguous
+ * slices. The state is one bit per slice in {@link #free}, none in the memory: claims are first fit from the lowest
+ * slice, and a released run merges with its free neighbours by construction. Chunk creation and deallocation only,
+ * never per buffer.
  * <p>
- * Single writer: the {@link #owner} heap claims spans and releases them; their chunks read {@link #buffer} itself.
- * Once that heap is freed, the last releases of its spans may come from any thread, hence the CAS on {@link #free}.
- * Chunk creation and deallocation only, never per buffer.
+ * A block of a {@link Region} has no owner: any thread claims and releases runs of its slices by CAS
+ * ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it, which alone
+ * touches that slice's {@link #freedAt}; the CAS that sets the bit again publishes it.
  * <p>
- * A block of a region's shared slices (see {@link PageStore}) has no owner: any thread claims and releases runs of
- * its slices by CAS ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it,
- * which alone touches that slice's {@link #freedAt}; the CAS that sets the bit again publishes it.
+ * A block of its own (without regions) belongs to its {@link #owner} heap, the single writer that claims and releases
+ * its spans ({@link #claim}, {@link #release}); once that heap is freed, the last releases may come from any thread,
+ * hence the CAS on {@link #free} there too.
  */
 final class Segment implements ChunkInfo {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -46,17 +46,13 @@ final class Segment implements ChunkInfo {
     volatile long free;
     /** {@code null} once given back to the {@link PageStore}, or on its way there. */
     volatile HeapSegments owner;
-    /** {@code null} for a segment allocated on its own. */
+    /** {@code null} for a block of its own. */
     final Region region;
     final int slot;
-    /** By first slice: a span claimed again with the same length reuses its buffer: re-creating a chunk is GC-free. */
-    // Owner only, for the purge of idle slices (see HeapSegments#purgeTick).
     /**
-     * Slices that may have memory behind them: claimed since the last purge of their memory, or, for a segment
-     * allocated on its own, since its allocation.
+     * A block of shared slices only, per slice, slice owner only: {@link Region#UNCOMMITTED}, else the
+     * {@link System#nanoTime()} of its last release.
      */
-    long resident;
-    /** Per slice, the {@link System#nanoTime()} of its last release. */
     final long[] freedAt;
     // Owner only, within one HeapSegments#markEvacuees round.
     /** Slices of the owner's chunks in this segment that hold no buffer. */
@@ -90,7 +86,7 @@ final class Segment implements ChunkInfo {
         this.slices = slices;
         allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
         free = allFree;
-        freedAt = new long[slices];
+        freedAt = region != null ? new long[slices] : null;
     }
 
     /**
@@ -110,16 +106,6 @@ final class Segment implements ChunkInfo {
         return (1L << n) - 1 << start;
     }
 
-    /**
-     * Its whole memory was used, and is released at {@code now}, by a chunk or buffer that took the segment whole:
-     * every slice may have memory behind it, and is purged in place a whole delay from now at the earliest. By the
-     * thread that owns the segment alone: the one giving it back.
-     */
-    void releasedWhole(long now) {
-        resident = allFree;
-        Arrays.fill(freedAt, now);
-    }
-
     /** The first slice of the lowest run of {@code n} free slices, now claimed, or -1. */
     int claim(int n) {
         for (;;) {
@@ -130,7 +116,6 @@ final class Segment implements ChunkInfo {
             }
             long bits = mask(start, n);
             if (FREE.compareAndSet(this, current, current & ~bits)) {
-                resident |= bits;
                 return start;
             }
         }
@@ -147,17 +132,13 @@ final class Segment implements ChunkInfo {
             }
             long next = current | bits;
             if (FREE.compareAndSet(this, current, next)) {
-                long now = System.nanoTime();
-                for (int i = start; i < start + n; i++) {
-                    freedAt[i] = now;
-                }
                 return next;
             }
         }
     }
 
     /**
-     * Shared slices: claims the lowest run of {@code n} free slices, from any thread. Returns its first slice, or -1.
+     * Region blocks: claims the lowest run of {@code n} free slices, from any thread. Returns its first slice, or -1.
      */
     int claimRun(int n) {
         if (n == slices) {
@@ -175,12 +156,12 @@ final class Segment implements ChunkInfo {
         }
     }
 
-    /** Shared slices: claims every slice if all are free. */
+    /** Region blocks: claims every slice if all are free. */
     boolean claimWhole() {
         return FREE.compareAndSet(this, allFree, 0);
     }
 
-    /** Shared slices: claims the slices of {@code bits} that are still free, and returns them. */
+    /** Region blocks: claims the slices of {@code bits} that are still free, and returns them. */
     long claimFree(long bits) {
         for (;;) {
             long current = free;
@@ -192,7 +173,7 @@ final class Segment implements ChunkInfo {
     }
 
     /**
-     * Shared slices: the run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
+     * Region blocks: the run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
      * slices with memory behind them stamped with {@code now} first. Throws if any of them is free already.
      */
     void releaseRun(int start, int n, long now) {
@@ -205,7 +186,7 @@ final class Segment implements ChunkInfo {
         giveBack(n == slices ? allFree : mask(start, n));
     }
 
-    /** Shared slices: the slices of {@code bits}, which the caller claimed, are free again, unstamped. */
+    /** Region blocks: the slices of {@code bits}, which the caller claimed, are free again, unstamped. */
     void giveBack(long bits) {
         for (;;) {
             long current = free;

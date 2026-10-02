@@ -19,6 +19,10 @@ import java.util.Arrays;
 import java.util.concurrent.locks.StampedLock;
 
 /**
+ * A heap's link to the {@link PageStore}. With regions, the heap holds no block: {@link #claim} takes a run of the
+ * store's shared slices, and {@link #release} gives it back, from any thread, heap freed or not. Without regions (heap
+ * memory), or once no region can be mapped, the heap has blocks ("segments") of its own: the rest of this class.
+ * <p>
  * The segments one heap has spans in, oldest first, and the rule that packs its spans: the fullest segment with a
  * long enough free run wins (the oldest on a tie), then the newest segment of the {@link #reserve}, and a segment is
  * taken from the {@link PageStore} only when none fits. A segment that becomes wholly free leaves the list for the
@@ -31,21 +35,14 @@ import java.util.concurrent.locks.StampedLock;
  * Single writer: the holder of the stripe lock, or the thread of a thread-local heap. Chunk creation ({@link #claim}),
  * chunk deallocation ({@link #release}) and decays only. After {@link #markFreed}, releases may come from any thread:
  * the release that empties a segment gives it back to the store, and the list is no longer touched.
- * <p>
- * With shared slices ({@link PageStoreConfig#sharesSlices}) the heap holds no region segment: {@link #claim} takes
- * a run of the store's shared slices, and {@link #release} gives it back from any thread, heap freed or not. Only when
- * no region can be mapped does the heap take segments of its own, as without regions.
  */
 final class HeapSegments {
     private final PageStore store;
     /** For assertions only. */
     private final StampedLock stripeLock;
     private final Thread ownerThread;
-    /** Where this heap starts looking among the store's regions: spreads equally full regions over the heaps. */
-    int regionOffset = System.identityHashCode(this) & Integer.MAX_VALUE;
-    /** Shared slices: where this heap starts looking among a region's blocks, as mimalloc's thread sequence. */
+    /** Where this heap starts looking among a region's blocks, as mimalloc's thread sequence. */
     final int seq;
-    private final boolean sharesSlices;
     // Read by tests and dumps.
     Segment[] segments = new Segment[4];
     int count;
@@ -56,7 +53,7 @@ final class HeapSegments {
     private int cold;
     private volatile boolean freed;
     private int claimedStart = -1;
-    /** Whether its segments' free slices are purged in place: region segments only. */
+    /** Whether the store has regions, whose purge this heap's ticks drive: see {@link #purgeTick}. */
     final boolean purgesSlices;
     private long lastPurgeTick = System.nanoTime();
     /** The segments {@link #markEvacuees} marked, until {@link #clearEvacuees}. */
@@ -68,9 +65,8 @@ final class HeapSegments {
         this.store = store;
         this.stripeLock = stripeLock;
         this.ownerThread = ownerThread;
-        reserve = new Segment[store.maxReserveLimit()];
+        reserve = new Segment[store.reserveLimit()];
         purgesSlices = store.regionSource != null;
-        sharesSlices = store.config.sharesSlices && store.regionSource != null;
         seq = store.nextHeapSequence();
         store.registerHeap(this);
     }
@@ -95,8 +91,8 @@ final class HeapSegments {
     /** Returns the segment of the span; {@link #claimedStart()} is its first slice. Scans the heap's segments once. */
     Segment claim(int slices) {
         assert inOwnerContext() && !freed;
-        // With shared slices, the heap has segments of its own only once no region could be mapped: those it holds
-        // come first, then the shared slices, then a reserved or new segment of its own.
+        // With regions, the heap has segments of its own only once no region could be mapped: those it holds come
+        // first, then the shared slices, then a reserved or new segment of its own.
         Segment best = null;
         int bestFree = Integer.MAX_VALUE;
         Segment[] segments = this.segments;
@@ -112,7 +108,7 @@ final class HeapSegments {
                 }
             }
         }
-        if (best == null && sharesSlices) {
+        if (best == null && purgesSlices) {
             long run = store.claimSlices(slices, seq, kind());
             if (run >= 0) {
                 int perBlock = store.config.slicesPerSegment();
@@ -336,8 +332,8 @@ final class HeapSegments {
 
     /**
      * Owner only, from the heap's decay ticks (see {@code IdleDecay#count}) and decays. At most once per
-     * {@link PageStoreConfig#purgeCheckNanos}: purges the idle slices of its region segments, and lets the store
-     * purge its idle free slots, if due and no other heap is purging them.
+     * {@link PageStoreConfig#purgeCheckNanos}: lets the store purge what stayed free for its delay, if due and no
+     * other heap is purging.
      */
     void purgeTick(long now) {
         assert inOwnerContext();
@@ -345,36 +341,6 @@ final class HeapSegments {
             return;
         }
         lastPurgeTick = now;
-        if (purgesSlices) {
-            purgeIdleSlices(now);
-        }
         store.purgeIfDue(now);
-    }
-
-    /**
-     * The memory of the free slices of the heap's region segments released {@link PageStoreConfig#purgeDelayNanos}
-     * ago or earlier goes back to the OS, one call per run (see {@link PageStore#purgeSlices}): the heap keeps the
-     * segments, and a purged slice claimed again costs page faults only. A slice is purged once until it is claimed
-     * again.
-     */
-    private void purgeIdleSlices(long now) {
-        long delay = store.config.purgeDelayNanos;
-        Segment[] segments = this.segments;
-        for (int i = 0, n = count; i < n; i++) {
-            Segment segment = segments[i];
-            if (segment.region == null) {
-                continue; // allocated on its own: nothing to purge in place
-            }
-            long idle = 0;
-            for (long bits = segment.free & segment.resident; bits != 0; bits &= bits - 1) {
-                int slice = Long.numberOfTrailingZeros(bits);
-                if (now - segment.freedAt[slice] >= delay) {
-                    idle |= 1L << slice;
-                }
-            }
-            if (idle != 0) {
-                segment.resident &= ~store.purgeSlices(segment, idle);
-            }
-        }
     }
 }

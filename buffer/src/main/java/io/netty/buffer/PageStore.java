@@ -34,60 +34,35 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 /**
  * The units, largest first, and their names in the code:
  * <pre>
- * region      256 MiB, one mmap; shared by all heaps' chunks      {@link Region}
- *  block      4 MiB, one 64-bit free bitmap                       {@link Segment}; a region's "slot"
+ * region      one piece of memory from a {@link RegionSource}       {@link Region}
+ *  block      4 MiB, one 64-bit free bitmap                       {@link Segment}
  *   slice     64 KiB, one bit of its block's bitmap
  *    chunk    a run of slices serving one size class              SizeClassedChunk
  *     slot    one buffer's place in a chunk                       SizeClassedChunk's "segment", segmentSize
  *    span     a run of slices holding one buffer above the sizes  SpanMagazine, SharedSpanChunk
  * heap        a thread-local heap or a stripe                     {@link HeapSegments}
- * reserve     the wholly free blocks a heap keeps                 {@link HeapSegments#reserve}
  * </pre>
- * With shared slices off, a heap takes whole blocks of the regions instead, and carves its chunks in them. Without
- * regions, each block is an allocation of its own; for heap memory, one {@code byte[]} (4032 KiB).
+ * Heaps own chunks, never blocks: any heap claims a run of slices from the regions' shared bitmaps by CAS, and
+ * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link #releaseSlices}), as mimalloc v3
+ * claims a page's slices straight from its arena's bitmap
+ * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
+ * A buffer above half a block takes whole blocks ({@link #takeWhole}, {@link #takeRun}). A new region is added under
+ * this store's monitor, the only lock, when no region has a fit.
  * <p>
- * Where an allocator's heaps take their segments from and give them back to: free slots of its {@link Region}s, or,
- * without a {@link RegionSource}, one allocation per segment. Slow paths only: once per segment taken or given back,
- * and the heaps' decays.
+ * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})
+ * purge the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
+ * memory behind it to its purge; {@code malloc}'d regions ({@link MallocRegionSource}) are charged and counted whole by
+ * their allocation, and go back whole once all of them stayed free for the delay. One purger at a time, driven by the
+ * heaps' ticks: see {@link #purgeIfDue}.
  * <p>
- * Regions: a slot is taken and given back by a CAS on its region's bitmap, without a lock; a new region is mapped
- * under this store's monitor, the only lock, when no region has a free slot. Regions are only added, never removed,
- * until {@link #close}. Instead, the memory of free slots is purged: see {@link #purgeIfDue}; and so is the memory of
- * the idle free slices of the segments heaps hold, by their own decays: see {@link #purgeSlices}. Once a region cannot
- * be mapped, none is mapped again, and a take that finds no free slot allocates its segment on its own.
- * <p>
- * Used memory, reported to {@link AdaptivePoolingAllocator#chunkBufferAllocated} and
- * {@link AdaptivePoolingAllocator#chunkBufferFreed} per segment: without regions, a segment from its allocation to
- * its free. With regions, the committed segments: a slot counts from the time it is taken with no memory behind it to
- * the time it is purged (or the close), whether a heap holds it or it is free meanwhile. A slot never taken, or
- * purged and not taken since, does not count: this follows what the process has resident, except for the pages of a
- * committed segment nobody touched yet, or whose idle slices its heap purged. The same slots are charged to
- * {@link PlatformDependent}'s direct memory limit, never whole regions; a segment allocated on its own is charged by
- * its allocation.
- * <p>
- * Shared slices ({@link PageStoreConfig#sharesSlices}), as mimalloc v3 claims a page's slices straight from its
- * arena's bitmap (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246): each slot of a
- * region is a block of slices whose free bitmap any thread claims runs in by CAS (see {@link Region#claimSlices}),
- * and a size-class chunk, a large-buffer span or a one-shot buffer is such a run, given back by CAS from whichever
- * thread frees it ({@link #releaseSlices}): no heap holds a region segment, and a hole one heap leaves is reused by
- * any. Used memory and the direct memory limit then count slices: from the claim that finds
- * no memory behind a slice to the purge of its memory (or the close). The purge works on the free slices, as on
- * the free slots: see {@link #purgeIfDue}. When no region can be mapped, a heap falls back to segments of its own.
+ * Without a region source (heap memory, a {@code byte[]} of 4032 KiB per block), or once no region can be mapped, a
+ * heap allocates blocks of its own, carves its chunks in them and keeps a reserve of wholly free ones (see
+ * {@link HeapSegments}); each is counted and, for direct memory, charged by its allocation.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
-    private static final AtomicLongFieldUpdater<PageStore> SEGMENTS_COMMITTED =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "segmentsCommitted");
     private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
-    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_CALLS =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeCalls");
-    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_BYTES =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeBytes");
-    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_HUGE_BLOCKS =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeHugeBlocks");
-    private static final AtomicLongFieldUpdater<PageStore> SLICE_PURGE_FAILURES =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicePurgeFailures");
     private static final AtomicLongFieldUpdater<PageStore> SLICES_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
     private static final AtomicLongFieldUpdater<PageStore> PURGE_WAITS =
@@ -108,13 +83,8 @@ final class PageStore {
     static final String THREAD_LOCAL = "thread-local";
     static final String NO_HEAP = "none";
     // Where a segment comes from, or goes to, in the JFR events.
-    static final String FRESH_SLOT = "fresh-slot";
-    static final String COMMITTED_SLOT = "committed-slot";
-    static final String PURGED_SLOT = "purged-slot";
     static final String HEAP_RESERVE = "heap-reserve";
     static final String OWN_ALLOCATION = "own-allocation";
-    static final String SLOT_RUN = "slot-run";
-    static final String FREE_SLOT = "free-slot";
     static final String OWN_FREED = "own-freed";
     static final String SHARED_SLICES = "shared-slices";
     static final String PURGED_SLICES = "purged-slices";
@@ -131,19 +101,17 @@ final class PageStore {
      */
     final boolean purgesSlices;
     /**
-     * Cleared for good when a region cannot be mapped: from then on a take that finds no free slot in the regions
-     * mapped so far allocates its segment on its own.
+     * Cleared for good when a region cannot be mapped: from then on a claim that finds no fit in the regions mapped
+     * so far falls back to a block of its own.
      */
     volatile boolean mapsRegions;
-    /** Replaced, one longer, under this store's monitor; read without it. */
+    /** Replaced under this store's monitor, one longer or with a released region's place taken; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
     /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
     private volatile long lastPurgeNanos = System.nanoTime();
     // Read by tests and dumps.
-    /** Slots taken while no memory backed them: each such take costs page faults as the segment is touched. */
-    volatile long segmentsCommitted;
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
     /** Shared slices: claims that found no fit while the purger held slices, and waited for it. */
@@ -158,19 +126,12 @@ final class PageStore {
     // Written by the purger only.
     long purges;
     long purgeCalls;
-    long segmentsPurged;
     long bytesPurged;
     long purgeFailures;
     /** Shared slices purged. */
     long slicesPurged;
     /** Regions given back whole: see {@link #releaseIdleRegions}. */
     long regionsReleased;
-    // Written by any heap's decay: the purges of idle slices of the segments heaps hold (see purgeSlices).
-    volatile long slicePurgeCalls;
-    volatile long slicePurgeBytes;
-    /** Whole {@link PageStoreConfig#regionAlignment} blocks inside the purged runs: huge pages a THP kernel keeps. */
-    volatile long slicePurgeHugeBlocks;
-    volatile long slicePurgeFailures;
     /**
      * With JFR available, for {@link PageStoreStateEvent} only, else {@code null}: the segments allocated on their own
      * while that event was enabled that are out, and the heaps, weakly.
@@ -236,100 +197,37 @@ final class PageStore {
     }
 
     /**
-     * A segment for {@code heap}, which owns it from now on: a free slot of the fullest region (the first from the
-     * heap's offset on a tie), else of a new region; without regions, or once one could not be mapped and no slot is
-     * free, a new allocation.
+     * A segment of its own for {@code heap}, which owns it from now on: a new allocation. Heaps hold segments only
+     * without regions (heap memory), or once no region can be mapped.
      */
     Segment take(HeapSegments heap) {
-        Segment segment = takeSegment(heap.regionOffset, heap.kind());
+        Segment segment = allocateSegment(heap.kind());
         segment.owner = heap;
         return segment;
     }
 
     /**
-     * Any thread. A segment for a chunk that uses it whole, outside any heap's segments: owned by no heap, and given
-     * back with {@link #free} from any thread once it is wholly free, which it stays: see
-     * {@link Segment#releasedWhole}.
-     *
-     * @param regionOffset where to start looking among the regions, as {@link HeapSegments#regionOffset}
+     * Any thread. A block for a buffer that uses it whole, owned by no heap, given back with {@link #free} from any
+     * thread: a wholly free block of the regions, else a new allocation.
      */
-    Segment takeWhole(int regionOffset) {
-        return takeSegment(regionOffset, NO_HEAP);
-    }
-
-    private Segment takeSegment(int regionOffset, String heap) {
-        if (config.sharesSlices && heap == NO_HEAP && regionSource != null) {
-            long run = takeBlocks(1, heap);
+    Segment takeWhole() {
+        if (regionSource != null) {
+            long run = takeBlocks(1, NO_HEAP);
             if (run >= 0) {
                 return region((int) (run >>> 32)).block((int) run);
             }
         }
-        Segment segment = regionSource != null && !config.sharesSlices ? takeFromRegions(regionOffset, heap) : null;
-        if (segment == null) {
-            segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
-            allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
-            if (ownSegments != null && PageStoreStateEvent.isEventEnabled()) {
-                ownSegments.add(segment);
-            }
-            taken(segment.memoryAddress(), config.segmentSize, 1, -1, OWN_ALLOCATION, heap);
-        }
-        return segment;
+        return allocateSegment(NO_HEAP);
     }
 
-    private Segment takeFromRegions(int regionOffset, String heap) {
-        for (;;) {
-            Region[] regions = this.regions;
-            int n = regions.length;
-            Region fullest = null;
-            int fullestFree = Integer.MAX_VALUE;
-            int i = n == 0 ? 0 : regionOffset % n;
-            for (int k = 0; k < n; k++, i++) {
-                if (i == n) {
-                    i = 0;
-                }
-                Region region = regions[i];
-                int free = Long.bitCount(region.free);
-                if (free != 0 && free < fullestFree) {
-                    fullest = region;
-                    fullestFree = free;
-                    if (free == 1) {
-                        break;
-                    }
-                }
-            }
-            if (fullest == null) {
-                if (!mapsRegions || !addRegion(regions, heap)) {
-                    return null;
-                }
-                continue;
-            }
-            int slot = fullest.takeSlot();
-            if (slot < 0) {
-                continue; // taken meanwhile: look again
-            }
-            boolean taken = false;
-            try {
-                Segment segment = fullest.segment(slot, segmentSource, config);
-                String source = COMMITTED_SLOT;
-                if (fullest.freedAt[slot] == Region.UNCOMMITTED) {
-                    PlatformDependent.incrementMemoryCounter(config.segmentSize);
-                    segment.resident = 0;
-                    fullest.freedAt[slot] = 0;
-                    source = fullest.everCommitted[slot] ? PURGED_SLOT : FRESH_SLOT;
-                    fullest.everCommitted[slot] = true;
-                    SEGMENTS_COMMITTED.incrementAndGet(this);
-                    allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
-                }
-                // The event before the flag: if it throws, the slot goes back.
-                taken(segment.memoryAddress(), config.segmentSize, 1, fullest.index, source, heap);
-                taken = true;
-                return segment;
-            } finally {
-                if (!taken) {
-                    fullest.giveBack(slot, System.nanoTime());
-                }
-            }
+    private Segment allocateSegment(String heap) {
+        Segment segment = new Segment(segmentSource.allocateSegment(config.segmentSize), config.sliceSize);
+        allocator.chunkBufferAllocated(segment, true, heap == THREAD_LOCAL);
+        if (ownSegments != null && PageStoreStateEvent.isEventEnabled()) {
+            ownSegments.add(segment);
         }
+        taken(segment.memoryAddress(), config.segmentSize, 1, -1, OWN_ALLOCATION, heap);
+        return segment;
     }
 
     /**
@@ -369,7 +267,7 @@ final class PageStore {
         if (event != null) {
             AbstractPageStoreCallEvent.end(event, buffer._memoryAddress(), config.regionSize, seen.length, null);
         }
-        Region region = config.sharesSlices ? sharedRegion(buffer) : new Region(buffer, config.segmentsPerRegion());
+        Region region = sharedRegion(buffer);
         if (!purgesSlices) {
             // Charged by its allocation, counted whole from now on.
             allocator.storeBytesCommitted(buffer._memoryAddress(), config.regionSize, heap == THREAD_LOCAL);
@@ -386,15 +284,12 @@ final class PageStore {
         return true;
     }
 
+    /** A malloc'd region has memory behind all of it, free since now. */
     private Region sharedRegion(AbstractByteBuf buffer) {
-        Region region = new Region(buffer, config.segmentsPerRegion(), segmentSource, config);
-        long now = System.nanoTime();
+        Region region = new Region(buffer, config.segmentsPerRegion(), segmentSource, config, !purgesSlices,
+                System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.block(slot);
-            if (!purgesSlices) {
-                // All of it has memory behind it, free since now.
-                Arrays.fill(block.freedAt, now);
-            }
             block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, false);
             block.threadLocalSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, true);
         }
@@ -558,76 +453,24 @@ final class PageStore {
     }
 
     /**
-     * Any thread. {@code slots} contiguous free slots of one region, for a buffer larger than a segment: returns the
-     * region's index in {@link #regions} in the high half and the first slot in the low half, or -1 without regions,
-     * or when {@code slots} is more than a region holds. Maps a new region when none has such a run. Each slot is
-     * committed and counted as {@link #take} does; give the run back with {@link #freeRun}, from any thread.
+     * Any thread. {@code slots} contiguous wholly free blocks of one region, for a buffer larger than a block: returns
+     * the region's index in {@link #regions} in the high half and the first block in the low half, or -1 without
+     * regions, or when {@code slots} is more than a region holds. Give them back with {@link #freeRun}.
      */
-    long takeRun(int slots, int regionOffset) {
+    long takeRun(int slots) {
         if (regionSource == null || slots > config.segmentsPerRegion()) {
             return -1;
         }
-        if (config.sharesSlices) {
-            return takeBlocks(slots, NO_HEAP);
-        }
-        for (;;) {
-            Region[] regions = this.regions;
-            int n = regions.length;
-            for (int k = 0, i = n == 0 ? 0 : regionOffset % n; k < n; k++, i = i + 1 == n ? 0 : i + 1) {
-                Region region = regions[i];
-                int start = region.takeRun(slots);
-                if (start >= 0) {
-                    commitRun(region, start, slots);
-                    return (long) i << 32 | start;
-                }
-            }
-            if (!mapsRegions || !addRegion(regions, NO_HEAP)) {
-                return -1;
-            }
-        }
+        return takeBlocks(slots, NO_HEAP);
     }
 
-    /** The run's slots with no memory behind them are charged and counted; on failure the whole run goes back. */
-    private void commitRun(Region region, int start, int slots) {
-        boolean committed = false;
-        try {
-            for (int slot = start; slot < start + slots; slot++) {
-                Segment segment = region.segment(slot, segmentSource, config);
-                if (region.freedAt[slot] == Region.UNCOMMITTED) {
-                    PlatformDependent.incrementMemoryCounter(config.segmentSize);
-                    region.freedAt[slot] = 0;
-                    region.everCommitted[slot] = true;
-                    SEGMENTS_COMMITTED.incrementAndGet(this);
-                    allocator.chunkBufferAllocated(segment, true, false);
-                }
-            }
-            // The event before the flag: if it throws, the run goes back.
-            taken(region.buffer._memoryAddress() + (long) start * config.segmentSize,
-                    (long) slots * config.segmentSize, slots, region.index, SLOT_RUN, NO_HEAP);
-            committed = true;
-        } finally {
-            if (!committed) {
-                region.giveBackRun(start, slots, System.nanoTime());
-            }
-        }
-    }
-
-    /** Any thread: the run {@link #takeRun} returned goes back to its region's free slots, purged as any free slot. */
+    /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */
     void freeRun(Region region, int start, int slots) {
         long now = System.nanoTime();
-        if (config.sharesSlices) {
-            for (int slot = start; slot < start + slots; slot++) {
-                Segment block = region.block(slot);
-                block.releaseRun(0, block.slices, now);
-            }
-            return;
-        }
         for (int slot = start; slot < start + slots; slot++) {
-            region.segmentOrNull(slot).releasedWhole(now);
+            Segment block = region.block(slot);
+            block.releaseRun(0, block.slices, now);
         }
-        region.giveBackRun(start, slots, now);
-        givenBack(region.buffer._memoryAddress() + (long) start * config.segmentSize,
-                (long) slots * config.segmentSize, slots, region.index, SLOT_RUN, NO_HEAP);
     }
 
     Region region(int index) {
@@ -651,12 +494,6 @@ final class PageStore {
         }
         assert segment.isWhollyFree() && segment.owner == null;
         long address = segment.memoryAddress();
-        Region region = segment.region;
-        if (region != null) {
-            region.giveBack(segment.slot, System.nanoTime());
-            givenBack(address, config.segmentSize, 1, region.index, FREE_SLOT, heap);
-            return;
-        }
         if (ownSegments != null) {
             ownSegments.remove(segment);
         }
@@ -677,17 +514,10 @@ final class PageStore {
             if (region.released) {
                 continue;
             }
-            if (config.sharesSlices && purgesSlices) {
+            if (purgesSlices) {
                 closeSlices(region);
-            } else if (!purgesSlices) {
+            } else {
                 allocator.storeBytesReleased(region.buffer._memoryAddress(), config.regionSize);
-            }
-            for (int slot = 0; slot < region.freedAt.length; slot++) {
-                if (region.freedAt[slot] != Region.UNCOMMITTED) {
-                    region.freedAt[slot] = Region.UNCOMMITTED;
-                    PlatformDependent.decrementMemoryCounter(config.segmentSize);
-                    allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
-                }
             }
             long address = region.buffer._memoryAddress();
             Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
@@ -753,30 +583,10 @@ final class PageStore {
      */
     private void purge(long now) {
         purges++;
-        if (config.sharesSlices) {
-            if (purgesSlices) {
-                purgeSharedSlices(now);
-            } else {
-                releaseIdleRegions(now);
-            }
-            return;
-        }
-        long delay = config.purgeDelayNanos;
-        for (Region region : regions) {
-            long candidates = purgeable(region, region.free, now, delay);
-            while (candidates != 0) {
-                long run = lowestRun(candidates);
-                candidates &= ~run;
-                long claimed = region.claim(run);
-                if (claimed == 0) {
-                    continue;
-                }
-                try {
-                    purgeRuns(region, purgeable(region, claimed, now, delay));
-                } finally {
-                    region.giveBackAll(claimed);
-                }
-            }
+        if (purgesSlices) {
+            purgeSharedSlices(now);
+        } else {
+            releaseIdleRegions(now);
         }
     }
 
@@ -966,94 +776,6 @@ final class PageStore {
         return length == Long.SIZE ? -1L : (1L << length) - 1 << start;
     }
 
-    /**
-     * The slots of {@code slots} with memory behind them, given back {@code delay} before {@code now} or earlier.
-     * Racy for slots the caller does not own, exact for those it does.
-     */
-    private static long purgeable(Region region, long slots, long now, long delay) {
-        long purgeable = 0;
-        for (long bits = slots; bits != 0; bits &= bits - 1) {
-            int slot = Long.numberOfTrailingZeros(bits);
-            long freed = region.freedAt[slot];
-            if (freed != Region.UNCOMMITTED && now - freed >= delay) {
-                purgeable |= 1L << slot;
-            }
-        }
-        return purgeable;
-    }
-
-    /**
-     * Purges each run of contiguous slots of {@code slots}, which the caller claimed, with one call. A run whose call
-     * fails keeps its memory, and stays purgeable: the failure never reaches the allocation that drove the decay.
-     */
-    private void purgeRuns(Region region, long slots) {
-        int segmentSize = config.segmentSize;
-        while (slots != 0) {
-            long bits = lowestRun(slots);
-            slots &= ~bits;
-            int start = Long.numberOfTrailingZeros(bits);
-            int run = Long.bitCount(bits);
-            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
-                    PageStorePurgeEvent.start() : null;
-            try {
-                regionSource.purge(region.buffer, start * segmentSize, run * segmentSize);
-            } catch (Throwable t) {
-                purged(event, SLOTS, region, start * segmentSize, run * segmentSize, t);
-                purgeFailed(t);
-                continue;
-            }
-            purged(event, SLOTS, region, start * segmentSize, run * segmentSize, null);
-            purgeCalls++;
-            bytesPurged += (long) run * segmentSize;
-            PlatformDependent.decrementMemoryCounter(run * segmentSize);
-            for (int slot = start; slot < start + run; slot++) {
-                region.freedAt[slot] = Region.UNCOMMITTED;
-                segmentsPurged++;
-                allocator.chunkBufferFreed(region.segmentOrNull(slot), true);
-            }
-        }
-    }
-
-    /**
-     * Any heap, from its decay, for a region segment it holds: gives the memory of each run of contiguous slices of
-     * {@code slices}, all free in the segment and owned by the heap, back to the OS with one call. Returns the slices
-     * purged: a run whose call fails keeps its memory, and the failure never reaches the heap. The segment stays in
-     * the used memory, whole, as long as a heap holds it.
-     */
-    long purgeSlices(Segment segment, long slices) {
-        int sliceSize = segment.sliceSize;
-        int base = segment.slot * config.segmentSize;
-        int hugeSlices = config.regionAlignment / sliceSize;
-        long purged = 0;
-        while (slices != 0) {
-            long run = lowestRun(slices);
-            slices &= ~run;
-            int start = Long.numberOfTrailingZeros(run);
-            int n = Long.bitCount(run);
-            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
-                    PageStorePurgeEvent.start() : null;
-            try {
-                regionSource.purge(segment.region.buffer, base + start * sliceSize, n * sliceSize);
-            } catch (Throwable t) {
-                purged(event, SLICES, segment.region, base + start * sliceSize, n * sliceSize, t);
-                slicePurgeFailed(t);
-                continue;
-            }
-            purged(event, SLICES, segment.region, base + start * sliceSize, n * sliceSize, null);
-            purged |= run;
-            SLICE_PURGE_CALLS.incrementAndGet(this);
-            SLICE_PURGE_BYTES.addAndGet(this, (long) n * sliceSize);
-            if (hugeSlices > 1) {
-                int blocks = (start + n) / hugeSlices - (start + hugeSlices - 1) / hugeSlices;
-                if (blocks > 0) {
-                    SLICE_PURGE_HUGE_BLOCKS.addAndGet(this, blocks);
-                }
-            }
-        }
-        return purged;
-    }
-
-    private static final String SLOTS = "slots";
     private static final String SLICES = "slices";
 
     private static void purged(Object event, String unit, Region region, int offset, int length, Throwable failure) {
@@ -1063,35 +785,21 @@ final class PageStore {
         }
     }
 
-    private void slicePurgeFailed(Throwable cause) {
-        if (SLICE_PURGE_FAILURES.getAndIncrement(this) == 0) {
-            logger.warn("Cannot purge idle slices of a segment: their memory stays committed. Further failures are "
-                    + "logged at debug level.", cause);
-        } else {
-            logger.debug("Cannot purge idle slices of a segment ({} failures).", slicePurgeFailures, cause);
-        }
-    }
-
     private void purgeFailed(Throwable cause) {
         if (purgeFailures++ == 0) {
-            logger.warn("Cannot purge free region slots: their memory stays committed. Further failures are logged "
-                    + "at debug level.", cause);
+            logger.warn("Cannot purge free slices: their memory stays committed. Further failures are logged at "
+                    + "debug level.", cause);
         } else {
-            logger.debug("Cannot purge free region slots ({} failures).", purgeFailures, cause);
+            logger.debug("Cannot purge free slices ({} failures).", purgeFailures, cause);
         }
     }
 
     /**
-     * The most wholly free segments a heap keeps (see {@link HeapSegments}). Without regions, a segment given back is
-     * freed, and taking one allocates a buffer, a {@link Segment} and later its span views: mimalloc's reserve of
-     * 32 MiB, from 1 to 8 segments, avoids that. While regions are mapped, one: a free slot is taken again by a CAS,
-     * its {@link Segment} reused, while a reserved slot is not free to the other heaps nor to the purge.
+     * The most wholly free segments a heap of its own segments keeps (see {@link HeapSegments}): taking one allocates
+     * a buffer, a {@link Segment} and later its span views, which mimalloc's reserve of 32 MiB, from 1 to 8 segments,
+     * avoids.
      */
     int reserveLimit() {
-        return mapsRegions ? 1 : maxReserveLimit();
-    }
-
-    int maxReserveLimit() {
         int configured = config.maxReservedSegments;
         return configured > 0 ? configured
                 : Math.min(Math.max(1, RESERVE_BYTES / config.segmentSize), MAX_RESERVED_SEGMENTS);
@@ -1128,27 +836,4 @@ final class PageStore {
         return regions.length;
     }
 
-    /**
-     * Racy, for tests and dumps: the slots of all regions {@code {in heaps, free with memory behind, free without}}.
-     * A slot the purger claimed counts as in a heap.
-     */
-    int[] slotCounts() {
-        int[] counts = new int[3];
-        if (config.sharesSlices) {
-            return counts;
-        }
-        for (Region region : regions) {
-            long free = region.free;
-            for (int slot = 0; slot < region.slots; slot++) {
-                if ((free & 1L << slot) == 0) {
-                    counts[0]++;
-                } else if (region.freedAt[slot] != Region.UNCOMMITTED) {
-                    counts[1]++;
-                } else {
-                    counts[2]++;
-                }
-            }
-        }
-        return counts;
-    }
 }
