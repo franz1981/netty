@@ -62,10 +62,12 @@ final class PageStore {
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final Region[] NO_REGIONS = new Region[0];
     /**
-     * The calls a purge pass makes at most (see {@link #purge}). Measured with {@code mmap}, 1 GiB freed at once: 8
-     * make a pass of about 3 ms and give the GiB back in about a minute; one pass of all of it took 130 to 145 ms.
+     * The bytes a purge pass gives back, {@code madvise}d or released whole, past which it makes no more calls (see
+     * {@link #purge}): bytes, not calls, as a call costs about as much as the memory it gives back. Measured with
+     * {@code mmap}, 1 GiB freed at once: passes of 8.6 ms (p50) and 10 ms (p90), 1 GiB back in 15.5 s; 32 MiB: 4.5
+     * and 5.5 ms, 31 s; 128 MiB: 17 and 19.5 ms, 7 to 8 s.
      */
-    static final int PURGE_CALLS = 8;
+    static final long PURGE_BYTES = 64L << 20;
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
@@ -472,10 +474,11 @@ final class PageStore {
     }
 
     /**
-     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, at most
-     * {@link #PURGE_CALLS} calls ({@code madvise} or region releases); one that stops short arms the purge again, due
-     * at once, and the next pass, after the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a
-     * pass by arenas purged instead, a quarter of them plus one, from an arena chosen by the thread's sequence
+     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, until its calls
+     * ({@code madvise} or region releases) gave back {@link #PURGE_BYTES}; the call that reaches it is made whole, so
+     * a pass makes one call at least. One that stops short arms the purge again, due at once, and the next pass, after
+     * the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a pass by arenas purged instead, a
+     * quarter of them plus one, from an arena chosen by the thread's sequence
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2433-L2450); one region of ours can need
      * thousands of calls.
      */
@@ -486,7 +489,7 @@ final class PageStore {
         int count = regions.length;
         int first = nextRegion < count ? nextRegion : 0;
         int from = first == nextRegion ? nextBlock : 0;
-        int budget = PURGE_CALLS;
+        long budget = PURGE_BYTES;
         // Region first from block from on, every other region, then region first up to block from.
         for (int k = 0; k <= count && count != 0; k++) {
             int index = first + k < count ? first + k : first + k - count;
@@ -497,7 +500,7 @@ final class PageStore {
             for (int slot = start; slot < end && !region.released; slot++) {
                 budget -= region.purgesSlices ? purgeBlock(region.blocks[slot], now, budget) :
                         releaseIfIdle(region, now);
-                if (budget == 0) {
+                if (budget <= 0) {
                     // This block may have more.
                     nextRegion = index;
                     nextBlock = slot;
@@ -513,8 +516,8 @@ final class PageStore {
 
     /**
      * Shared slices: purges the free slices of {@code block} with memory behind them freed
-     * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, at most
-     * {@code budget} calls, and returns the calls made. As mimalloc v3's {@code mi_arena_try_purge_range}
+     * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, until the calls
+     * reached {@code budget} bytes, and returns their bytes. As mimalloc v3's {@code mi_arena_try_purge_range}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2345-L2359): a run's
      * slices are claimed by CAS first, so that no claim can take them while their memory goes, and given back after;
      * and as its {@code _mi_bitmap_forall_setc_ranges}
@@ -525,11 +528,11 @@ final class PageStore {
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L246) and reserves a new arena
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L548-L564).
      */
-    private int purgeBlock(Segment block, long now, int budget) {
+    private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;
-        int calls = 0;
+        long bytes = 0;
         long candidates = purgeable(block, block.free, now, delay);
-        while (candidates != 0 && calls < budget) {
+        while (candidates != 0 && bytes < budget) {
             long run = lowestRun(candidates);
             candidates &= ~run;
             long claimed = block.claimFree(run);
@@ -538,27 +541,27 @@ final class PageStore {
                 block.giveBack(claimed & ~exact);
             }
             while (exact != 0) {
-                if (calls == budget) {
+                if (bytes >= budget) {
                     block.giveBack(exact);
                     break;
                 }
                 long bits = lowestRun(exact);
                 exact &= ~bits;
                 purgeSliceRun(block, bits);
-                calls++;
+                bytes += Long.bitCount(bits) * (long) block.sliceSize;
             }
         }
-        return calls;
+        return bytes;
     }
 
     /**
      * Gives back {@code region}, of a source that cannot purge part of a region, if all its slices stayed free for the
-     * purge delay, and returns the calls made: 1 if it did. Its blocks are claimed whole by CAS first, as a purge
-     * claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer wholly free and
-     * idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that still sees
-     * it finds nothing there, and its place in {@link #regions} is taken by the next region mapped.
+     * purge delay, and returns the bytes given back: its length if it did. Its blocks are claimed whole by CAS first,
+     * as a purge claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer wholly
+     * free and idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that
+     * still sees it finds nothing there, and its place in {@link #regions} is taken by the next region mapped.
      */
-    private int releaseIfIdle(Region region, long now) {
+    private long releaseIfIdle(Region region, long now) {
         long delay = config.purgeDelayNanos;
         if (!whollyFree(region)) {
             return 0;
@@ -573,7 +576,7 @@ final class PageStore {
             claimed++;
         }
         if (claimed == region.slots && shortestWait(region, now) >= delay && release(region)) {
-            return 1;
+            return region.length;
         }
         for (int slot = 0; slot < claimed; slot++) {
             Segment block = region.blocks[slot];

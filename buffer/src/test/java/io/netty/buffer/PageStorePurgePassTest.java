@@ -28,6 +28,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * When a purge pass runs and how far it goes: every time is a {@code now} the test passes, from a base where the raw
@@ -47,7 +48,11 @@ final class PageStorePurgePassTest {
 
     /** A store whose last pass was at {@code base}, with blocks 0 to {@code blocks - 1} of its region claimed whole. */
     private PageStore store(long base, int blocks) {
-        PageStore store = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, DELAY)).pageStore;
+        return store(base, blocks, REGION_SIZE);
+    }
+
+    private PageStore store(long base, int blocks, int regionSize) {
+        PageStore store = closer.add(newSharedAllocator(segments, regions, regionSize, DELAY)).pageStore;
         assertEquals(DELAY / 4, store.config.purgeCheckNanos);
         store.lastPurgeNanos = base;
         for (int i = 0; i < blocks; i++) {
@@ -135,42 +140,97 @@ final class PageStorePurgePassTest {
     }
 
     /**
-     * {@link PageStore#PURGE_CALLS} runs a pass at most; the next pass runs after the cadence floor with no release
-     * meanwhile, and goes on from the block where the last one stopped, before the blocks ahead of it.
+     * A pass stops at the call that reaches {@link PageStore#PURGE_BYTES}, made whole, here in the middle of a block;
+     * the next pass runs after the cadence floor with no release meanwhile, and goes on from that block, then the
+     * blocks ahead of it, then around to the blocks behind.
      */
     @ParameterizedTest
     @ValueSource(longs = {Long.MAX_VALUE - DELAY / 2, -DELAY / 4, 0})
     void aPassStopsAtItsBudgetAndTheNextGoesOnFromThere(long base) {
-        int budget = PageStore.PURGE_CALLS;
-        PageStore store = store(base, 3);
-        // Single free slices, apart: one call each. Block 0, then 3 in block 1 fill the first pass.
-        int first = budget - 3;
-        releaseApart(block(store, 0), 0, first, base);
-        releaseApart(block(store, 1), 0, 5, base);
-        releaseApart(block(store, 2), 0, 3, base);
+        // Two runs of run slices per block, apart; an odd number of them reaches the budget: a pass ends after the
+        // first run of block stop.
+        int run = PER_BLOCK / 2 - 1;
+        while (callsToBudget(run) % 2 == 0) {
+            run--;
+        }
+        int calls = callsToBudget(run);
+        long runBytes = (long) run * SLICE;
+        assertTrue((calls - 1) * runBytes < PageStore.PURGE_BYTES && calls * runBytes > PageStore.PURGE_BYTES);
+        int stop = calls / 2;
+        int blocks = stop + 3;
+        PageStore store = store(base, blocks, blocks * SEGMENT_SIZE);
+        for (int slot = 0; slot < blocks; slot++) {
+            block(store, slot).releaseRun(0, run, base);
+            block(store, slot).releaseRun(PER_BLOCK / 2, run, base);
+        }
         long now = base + DELAY;
         store.purgeIfDue(now);
-        assertEquals(budget, regions.purgeCalls());
-        assertEquals(1, purgedBlock(budget - 1), "stopped in block 1");
-        // Due runs ahead of where the pass stopped: the next pass reaches them last.
-        releaseApart(block(store, 0), 2 * first, budget, base);
+        assertEquals(calls, regions.purgeCalls(), "the call that reaches the budget is the last");
+        assertEquals(calls * runBytes, store.bytesPurged);
+        assertEquals(stop * SEGMENT_SIZE, regions.purges.get(calls - 1)[0], "stopped after block stop's first run");
+        // Due slices behind where the pass stopped: the next pass reaches them last.
+        block(store, 0).releaseRun(PER_BLOCK / 2 - 1, 1, base);
+        block(store, 0).releaseRun(PER_BLOCK - 1, 1, base);
         store.purgeIfDue(now + CHECK - 1);
-        assertEquals(budget, regions.purgeCalls(), "the cadence floor");
+        assertEquals(calls, regions.purgeCalls(), "the cadence floor");
         store.purgeIfDue(now + CHECK);
-        assertEquals(2 * budget, regions.purgeCalls());
-        assertEquals(1, purgedBlock(budget), "the rest of block 1 first");
-        assertEquals(1, purgedBlock(budget + 1));
-        for (int i = budget + 2; i < budget + 5; i++) {
-            assertEquals(2, purgedBlock(i));
+        assertEquals(calls + 7, regions.purgeCalls());
+        assertEquals(stop * SEGMENT_SIZE + PER_BLOCK / 2 * SLICE, regions.purges.get(calls)[0],
+                "the rest of block stop first");
+        for (int i = 1; i < 5; i++) {
+            assertEquals(stop + 1 + (i - 1) / 2, purgedBlock(calls + i), "then the blocks ahead");
         }
-        for (int i = budget + 5; i < 2 * budget; i++) {
-            assertEquals(0, purgedBlock(i), "then around to block 0");
-        }
-        store.purgeIfDue(now + 2 * CHECK);
-        assertEquals(budget + 5 + budget, regions.purgeCalls(), "the rest of block 0, then nothing left");
-        assertEquals(3, store.purges);
+        assertEquals((PER_BLOCK / 2 - 1) * SLICE, regions.purges.get(calls + 5)[0], "then around to block 0");
+        assertEquals((PER_BLOCK - 1) * SLICE, regions.purges.get(calls + 6)[0]);
         store.purgeIfDue(now + 10 * DELAY);
-        assertEquals(3, store.purges, "the last pass finished: disarmed");
+        assertEquals(2, store.purges, "the last pass finished: disarmed");
+    }
+
+    /** A pass whose calls reach {@link PageStore#PURGE_BYTES} exactly stops there, and the next one goes on. */
+    @Test
+    void aPassThatSpendsItsBudgetExactlyStopsThere() {
+        int blocks = (int) (PageStore.PURGE_BYTES / SEGMENT_SIZE) + 1;
+        long base = 0;
+        PageStore store = store(base, blocks, blocks * SEGMENT_SIZE);
+        for (int slot = 0; slot < blocks; slot++) {
+            block(store, slot).releaseRun(0, PER_BLOCK, base);
+        }
+        store.purgeIfDue(base + DELAY);
+        assertEquals(blocks - 1, regions.purgeCalls());
+        assertEquals(PageStore.PURGE_BYTES, store.bytesPurged);
+        store.purgeIfDue(base + DELAY + CHECK);
+        assertEquals(blocks, regions.purgeCalls(), "the last block, in the next pass");
+    }
+
+    /** The calls of {@code run} slices each that reach {@link PageStore#PURGE_BYTES}. */
+    private static int callsToBudget(int run) {
+        long runBytes = (long) run * SLICE;
+        return (int) ((PageStore.PURGE_BYTES + runBytes - 1) / runBytes);
+    }
+
+    /**
+     * A pass makes one call at least, however large: a {@code malloc}'d region larger than
+     * {@link PageStore#PURGE_BYTES} goes back whole, one per pass.
+     */
+    @Test
+    void aPassMakesOneCallEvenPastItsBudget() {
+        int blocks = (int) (PageStore.PURGE_BYTES / SEGMENT_SIZE) + 1;
+        CountingRegionSource malloc = new CountingRegionSource(true);
+        PageStore store = closer.add(newSharedAllocator(segments, malloc, blocks * SEGMENT_SIZE, DELAY)).pageStore;
+        assertEquals(0, (int) store.takeRun(blocks));
+        assertEquals(1L << 32, store.takeRun(blocks));
+        long base = System.nanoTime();
+        for (Region region : store.regions) {
+            for (Segment block : region.blocks) {
+                block.releaseRun(0, PER_BLOCK, base);
+            }
+        }
+        store.purgeIfDue(base + DELAY);
+        assertEquals(1, store.regionsReleased);
+        assertEquals(1, malloc.released.size());
+        store.purgeIfDue(base + DELAY + CHECK);
+        assertEquals(2, store.regionsReleased, "the other one, in the next pass");
+        assertEquals(2, store.purges);
     }
 
     /**
@@ -195,12 +255,5 @@ final class PageStorePurgePassTest {
         assertEquals(4 * SLICE, regions.purges.get(0)[1]);
         assertEquals(used - 4L * SLICE, allocator.usedMemory());
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
-    }
-
-    /** {@code n} single slices of {@code block} from {@code start}, one free and one claimed. */
-    private static void releaseApart(Segment block, int start, int n, long now) {
-        for (int i = 0; i < n; i++) {
-            block.releaseRun(start + 2 * i, 1, now);
-        }
     }
 }

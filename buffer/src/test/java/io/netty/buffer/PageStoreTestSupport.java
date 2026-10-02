@@ -263,8 +263,8 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Purge passes from {@code now} on, a cadence floor apart, as long as one is due: all a pass of
-     * {@link PageStore#PURGE_CALLS} calls at most leaves to the next ones.
+     * Purge passes from {@code now} on, a cadence floor apart, as long as one is due: all that a pass, which stops at
+     * {@link PageStore#PURGE_BYTES}, leaves to the next ones.
      */
     static void purgeUntilDone(PageStore store, long now) {
         for (int i = 0; i < 10000; i++) {
