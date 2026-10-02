@@ -32,6 +32,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 @Isolated("Uses a large amount of heap memory, so we don't want it to run concurrently with other allocator tests")
 public class AdaptiveByteBufAllocatorGrowthTest {
     private static final int THREAD_COUNT = Math.max(4, NettyRuntime.availableProcessors() * 2);
@@ -42,7 +44,7 @@ public class AdaptiveByteBufAllocatorGrowthTest {
     @AfterAll
     static void cleanUp() throws InterruptedException {
         THREAD_POOL.shutdown();
-        THREAD_POOL.awaitTermination(1, TimeUnit.MINUTES);
+        assertTrue(THREAD_POOL.awaitTermination(1, TimeUnit.MINUTES), "the pool's threads still run");
         allocator.close();
         allocator = null;
     }
