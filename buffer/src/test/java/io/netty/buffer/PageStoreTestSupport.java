@@ -97,8 +97,7 @@ final class PageStoreTestSupport {
                     new UnpooledHeapByteBuf(alloc, initialCapacity, maxCapacity);
         }
 
-        @Override
-        public synchronized AbstractByteBuf allocateSegment(int size) {
+        synchronized AbstractByteBuf allocateSegment(int size) {
             AbstractByteBuf buf = newBuffer(size, size);
             segments.add(buf);
             return buf;

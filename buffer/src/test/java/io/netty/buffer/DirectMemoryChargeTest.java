@@ -165,19 +165,20 @@ final class DirectMemoryChargeTest {
         store.close();
     }
 
-    /** The direct allocator's own segment source, used without regions: each segment is charged by its allocation. */
+    /** The direct allocator's regions of one block: each is charged by its allocation, credited by its release. */
     @Test
-    void segmentsOfTheirOwnAreChargedByTheirAllocation() throws Exception {
+    void mallocBlocksAreChargedByTheirAllocation() throws Exception {
         AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
         Field direct = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
         direct.setAccessible(true);
-        SegmentSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.segmentSource;
+        RegionSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.segmentSource
+                .mallocRegionSource();
         long base = used();
-        AbstractByteBuf segment = source.allocateSegment(SEGMENT_SIZE);
+        AbstractByteBuf block = source.allocateRegion(SEGMENT_SIZE, 0);
         try {
             assertEquals(base + SEGMENT_SIZE, used());
         } finally {
-            segment.release();
+            source.releaseRegion(block);
         }
         assertEquals(base, used());
     }

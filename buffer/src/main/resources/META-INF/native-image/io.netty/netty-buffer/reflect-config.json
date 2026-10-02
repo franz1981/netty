@@ -137,9 +137,6 @@
     "fields": [
       {
         "name": "free"
-      },
-      {
-        "name": "owner"
       }
     ]
   },

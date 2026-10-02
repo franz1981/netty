@@ -79,7 +79,6 @@ final class SharedSliceAllocatorTest {
         ByteBuf buf = allocator.allocate(1024, 1024);
         Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk) adaptive(buf).chunk).segment;
         assertNotNull(block.sharedSpans, "a block of shared slices");
-        assertNull(block.owner);
         assertEquals(0, segments.segmentsAllocated());
         assertTrue(regionOffset(buf) >= 0 && regionOffset(buf) < REGION_SIZE);
         assertSharedAccounted(segments, allocator);

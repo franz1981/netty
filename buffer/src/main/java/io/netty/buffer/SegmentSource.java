@@ -16,14 +16,10 @@
 package io.netty.buffer;
 
 /**
- * Memory for segments: libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf} for the direct
- * allocator, a {@code byte[]} for the heap allocator. Implementations: the chunk allocators and test sources. Called
- * once per segment allocated.
+ * Where a page store's regions come from, and the views of their blocks: libc {@code malloc} or {@code mmap} for the
+ * direct allocator, a {@code byte[]} for the heap allocator. Implementations: the chunk allocators and test sources.
  */
 interface SegmentSource {
-    /** Freed by {@link AbstractByteBuf#release()}, which may return memory to the OS. */
-    AbstractByteBuf allocateSegment(int size);
-
     /**
      * A view of {@code segment} (or of a region) that never frees memory, of the class of {@code segment}, so that
      * the buffers reading a chunk see one class whatever the chunk. Or {@code segment} itself, never released by its
@@ -32,12 +28,15 @@ interface SegmentSource {
      */
     AbstractByteBuf span(AbstractByteBuf segment, int offset, int length);
 
-    /** {@code null}: no regions, one allocation per segment. */
+    /** Regions of many blocks ({@code mmap}), or {@code null}: none here. */
     default RegionSource regionSource() {
         return null;
     }
 
-    /** Regions of plain allocations, for where {@link #regionSource()} has none; {@code null}: none either. */
+    /**
+     * Regions of one block, one plain allocation each, for where {@link #regionSource()} has none or cannot map one;
+     * {@code null}: none either.
+     */
     default RegionSource mallocRegionSource() {
         return null;
     }

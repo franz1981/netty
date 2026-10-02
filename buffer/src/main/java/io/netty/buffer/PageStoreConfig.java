@@ -42,12 +42,13 @@ final class PageStoreConfig {
     /** A direct allocator's regions start at a multiple of 2 MiB, so that a THP-enabled kernel can back them whole. */
     static final int REGION_ALIGNMENT_BYTES = 2 * 1024 * 1024;
     /**
-     * {@code io.netty.allocator.segmentRegionSize}: the size of the regions a direct allocator carves its
-     * {@link Segment}s out of (see {@link PageStore}), rounded to the nearest multiple of the segment size from 2 up to
-     * {@link Long#SIZE} segments; 0: no regions, one allocation per segment. Default: {@link Long#SIZE} segments
-     * (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a segment's pages are committed
-     * as they are touched. Regions need a {@link RegionSource}, {@link MmapRegionSource} for the direct allocator,
-     * and pages no larger than {@link #SLICE_SIZE_BYTES}: 0 otherwise.
+     * {@code io.netty.allocator.segmentRegionSize}: the size of the {@code mmap} regions a direct allocator carves
+     * its {@link Segment}s out of (see {@link PageStore}), rounded to the nearest multiple of the segment size from 2
+     * up to {@link Long#SIZE} segments; 0: none, {@code malloc}'d regions of one segment instead. Default:
+     * {@link Long#SIZE} segments (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a
+     * segment's pages are committed as they are touched. Regions need a {@link RegionSource},
+     * {@link MmapRegionSource} for the direct allocator, and pages no larger than {@link #SLICE_SIZE_BYTES}: 0
+     * otherwise.
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(PAGE_SIZE_BYTES, SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
@@ -113,38 +114,24 @@ final class PageStoreConfig {
      * {@link PageStore#purgeIfDue}).
      */
     final long purgeCheckNanos;
-    /** 2 to {@link Long#SIZE} whole segments, or 0: one allocation per segment. */
+    /**
+     * 2 to {@link Long#SIZE} whole segments, or {@link #mallocRegionSize} (see {@link #withMallocRegions}); 0: regions
+     * of {@link #mallocRegionSize} only.
+     */
     final int regionSize;
     /** A power of two, honoured if the region source can; 0: any address. */
     final int regionAlignment;
-    /** The most wholly free segments a heap keeps, or 0: see {@link PageStore#reserveLimit}. */
-    final int maxReservedSegments;
     /** Where no {@code mmap} region source is had: the size of {@code malloc}'d regions (one block), or 0: none. */
     final int mallocRegionSize;
 
-    /** Without regions: one allocation per segment. */
-    PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos) {
-        this(segmentSize, sliceSize, purgeDelayNanos, 0, 0);
-    }
-
-    /** Without regions, a heap keeping at most {@code maxReservedSegments} wholly free segments. */
-    PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int maxReservedSegments) {
-        this(segmentSize, sliceSize, purgeDelayNanos, 0, 0, maxReservedSegments, 0);
-    }
-
     /** With regions of {@code regionSize} from the allocator's region source. */
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment) {
-        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0, 0);
+        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0);
     }
 
     /** With {@code mmap} regions of {@code regionSize}, else {@code malloc}'d ones of {@code mallocRegionSize}. */
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
                     int mallocRegionSize) {
-        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0, mallocRegionSize);
-    }
-
-    private PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
-                            int maxReservedSegments, int mallocRegionSize) {
         if (sliceSize <= 0) {
             throw new IllegalArgumentException("sliceSize: " + sliceSize);
         }
@@ -179,10 +166,6 @@ final class PageStoreConfig {
         }
         this.regionSize = regionSize;
         this.regionAlignment = regionAlignment;
-        if (maxReservedSegments < 0) {
-            throw new IllegalArgumentException("maxReservedSegments: " + maxReservedSegments);
-        }
-        this.maxReservedSegments = maxReservedSegments;
         if (mallocRegionSize != 0 && mallocRegionSize != segmentSize) {
             throw new IllegalArgumentException("mallocRegionSize " + mallocRegionSize + " is not 0 nor one segment of "
                     + segmentSize);
@@ -192,8 +175,7 @@ final class PageStoreConfig {
 
     /** This, with {@code malloc}'d regions of one block each, at libc's alignment. */
     PageStoreConfig withMallocRegions() {
-        return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, mallocRegionSize, 0, maxReservedSegments,
-                mallocRegionSize);
+        return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, mallocRegionSize, 0, mallocRegionSize);
     }
 
     /** Regions of one block, one {@code byte[]} each (see {@link MallocRegionSource}): nothing to map nor purge. */

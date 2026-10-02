@@ -112,11 +112,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
 
         @Override
-        public AbstractByteBuf allocateSegment(int size) {
-            return allocate(size, size);
-        }
-
-        @Override
         public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
             return segment;
         }
@@ -143,11 +138,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         @Override
         public AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
             return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity);
-        }
-
-        @Override
-        public AbstractByteBuf allocateSegment(int size) {
-            return UnsafeByteBufUtil.newDirectByteBuf(allocator, size, size);
         }
 
         @Override

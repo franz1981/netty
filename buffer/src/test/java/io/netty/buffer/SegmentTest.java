@@ -32,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 final class SegmentTest {
     private static Segment segment(int slices) {
-        return new Segment((AbstractByteBuf) Unpooled.buffer(slices * SLICE_SIZE_BYTES), SLICE_SIZE_BYTES);
+        return new Segment((AbstractByteBuf) Unpooled.buffer(slices * SLICE_SIZE_BYTES), SLICE_SIZE_BYTES, null, 0);
     }
 
     /** Every length and every start of a lone span in an empty segment, both segment sizes. */
@@ -41,16 +41,16 @@ final class SegmentTest {
     void claimsTheLowestRunOfEveryLength(int slices) {
         Segment segment = segment(slices);
         for (int n = 1; n <= 32; n++) {
-            assertEquals(0, segment.claim(n), "n=" + n);
+            assertEquals(0, segment.claimRun(n), "n=" + n);
             assertEquals(slices - n, segment.freeSlices());
-            segment.release(0, n);
+            segment.releaseRun(0, n, 0);
             assertTrue(segment.isWhollyFree());
             // Every start: occupy the slices below it, so the lowest run of n is there.
             for (int start = 1; start + n <= slices; start++) {
-                assertEquals(0, segment.claim(start));
-                assertEquals(start, segment.claim(n), "n=" + n + " start=" + start);
-                segment.release(0, start);
-                segment.release(start, n);
+                assertEquals(0, segment.claimRun(start));
+                assertEquals(start, segment.claimRun(n), "n=" + n + " start=" + start);
+                segment.releaseRun(0, start, 0);
+                segment.releaseRun(start, n, 0);
                 assertTrue(segment.isWhollyFree());
             }
         }
@@ -61,49 +61,49 @@ final class SegmentTest {
     @ValueSource(ints = {32, 64})
     void claimsNothingPastTheLastSlice(int slices) {
         Segment segment = segment(slices);
-        assertEquals(0, segment.claim(slices - 3));
-        assertEquals(-1, segment.claim(4), "3 slices left");
-        assertEquals(slices - 3, segment.claim(3));
+        assertEquals(0, segment.claimRun(slices - 3));
+        assertEquals(-1, segment.claimRun(4), "3 slices left");
+        assertEquals(slices - 3, segment.claimRun(3));
         assertEquals(0, segment.freeSlices());
-        assertEquals(-1, segment.claim(1));
-        segment.release(slices - 3, 3);
-        assertEquals(slices - 1, segment.claim(1) + 2, "lowest of the three at the top");
+        assertEquals(-1, segment.claimRun(1));
+        segment.releaseRun(slices - 3, 3, 0);
+        assertEquals(slices - 1, segment.claimRun(1) + 2, "lowest of the three at the top");
     }
 
     /** Freed spans merge with their free neighbours: a longer run fits where three spans were. */
     @Test
     void freedSpansCoalesce() {
         Segment segment = segment(64);
-        assertEquals(0, segment.claim(2));
-        assertEquals(2, segment.claim(3));
-        assertEquals(5, segment.claim(2));
-        assertEquals(7, segment.claim(57));
-        assertEquals(-1, segment.claim(4));
-        segment.release(0, 2);
-        assertEquals(-1, segment.claim(4), "two free slices only");
-        segment.release(5, 2);
-        assertEquals(-1, segment.claim(4), "two runs of two, not adjacent");
-        segment.release(2, 3);
-        assertEquals(0, segment.claim(7), "0..6 merged");
-        segment.release(0, 7);
-        segment.release(7, 57);
+        assertEquals(0, segment.claimRun(2));
+        assertEquals(2, segment.claimRun(3));
+        assertEquals(5, segment.claimRun(2));
+        assertEquals(7, segment.claimRun(57));
+        assertEquals(-1, segment.claimRun(4));
+        segment.releaseRun(0, 2, 0);
+        assertEquals(-1, segment.claimRun(4), "two free slices only");
+        segment.releaseRun(5, 2, 0);
+        assertEquals(-1, segment.claimRun(4), "two runs of two, not adjacent");
+        segment.releaseRun(2, 3, 0);
+        assertEquals(0, segment.claimRun(7), "0..6 merged");
+        segment.releaseRun(0, 7, 0);
+        segment.releaseRun(7, 57, 0);
         assertTrue(segment.isWhollyFree());
     }
 
     @Test
     void releasingFreeSlicesThrows() {
         Segment segment = segment(64);
-        assertEquals(0, segment.claim(4));
-        segment.release(0, 4);
-        assertThrows(IllegalStateException.class, () -> segment.release(0, 4));
-        assertThrows(IllegalStateException.class, () -> segment.release(2, 1));
+        assertEquals(0, segment.claimRun(4));
+        segment.releaseRun(0, 4, 0);
+        assertThrows(IllegalStateException.class, () -> segment.releaseRun(0, 4, 0));
+        assertThrows(IllegalStateException.class, () -> segment.releaseRun(2, 1, 0));
     }
 
     @Test
     void usedAndFreeSlicesAddUp() {
         Segment segment = segment(64);
-        segment.claim(9);
-        segment.claim(2);
+        segment.claimRun(9);
+        segment.claimRun(2);
         assertEquals(11, segment.usedSlices());
         assertEquals(53, segment.freeSlices());
         assertEquals(64L * SLICE_SIZE_BYTES, segment.capacity());
@@ -134,7 +134,7 @@ final class SegmentTest {
         for (int op = 0; op < 100_000; op++) {
             if (live > 0 && random.nextBoolean()) {
                 int k = random.nextInt(live);
-                segment.release(starts[k], lengths[k]);
+                segment.releaseRun(starts[k], lengths[k], 0);
                 mark(used, starts[k], lengths[k], false);
                 live--;
                 starts[k] = starts[live];
@@ -142,7 +142,7 @@ final class SegmentTest {
             } else {
                 int n = 1 + random.nextInt(9);
                 int expected = lowestRun(used, n);
-                assertEquals(expected, segment.claim(n), "op " + op);
+                assertEquals(expected, segment.claimRun(n), "op " + op);
                 if (expected >= 0) {
                     mark(used, expected, n, true);
                     starts[live] = expected;

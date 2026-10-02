@@ -37,19 +37,20 @@ final class PageStoreConfigTest {
     @Test
     void pageStoreConfigRejectsBadParameters() {
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(65 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL), "65 slices");
+                () -> new PageStoreConfig(65 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL, 0, 0), "65 slices");
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE_BYTES, INTERVAL), "partial slice");
+                () -> new PageStoreConfig(SEGMENT_SIZE + 4096, SLICE_SIZE_BYTES, INTERVAL, 0, 0), "partial slice");
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, 0, INTERVAL), "no slice");
+                () -> new PageStoreConfig(SEGMENT_SIZE, 0, INTERVAL, 0, 0), "no slice");
         final int halfPage = PageStoreConfig.PAGE_SIZE_BYTES / 2;
         assertThrows(IllegalArgumentException.class, () -> new PageStoreConfig(64 * halfPage, halfPage, INTERVAL,
                 128 * halfPage, 0), "with regions, a slice is whole pages");
-        new PageStoreConfig(64 * halfPage, halfPage, INTERVAL); // without regions, pages do not matter
         assertThrows(IllegalArgumentException.class,
-                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0), "no interval");
-        PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL);
+                () -> new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, 0, 0, 0), "no interval");
+        PageStoreConfig ok = new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, 0, 0, SEGMENT_SIZE)
+                .withMallocRegions();
         assertEquals(64, ok.slicesPerSegment());
+        assertEquals(SEGMENT_SIZE, ok.regionSize);
     }
 
     /** The direct defaults: 64 KiB slices, the property-driven segment size, the heaps' decay interval. */
