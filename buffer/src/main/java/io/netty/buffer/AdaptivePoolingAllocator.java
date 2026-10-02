@@ -323,8 +323,33 @@ final class AdaptivePoolingAllocator {
     /** The regions come from {@code segmentSource}'s {@link SegmentSource#regionSource()}, if the config has them. */
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
                              SegmentSource segmentSource, PageStoreConfig config) {
-        this(chunkAllocator, useCacheForNonEventLoopThreads, segmentSource,
-                segmentSource != null && config.regionSize > 0 ? segmentSource.regionSource() : null, config);
+        this(chunkAllocator, useCacheForNonEventLoopThreads, segmentSource, new Regions(segmentSource, config));
+    }
+
+    private AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
+                                     SegmentSource segmentSource, Regions regions) {
+        this(chunkAllocator, useCacheForNonEventLoopThreads, segmentSource, regions.source, regions.config);
+    }
+
+    /**
+     * Where the regions come from: {@code mmap} where the config has regions and the segment source can map them,
+     * else, with shared slices, {@code malloc}'d regions of the config's other size; else none.
+     */
+    private static final class Regions {
+        final RegionSource source;
+        final PageStoreConfig config;
+
+        Regions(SegmentSource segmentSource, PageStoreConfig config) {
+            RegionSource source = segmentSource != null && config.regionSize > 0 ? segmentSource.regionSource() : null;
+            if (source == null && segmentSource != null && config.sharesSlices && config.mallocRegionSize > 0) {
+                source = segmentSource.mallocRegionSource();
+                if (source != null) {
+                    config = config.withMallocRegions();
+                }
+            }
+            this.source = source;
+            this.config = config;
+        }
     }
 
     /**

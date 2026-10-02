@@ -19,6 +19,8 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -217,18 +219,22 @@ final class SharedSlicesTest {
 
     /**
      * Threads claim runs and whole blocks, write their slices, check them and release them, while a purger purges
-     * every free slice it can: no slice is ever claimed twice, none in use is purged (its owner would see zeroes,
-     * and the purge itself checks), the memory accounting holds after, and every slice is free.
+     * every free slice it can ({@code mmap}), or gives back every wholly free region ({@code malloc}): no slice is
+     * ever claimed twice, none in use is purged or given back (its owner would see zeroes or freed memory, and the
+     * source itself checks), the memory accounting holds after, and every slice is free.
      */
-    @Test
+    @ParameterizedTest(name = "malloc: {0}")
+    @ValueSource(booleans = {false, true})
     @Timeout(value = 120, unit = TimeUnit.SECONDS)
-    void concurrentClaimsReleasesAndPurges() throws Exception {
+    void concurrentClaimsReleasesAndPurges(boolean malloc) throws Exception {
         final int threads = 8;
-        final int maxRegions = 64;
+        final int maxRegions = 256;
         final AtomicIntegerArray owners = new AtomicIntegerArray(maxRegions * PER_REGION);
         final AtomicReference<String> failure = new AtomicReference<String>();
-        final CheckingRegionSource source = new CheckingRegionSource(regions, owners, failure);
-        final PageStore store = newSharedAllocator(segments, source, REGION_SIZE, 1).pageStore;
+        final CheckingRegionSource source = new CheckingRegionSource(malloc ? new CountingRegionSource(true) : regions,
+                owners, failure);
+        // malloc'd regions are one block each, as the direct allocator's.
+        final PageStore store = newSharedAllocator(segments, source, malloc ? SEGMENT_SIZE : REGION_SIZE, 1).pageStore;
         source.store = store;
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         final CountDownLatch start = new CountDownLatch(1);
@@ -267,11 +273,61 @@ final class SharedSlicesTest {
         assertNull(failure.get());
         assertTrue(store.regionCount() <= maxRegions);
         assertTrue(operations.get() > 1000, "too few claims to mean anything: " + operations.get());
-        assertTrue(store.slicesPurged > 0, "the purger purged nothing");
         assertEquals(0, store.sliceCounts()[0], "a slice is still claimed");
         assertSharedAccounted(segments, store.allocator);
+        if (malloc) {
+            // All free and idle now: every region goes back.
+            store.purgeIfDue(System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+            assertEquals(0, countLive(store), "a wholly free region stayed");
+            assertEquals(source.mapped(), store.regionsReleased, "every region mapped went back");
+            assertEquals(0, store.allocator.usedMemory());
+        } else {
+            assertTrue(store.slicesPurged > 0, "the purger purged nothing");
+        }
         store.close();
         assertEquals(0, store.allocator.usedMemory());
+    }
+
+    private static int countLive(PageStore store) {
+        int live = 0;
+        for (Region region : store.regions) {
+            live += region.released ? 0 : 1;
+        }
+        return live;
+    }
+
+    /**
+     * A {@code malloc}'d region goes back whole once all of it stayed free for the purge delay, never before nor while
+     * a slice is claimed; the next region mapped takes its place.
+     */
+    @Test
+    void aWhollyIdleMallocRegionGoesBackAndItsPlaceIsTaken() {
+        CountingRegionSource malloc = new CountingRegionSource(true);
+        PageStore store = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL).pageStore;
+        long first = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        assertEquals(REGION_SIZE, store.allocator.usedMemory(), "counted whole");
+        release(store, first, 9);
+        store.purgeIfDue(System.nanoTime() + INTERVAL / 2);
+        assertEquals(0, store.regionsReleased, "freed less than a delay ago");
+        first = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
+        assertEquals(0, store.regionsReleased, "a slice is claimed");
+        release(store, first, 9);
+        store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
+        assertEquals(1, store.regionsReleased);
+        assertEquals(1, malloc.released.size());
+        assertEquals(0, malloc.released.get(0).refCnt(), "freed");
+        assertEquals(0, store.allocator.usedMemory());
+        assertEquals(0, store.purgeCalls, "no part of a malloc'd region is purged");
+        long again = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        assertEquals(0, (int) (again >>> 32), "the released region's place");
+        assertEquals(1, store.regionCount());
+        assertEquals(2, malloc.regions.size());
+        assertTrue(store.region(0).buffer != malloc.released.get(0));
+        release(store, again, 9);
+        store.close();
+        assertEquals(0, store.allocator.usedMemory());
+        assertEquals(0, malloc.live());
     }
 
     private static final class Worker {
@@ -310,7 +366,7 @@ final class SharedSlicesTest {
         private void claim() {
             int[] run;
             if (random.nextInt(16) == 0) {
-                int blocks = 1 + random.nextInt(2);
+                int blocks = 1 + random.nextInt(Math.min(2, store.config.segmentsPerRegion()));
                 long taken = store.takeRun(blocks, id);
                 assertTrue(taken >= 0);
                 run = new int[] {(int) (taken >>> 32), (int) taken * PER_BLOCK, blocks * PER_BLOCK, 1};
@@ -377,21 +433,43 @@ final class SharedSlicesTest {
         }
 
         @Override
+        public boolean canPurgeSlices() {
+            return delegate.canPurgeSlices();
+        }
+
+        @Override
+        public void releaseRegion(AbstractByteBuf region) {
+            check(region, 0, REGION_SIZE, "given back");
+            delegate.releaseRegion(region);
+        }
+
+        @Override
         public void purge(AbstractByteBuf region, int offset, int length) {
+            check(region, offset, length, "purged");
+            delegate.purge(region, offset, length);
+        }
+
+        int mapped() {
+            return delegate.regions.size();
+        }
+
+        private void check(AbstractByteBuf region, int offset, int length, String what) {
             int index = -1;
             for (Region r : store.regions) {
                 if (r.buffer == region) {
                     index = r.index;
                 }
             }
+            if (index < 0) {
+                return; // the close: nothing claims any more
+            }
             for (int s = offset / SLICE; s < (offset + length) / SLICE; s++) {
                 int owner = owners.get(index * PER_REGION + s);
                 if (owner != 0) {
-                    failure.compareAndSet(null, "slice " + s + " of region " + index + " purged while " + owner
-                            + " holds it");
+                    failure.compareAndSet(null, "slice " + s + " of region " + index + ' ' + what + " while "
+                            + owner + " holds it");
                 }
             }
-            delegate.purge(region, offset, length);
         }
     }
 }

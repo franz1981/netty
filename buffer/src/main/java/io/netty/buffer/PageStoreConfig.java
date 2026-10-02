@@ -128,6 +128,8 @@ final class PageStoreConfig {
     final int maxReservedSegments;
     /** With regions: chunks are runs of the regions' shared slices, not spans of a heap's segments. */
     final boolean sharesSlices;
+    /** Where no {@code mmap} region source is had: the size of {@code malloc}'d regions (one block), or 0: none. */
+    final int mallocRegionSize;
 
     /** Without regions: one allocation per segment. */
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos) {
@@ -150,11 +152,24 @@ final class PageStoreConfig {
 
     private PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
                             int maxReservedSegments) {
-        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, maxReservedSegments, false);
+        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, maxReservedSegments, false, 0);
     }
 
     private PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
                             int maxReservedSegments, boolean sharesSlices) {
+        this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, maxReservedSegments, sharesSlices,
+                0);
+    }
+
+    /** Shared slices with {@code mmap} regions of {@code regionSize}, else {@code malloc}'d ones of the other size. */
+    static PageStoreConfig sharedSlices(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize,
+                                        int regionAlignment, int mallocRegionSize) {
+        return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0, true,
+                mallocRegionSize);
+    }
+
+    private PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment,
+                            int maxReservedSegments, boolean sharesSlices, int mallocRegionSize) {
         if (sliceSize <= 0) {
             throw new IllegalArgumentException("sliceSize: " + sliceSize);
         }
@@ -169,10 +184,12 @@ final class PageStoreConfig {
         this.sliceSize = sliceSize;
         this.purgeDelayNanos = purgeDelayNanos;
         purgeCheckNanos = Math.max(1, purgeDelayNanos >>> 2);
+        // A region of one block is a malloc'd one (see withMallocRegions); mmap'd ones hold 2 or more.
+        int minBlocks = mallocRegionSize != 0 && regionSize == mallocRegionSize ? 1 : 2;
         if (regionSize != 0 && (regionSize < 0 || regionSize % segmentSize != 0
-                || regionSize / segmentSize < 2 || regionSize / segmentSize > Long.SIZE)) {
-            throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor 2 to " + Long.SIZE
-                    + " segments of " + segmentSize);
+                || regionSize / segmentSize < minBlocks || regionSize / segmentSize > Long.SIZE)) {
+            throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor " + minBlocks + " to "
+                    + Long.SIZE + " segments of " + segmentSize);
         }
         if (regionSize != 0 && sliceSize % PAGE_SIZE_BYTES != 0) {
             throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES
@@ -191,7 +208,18 @@ final class PageStoreConfig {
             throw new IllegalArgumentException("maxReservedSegments: " + maxReservedSegments);
         }
         this.maxReservedSegments = maxReservedSegments;
-        this.sharesSlices = sharesSlices && regionSize != 0;
+        this.sharesSlices = sharesSlices;
+        if (mallocRegionSize != 0 && mallocRegionSize != segmentSize) {
+            throw new IllegalArgumentException("mallocRegionSize " + mallocRegionSize + " is not 0 nor one segment of "
+                    + segmentSize);
+        }
+        this.mallocRegionSize = mallocRegionSize;
+    }
+
+    /** This, with {@code malloc}'d regions of one block each, at libc's alignment. */
+    PageStoreConfig withMallocRegions() {
+        return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, mallocRegionSize, 0, maxReservedSegments,
+                sharesSlices, mallocRegionSize);
     }
 
     /** The direct defaults without regions: a heap segment is one {@code byte[]}, nothing to map nor purge. */
@@ -231,7 +259,7 @@ final class PageStoreConfig {
     static PageStoreConfig directDefaults() {
         return new PageStoreConfig(SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
                 TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), SEGMENT_REGION_SIZE_BYTES, REGION_ALIGNMENT_BYTES,
-                SHARED_SLICES);
+                0, SHARED_SLICES, SEGMENT_SIZE_BYTES);
     }
 
     int segmentsPerRegion() {

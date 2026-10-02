@@ -149,14 +149,16 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
             return directSpan(allocator, segment, offset, length);
         }
 
-        /**
-         * {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none: one
-         * {@code malloc} per segment, which glibc maps on its own, so that its free returns it, only below its mmap
-         * threshold, e.g. with {@code MALLOC_MMAP_THRESHOLD_=131072}.
-         */
+        /** {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none. */
         @Override
         public RegionSource regionSource() {
             return MmapRegionSource.isAvailable() ? new MmapRegionSource(allocator) : null;
+        }
+
+        /** Elsewhere, {@code malloc}'d regions. */
+        @Override
+        public RegionSource mallocRegionSource() {
+            return new MallocRegionSource(this);
         }
     }
 

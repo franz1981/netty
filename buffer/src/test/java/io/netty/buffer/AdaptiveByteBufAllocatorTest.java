@@ -127,7 +127,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int segmentSize = directSegmentSize(allocator);
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
         long unit = directPageStoreUnit(allocator);
+        // Without regions a segment counts; mmap'd regions count the chunks' slices; malloc'd ones, the region.
         boolean perSegment = segmentSize > 0 && !directSharesSlices(allocator);
+        if (directMallocRegions(allocator)) {
+            unit = direct(allocator).pageStore.config.regionSize;
+        }
         try {
             int capacity = buffer.capacity();
             long first = perSegment ? unit : expectedUsedMemory(allocator, capacity);
@@ -168,10 +172,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return store != null && store.regionSource != null;
     }
 
-    /** Whether the direct allocator's chunks are runs of its regions' shared slices. */
+    /** Whether the direct allocator's regions are mmap'd: their slices count from their first claim. */
     static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
-        PageStore store = direct(allocator).pageStore;
-        return directRegions(allocator) && store.config.sharesSlices;
+        return directRegions(allocator) && direct(allocator).pageStore.purgesSlices;
+    }
+
+    /** Whether the direct allocator's regions are malloc'd: counted whole, from their allocation. */
+    static boolean directMallocRegions(AdaptiveByteBufAllocator allocator) {
+        return directRegions(allocator) && !direct(allocator).pageStore.purgesSlices;
     }
 
     /**

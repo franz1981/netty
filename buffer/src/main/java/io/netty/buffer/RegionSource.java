@@ -16,9 +16,9 @@
 package io.netty.buffer;
 
 /**
- * Memory for regions: address space whose pages cost nothing until touched, and can be given back to the OS in place.
- * Implementations: {@link MmapRegionSource} and test sources. Called once per region, and once per purged run of
- * slots; a region is given back whole by {@link AbstractByteBuf#release()}.
+ * Memory for regions: address space whose pages cost nothing until touched, and can be given back to the OS in place
+ * ({@link MmapRegionSource}), or plain allocations that only go back whole ({@link MallocRegionSource}). Also test
+ * sources. Called once per region, once per purged run, and once per region given back.
  */
 interface RegionSource {
     /** A new region of exactly {@code size} bytes, untouched, starting at a multiple of {@code alignment} (0: any). */
@@ -29,4 +29,14 @@ interface RegionSource {
      * when touched again. One system call.
      */
     void purge(AbstractByteBuf region, int offset, int length);
+
+    /** Whether {@link #purge} gives part of a region back; else only a whole region goes back. */
+    default boolean canPurgeSlices() {
+        return true;
+    }
+
+    /** A wholly free region, out of use for good, goes back. */
+    default void releaseRegion(AbstractByteBuf region) {
+        region.release();
+    }
 }

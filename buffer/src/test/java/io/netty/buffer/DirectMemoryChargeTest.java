@@ -181,6 +181,55 @@ final class DirectMemoryChargeTest {
         assertEquals(base, used());
     }
 
+    /**
+     * {@code malloc}'d regions: charged whole by their allocation, never per slice, and credited when a wholly idle one
+     * goes back, or at the close.
+     */
+    @Test
+    void mallocRegionsAreChargedByTheirAllocation() {
+        long base = used();
+        CountingRegionSource malloc = new CountingRegionSource(true);
+        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
+        PageStore store = allocator.pageStore;
+        long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        assertEquals(base + REGION_SIZE, used(), "the region, whole");
+        store.takeRun(SLOTS, 0); // a second region, whole
+        assertEquals(base + 2L * REGION_SIZE, used());
+        store.releaseSlices(store.region(0).block(0), 0, 9);
+        assertEquals((int) run, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(base + 2L * REGION_SIZE, used(), "nothing per slice");
+        store.releaseSlices(store.region(0).block(0), 0, 9);
+        store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
+        assertEquals(1, store.regionsReleased, "the first region went back, the second is out");
+        assertEquals(base + REGION_SIZE, used(), "credited by its free");
+        PageStoreTestSupport.assertSharedAccounted(segments, allocator);
+        store.close();
+        assertEquals(base, used(), "the close credits the rest");
+    }
+
+    /**
+     * A {@code malloc}'d region past the direct memory limit: the claim that needed it throws, and regions are still
+     * made once there is room.
+     */
+    @Test
+    void aMallocRegionPastTheLimitFailsOnlyItsClaim() {
+        CountingRegionSource malloc = new CountingRegionSource(true);
+        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
+        PageStore store = allocator.pageStore;
+        long filler = PlatformDependent.maxDirectMemory() - used() - REGION_SIZE / 2;
+        charge(filler);
+        try {
+            assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, 0, PageStore.NO_HEAP));
+            assertTrue(store.mapsRegions, "regions are still made");
+            assertEquals(0, store.regionCount());
+        } finally {
+            credit(filler);
+        }
+        assertEquals(0, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(1, store.regionCount());
+        store.close();
+    }
+
     /** The direct allocator's own segment source, used without regions: each segment is charged by its allocation. */
     @Test
     void segmentsOfTheirOwnAreChargedByTheirAllocation() throws Exception {

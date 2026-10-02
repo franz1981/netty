@@ -79,28 +79,56 @@ public class AdaptiveSegmentRegionsTest {
         assertEquals(Long.SIZE * direct.segmentSize, direct.regionSize);
         assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
-        assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.directRegions(allocator));
+        assertTrue(AdaptiveByteBufAllocatorTest.directRegions(allocator), "mmap'd or malloc'd");
+        assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.direct(allocator).pageStore
+                .regionSource instanceof MmapRegionSource);
     }
 
     /**
-     * Below Java 22, or without native access: no regions, each segment is its own allocation, given back to its
-     * source when its heap gives it back.
+     * Below Java 22, or without native access: {@code malloc}'d regions of {@link PageStoreConfig#MALLOC_REGION_SIZE_BYTES},
+     * counted whole from their allocation.
      */
     @Test
-    void withoutMmapEachSegmentIsItsOwnAllocation() {
+    void withoutMmapRegionsAreMalloced() {
         if (PlatformDependent.javaVersion() < 22) {
             assertFalse(MmapRegionSource.isAvailable());
         }
         assumeFalse(MmapRegionSource.isAvailable(), "mmap regions are available here");
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
-        assertFalse(AdaptiveByteBufAllocatorTest.directRegions(allocator));
+        PageStore store = AdaptiveByteBufAllocatorTest.direct(allocator).pageStore;
+        assertTrue(store.regionSource instanceof MallocRegionSource);
+        assertFalse(store.purgesSlices);
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         ByteBuf adaptive = buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap();
-        Segment segment = ((AdaptivePoolingAllocator.SizeClassedChunk)
+        Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk)
                 ((AdaptivePoolingAllocator.AdaptiveByteBuf) adaptive).chunk).segment;
-        assertNull(segment.region);
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, segment.buffer.capacity());
+        assertNotNull(block.region);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
         buf.release();
+    }
+
+    /**
+     * {@code malloc}'d regions in place of {@code mmap} ones, by configuration (a region size of 0): the same shared
+     * slices, the region counted whole.
+     */
+    @Test
+    void aConfigWithoutMmapRegionsMallocsThem() {
+        AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
+        AdaptivePoolingAllocator direct = AdaptiveByteBufAllocatorTest.direct(adaptive);
+        SegmentSource source = direct.pageStore.segmentSource;
+        PageStoreConfig noMmap = PageStoreConfig.sharedSlices(PageStoreConfig.SEGMENT_SIZE_BYTES,
+                PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
+                PageStoreConfig.SEGMENT_SIZE_BYTES);
+        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(
+                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, noMmap);
+        PageStore store = allocator.pageStore;
+        assertTrue(store.regionSource instanceof MallocRegionSource);
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);
+        ByteBuf buf = allocator.allocate(1024, 1024);
+        assertEquals(1, store.regionCount());
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.usedMemory());
+        buf.release();
+        store.close();
+        assertEquals(0, allocator.usedMemory());
     }
 }

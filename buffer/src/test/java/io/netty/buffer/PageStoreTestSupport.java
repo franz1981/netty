@@ -22,6 +22,7 @@ import io.netty.util.internal.PlatformDependent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -130,9 +131,41 @@ final class PageStoreTestSupport {
      * whose purged ranges are zeroed.
      */
     static final class CountingRegionSource implements RegionSource {
-        final MmapRegionSource mmap = MmapRegionSource.isAvailable() ?
-                new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) : null;
+        final MmapRegionSource mmap;
+        /** Whether this stands for {@link MallocRegionSource}: whole regions only, charged by their allocation. */
+        final boolean malloc;
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
+        /** Regions given back, in call order. */
+        final List<AbstractByteBuf> released = new ArrayList<AbstractByteBuf>();
+        /** Runs inside each release, before it releases, when set. */
+        volatile Consumer<AbstractByteBuf> onRelease;
+
+        CountingRegionSource() {
+            this(false);
+        }
+
+        CountingRegionSource(boolean malloc) {
+            this.malloc = malloc;
+            mmap = !malloc && MmapRegionSource.isAvailable() ? new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) :
+                    null;
+        }
+
+        @Override
+        public boolean canPurgeSlices() {
+            return !malloc;
+        }
+
+        @Override
+        public void releaseRegion(AbstractByteBuf region) {
+            Consumer<AbstractByteBuf> hook = onRelease;
+            if (hook != null) {
+                hook.accept(region);
+            }
+            synchronized (this) {
+                released.add(region);
+            }
+            region.release();
+        }
         /** {offset, length} of each purge call, in call order. */
         final List<int[]> purges = new ArrayList<int[]>();
         /** Runs inside each purge call, before it purges, when set. */
@@ -140,6 +173,9 @@ final class PageStoreTestSupport {
 
         @Override
         public void purge(AbstractByteBuf region, int offset, int length) {
+            if (malloc) {
+                throw new UnsupportedOperationException("malloc: no purge");
+            }
             Runnable hook = onPurge;
             if (hook != null) {
                 hook.run();
@@ -201,14 +237,27 @@ final class PageStoreTestSupport {
     /** With shared slices: every chunk is a run of the regions' shared slices (see {@link PageStore}). */
     static AdaptivePoolingAllocator newSharedAllocator(CountingSegmentSource segments, RegionSource regions,
                                                        int regionSize, long purgeDelayNanos) {
-        return new AdaptivePoolingAllocator(segments, true, segments, regions, new PageStoreConfig(SEGMENT_SIZE,
-                SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT, true));
+        // A region of one block is a malloc'd one's size.
+        PageStoreConfig config = regionSize == SEGMENT_SIZE ? PageStoreConfig.sharedSlices(SEGMENT_SIZE,
+                SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE).withMallocRegions() :
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT, true);
+        return new AdaptivePoolingAllocator(segments, true, segments, regions, config);
     }
 
     /** Shared slices: the used memory is the segments allocated on their own plus the committed slices. */
     static void assertSharedAccounted(CountingSegmentSource segments, AdaptivePoolingAllocator allocator) {
-        assertEquals(segments.unreleasedBytes() + committedSlices(allocator.pageStore) * (long) SLICE_SIZE_BYTES,
-                allocator.usedMemory(), "usedMemory() and the committed slices disagree");
+        PageStore store = allocator.pageStore;
+        long stored = 0;
+        if (store.purgesSlices) {
+            stored = committedSlices(store) * (long) SLICE_SIZE_BYTES;
+        } else {
+            // malloc'd regions count whole, from their allocation to their release.
+            for (Region region : store.regions) {
+                stored += region.released ? 0 : store.config.regionSize;
+            }
+        }
+        assertEquals(segments.unreleasedBytes() + stored, allocator.usedMemory(),
+                "usedMemory() and the committed slices disagree");
     }
 
     static int committedSlices(PageStore store) {
@@ -217,6 +266,9 @@ final class PageStoreTestSupport {
         // A claimed slice always has memory behind it.
         int behind = 0;
         for (Region region : store.regions) {
+            if (region.released) {
+                continue;
+            }
             for (int slot = 0; slot < region.slots; slot++) {
                 for (long freedAt : region.block(slot).freedAt) {
                     behind += freedAt != Region.UNCOMMITTED ? 1 : 0;

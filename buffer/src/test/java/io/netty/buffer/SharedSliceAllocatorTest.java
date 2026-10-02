@@ -19,7 +19,8 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -49,8 +50,13 @@ final class SharedSliceAllocatorTest {
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
-    private final AdaptivePoolingAllocator allocator =
-            newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
+    private AdaptivePoolingAllocator allocator;
+
+    /** On {@code mmap} regions where they can be had, or on {@code malloc}'d ones. */
+    private void use(boolean malloc) {
+        allocator = newSharedAllocator(segments, malloc ? new CountingRegionSource(true) : regions, REGION_SIZE,
+                INTERVAL);
+    }
 
     @BeforeEach
     void pooledAboveTheSizeClasses() {
@@ -66,8 +72,10 @@ final class SharedSliceAllocatorTest {
         return buf.memoryAddress() - allocator.pageStore.region(0).buffer.memoryAddress();
     }
 
-    @Test
-    void sizeClassChunksAreRunsOfSharedSlices() {
+    @ParameterizedTest(name = "malloc: {0}")
+    @ValueSource(booleans = {false, true})
+    void sizeClassChunksAreRunsOfSharedSlices(boolean malloc) {
+        use(malloc);
         ByteBuf buf = allocator.allocate(1024, 1024);
         Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk) adaptive(buf).chunk).segment;
         assertNotNull(block.sharedSpans, "a block of shared slices");
@@ -83,8 +91,10 @@ final class SharedSliceAllocatorTest {
      * Two thread-local heaps: the span the first frees is the span the second gets, as it would be from a heap's own
      * segment, without either holding the block.
      */
-    @Test
-    void aSpanOneHeapFreesIsTheNextHeapsSpan() throws Exception {
+    @ParameterizedTest(name = "malloc: {0}")
+    @ValueSource(booleans = {false, true})
+    void aSpanOneHeapFreesIsTheNextHeapsSpan(boolean malloc) throws Exception {
+        use(malloc);
         final int size = 3 * MIB / 2;
         final AtomicLong first = new AtomicLong();
         final AtomicLong second = new AtomicLong();
@@ -110,8 +120,10 @@ final class SharedSliceAllocatorTest {
      * A thread-local heap's buffers, of the size classes and above, released by another thread after the heap died:
      * every slice comes back.
      */
-    @Test
-    void buffersReleasedAfterTheirHeapDiedGiveTheirSlicesBack() throws Exception {
+    @ParameterizedTest(name = "malloc: {0}")
+    @ValueSource(booleans = {false, true})
+    void buffersReleasedAfterTheirHeapDiedGiveTheirSlicesBack(boolean malloc) throws Exception {
+        use(malloc);
         final List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         runOnOwnHeap(() -> {
@@ -132,8 +144,10 @@ final class SharedSliceAllocatorTest {
     }
 
     /** Above half a segment, one-shot buffers: a whole block up to a segment, contiguous blocks above. */
-    @Test
-    void oneShotBuffersAreWholeBlocks() {
+    @ParameterizedTest(name = "malloc: {0}")
+    @ValueSource(booleans = {false, true})
+    void oneShotBuffersAreWholeBlocks(boolean malloc) {
+        use(malloc);
         ByteBuf block = allocator.allocate(3 * MIB, 3 * MIB);
         ByteBuf blocks = allocator.allocate(SEGMENT_SIZE + 1, SEGMENT_SIZE + 1);
         assertEquals(0, regionOffset(block) % SEGMENT_SIZE);

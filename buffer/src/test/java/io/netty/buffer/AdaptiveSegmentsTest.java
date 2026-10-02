@@ -627,12 +627,12 @@ public class AdaptiveSegmentsTest {
         assertEquals(Long.SIZE * PageStoreConfig.SEGMENT_SIZE_BYTES, PageStoreConfig.SEGMENT_REGION_SIZE_BYTES);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
-        boolean regions = MmapRegionSource.isAvailable();
-        assertEquals(regions, AdaptiveByteBufAllocatorTest.directRegions(allocator));
+        // Direct memory always has regions: mmap'd where they can be, else malloc'd.
+        assertTrue(AdaptiveByteBufAllocatorTest.directRegions(allocator));
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         assertNotNull(chunkOf(buf).segment);
-        assertEquals(regions, chunkOf(buf).segment.region != null);
-        // With shared slices, the chunk's slices: 128 KiB for 1 KiB buffers.
+        assertNotNull(chunkOf(buf).segment.region);
+        // mmap'd: the chunk's slices, 128 KiB for 1 KiB buffers; malloc'd: the whole region.
         long directUsed = AdaptiveByteBufAllocatorTest.directSharesSlices(allocator) ? 128 * 1024 :
                 PageStoreConfig.SEGMENT_SIZE_BYTES;
         assertEquals(directUsed, allocator.metric().usedDirectMemory());

@@ -136,6 +136,9 @@ final class PageStoreStateEvent extends Event {
         long segmentSize = shared ? store.config.sliceSize : store.config.segmentSize;
         int perBlock = store.config.slicesPerSegment();
         for (Region region : store.regions) {
+            if (region.released) {
+                continue;
+            }
             int units = shared ? region.slots * perBlock : region.slots;
             PageStoreStateEvent event = new PageStoreStateEvent();
             event.store = id;

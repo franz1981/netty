@@ -36,4 +36,9 @@ interface SegmentSource {
     default RegionSource regionSource() {
         return null;
     }
+
+    /** Regions of plain allocations, for where {@link #regionSource()} has none; {@code null}: none either. */
+    default RegionSource mallocRegionSource() {
+        return null;
+    }
 }

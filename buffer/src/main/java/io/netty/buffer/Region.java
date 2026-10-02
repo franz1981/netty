@@ -55,6 +55,8 @@ final class Region {
     final boolean[] everCommitted;
     /** Its index in {@link PageStore#regions}, set before it is published there. */
     int index = -1;
+    /** Given back to its source whole: every block stays claimed. Set by the purger under the store's monitor. */
+    volatile boolean released;
     /**
      * Shared slices: per slice of the region, whether memory was ever behind it, so that a slice with none now was
      * purged; slice owner only. Else {@code null}.
