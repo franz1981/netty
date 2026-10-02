@@ -40,7 +40,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * mimalloc v3 claims a page's slices straight from its arena's bitmap
  * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
  * A buffer above a block takes a run of whole blocks ({@link #takeRun}). A new region is added under
- * this store's monitor, the only lock, when no region has a fit.
+ * this store's monitor, the only lock, when no region has a fit, and the claim that added it takes its run there
+ * before any other thread sees the region.
  * <p>
  * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})
  * purge the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
@@ -146,19 +147,23 @@ final class PageStore {
 
     /**
      * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
-     * allocation for a region of one block. When a region cannot be had, switches to {@link #fallbackSource} if there
-     * is one, and makes no region: the caller scans again.
+     * allocation for a region of one block. Claims the caller's run in it before publishing it: {@code blocks} whole
+     * blocks, or if 0, {@code slices} slices of its first block. Published wholly free, a region could be given back
+     * by the purger, idle, before the claim that mapped it scanned it, and the claim map another: with a short purge
+     * delay, without end. Returns the run as {@link #claimSlices} and {@link #takeRun} encode theirs, not committed,
+     * or -1 for the caller to scan again: a region was added meanwhile, the run does not fit a new region, or a region
+     * cannot be had and this switched to {@link #fallbackSource}.
      */
-    private synchronized void addRegion(Region[] seen, boolean threadLocal) {
+    private synchronized long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
         if (closed) {
             throw new IllegalStateException("closed");
         }
         if (regions != seen) {
-            return;
+            return -1;
         }
         RegionSource source = regionSource;
-        int blocks = regionBlocks;
-        int size = blocks * config.segmentSize;
+        int slots = regionBlocks;
+        int size = slots * config.segmentSize;
         AbstractByteBuf buffer;
         Object event = PlatformDependent.isJfrEnabled() && PageStoreMapEvent.isEventEnabled() ?
                 PageStoreMapEvent.start() : null;
@@ -179,13 +184,13 @@ final class PageStore {
             regionAlignment = 0;
             regionSource = fallback;
             logger.warn("Cannot map a region of {} bytes: regions are one block each from now on.", size, e);
-            return;
+            return -1;
         }
         assert buffer.capacity() == size;
         if (event != null) {
             AbstractPageStoreEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
         }
-        Region region = sharedRegion(buffer, source, blocks);
+        Region region = sharedRegion(buffer, source, slots);
         if (!region.purgesSlices) {
             // Charged by its allocation, counted whole from now on.
             allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
@@ -197,8 +202,10 @@ final class PageStore {
         // The place of a region given back is taken again: nothing claims in a released region.
         Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
         region.index = index;
+        int first = blocks != 0 ? region.claimBlocks(blocks) : region.claimSlices(slices, 0);
         grown[index] = region;
         regions = grown;
+        return first < 0 ? -1 : (long) index << 32 | first;
     }
 
     /** A region charged whole has memory behind all of it, free since now. */
@@ -215,9 +222,9 @@ final class PageStore {
 
     /**
      * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block, the first
-     * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, mapping a new
-     * region when none has. Returns the region's index in the high half and the run's first slice in the region in
-     * the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
+     * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, else in a new
+     * region (see {@link #addRegion}). Returns the region's index in the high half and the run's first slice in the
+     * region in the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
      * {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, int seq, boolean threadLocal) {
@@ -238,13 +245,17 @@ final class PageStore {
                 rescanned = true;
                 continue;
             }
-            addRegion(regions, threadLocal);
+            long run = addRegion(regions, threadLocal, slices, 0);
+            if (run >= 0) {
+                commitSlices(block(run), start(run), slices, threadLocal);
+                return run;
+            }
         }
     }
 
     /**
      * Any thread: claims {@code blocks} contiguous wholly free blocks of one region, for a buffer larger than a block
-     * (see {@link Region#claimBlocks}), mapping a new region when none has them. Returns the region's index in
+     * (see {@link Region#claimBlocks}), else in a new region (see {@link #addRegion}). Returns the region's index in
      * {@link #regions} in the high half and the first block in the low half, or -1 when new regions hold fewer blocks.
      * Every slice is committed; give them back with {@link #freeRun}.
      */
@@ -269,7 +280,11 @@ final class PageStore {
                 rescanned = true;
                 continue;
             }
-            addRegion(regions, false);
+            long run = addRegion(regions, false, 0, blocks);
+            if (run >= 0) {
+                commitBlocks(this.regions[(int) (run >>> 32)], (int) run, blocks);
+                return run;
+            }
         }
     }
 

@@ -25,7 +25,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.SplittableRandom;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerArray;
@@ -220,7 +222,7 @@ final class SharedSlicesTest {
             workers.add(new Thread(() -> {
                 try {
                     start.await();
-                    new Worker(store, owners, failure, id).run(deadline, operations);
+                    new Worker(store, owners, source.claimedIn, failure, id).run(deadline, operations);
                 } catch (Throwable e) {
                     failure.compareAndSet(null, "worker " + id + ": " + e);
                 }
@@ -311,6 +313,7 @@ final class SharedSlicesTest {
         private static final int[] SIZES = {1, 2, 3, 4, 5, 8, 9, 17, 24, 32, 63};
         private final PageStore store;
         private final AtomicIntegerArray owners;
+        private final Set<Region> claimedIn;
         private final AtomicReference<String> failure;
         private final int id;
         private final SplittableRandom random;
@@ -319,10 +322,12 @@ final class SharedSlicesTest {
         private final List<int[]> held = new ArrayList<int[]>();
         private long stamp;
 
-        Worker(PageStore store, AtomicIntegerArray owners, AtomicReference<String> failure, int id) {
+        Worker(PageStore store, AtomicIntegerArray owners, Set<Region> claimedIn, AtomicReference<String> failure,
+               int id) {
             this.store = store;
             perBlock = store.config.slicesPerSegment();
             this.owners = owners;
+            this.claimedIn = claimedIn;
             this.failure = failure;
             this.id = id;
             random = new SplittableRandom(id);
@@ -362,7 +367,9 @@ final class SharedSlicesTest {
                             + " while " + owner + " holds it");
                 }
             }
-            AbstractByteBuf memory = store.regions[run[0]].buffer;
+            Region region = store.regions[run[0]];
+            claimedIn.add(region);
+            AbstractByteBuf memory = region.buffer;
             long value = (long) id << 40 | ++stamp;
             for (int s = run[1]; s < run[1] + run[2]; s++) {
                 memory.setLong(s * SLICE, value);
@@ -397,6 +404,8 @@ final class SharedSlicesTest {
         private final CountingRegionSource delegate;
         private final AtomicIntegerArray owners;
         private final AtomicReference<String> failure;
+        /** The regions a worker claimed a run in. */
+        final Set<Region> claimedIn = ConcurrentHashMap.newKeySet();
         volatile PageStore store;
 
         CheckingRegionSource(CountingRegionSource delegate, AtomicIntegerArray owners,
@@ -418,7 +427,11 @@ final class SharedSlicesTest {
 
         @Override
         public void releaseRegion(AbstractByteBuf region) {
-            check(region, 0, REGION_SIZE, "given back");
+            Region r = check(region, 0, REGION_SIZE, "given back");
+            if (r != null && !claimedIn.contains(r)) {
+                // Mapped for a claim, and given back before that claim had its run.
+                failure.compareAndSet(null, "region " + r.index + " given back before any claim had a run in it");
+            }
             delegate.releaseRegion(region);
         }
 
@@ -432,16 +445,18 @@ final class SharedSlicesTest {
             return delegate.regions.size();
         }
 
-        private void check(AbstractByteBuf region, int offset, int length, String what) {
-            int index = -1;
+        /** The region of {@code region}, or {@code null} at the close. */
+        private Region check(AbstractByteBuf region, int offset, int length, String what) {
+            Region found = null;
             for (Region r : store.regions) {
                 if (r.buffer == region) {
-                    index = r.index;
+                    found = r;
                 }
             }
-            if (index < 0) {
-                return; // the close: nothing claims any more
+            if (found == null) {
+                return null; // the close: nothing claims any more
             }
+            int index = found.index;
             for (int s = offset / SLICE; s < (offset + length) / SLICE; s++) {
                 int owner = owners.get(index * PER_REGION + s);
                 if (owner != 0) {
@@ -449,6 +464,7 @@ final class SharedSlicesTest {
                             + owner + " holds it");
                 }
             }
+            return found;
         }
     }
 }
