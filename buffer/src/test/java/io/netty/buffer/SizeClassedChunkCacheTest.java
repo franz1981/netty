@@ -38,8 +38,8 @@ import static org.mockito.Mockito.when;
 
 public class SizeClassedChunkCacheTest {
 
-    /** The cache never gives up the last chunk of its size class; everything above that may go. */
-    private static final int RETENTION_FLOOR = 1;
+    /** The empty chunks the cache keeps for its size class; everything above that may go. */
+    private static final int RETENTION_FLOOR = SizeClassedChunkCache.FLOOR;
 
     private static SizeClassedChunk chunkWithCapacity() {
         SizeClassedChunk chunk = mock(SizeClassedChunk.class);

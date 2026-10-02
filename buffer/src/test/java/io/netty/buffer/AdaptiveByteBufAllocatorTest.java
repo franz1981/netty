@@ -114,14 +114,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator =  newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         assertEquals(0, metric.usedDirectMemory());
-        int segmentSize = directSegmentSize(allocator);
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
-        long unit = directPageStoreUnit(allocator);
-        // Without regions a segment counts; mmap'd regions count the chunks' slices; malloc'd ones, the region.
-        boolean perSegment = segmentSize > 0 && !directSharesSlices(allocator);
-        if (directMallocRegions(allocator)) {
-            unit = direct(allocator).pageStore.config.regionSize;
-        }
+        // mmap'd regions count the chunks' slices; malloc'd ones, the region.
+        boolean perSegment = !directSharesSlices(allocator);
+        long unit = direct(allocator).pageStore.config.regionSize;
         try {
             int capacity = buffer.capacity();
             long first = perSegment ? unit : expectedUsedMemory(allocator, capacity);
@@ -150,34 +146,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** The size of the direct allocator's segments, or 0 when its chunks are not carved out of segments. */
+    /** The size of the direct allocator's blocks. */
     static int directSegmentSize(AdaptiveByteBufAllocator allocator) {
-        AdaptivePoolingAllocator direct = direct(allocator);
-        return direct.pageStore != null ? direct.pageStore.config.segmentSize : 0;
-    }
-
-    /** Whether the direct allocator carves its segments out of regions. */
-    static boolean directRegions(AdaptiveByteBufAllocator allocator) {
-        PageStore store = direct(allocator).pageStore;
-        return store != null && store.regionSource != null;
+        return direct(allocator).pageStore.config.segmentSize;
     }
 
     /** Whether the direct allocator's regions are mmap'd: their slices count from their first claim. */
     static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
-        return directRegions(allocator) && direct(allocator).pageStore.regionSource.canPurgeSlices();
-    }
-
-    /** Whether the direct allocator's regions are malloc'd: counted whole, from their allocation. */
-    static boolean directMallocRegions(AdaptiveByteBufAllocator allocator) {
-        return directRegions(allocator) && !direct(allocator).pageStore.regionSource.canPurgeSlices();
-    }
-
-    /**
-     * What the direct allocator's page store accounts per unit: a segment, with regions or not (a region's slots
-     * count one by one, from their first use); 0 without segments.
-     */
-    static long directPageStoreUnit(AdaptiveByteBufAllocator allocator) {
-        return directSegmentSize(allocator);
+        return direct(allocator).pageStore.regionSource.canPurgeSlices();
     }
 
     static AdaptivePoolingAllocator heap(AdaptiveByteBufAllocator allocator) {
@@ -190,19 +166,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** The size of the heap allocator's segments, or 0 when its chunks are not carved out of segments. */
+    /** The size of the heap allocator's blocks. */
     static int heapSegmentSize(AdaptiveByteBufAllocator allocator) {
-        AdaptivePoolingAllocator heap = heap(allocator);
-        return heap.pageStore != null ? heap.pageStore.config.segmentSize : 0;
+        return heap(allocator).pageStore.config.segmentSize;
     }
 
     /**
-     * Whether the heap allocator pools buffers of {@code size}: always without heap segments, else up to a segment,
-     * which G1 regions below 16 MiB make smaller than 4 MiB (see {@link PageStoreConfig#heapSegmentSizeOf}).
+     * Whether the heap allocator pools buffers of {@code size}: up to a block, which G1 regions below 16 MiB make
+     * smaller than 4 MiB (see {@link PageStoreConfig#heapSegmentSizeOf}).
      */
     static boolean heapSegmentsHold(AdaptiveByteBufAllocator allocator, int size) {
-        int segmentSize = heapSegmentSize(allocator);
-        return segmentSize == 0 || size <= segmentSize;
+        return size <= heapSegmentSize(allocator);
     }
 
     @Override
@@ -238,7 +212,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Buffers above the largest pooled size, without a page store or in low-memory mode, get a one-shot chunk of
+     * Buffers above the largest pooled size, in low-memory mode, get a one-shot chunk of
      * their own, of their exact size: accounted while the buffer lives, replaced on growth with the content kept, and
      * freed as soon as the buffer is released.
      */
@@ -246,7 +220,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ValueSource(booleans = {true, false})
     void oneShotChunkIsFreedWithItsBuffer(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeFalse(spansUpToABlock(allocator, direct), "see buffersUpToABlockAreSpans");
+        assumeTrue(isLowMemory(), "see buffersUpToABlockAreSpans");
         ByteBufAllocatorMetric metric = allocator.metric();
         int size = 2200000; // above the largest pooled size
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
@@ -267,14 +241,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertEquals(0, direct ? metric.usedDirectMemory() : metric.usedHeapMemory());
     }
 
-    /** Whether the allocator's page store holds the buffers above the size classes, up to a block, as spans. */
-    private static boolean spansUpToABlock(AdaptiveByteBufAllocator allocator, boolean direct) throws Exception {
-        PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
-        return store != null && !isLowMemory();
-    }
-
     /**
-     * With a page store, a buffer above half a block and up to a block is a span of whole slices: counted by its
+     * A buffer above half a block and up to a block is a span of whole slices: counted by its
      * slices in {@code mmap}'d regions, by its whole block in regions of one block. Grown to a whole block, it moves
      * to another block; the first span goes back free and stays counted, as the second does once released, until a
      * purge.
@@ -283,7 +251,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ValueSource(booleans = {true, false})
     void buffersUpToABlockAreSpans(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeTrue(spansUpToABlock(allocator, direct), "low-memory mode: no spans above the size classes");
+        assumeFalse(isLowMemory(), "low-memory mode: no spans above the size classes");
         PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
         int block = store.config.segmentSize;
         int slice = store.config.sliceSize;
@@ -443,12 +411,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Blocks released on another thread make their buddy chunks usable again for the thread that allocates: a second
-     * round of the same allocations after a foreign release needs no new memory.
+     * Spans released on another thread are usable again for the thread that allocates: a second round of the same
+     * allocations after a foreign release needs no new memory.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void buddyChunksReleasedByAnotherThreadAreReused(boolean direct) throws Exception {
+    void largeBuffersReleasedByAnotherThreadAreReused(boolean direct) throws Exception {
         final AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         final int size = 512 * 1024; // above the largest size class, below the unpooled fallback
@@ -478,7 +446,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      * is held, without any further allocation, once the page store purged what stayed free for its delay.
      */
     @Test
-    void idleBuddyMemoryIsBoundedInBytes() {
+    void idleLargeBufferMemoryGoesBack() {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         PageStore store = heap(allocator).pageStore;
         int size = 1024 * 1024; // the largest pooled size
@@ -497,13 +465,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Several threads allocate buddy-sized buffers and hand them to each other to check and release, so blocks go
-     * back through the chunks' free lists from threads that did not allocate them while the stripe's magazine keeps
-     * allocating: every buffer keeps its content until it is released, and nothing fails (run with assertions on).
+     * Several threads allocate buffers above the size classes and hand them to each other to check and release, so
+     * spans go back from threads that did not allocate them while the stripe's magazine keeps allocating: every buffer
+     * keeps its content until it is released, and nothing fails (run with assertions on).
      */
     @DisabledForSlowLeakDetection
     @Test
-    void buddyBuffersReleasedAcrossThreadsKeepTheirContent() throws Throwable {
+    void largeBuffersReleasedAcrossThreadsKeepTheirContent() throws Throwable {
         final AdaptiveByteBufAllocator allocator = newAllocator(true);
         final int[] sizes = {140 * 1024, 256 * 1024, 300 * 1024, 512 * 1024, 700 * 1024, 1024 * 1024};
         final int threads = 8;
@@ -557,12 +525,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Buddy chunks given up by a magazine are reused by it: allocating and releasing the same set of large buffers
-     * over and over from one thread does not grow the memory held after the first round.
+     * Spans given back are reused: allocating and releasing the same set of large buffers over and over from one
+     * thread does not grow the memory held after the first round.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void buddyChunksAreReusedAcrossRounds(boolean direct) throws Exception {
+    void largeBuffersAreReusedAcrossRounds(boolean direct) throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
@@ -590,10 +558,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     @DisabledForSlowLeakDetection
     @RepeatedTest(100)
-    void buddyAllocationConsistency(RepetitionInfo info) {
+    void largeAllocationConsistency(RepetitionInfo info) {
         SplittableRandom rng = new SplittableRandom(info.getCurrentRepetition());
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        int small = 256 * 1024; // above the largest size class, so every size here takes the buddy path
+        int small = 256 * 1024; // above the largest size class: every size here is a span or a one-shot
         int large = 2 * small;
         int xlarge = 2 * large;
 

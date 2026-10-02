@@ -55,9 +55,11 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
 
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
-        direct = new AdaptivePoolingAllocator(new DirectChunkAllocator(this), useCacheForNonEventLoopThreads);
+        DirectChunkAllocator directChunks = new DirectChunkAllocator(this);
+        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, directChunks, null,
+                PageStoreConfig.directDefaults());
         HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
-        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, heapChunks,
+        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, heapChunks, null,
                 PageStoreConfig.heapDefaults());
     }
 

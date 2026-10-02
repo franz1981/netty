@@ -112,9 +112,20 @@ final class PageStore {
     /** Regions given back whole: see {@link #releaseIdleRegions}. */
     long regionsReleased;
 
-    /** {@code config} must have regions, and {@code regionSource} make them. */
+    /**
+     * @param regionSource where the regions come from, or {@code null} for {@code segmentSource}'s: {@code mmap} where
+     *                     the config has regions and the source can map them, else {@code malloc}'d regions of one
+     *                     block where the config has them
+     */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
               RegionSource regionSource) {
+        if (regionSource == null) {
+            regionSource = config.regionSize > 0 ? segmentSource.regionSource() : null;
+            if (regionSource == null && config.mallocRegionSize > 0) {
+                regionSource = segmentSource.mallocRegionSource();
+                config = config.withMallocRegions();
+            }
+        }
         if (config.regionSize == 0 || regionSource == null) {
             throw new IllegalArgumentException("a page store needs regions: " + config.regionSize + ", "
                     + regionSource);

@@ -56,7 +56,7 @@ public class AdaptiveByteBufAllocatorGrowthTest {
         final int bufSizeAdditional;
         final int bufSizeGrowth;
         if ((info.getCurrentRepetition() & 1) == 0) {
-            // Target large buffers: above the largest size class, so they take the buddy path.
+            // Target large buffers: above the largest size class, so they are spans or one-shots.
             bufSizeBase = 140000;
             bufSizeAdditional = 50000;
             bufSizeGrowth = 80000;
@@ -77,7 +77,6 @@ public class AdaptiveByteBufAllocatorGrowthTest {
                 SplittableRandom rng = new SplittableRandom();
                 for (int i = 0; i < 2000; i++) {
                     // Allocate buffers in various sizes.
-                    // For large buffers this exercises different buddy tree levels in the BuddyChunk.
                     int initialSize = bufSizeBase + rng.nextInt(bufSizeAdditional);
                     ByteBuf buf = allocator.heapBuffer(initialSize);
                     try {

@@ -30,7 +30,6 @@ import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
@@ -79,7 +78,6 @@ public class AdaptiveSegmentRegionsTest {
         assertEquals(Long.SIZE * direct.segmentSize, direct.regionSize);
         assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
-        assertTrue(AdaptiveByteBufAllocatorTest.directRegions(allocator), "mmap'd or malloc'd");
         assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.direct(allocator).pageStore
                 .regionSource instanceof MmapRegionSource);
     }
@@ -120,7 +118,7 @@ public class AdaptiveSegmentRegionsTest {
                 PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
                 PageStoreConfig.SEGMENT_SIZE_BYTES);
         AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(
-                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, noMmap);
+                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, null, noMmap);
         PageStore store = allocator.pageStore;
         assertTrue(store.regionSource instanceof MallocRegionSource);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);

@@ -42,7 +42,6 @@ import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -575,8 +574,6 @@ public class AdaptiveSegmentsTest {
         assertEquals(Long.SIZE * PageStoreConfig.SEGMENT_SIZE_BYTES, PageStoreConfig.SEGMENT_REGION_SIZE_BYTES);
         AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, AdaptiveByteBufAllocatorTest.directSegmentSize(allocator));
-        // Direct memory always has regions: mmap'd where they can be, else malloc'd.
-        assertTrue(AdaptiveByteBufAllocatorTest.directRegions(allocator));
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         assertNotNull(chunkOf(buf).segment);
         assertNotNull(chunkOf(buf).segment.region);
@@ -608,7 +605,7 @@ public class AdaptiveSegmentsTest {
     @Test
     void chunkSizesFollowTheInstanceSliceSize() {
         CountingSegmentSource source = new CountingSegmentSource();
-        AdaptivePoolingAllocator small = new AdaptivePoolingAllocator(source, true, source,
+        AdaptivePoolingAllocator small = new AdaptivePoolingAllocator(source, true, source, null,
                 new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, INTERVAL, 0, 0, 2 * 1024 * 1024));
         AdaptivePoolingAllocator large = newAllocator(source, SEGMENT_SIZE);
         ByteBuf a = small.allocate(4352, 4352);
@@ -631,7 +628,7 @@ public class AdaptiveSegmentsTest {
     @Test
     void segmentsMustHoldTheLargestSizeClass() {
         final CountingSegmentSource source = new CountingSegmentSource();
-        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true, source,
+        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true, source, null,
                 new PageStoreConfig(2 * SLICE_SIZE_BYTES, SLICE_SIZE_BYTES, INTERVAL, 0, 0, 2 * SLICE_SIZE_BYTES)),
                 "132 KiB takes 3 slices");
     }

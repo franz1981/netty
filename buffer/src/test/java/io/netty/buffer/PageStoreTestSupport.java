@@ -266,7 +266,7 @@ final class PageStoreTestSupport {
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
     static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {
-        return new AdaptivePoolingAllocator(source, true, source,
+        return new AdaptivePoolingAllocator(source, true, source, null,
                 new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL, 0, 0, segmentSize));
     }
 
