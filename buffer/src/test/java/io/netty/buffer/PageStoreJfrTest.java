@@ -33,12 +33,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
-import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
-import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
@@ -127,7 +124,7 @@ public class PageStoreJfrTest {
             });
             ByteBuf span = allocator.allocate(512 * 1024, 512 * 1024); // a span of 8 slices
             ByteBuf whole = allocator.allocate(SEGMENT_SIZE, SEGMENT_SIZE); // a span of a whole block
-            base = store.region(0).buffer.memoryAddress();
+            base = store.regions[0].buffer.memoryAddress();
             assertTrue(stateSeen.await(10, TimeUnit.SECONDS), "a periodic state event with 8 slices and a block out");
             span.release();
             whole.release();

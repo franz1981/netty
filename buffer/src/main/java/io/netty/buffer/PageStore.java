@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * heap        a thread-local heap or a stripe                     StripedHeap, ThreadLocalSizeClassHeap
  * </pre>
  * Heaps own chunks, never blocks: any heap claims a run of slices from the regions' shared bitmaps by CAS, and
- * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link #releaseSlices}), as mimalloc v3
- * claims a page's slices straight from its arena's bitmap
+ * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link Segment#releaseRun}), as
+ * mimalloc v3 claims a page's slices straight from its arena's bitmap
  * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
  * A buffer above a block takes a run of whole blocks ({@link #takeRun}). A new region is added under
  * this store's monitor, the only lock, when no region has a fit.
@@ -225,7 +225,7 @@ final class PageStore {
         Region region = new Region(buffer, source, blocks, segmentSource, config, !source.canPurgeSlices(),
                 System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.block(slot);
+            Segment block = region.blocks[slot];
             block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, false);
             block.threadLocalSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, true);
         }
@@ -237,7 +237,7 @@ final class PageStore {
      * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, mapping a new
      * region when none has. Returns the region's index in the high half and the run's first slice in the region in
      * the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
-     * {@link #releaseSlices}, from any thread.
+     * {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, int seq, String heap) {
         boolean rescanned = false;
@@ -249,7 +249,7 @@ final class PageStore {
                 int slice = region.claimSlices(slices, seq);
                 if (slice >= 0) {
                     int perBlock = config.slicesPerSegment();
-                    commitSlices(region.block(slice / perBlock), slice % perBlock, slices, heap);
+                    commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, heap);
                     return (long) i << 32 | slice;
                 }
             }
@@ -315,7 +315,7 @@ final class PageStore {
         int committed = 0;
         try {
             for (; committed < blocks; committed++) {
-                Segment block = region.block(first + committed);
+                Segment block = region.blocks[first + committed];
                 commitSlices(block, 0, block.slices, NO_HEAP);
             }
         } finally {
@@ -323,11 +323,11 @@ final class PageStore {
                 // commitSlices gave back the block it failed on: the ones after it go back as they are.
                 long now = System.nanoTime();
                 for (int slot = 0; slot < committed; slot++) {
-                    Segment block = region.block(first + slot);
+                    Segment block = region.blocks[first + slot];
                     block.releaseRun(0, block.slices, now);
                 }
                 for (int slot = committed + 1; slot < blocks; slot++) {
-                    Segment block = region.block(first + slot);
+                    Segment block = region.blocks[first + slot];
                     block.giveBack(block.allFree);
                 }
             }
@@ -349,7 +349,7 @@ final class PageStore {
                 fresh++;
             }
         }
-        long address = block.memoryAddress() + (long) start * sliceSize;
+        long address = block.buffer._memoryAddress() + (long) start * sliceSize;
         boolean committed = false;
         try {
             if (fresh != 0) {
@@ -362,7 +362,8 @@ final class PageStore {
                     }
                 }
                 SLICES_COMMITTED.addAndGet(this, fresh);
-                allocator.storeBytesCommitted(address, fresh * sliceSize, block.isDirect(), heap == THREAD_LOCAL);
+                allocator.storeBytesCommitted(address, fresh * sliceSize, block.buffer.isDirect(),
+                        heap == THREAD_LOCAL);
                 // A memory event, as the purge's give-back: from the run's start, for the slices committed now.
                 taken(address, (long) fresh * sliceSize, 0, region.index, SHARED_SLICES, heap);
             }
@@ -376,7 +377,7 @@ final class PageStore {
 
     /** The block of a run {@link #claimSlices} returned. */
     Segment block(long run) {
-        return regions[(int) (run >>> 32)].block((int) run / config.slicesPerSegment());
+        return regions[(int) (run >>> 32)].blocks[(int) run / config.slicesPerSegment()];
     }
 
     /** The first slice in its block of a run {@link #claimSlices} returned. */
@@ -384,25 +385,13 @@ final class PageStore {
         return (int) run % config.slicesPerSegment();
     }
 
-    /**
-     * Shared slices, any thread: the run of {@code n} slices of {@code block} from {@code start}, which the caller
-     * claimed, goes back at once, free for any heap, and purged once idle.
-     */
-    void releaseSlices(Segment block, int start, int n) {
-        block.releaseRun(start, n, System.nanoTime());
-    }
-
     /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */
     void freeRun(Region region, int start, int slots) {
         long now = System.nanoTime();
         for (int slot = start; slot < start + slots; slot++) {
-            Segment block = region.block(slot);
+            Segment block = region.blocks[slot];
             block.releaseRun(0, block.slices, now);
         }
-    }
-
-    Region region(int index) {
-        return regions[index];
     }
 
     /**
@@ -443,7 +432,7 @@ final class PageStore {
     private void closeSlices(Region region) {
         int sliceSize = config.sliceSize;
         for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.block(slot);
+            Segment block = region.blocks[slot];
             int committed = 0;
             for (int i = 0; i < block.slices; i++) {
                 if (block.freedAt[i] != Region.UNCOMMITTED) {
@@ -453,7 +442,8 @@ final class PageStore {
             }
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
-                allocator.storeBytesReleased(block.memoryAddress(), committed * sliceSize, block.isDirect());
+                allocator.storeBytesReleased(block.buffer._memoryAddress(), committed * sliceSize,
+                        block.buffer.isDirect());
             }
         }
     }
@@ -507,7 +497,7 @@ final class PageStore {
                 continue;
             }
             for (int slot = 0; slot < region.slots; slot++) {
-                Segment block = region.block(slot);
+                Segment block = region.blocks[slot];
                 long candidates = purgeable(block, block.free, now, delay);
                 while (candidates != 0) {
                     long run = lowestRun(candidates);
@@ -548,14 +538,14 @@ final class PageStore {
             purgeSequence++; // odd: the purger holds slices
             try {
                 int claimed = 0;
-                while (claimed < region.slots && region.block(claimed).claimWhole()) {
+                while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
                     claimed++;
                 }
                 if (claimed == region.slots && idle(region, now, delay, true) && release(region)) {
                     continue;
                 }
                 for (int slot = 0; slot < claimed; slot++) {
-                    Segment block = region.block(slot);
+                    Segment block = region.blocks[slot];
                     block.giveBack(block.allFree);
                 }
             } finally {
@@ -570,7 +560,7 @@ final class PageStore {
      */
     private static boolean idle(Region region, long now, long delay, boolean claimed) {
         for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.block(slot);
+            Segment block = region.blocks[slot];
             if (!claimed && !block.isWhollyFree()) {
                 return false;
             }
@@ -663,7 +653,7 @@ final class PageStore {
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     long address = region.buffer._memoryAddress() + offset;
-                    allocator.storeBytesReleased(address, length, block.isDirect());
+                    allocator.storeBytesReleased(address, length, block.buffer.isDirect());
                     givenBack(address, length, 0, region.index, PURGED_SLICES, NO_HEAP);
                 }
             } finally {
@@ -708,7 +698,7 @@ final class PageStore {
                 continue;
             }
             for (int slot = 0; slot < region.slots; slot++) {
-                Segment block = region.block(slot);
+                Segment block = region.blocks[slot];
                 long free = block.free;
                 for (int i = 0; i < block.slices; i++) {
                     if ((free & 1L << i) == 0) {

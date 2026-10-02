@@ -22,7 +22,6 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.Random;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
-import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -106,7 +105,7 @@ final class SegmentTest {
         segment.claimRun(2);
         assertEquals(11, segment.usedSlices());
         assertEquals(53, segment.freeSlices());
-        assertEquals(64L * SLICE_SIZE_BYTES, segment.capacity());
+        assertEquals(64L * SLICE_SIZE_BYTES, segment.buffer.capacity());
     }
 
     @Test

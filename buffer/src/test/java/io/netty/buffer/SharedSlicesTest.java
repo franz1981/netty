@@ -39,7 +39,6 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -67,11 +66,11 @@ final class SharedSlicesTest {
     }
 
     private static Segment block(PageStore store, long run) {
-        return store.region((int) (run >>> 32)).block(slice(run) / PER_BLOCK);
+        return store.regions[(int) (run >>> 32)].blocks[slice(run) / PER_BLOCK];
     }
 
     private static void release(PageStore store, long run, int n) {
-        store.releaseSlices(block(store, run), slice(run) % PER_BLOCK, n);
+        block(store, run).releaseRun(slice(run) % PER_BLOCK, n, System.nanoTime());
     }
 
     @Test
@@ -131,7 +130,7 @@ final class SharedSlicesTest {
         long second = store.takeRun(2);
         assertEquals(3, (int) second, "block 2 has a slice claimed");
         assertEquals(5, (int) store.takeRun(1));
-        Region region = store.region(0);
+        Region region = store.regions[0];
         store.freeRun(region, 0, 2);
         assertEquals(0, (int) store.takeRun(2), "free again");
         store.freeRun(region, 5, 1);
@@ -297,7 +296,7 @@ final class SharedSlicesTest {
         assertEquals(0, (int) (again >>> 32), "the released region's place");
         assertEquals(1, store.regionCount());
         assertEquals(2, malloc.regions.size());
-        assertTrue(store.region(0).buffer != malloc.released.get(0));
+        assertTrue(store.regions[0].buffer != malloc.released.get(0));
         release(store, again, 9);
         store.close();
         assertEquals(0, store.allocator.usedMemory());
@@ -359,7 +358,7 @@ final class SharedSlicesTest {
                             + " while " + owner + " holds it");
                 }
             }
-            AbstractByteBuf memory = store.region(run[0]).buffer;
+            AbstractByteBuf memory = store.regions[run[0]].buffer;
             long value = (long) id << 40 | ++stamp;
             for (int s = run[1]; s < run[1] + run[2]; s++) {
                 memory.setLong(s * SLICE, value);
@@ -369,7 +368,7 @@ final class SharedSlicesTest {
         }
 
         private void release(int[] run) {
-            AbstractByteBuf memory = store.region(run[0]).buffer;
+            AbstractByteBuf memory = store.regions[run[0]].buffer;
             long value = (long) run[4] << 32 | run[5] & 0xFFFFFFFFL;
             for (int s = run[1]; s < run[1] + run[2]; s++) {
                 if (memory.getLong(s * SLICE) != value || memory.getLong(s * SLICE + SLICE - 8) != value) {
@@ -380,11 +379,11 @@ final class SharedSlicesTest {
                     failure.compareAndSet(null, "slice " + s + " of region " + run[0] + " not owned by " + id);
                 }
             }
-            Region region = store.region(run[0]);
+            Region region = store.regions[run[0]];
             if (run[3] == 1) {
                 store.freeRun(region, run[1] / perBlock, run[2] / perBlock);
             } else {
-                store.releaseSlices(region.block(run[1] / perBlock), run[1] % perBlock, run[2]);
+                region.blocks[run[1] / perBlock].releaseRun(run[1] % perBlock, run[2], System.nanoTime());
             }
         }
     }

@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it, which alone
  * touches that slice's {@link #freedAt}; the CAS that sets the bit again publishes it.
  */
-final class Segment implements ChunkInfo {
+final class Segment {
     private static final AtomicLongFieldUpdater<Segment> FREE =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
 
@@ -149,21 +149,6 @@ final class Segment implements ChunkInfo {
 
     int usedSlices() {
         return slices - freeSlices();
-    }
-
-    @Override
-    public int capacity() {
-        return buffer.capacity();
-    }
-
-    @Override
-    public boolean isDirect() {
-        return buffer.isDirect();
-    }
-
-    @Override
-    public long memoryAddress() {
-        return buffer._memoryAddress();
     }
 
     @Override

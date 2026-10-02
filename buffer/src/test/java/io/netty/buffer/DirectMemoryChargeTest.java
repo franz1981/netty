@@ -33,7 +33,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -69,11 +68,11 @@ final class DirectMemoryChargeTest {
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
         assertEquals(base + regionCharge + 9L * SLICE, used(), "the region is not charged, the slices are");
-        Segment block = store.region(0).block(0);
-        store.releaseSlices(block, 0, 9);
+        Segment block = store.regions[0].blocks[0];
+        block.releaseRun(0, 9, System.nanoTime());
         assertEquals(run, store.claimSlices(9, 0, PageStore.NO_HEAP));
         assertEquals(base + regionCharge + 9L * SLICE, used(), "committed already: not charged again");
-        store.releaseSlices(block, 3, 6);
+        block.releaseRun(3, 6, System.nanoTime());
         long now = System.nanoTime();
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(6, store.slicesPurged);
@@ -96,7 +95,7 @@ final class DirectMemoryChargeTest {
         AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
         PageStore store = allocator.pageStore;
         store.claimSlices(9, 0, PageStore.NO_HEAP);
-        Segment block = store.region(0).block(0);
+        Segment block = store.regions[0].blocks[0];
         long filler = PlatformDependent.maxDirectMemory() - used() - 4L * SLICE;
         charge(filler);
         try {
@@ -104,7 +103,7 @@ final class DirectMemoryChargeTest {
             assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
             assertEquals(Region.UNCOMMITTED, block.freedAt[9]);
             assertEquals(9, store.slicesCommitted);
-            store.releaseSlices(block, 0, 9);
+            block.releaseRun(0, 9, System.nanoTime());
             assertEquals(0, (int) store.claimSlices(9, 0, PageStore.NO_HEAP), "committed: nothing to charge");
         } finally {
             credit(filler);
@@ -130,10 +129,10 @@ final class DirectMemoryChargeTest {
         assertEquals(base + REGION_SIZE, used(), "the region, whole");
         store.takeRun(SLOTS); // a second region, whole
         assertEquals(base + 2L * REGION_SIZE, used());
-        store.releaseSlices(store.region(0).block(0), 0, 9);
+        store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         assertEquals((int) run, (int) store.claimSlices(9, 0, PageStore.NO_HEAP));
         assertEquals(base + 2L * REGION_SIZE, used(), "nothing per slice");
-        store.releaseSlices(store.region(0).block(0), 0, 9);
+        store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
         assertEquals(1, store.regionsReleased, "the first region went back, the second is out");
         assertEquals(base + REGION_SIZE, used(), "credited by its free");

@@ -69,7 +69,7 @@ final class SharedSliceAllocatorTest {
     }
 
     private long regionOffset(ByteBuf buf) {
-        return buf.memoryAddress() - allocator.pageStore.region(0).buffer.memoryAddress();
+        return buf.memoryAddress() - allocator.pageStore.regions[0].buffer.memoryAddress();
     }
 
     @ParameterizedTest(name = "malloc: {0}")
@@ -155,7 +155,7 @@ final class SharedSliceAllocatorTest {
         assertEquals(0, regionOffset(blocks) % SEGMENT_SIZE);
         assertEquals((3 * MIB + MIB) / SLICE + 2 * (SEGMENT_SIZE / SLICE), allocator.pageStore.sliceCounts()[0]);
         assertEquals(0, segments.segmentsAllocated());
-        assertSame(allocator.pageStore.region(0), allocator.pageStore.regions[0]);
+        assertSame(allocator.pageStore.regions[0], allocator.pageStore.regions[0]);
         span.release();
         small.release();
         blocks.release();

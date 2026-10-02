@@ -41,7 +41,7 @@ final class Region {
     final int slots;
     /** {@link #slots} blocks, in bytes. */
     final int length;
-    private final Segment[] blocks;
+    final Segment[] blocks;
     /**
      * Per slice of the region, slice owner only: whether memory was ever behind it, so that a slice with none now was
      * purged.
@@ -74,10 +74,6 @@ final class Region {
         if (committed) {
             Arrays.fill(sliceEverCommitted, true);
         }
-    }
-
-    Segment block(int slot) {
-        return blocks[slot];
     }
 
     /**

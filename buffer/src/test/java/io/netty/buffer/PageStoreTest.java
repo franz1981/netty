@@ -31,9 +31,6 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -60,7 +57,7 @@ final class PageStoreTest {
         for (int i = 0; i < 3; i++) {
             long run = store.claimSlices(63, 0, PageStore.NO_HEAP);
             assertEquals(0, store.start(run));
-            assertEquals(0, store.block(run).memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
+            assertEquals(0, store.block(run).buffer.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
         }
         assertEquals(0, allocator.pageStore.regions[0].buffer.memoryAddress() & REGION_ALIGNMENT - 1);
     }
@@ -91,7 +88,7 @@ final class PageStoreTest {
                 store.purgeIfDue(now += INTERVAL / 2);
             } else if (live == capacity || live > 0 && dice < 8) {
                 int k = random.nextInt(live);
-                store.releaseSlices(spans[k], starts[k], lengths[k]);
+                spans[k].releaseRun(starts[k], lengths[k], System.nanoTime());
                 live--;
                 spans[k] = spans[live];
                 starts[k] = starts[live];
@@ -108,7 +105,7 @@ final class PageStoreTest {
         }
         while (live > 0) {
             live--;
-            store.releaseSlices(spans[live], starts[live], lengths[live]);
+            spans[live].releaseRun(starts[live], lengths[live], System.nanoTime());
         }
         assertEquals(0, store.sliceCounts()[0], "no span out");
         assertEquals(withRegions, !regions.regions.isEmpty());
@@ -176,7 +173,7 @@ final class PageStoreTest {
         assertSame(malloc, store.regionSource);
         assertSame(malloc, first.region.source);
         assertEquals(1, first.region.slots, "a region of one block");
-        store.releaseSlices(blocks[4], 0, SPAN);
+        blocks[4].releaseRun(0, SPAN, System.nanoTime());
         assertSame(blocks[4], claim(store, SPAN), "the free slices of the mapped region");
         Segment second = claim(store, SPAN);
         assertSame(malloc, second.region.source);
@@ -187,10 +184,10 @@ final class PageStoreTest {
         assertEquals(0, segments.segmentsAllocated());
         assertSharedAccounted(segments, allocator);
         for (Segment block : new Segment[] {first, second}) {
-            store.releaseSlices(block, 0, SPAN);
+            block.releaseRun(0, SPAN, System.nanoTime());
         }
         for (Segment block : blocks) {
-            store.releaseSlices(block, 0, SPAN);
+            block.releaseRun(0, SPAN, System.nanoTime());
         }
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
         assertEquals(2, store.regionsReleased, "the idle one-block regions went back, the mapped one stays");

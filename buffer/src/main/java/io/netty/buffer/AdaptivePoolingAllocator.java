@@ -230,7 +230,6 @@ final class AdaptivePoolingAllocator {
 
     private final ChunkAllocator chunkAllocator;
     private final ChunkRegistry chunkRegistry;
-    private final SizeClassChunkManagementStrategy[] sizeClassStrategies;
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
 
@@ -266,11 +265,6 @@ final class AdaptivePoolingAllocator {
         int segmentSize = pageStore.config.segmentSize;
         chunkSizes = distinctChunkSizes(SIZE_CLASSES, sliceSize, segmentSize);
         sizeClassToChunkPool = chunkPools(SIZE_CLASSES, chunkSizes, sliceSize, segmentSize);
-        sizeClassStrategies = new SizeClassChunkManagementStrategy[SIZE_CLASSES.length];
-        for (int i = 0; i < SIZE_CLASSES.length; i++) {
-            sizeClassStrategies[i] = new SizeClassChunkManagementStrategy(
-                    SIZE_CLASSES[i], chunkSizeOf(SIZE_CLASSES[i], sliceSize, segmentSize));
-        }
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new StripedHeap(pageStore);
@@ -518,7 +512,7 @@ final class AdaptivePoolingAllocator {
         if (run < 0) {
             return null;
         }
-        Region region = store.region((int) (run >>> 32));
+        Region region = store.regions[(int) (run >>> 32)];
         int start = (int) run;
         boolean made = false;
         try {
@@ -574,7 +568,6 @@ final class AdaptivePoolingAllocator {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
                 event.threadLocal = threadLocal;
-                event.segment = chunk instanceof Segment;
                 event.commit();
             }
         }
@@ -588,7 +581,6 @@ final class AdaptivePoolingAllocator {
             if (event.shouldCommit()) {
                 event.fill(chunk, AdaptiveByteBufAllocator.class);
                 event.pooled = pooled;
-                event.segment = chunk instanceof Segment;
                 event.commit();
             }
         }
@@ -603,7 +595,10 @@ final class AdaptivePoolingAllocator {
         if (PlatformDependent.isJfrEnabled() && AllocateChunkEvent.isEventEnabled()) {
             AllocateChunkEvent event = new AllocateChunkEvent();
             if (event.shouldCommit()) {
-                event.fill(new StoreBytes(address, bytes, direct), AdaptiveByteBufAllocator.class);
+                event.allocatorType = AdaptiveByteBufAllocator.class;
+                event.capacity = bytes;
+                event.direct = direct;
+                event.address = address;
                 event.pooled = true;
                 event.threadLocal = threadLocal;
                 event.segment = true;
@@ -618,39 +613,14 @@ final class AdaptivePoolingAllocator {
         if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
             FreeChunkEvent event = new FreeChunkEvent();
             if (event.shouldCommit()) {
-                event.fill(new StoreBytes(address, bytes, direct), AdaptiveByteBufAllocator.class);
+                event.allocatorType = AdaptiveByteBufAllocator.class;
+                event.capacity = bytes;
+                event.direct = direct;
+                event.address = address;
                 event.pooled = true;
                 event.segment = true;
                 event.commit();
             }
-        }
-    }
-
-    /** Shared slices or a whole region, for the JFR chunk events only. */
-    private static final class StoreBytes implements ChunkInfo {
-        private final long address;
-        private final int bytes;
-        private final boolean direct;
-
-        StoreBytes(long address, int bytes, boolean direct) {
-            this.address = address;
-            this.bytes = bytes;
-            this.direct = direct;
-        }
-
-        @Override
-        public int capacity() {
-            return bytes;
-        }
-
-        @Override
-        public boolean isDirect() {
-            return direct;
-        }
-
-        @Override
-        public long memoryAddress() {
-            return address;
         }
     }
 
@@ -974,8 +944,7 @@ final class AdaptivePoolingAllocator {
             if (recycler == null) {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
-            SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
-            SizeClassMagazine mag = new SizeClassMagazine(allocator, strategy, chunkRecycler, idleDecay,
+            SizeClassMagazine mag = new SizeClassMagazine(allocator, chunkRecycler, idleDecay,
                     sizeClassIndex, null, recycler, lock, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
@@ -1134,8 +1103,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private SizeClassMagazine createMagazine(int sizeClassIndex) {
-            SizeClassChunkManagementStrategy strategy = allocator.sizeClassStrategies[sizeClassIndex];
-            SizeClassMagazine mag = new SizeClassMagazine(allocator, strategy, chunkRecycler, idleDecay,
+            SizeClassMagazine mag = new SizeClassMagazine(allocator, chunkRecycler, idleDecay,
                                        sizeClassIndex, Thread.currentThread(), null, null, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
@@ -1710,25 +1678,6 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private static final class SizeClassChunkManagementStrategy {
-        private final int segmentSize;
-        private final int chunkSize;
-
-        private SizeClassChunkManagementStrategy(int segmentSize, int chunkSize) {
-            this.segmentSize = ObjectUtil.checkPositive(segmentSize, "segmentSize");
-            this.chunkSize = chunkSize;
-        }
-
-        SizeClassChunkController createController() {
-            return new SizeClassChunkController(segmentSize, chunkSize);
-        }
-
-        SizeClassedChunkCache createChunkCache(SizeClassChunkRecycler chunkRecycler, int sizeClassIndex,
-                                               StampedLock stripeLock) {
-            return new SizeClassedChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
-        }
-    }
-
     private static final class SizeClassChunkController {
 
         private static final int COLOUR_SHIFT = 6;
@@ -1843,7 +1792,7 @@ final class AdaptivePoolingAllocator {
                 }
                 return new SizeClassedChunk(span, magazine, this, segment, start, base, capacity);
             } catch (Throwable t) {
-                store.releaseSlices(segment, start, slices);
+                segment.releaseRun(start, slices, System.nanoTime());
                 throw t;
             }
         }
@@ -1927,7 +1876,7 @@ final class AdaptivePoolingAllocator {
         private int purgeTicksAtDecay;
         private int allocCountAtDecay;
 
-        SizeClassMagazine(AdaptivePoolingAllocator allocator, SizeClassChunkManagementStrategy strategy,
+        SizeClassMagazine(AdaptivePoolingAllocator allocator,
                           SizeClassChunkRecycler chunkRecycler, IdleDecay idleDecay, int sizeClassIndex,
                           Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
                           SizeClassMagazine[] heapMagazines, int seq) {
@@ -1939,10 +1888,12 @@ final class AdaptivePoolingAllocator {
             this.sizeClassIndex = sizeClassIndex;
             this.chunkRecycler = chunkRecycler;
             this.bufRecycler = bufRecycler;
-            this.chunkController = strategy.createController();
-            this.chunkCache = strategy.createChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
+            int segmentSize = SIZE_CLASSES[sizeClassIndex];
+            int chunkSize = allocator.chunkSizes[allocator.sizeClassToChunkPool[sizeClassIndex]];
+            this.chunkController = new SizeClassChunkController(segmentSize, chunkSize);
+            this.chunkCache = new SizeClassedChunkCache(chunkRecycler, sizeClassIndex, stripeLock);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
-                    CHUNK_PURGE_INTERVAL * (strategy.chunkSize / strategy.segmentSize));
+                    CHUNK_PURGE_INTERVAL * (chunkSize / segmentSize));
         }
 
         /**
@@ -2183,7 +2134,7 @@ final class AdaptivePoolingAllocator {
                 initialized = true;
             } finally {
                 if (!initialized) {
-                    store.releaseSlices(segment, start, slices);
+                    segment.releaseRun(start, slices, System.nanoTime());
                 }
             }
             idleDecay.count(size >>> COUNT_SHIFT);
@@ -2223,7 +2174,7 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int offset, int length) {
             int shift = sliceShift;
-            store.releaseSlices(block, offset >>> shift, length + (1 << shift) - 1 >>> shift);
+            block.releaseRun(offset >>> shift, length + (1 << shift) - 1 >>> shift, System.nanoTime());
         }
 
         @Override
@@ -2715,9 +2666,9 @@ final class AdaptivePoolingAllocator {
             markToDeallocate();
         }
 
-        /** The span goes back to the store's shared slices, from any thread (see {@link PageStore#releaseSlices}). */
+        /** The span goes back to the store's shared slices, from any thread (see {@link Segment#releaseRun}). */
         protected void deallocate() {
-            allocator.pageStore.releaseSlices(segment, spanStart, spanSlices());
+            segment.releaseRun(spanStart, spanSlices(), System.nanoTime());
         }
 
         void markToDeallocate() {

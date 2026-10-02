@@ -33,7 +33,6 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -261,7 +260,7 @@ final class PageStoreTestSupport {
             assertSame(segment.buffer.array(), buf.array(), "not the segment's array");
             return buf.arrayOffset() - segment.buffer.arrayOffset();
         }
-        return buf.memoryAddress() - segment.memoryAddress();
+        return buf.memoryAddress() - segment.buffer.memoryAddress();
     }
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
@@ -307,7 +306,7 @@ final class PageStoreTestSupport {
     private static int committedSlices(Region region) {
         int committed = 0;
         for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.block(slot);
+            Segment block = region.blocks[slot];
             long free = block.free;
             for (int i = 0; i < block.slices; i++) {
                 boolean behind = block.freedAt[i] != Region.UNCOMMITTED;

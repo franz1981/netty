@@ -129,9 +129,9 @@ public class AdaptiveSegmentsTest {
 
     /** The slices claimed in the block of region {@code index}, a region of one block. */
     private static int usedSlices(AdaptivePoolingAllocator allocator, int index) {
-        Region region = allocator.pageStore.region(index);
+        Region region = allocator.pageStore.regions[index];
         assertFalse(region.released);
-        return region.block(0).usedSlices();
+        return region.blocks[0].usedSlices();
     }
 
     /** The slices claimed in all regions. */

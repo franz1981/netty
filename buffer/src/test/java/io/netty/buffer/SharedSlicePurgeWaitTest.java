@@ -55,7 +55,7 @@ final class SharedSlicePurgeWaitTest {
         final PageStore store = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL).pageStore;
         int blocks = REGION_SIZE / SEGMENT_SIZE;
         assertEquals(0, (int) store.takeRun(blocks), "the whole region");
-        Region region = store.region(0);
+        Region region = store.regions[0];
         store.freeRun(region, blocks - 1, 1); // the last block is the only free memory
         // A first purge, so that the one under test does not pay for the first call's linking.
         store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);

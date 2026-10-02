@@ -176,7 +176,7 @@ final class PageStoreStateEvent extends Event {
     private static final int UNTOUCHED = 3;
 
     private static int sliceStateOf(Region region, int slice, int perBlock) {
-        Segment block = region.block(slice / perBlock);
+        Segment block = region.blocks[slice / perBlock];
         int i = slice % perBlock;
         if ((block.free & 1L << i) == 0) {
             return OUT;
