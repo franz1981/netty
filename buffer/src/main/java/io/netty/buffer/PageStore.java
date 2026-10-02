@@ -348,7 +348,8 @@ final class PageStore {
         Region region = new Region(buffer, config.segmentsPerRegion(), segmentSource, config);
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.block(slot);
-            block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this);
+            block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, false);
+            block.threadLocalSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, true);
         }
         return region;
     }

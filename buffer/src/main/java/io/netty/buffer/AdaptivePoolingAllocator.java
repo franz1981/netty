@@ -2056,7 +2056,8 @@ final class AdaptivePoolingAllocator {
         }
 
         private static void countIfMovable(SizeClassedChunk chunk) {
-            if (chunk != null && chunk.hasFullCapacity()) {
+            // Only the heap's own segments evacuate: a block of shared slices is no heap's.
+            if (chunk != null && chunk.segment.sharedSpans == null && chunk.hasFullCapacity()) {
                 chunk.segment.movableSlices += chunk.spanSlices();
             }
         }
@@ -3056,8 +3057,9 @@ final class AdaptivePoolingAllocator {
             // past the buffer, so it costs no memory. A release rounds its capacity up to whole slices again.
             int colours = Math.min(MAX_COLOURS, (int) (((long) slices << sliceShift) - size >>> COLOUR_SHIFT) + 1);
             int colour = colours == 1 ? 0 : (nextColour++ & Integer.MAX_VALUE) % colours << COLOUR_SHIFT;
-            // A block of shared slices has one chunk for every heap's spans; a segment of the heap's own, its own.
-            Chunk chunk = segment.sharedSpans;
+            // A block of shared slices has one chunk for the spans of every thread-local heap, and one for every
+            // stripe's; a segment of the heap's own, its own.
+            Chunk chunk = ownerThread != null ? segment.threadLocalSpans : segment.sharedSpans;
             if (chunk == null) {
                 chunk = spanChunkOf(segment);
             }
@@ -3251,11 +3253,14 @@ final class AdaptivePoolingAllocator {
         private final PageStore store;
         private final Segment block;
         private final int sliceShift;
+        private final boolean threadLocal;
 
-        SharedSpanChunk(Segment block, PageStore store) {
+        /** @param threadLocal whether the heaps whose spans this chunk holds are thread-local ones, for JFR */
+        SharedSpanChunk(Segment block, PageStore store, boolean threadLocal) {
             super(block.buffer, store.allocator, true);
             this.store = store;
             this.block = block;
+            this.threadLocal = threadLocal;
             assert (block.sliceSize & block.sliceSize - 1) == 0 : "slices of a power of two";
             sliceShift = Integer.numberOfTrailingZeros(block.sliceSize);
         }
@@ -3265,6 +3270,11 @@ final class AdaptivePoolingAllocator {
         void releaseSegment(int offset, int length) {
             int shift = sliceShift;
             store.releaseSlices(block, offset >>> shift, length + (1 << shift) - 1 >>> shift);
+        }
+
+        @Override
+        boolean inThreadLocalMagazine() {
+            return threadLocal;
         }
 
         @Override
@@ -3985,7 +3995,10 @@ final class AdaptivePoolingAllocator {
         @Override
         protected void deallocate() {
             if (segment != null) {
-                segment.releasedWhole(System.nanoTime());
+                if (segment.sharedSpans == null) {
+                    // A shared block's release stamps its own slices.
+                    segment.releasedWhole(System.nanoTime());
+                }
                 allocator.pageStore.free(segment);
             } else if (region != null) {
                 allocator.pageStore.freeRun(region, runStart, runSlots);

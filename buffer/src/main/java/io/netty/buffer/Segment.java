@@ -69,10 +69,12 @@ final class Segment implements ChunkInfo {
      */
     AdaptivePoolingAllocator.SpanChunk spanChunk;
     /**
-     * A block of shared slices only, else {@code null}: the chunk of every large-buffer span claimed in it, by any
-     * heap. Set before its region is published.
+     * A block of shared slices only, else {@code null}: the chunk of every large-buffer span a stripe claimed in it.
+     * Set before its region is published.
      */
     AdaptivePoolingAllocator.Chunk sharedSpans;
+    /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
+    AdaptivePoolingAllocator.Chunk threadLocalSpans;
 
     Segment(AbstractByteBuf buffer, int sliceSize) {
         this(buffer, sliceSize, null, -1);

@@ -600,8 +600,7 @@ public class JfrEventsTest {
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools no 512 KiB buffers");
         final int size = 512 * 1024;
         AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
-        // With shared slices the page store's event is the span's own slices, and the span's chunk is the block's,
-        // which belongs to no heap.
+        // With shared slices the page store's event is the span's own slices.
         final boolean shared = AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
         Callable<Void> allocateAndRelease = () -> {
             try (RecordingStream stream = new RecordingStream()) {
@@ -625,8 +624,7 @@ public class JfrEventsTest {
                 alloc.directBuffer(size, size).release();
 
                 assertTrue(chunkFuture.get(10, TimeUnit.SECONDS).getBoolean("threadLocal"), "the chunk event");
-                assertEquals(!shared, bufferFuture.get(10, TimeUnit.SECONDS).getBoolean("chunkThreadLocal"),
-                        "the buffer event");
+                assertTrue(bufferFuture.get(10, TimeUnit.SECONDS).getBoolean("chunkThreadLocal"), "the buffer event");
                 return null;
             }
         };
