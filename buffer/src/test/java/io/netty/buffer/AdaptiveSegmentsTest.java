@@ -347,8 +347,7 @@ public class AdaptiveSegmentsTest {
 
     /**
      * Buffers of different chunks of one heap segment, each written whole with its own pattern, then read back: no two
-     * overlap. The second round's chunks are re-created with the free lists of the first round's (see
-     * {@link AdaptivePoolingAllocator.SizeClassChunkRecycler}), at other spans.
+     * overlap. The second round's chunks are re-created at other spans than the first round's.
      */
     @ParameterizedTest
     @CsvSource({"false, false", "false, true", "true, false", "true, true"})
@@ -359,13 +358,11 @@ public class AdaptiveSegmentsTest {
         final int small = 1024; // 2-slice chunks
         final int large = isLowMemory() ? 16384 : 65536; // 8-slice chunks
         Callable<Void> work = () -> {
-            List<Object> firstLists = new ArrayList<Object>();
             List<ByteBuf> bufs = new ArrayList<ByteBuf>();
             for (int i = 0; i < 3 * (8 * SLICE_SIZE_BYTES / large); i++) {
                 bufs.add(allocator.allocate(large, large));
             }
             for (ByteBuf buf : bufs) {
-                firstLists.add(field(chunkOf(buf), "externalFreeList"));
                 buf.release();
             }
             bufs.clear();
@@ -383,7 +380,7 @@ public class AdaptiveSegmentsTest {
                 SizeClassedChunk chunk = chunkOf(buf);
                 if (!seen.contains(chunk)) {
                     seen.add(chunk);
-                    recreated += firstLists.contains(field(chunk, "externalFreeList")) && chunk.spanStart != 0 ? 1 : 0;
+                    recreated += chunk.spanStart != 0 ? 1 : 0;
                 }
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES && offset + buf.capacity()
@@ -392,7 +389,7 @@ public class AdaptiveSegmentsTest {
                     buf.setLong(j, (long) i << 32 | j);
                 }
             }
-            assertTrue(recreated > 0, "a chunk re-created from recycled lists, not at the segment's start");
+            assertTrue(recreated > 0, "a chunk re-created, not at the segment's start");
             for (int i = 0; i < bufs.size(); i++) {
                 ByteBuf buf = bufs.get(i);
                 for (int j = 0; j < buf.capacity(); j += 8) {
