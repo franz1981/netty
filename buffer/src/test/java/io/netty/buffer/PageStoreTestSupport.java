@@ -17,7 +17,7 @@ package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.internal.PlatformDependent;
 
 import java.util.ArrayList;
@@ -53,10 +53,9 @@ final class PageStoreTestSupport {
      * Direct or heap blocks counted as they are allocated and freed, as the regions of one block of
      * {@link #mallocRegionSource()} unless {@link #fallback} is set; also the chunk allocator of the allocator under
      * test, for the chunks that are not carved from blocks. The heap one does what the heap allocator's does: a
-     * {@code byte[]} per block or chunk, and a span is the block itself.
+     * {@code byte[]} per block or chunk, and a view is the block itself.
      */
-    static final class CountingSegmentSource
-            implements SegmentSource, AdaptivePoolingAllocator.ChunkAllocator {
+    static final class CountingMemorySource implements MemorySource {
         final boolean heap;
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
@@ -78,11 +77,11 @@ final class PageStoreTestSupport {
             }
         };
 
-        CountingSegmentSource() {
+        CountingMemorySource() {
             this(false);
         }
 
-        CountingSegmentSource(boolean heap) {
+        CountingMemorySource(boolean heap) {
             this.heap = heap;
         }
 
@@ -102,9 +101,9 @@ final class PageStoreTestSupport {
         }
 
         @Override
-        public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
-            return heap ? segment :
-                    AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, segment, offset, length);
+        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
+            return heap ? block :
+                    AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, block, offset, length);
         }
 
         @Override
@@ -279,33 +278,33 @@ final class PageStoreTestSupport {
     }
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
-    static AdaptivePoolingAllocator newAllocator(CountingSegmentSource source, int segmentSize) {
-        return new AdaptivePoolingAllocator(source, true, source, null,
+    static AdaptivePoolingAllocator newAllocator(CountingMemorySource source, int segmentSize) {
+        return new AdaptivePoolingAllocator(source, true, null,
                 new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL, 0, 0, segmentSize));
     }
 
-    static AdaptivePoolingAllocator newAllocator(CountingSegmentSource segments, CountingRegionSource regions,
+    static AdaptivePoolingAllocator newAllocator(CountingMemorySource segments, CountingRegionSource regions,
                                                  int regionSize, int alignment) {
-        return new AdaptivePoolingAllocator(segments, true, segments, regions,
+        return new AdaptivePoolingAllocator(segments, true, regions,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 
     /** With regions of {@code regionSize} from {@code regions}: every chunk is a run of their shared slices. */
-    static AdaptivePoolingAllocator newSharedAllocator(CountingSegmentSource segments, RegionSource regions,
+    static AdaptivePoolingAllocator newSharedAllocator(CountingMemorySource segments, RegionSource regions,
                                                        int regionSize, long purgeDelayNanos) {
         // A region of one block is a malloc'd one's size.
         PageStoreConfig config = regionSize == SEGMENT_SIZE ?
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE)
                         .withMallocRegions() :
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT);
-        return new AdaptivePoolingAllocator(segments, true, segments, regions, config);
+        return new AdaptivePoolingAllocator(segments, true, regions, config);
     }
 
     /**
      * The used memory is the chunk buffers allocated on their own, plus the committed slices of the regions that purge
      * them, plus the other regions whole, from their allocation to their release.
      */
-    static void assertSharedAccounted(CountingSegmentSource segments, AdaptivePoolingAllocator allocator) {
+    static void assertSharedAccounted(CountingMemorySource segments, AdaptivePoolingAllocator allocator) {
         PageStore store = allocator.pageStore;
         long stored = 0;
         for (Region region : store.regions) {
@@ -329,12 +328,12 @@ final class PageStoreTestSupport {
         return committed;
     }
 
-    static void assertAccounted(CountingSegmentSource source, AdaptivePoolingAllocator allocator) {
+    static void assertAccounted(CountingMemorySource source, AdaptivePoolingAllocator allocator) {
         assertEquals(source.unreleasedBytes(), allocator.usedMemory(), "usedMemory() and the segment source disagree");
     }
 
     /** As {@link #assertSharedAccounted}: {@code regions} are counted through the store. */
-    static void assertAccounted(CountingSegmentSource segments, CountingRegionSource regions,
+    static void assertAccounted(CountingMemorySource segments, CountingRegionSource regions,
                                 AdaptivePoolingAllocator allocator) {
         assertSharedAccounted(segments, allocator);
     }

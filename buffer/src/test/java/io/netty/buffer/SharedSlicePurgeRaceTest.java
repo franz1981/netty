@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -45,7 +45,7 @@ final class SharedSlicePurgeRaceTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /**

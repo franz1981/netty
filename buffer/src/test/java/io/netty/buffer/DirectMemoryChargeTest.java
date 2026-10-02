@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.internal.OutOfDirectMemoryError;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.BeforeEach;
@@ -55,7 +55,7 @@ final class DirectMemoryChargeTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
     /** Without mmap, the test regions are direct buffers, charged whole by their allocation. */
     private final long regionCharge = regions.mmap != null ? 0 : REGION_SIZE;
@@ -200,7 +200,7 @@ final class DirectMemoryChargeTest {
         AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
         Field direct = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
         direct.setAccessible(true);
-        RegionSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.segmentSource
+        RegionSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.memory
                 .mallocRegionSource();
         long base = PlatformDependent.usedDirectMemory();
         AbstractByteBuf block = source.allocateRegion(SEGMENT_SIZE, 0);

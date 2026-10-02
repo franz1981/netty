@@ -15,7 +15,7 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -35,7 +35,7 @@ final class SegmentTest {
     /** The block of a region of one, whose releases arm a page store's purge. */
     private static Segment segment(int slices) {
         int size = slices * SLICE_SIZE_BYTES;
-        CountingSegmentSource source = new CountingSegmentSource(true);
+        CountingMemorySource source = new CountingMemorySource(true);
         PageStore store = newAllocator(source, size).pageStore;
         return new Region(store, source.allocateSegment(size), source.fallback, 1, source, store.config, true, 0)
                 .blocks[0];

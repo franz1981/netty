@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -59,7 +59,7 @@ final class SharedSlicesTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     private PageStore store(long purgeDelayNanos) {
@@ -204,11 +204,11 @@ final class SharedSlicesTest {
                 new CountingRegionSource(true, "heap".equals(kind)), owners, failure);
         // malloc'd and byte[] regions are one block each, as the direct and heap allocators'.
         final boolean heap = "heap".equals(kind);
-        final CountingSegmentSource segments = heap ? new CountingSegmentSource(true) : this.segments;
+        final CountingMemorySource segments = heap ? new CountingMemorySource(true) : this.segments;
         final PageStore store;
         if (heap) {
             int block = PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES;
-            store = closer.add(new AdaptivePoolingAllocator(segments, true, segments, source,
+            store = closer.add(new AdaptivePoolingAllocator(segments, true, source,
                     new PageStoreConfig(block, SLICE, 1, 0, 0, block).withMallocRegions())).pageStore;
         } else {
             store = closer.add(newSharedAllocator(segments, source, mmap ? REGION_SIZE : SEGMENT_SIZE, 1)).pageStore;

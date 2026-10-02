@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -61,7 +61,7 @@ final class AdaptiveLargeSegmentsTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private CountingSegmentSource segments = new CountingSegmentSource();
+    private CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     @BeforeEach
@@ -79,7 +79,7 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     private AdaptivePoolingAllocator withoutRegions(boolean heap) {
-        segments = new CountingSegmentSource(heap);
+        segments = new CountingMemorySource(heap);
         return withoutRegions();
     }
 

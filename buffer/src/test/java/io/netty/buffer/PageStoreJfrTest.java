@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
 import org.junit.jupiter.api.Test;
@@ -105,7 +105,7 @@ public class PageStoreJfrTest {
             stream.enable(PageStoreStateEvent.NAME).withPeriod(Duration.ofMillis(50));
             stream.startAsync();
             AdaptivePoolingAllocator allocator = closer.add(PageStoreTestSupport.newSharedAllocator(
-                    new CountingSegmentSource(), regions, REGION_SIZE, INTERVAL));
+                    new CountingMemorySource(), regions, REGION_SIZE, INTERVAL));
             PageStore store = allocator.pageStore;
             final int id = System.identityHashCode(allocator);
             stream.onEvent(PageStoreStateEvent.NAME, event -> {

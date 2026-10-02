@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -50,7 +50,7 @@ final class PageStoreTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /** Where regions are mapped, a region starts at a multiple of 2 MiB, and so does each of its (4 MiB) blocks. */
@@ -164,7 +164,7 @@ final class PageStoreTest {
         };
         CountingRegionSource malloc = new CountingRegionSource(true);
         segments.fallback = malloc;
-        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(segments, true, segments, failing,
+        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(segments, true, failing,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT,
                         SEGMENT_SIZE)));
         PageStore store = allocator.pageStore;
@@ -214,8 +214,8 @@ final class PageStoreTest {
     @Test
     void withoutRegionsThereIsNoPageStore() {
         assertThrows(IllegalArgumentException.class, () -> newAllocator(segments, regions, 0, 0));
-        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(segments, true, segments,
-                null, new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT)));
+        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(segments, true, null,
+                new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT)));
         assertEquals(0, segments.segmentsAllocated());
         assertEquals(0, regions.regions.size());
     }

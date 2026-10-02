@@ -27,7 +27,7 @@ class UnpooledUnsafeNoCleanerDirectByteBuf extends UnpooledUnsafeDirectByteBuf {
 
     /**
      * A view of {@code span}, a slice of another buffer of this class, that never frees it: see
-     * {@code SegmentSource#span}.
+     * {@code MemorySource#view}.
      */
     UnpooledUnsafeNoCleanerDirectByteBuf(ByteBufAllocator alloc, ByteBuffer span, int capacity) {
         super(alloc, span, capacity, false);

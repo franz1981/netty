@@ -71,7 +71,7 @@ final class PageStore {
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
-    final SegmentSource segmentSource;
+    final MemorySource memory;
     /** Where new regions come from. Replaced once, under this store's monitor, by {@link #fallbackSource}. */
     volatile RegionSource regionSource;
     /** The blocks of a new region, and where it starts: replaced with {@link #regionSource}. */
@@ -117,16 +117,16 @@ final class PageStore {
     private int nextBlock;
 
     /**
-     * @param regionSource where the regions come from, or {@code null} for {@code segmentSource}'s: {@code mmap} where
+     * @param regionSource where the regions come from, or {@code null} for {@code memory}'s: {@code mmap} where
      *                     the config has regions and the source can map them, else {@code malloc}'d regions of one
      *                     block where the config has them
      */
-    PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, SegmentSource segmentSource,
+    PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, MemorySource memory,
               RegionSource regionSource) {
         if (regionSource == null) {
-            regionSource = config.regionSize > 0 ? segmentSource.regionSource() : null;
+            regionSource = config.regionSize > 0 ? memory.regionSource() : null;
             if (regionSource == null && config.mallocRegionSize > 0) {
-                regionSource = segmentSource.mallocRegionSource();
+                regionSource = memory.mallocRegionSource();
                 config = config.withMallocRegions();
             }
         }
@@ -136,12 +136,12 @@ final class PageStore {
         }
         this.allocator = allocator;
         this.config = config;
-        this.segmentSource = segmentSource;
+        this.memory = memory;
         this.regionSource = regionSource;
         regionBlocks = config.segmentsPerRegion();
         regionAlignment = config.regionAlignment;
         fallbackSource = config.mallocRegionSize > 0 && config.regionSize != config.mallocRegionSize ?
-                segmentSource.mallocRegionSource() : null;
+                memory.mallocRegionSource() : null;
         if (PlatformDependent.isJfrEnabled()) {
             PageStoreStateEvent.register(this);
         }
@@ -224,7 +224,7 @@ final class PageStore {
 
     /** A region charged whole has memory behind all of it, free since now. */
     private Region sharedRegion(AbstractByteBuf buffer, RegionSource source, int blocks) {
-        Region region = new Region(this, buffer, source, blocks, segmentSource, config, !source.canPurgeSlices(),
+        Region region = new Region(this, buffer, source, blocks, memory, config, !source.canPurgeSlices(),
                 System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];

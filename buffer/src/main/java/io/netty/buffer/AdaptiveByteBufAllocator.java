@@ -56,10 +56,10 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
         DirectChunkAllocator directChunks = new DirectChunkAllocator(this);
-        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, directChunks, null,
+        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, null,
                 PageStoreConfig.directDefaults());
         HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
-        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, heapChunks, null,
+        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, null,
                 PageStoreConfig.heapDefaults());
     }
 
@@ -103,7 +103,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     }
 
     /** Heap chunk buffers, and the blocks the size classes carve their chunks out of: one {@code byte[]} each. */
-    private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
+    private static final class HeapChunkAllocator implements MemorySource {
         private final ByteBufAllocator allocator;
 
         private HeapChunkAllocator(ByteBufAllocator allocator) {
@@ -118,8 +118,8 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
 
         @Override
-        public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
-            return segment;
+        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
+            return block;
         }
 
         /** Regions of one block each, one {@code byte[]} per block. */
@@ -134,7 +134,7 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
      * behind {@link UnsafeByteBufUtil#newDirectByteBuf} (or {@link java.nio.ByteBuffer#allocateDirect} without
      * {@code Unsafe}, which touches every page at once).
      */
-    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator, SegmentSource {
+    private static final class DirectChunkAllocator implements MemorySource {
         private final ByteBufAllocator allocator;
 
         private DirectChunkAllocator(ByteBufAllocator allocator) {
@@ -147,8 +147,8 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
 
         @Override
-        public AbstractByteBuf span(AbstractByteBuf segment, int offset, int length) {
-            return directSpan(allocator, segment, offset, length);
+        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
+            return directSpan(allocator, block, offset, length);
         }
 
         /** {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none. */

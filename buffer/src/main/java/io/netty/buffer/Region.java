@@ -53,7 +53,7 @@ final class Region {
     private volatile int maxAccessed = -1;
 
     /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
-    Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots, SegmentSource views,
+    Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots, MemorySource views,
            PageStoreConfig config, boolean committed, long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
         this.store = store;
@@ -65,7 +65,7 @@ final class Region {
         length = slots * size;
         blocks = new Segment[slots];
         for (int slot = 0; slot < slots; slot++) {
-            Segment block = new Segment(views.span(buffer, slot * size, size), config.sliceSize, this, slot);
+            Segment block = new Segment(views.view(buffer, slot * size, size), config.sliceSize, this, slot);
             if (committed) {
                 block.committed = block.allFree;
                 Arrays.fill(block.freedAt, committedAt);

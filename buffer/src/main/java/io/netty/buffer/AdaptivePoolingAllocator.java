@@ -228,7 +228,7 @@ final class AdaptivePoolingAllocator {
     private static final int POOLED_SIZE_CLASSES_COUNT =
             IS_LOW_MEM ? sizeClassIndexOf(LOW_MEM_MAX_SIZE_CLASS) + 1 : SIZE_CLASSES_COUNT;
 
-    private final ChunkAllocator chunkAllocator;
+    private final MemorySource memory;
     private final ChunkRegistry chunkRegistry;
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
@@ -250,16 +250,15 @@ final class AdaptivePoolingAllocator {
     private final int largeSpanLimit;
 
     /**
-     * @param segmentSource where the blocks and their views come from
-     * @param regionSource  where the regions come from, or {@code null} for {@code segmentSource}'s (see
-     *                      {@link PageStore#PageStore})
+     * @param regionSource where the regions come from, or {@code null} for {@code memory}'s (see
+     *                     {@link PageStore#PageStore})
      */
-    AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads,
-                             SegmentSource segmentSource, RegionSource regionSource, PageStoreConfig config) {
+    AdaptivePoolingAllocator(MemorySource memory, boolean useCacheForNonEventLoopThreads,
+                             RegionSource regionSource, PageStoreConfig config) {
         checkSizeClassSpansFit(config);
-        pageStore = new PageStore(this, config, segmentSource, regionSource);
+        pageStore = new PageStore(this, config, memory, regionSource);
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
-        this.chunkAllocator = ObjectUtil.checkNotNull(chunkAllocator, "chunkAllocator");
+        this.memory = ObjectUtil.checkNotNull(memory, "memory");
         chunkRegistry = new ChunkRegistry();
         int sliceSize = pageStore.config.sliceSize;
         int segmentSize = pageStore.config.segmentSize;
@@ -471,7 +470,7 @@ final class AdaptivePoolingAllocator {
         // Above a span, a run of the store's blocks if one fits; else an allocation of its own.
         OneShotChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
         if (chunk == null) {
-            chunk = new OneShotChunk(chunkAllocator.allocate(size, maxCapacity), this, null, 0, 0);
+            chunk = new OneShotChunk(memory.allocate(size, maxCapacity), this, null, 0, 0);
             chunkBufferAllocated(chunk, false, false);
         }
         boolean initialized = false;
@@ -516,7 +515,7 @@ final class AdaptivePoolingAllocator {
         int start = (int) run;
         boolean made = false;
         try {
-            AbstractByteBuf view = store.segmentSource.span(region.buffer, start * segmentSize, slots * segmentSize);
+            AbstractByteBuf view = store.memory.view(region.buffer, start * segmentSize, slots * segmentSize);
             OneShotChunk chunk = new OneShotChunk(view, this, region, start, slots);
             made = true;
             return chunk;
@@ -555,7 +554,7 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A chunk buffer was just taken from {@link #chunkAllocator} for {@code chunk}.
+     * A chunk buffer was just taken from {@link #memory} for {@code chunk}.
      *
      * @param pooled      whether the chunk serves many buffers, or is a one-shot chunk for a single one
      * @param threadLocal whether the chunk belongs to a thread-local heap
@@ -573,7 +572,7 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    /** The chunk buffer behind {@code chunk} is about to be released back to {@link #chunkAllocator} by its chunk. */
+    /** The chunk buffer behind {@code chunk} is about to be released back to {@link #memory} by its chunk. */
     void chunkBufferFreed(ChunkInfo chunk, boolean pooled) {
         chunkRegistry.remove(chunk.capacity());
         if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
@@ -3262,19 +3261,5 @@ final class AdaptivePoolingAllocator {
             rootParent = null;
             handle.unguardedRecycle(this);
         }
-    }
-
-    /**
-     * Where the one-shot chunks of their own allocation, and the blocks of {@link MallocRegionSource}, come from.
-     */
-    interface ChunkAllocator {
-        /**
-         * Allocate a buffer for a chunk. This can be any kind of {@link AbstractByteBuf} implementation.
-         *
-         * @param initialCapacity The initial capacity of the returned {@link AbstractByteBuf}.
-         * @param maxCapacity     The maximum capacity of the returned {@link AbstractByteBuf}.
-         * @return The buffer that represents the chunk memory.
-         */
-        AbstractByteBuf allocate(int initialCapacity, int maxCapacity);
     }
 }

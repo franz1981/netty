@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -43,7 +43,7 @@ final class PageStorePurgePassTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /** A store whose last pass was at {@code base}, with blocks 0 to {@code blocks - 1} of its region claimed whole. */

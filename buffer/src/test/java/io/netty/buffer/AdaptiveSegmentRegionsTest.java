@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
-import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
+import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -42,7 +42,7 @@ public class AdaptiveSegmentRegionsTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    private final CountingSegmentSource segments = new CountingSegmentSource();
+    private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /** Buffers of the size classes through the allocator's own heaps, with regions: data lands inside the region. */
@@ -117,12 +117,11 @@ public class AdaptiveSegmentRegionsTest {
     void aConfigWithoutMmapRegionsMallocsThem() {
         AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
         AdaptivePoolingAllocator direct = AdaptiveByteBufAllocatorTest.direct(adaptive);
-        SegmentSource source = direct.pageStore.segmentSource;
+        MemorySource source = direct.pageStore.memory;
         PageStoreConfig noMmap = new PageStoreConfig(PageStoreConfig.SEGMENT_SIZE_BYTES,
                 PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
                 PageStoreConfig.SEGMENT_SIZE_BYTES);
-        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(
-                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, null, noMmap));
+        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(source, true, null, noMmap));
         PageStore store = allocator.pageStore;
         assertTrue(store.regionSource instanceof MallocRegionSource);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);

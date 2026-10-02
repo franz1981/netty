@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 /**
- * Regions of one block each, one allocation of a {@link AdaptivePoolingAllocator.ChunkAllocator} per block, as
+ * Regions of one block each, one allocation of a {@link MemorySource} per block, as
  * mimalloc's Java port allocates its 4 MiB segments. No part of a block can go back; a wholly idle one goes back by
  * its release. Direct: libc {@code malloc} behind {@link UnsafeByteBufUtil#newDirectByteBuf}, charged to the direct
  * memory limit by the allocation, for where {@code mmap} regions cannot be had (before Java 22, without native access)
@@ -24,9 +24,9 @@ package io.netty.buffer;
  * {@code byte[]}, which the GC reclaims once released.
  */
 final class MallocRegionSource implements RegionSource {
-    private final AdaptivePoolingAllocator.ChunkAllocator allocator;
+    private final MemorySource allocator;
 
-    MallocRegionSource(AdaptivePoolingAllocator.ChunkAllocator allocator) {
+    MallocRegionSource(MemorySource allocator) {
         this.allocator = allocator;
     }
 
