@@ -123,6 +123,8 @@ final class PageStore {
     long segmentsPurged;
     long bytesPurged;
     long purgeFailures;
+    /** Shared slices purged. */
+    long slicesPurged;
     // Written by any heap's decay: the purges of idle slices of the segments heaps hold (see purgeSlices).
     volatile long slicePurgeCalls;
     volatile long slicePurgeBytes;
@@ -651,6 +653,10 @@ final class PageStore {
      */
     private void purge(long now) {
         purges++;
+        if (config.sharesSlices) {
+            purgeSharedSlices(now);
+            return;
+        }
         long delay = config.purgeDelayNanos;
         for (Region region : regions) {
             long candidates = purgeable(region, region.free, now, delay);
@@ -667,6 +673,128 @@ final class PageStore {
                     region.giveBackAll(claimed);
                 }
             }
+        }
+    }
+
+    /**
+     * Shared slices: purges the free slices with memory behind them freed {@link PageStoreConfig#purgeDelayNanos} ago
+     * or earlier, each run of contiguous ones in a region with one call, across blocks. As mimalloc v3's
+     * {@code mi_arena_try_purge_range}: a run's slices are claimed by CAS first, so that no claim can take them while
+     * their memory goes, and given back after; a claim meanwhile finds every other free slice.
+     */
+    private void purgeSharedSlices(long now) {
+        long delay = config.purgeDelayNanos;
+        for (Region region : regions) {
+            int perBlock = config.slicesPerSegment();
+            int runStart = -1;
+            for (int slot = 0; slot < region.slots; slot++) {
+                Segment block = region.block(slot);
+                long claimed = 0;
+                long candidates = purgeable(block, block.free, now, delay);
+                if (candidates != 0) {
+                    claimed = block.claimFree(candidates);
+                    long exact = purgeable(block, claimed, now, delay);
+                    if (exact != claimed) {
+                        block.giveBack(claimed & ~exact);
+                    }
+                    claimed = exact;
+                }
+                int base = slot * perBlock;
+                if (runStart >= 0 && (claimed & 1) == 0) {
+                    purgeSliceRun(region, runStart, base);
+                    runStart = -1;
+                }
+                while (claimed != 0) {
+                    long run = lowestRun(claimed);
+                    claimed &= ~run;
+                    int start = Long.numberOfTrailingZeros(run);
+                    int end = start + Long.bitCount(run);
+                    if (runStart < 0) {
+                        runStart = base + start;
+                    }
+                    if (end < perBlock) {
+                        purgeSliceRun(region, runStart, base + end);
+                        runStart = -1;
+                    }
+                }
+            }
+            if (runStart >= 0) {
+                purgeSliceRun(region, runStart, region.slots * perBlock);
+            }
+        }
+    }
+
+    /**
+     * Free slices with memory behind them of {@code slices}, freed {@code delay} before {@code now} or earlier. Racy
+     * for slices the caller does not own, exact for those it does.
+     */
+    private static long purgeable(Segment block, long slices, long now, long delay) {
+        long purgeable = 0;
+        long[] freedAt = block.freedAt;
+        for (long bits = slices; bits != 0; bits &= bits - 1) {
+            int slice = Long.numberOfTrailingZeros(bits);
+            long freed = freedAt[slice];
+            if (freed != Region.UNCOMMITTED && now - freed >= delay) {
+                purgeable |= 1L << slice;
+            }
+        }
+        return purgeable;
+    }
+
+    /**
+     * Purges the region's slices {@code from} to {@code to} (exclusive), which the purger claimed, with one call, then
+     * gives them back. A run whose call fails keeps its memory, and stays purgeable.
+     */
+    private void purgeSliceRun(Region region, int from, int to) {
+        int sliceSize = config.sliceSize;
+        int offset = from * sliceSize;
+        int length = (to - from) * sliceSize;
+        boolean purged = false;
+        try {
+            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
+                    PageStorePurgeEvent.start() : null;
+            Throwable failure = null;
+            try {
+                regionSource.purge(region.buffer, offset, length);
+                purged = true;
+            } catch (Throwable t) {
+                failure = t;
+            }
+            purged(event, SLICES, region, offset, length, failure);
+            if (failure != null) {
+                purgeFailed(failure);
+            }
+        } finally {
+            try {
+                if (purged) {
+                    // Credited before a claim can find the slices uncommitted and charge them again.
+                    purgeCalls++;
+                    bytesPurged += length;
+                    slicesPurged += to - from;
+                    PlatformDependent.decrementMemoryCounter(length);
+                    allocator.storeBytesReleased(region.buffer._memoryAddress() + offset, length);
+                }
+            } finally {
+                giveBackPurged(region, from, to, purged);
+            }
+        }
+    }
+
+    /** The purger's slices {@code from} to {@code to} go back, without memory behind them if {@code purged}. */
+    private void giveBackPurged(Region region, int from, int to, boolean purged) {
+        int perBlock = config.slicesPerSegment();
+        for (int slice = from; slice < to;) {
+            Segment block = region.block(slice / perBlock);
+            int start = slice % perBlock;
+            int end = Math.min(perBlock, start + to - slice);
+            if (purged) {
+                for (int i = start; i < end; i++) {
+                    block.freedAt[i] = Region.UNCOMMITTED;
+                }
+            }
+            int n = end - start;
+            block.giveBack(n == Long.SIZE ? -1L : (1L << n) - 1 << start);
+            slice += n;
         }
     }
 

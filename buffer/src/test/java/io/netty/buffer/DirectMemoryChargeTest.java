@@ -126,6 +126,31 @@ final class DirectMemoryChargeTest {
         assertEquals(base, used());
     }
 
+    /** Shared slices: a slice is charged by the claim that commits it, credited by its purge or the close. */
+    @Test
+    void sharedSlicesAreChargedOnceAndCreditedByThePurgeAndTheClose() {
+        long base = used();
+        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
+        PageStore store = allocator.pageStore;
+        long run = store.claimSlices(9, 0, PageStore.NO_HEAP);
+        assertEquals(base + regionCharge + 9L * SLICE, used(), "the region is not charged, the slices are");
+        Segment block = store.region(0).block(0);
+        store.releaseSlices(block, 0, 9);
+        assertEquals(run, store.claimSlices(9, 0, PageStore.NO_HEAP));
+        assertEquals(base + regionCharge + 9L * SLICE, used(), "committed already: not charged again");
+        store.releaseSlices(block, 3, 6);
+        long now = System.nanoTime();
+        store.purgeIfDue(now + 2 * INTERVAL);
+        assertEquals(6, store.slicesPurged);
+        assertEquals(base + regionCharge + 3L * SLICE, used(), "the purge credits them");
+        assertEquals(3, (int) store.claimSlices(6, 0, PageStore.NO_HEAP));
+        assertEquals(base + regionCharge + 9L * SLICE, used(), "purged: charged again");
+        assertEquals(15, store.slicesCommitted);
+        PageStoreTestSupport.assertSharedAccounted(segments, allocator);
+        store.close();
+        assertEquals(base, used(), "the close credits the rest");
+    }
+
     /**
      * Shared slices: a claim that would pass the limit throws, its slices free again with no memory behind them; a
      * claim of committed slices needs no charge.
