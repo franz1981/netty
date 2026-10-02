@@ -16,6 +16,7 @@
 package io.netty.buffer;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
@@ -24,9 +25,16 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * heap that took the slot, its releaser, or the purger that claimed it), which alone touches the slot's
  * {@link #segments} and {@link #freedAt} entries; the CAS that gives the bit back publishes them to the next owner.
  * A region lives as long as its {@link PageStore}.
+ * <p>
+ * With shared slices, the slots are blocks made with the region, which nobody takes whole for long: each block's
+ * {@link Segment#free} is the free bitmap of its slices, claimed in runs by any thread (see {@link #claimSlices}), and
+ * the slot bitmap stays empty. {@link #freedAt} and {@link #everCommitted} are then unused: the blocks keep their own,
+ * per slice.
  */
 final class Region {
     private static final AtomicLongFieldUpdater<Region> FREE = AtomicLongFieldUpdater.newUpdater(Region.class, "free");
+    private static final AtomicIntegerFieldUpdater<Region> MAX_ACCESSED =
+            AtomicIntegerFieldUpdater.newUpdater(Region.class, "maxAccessed");
 
     /** No memory behind the slot: never taken since the region was mapped, or purged since. */
     static final long UNCOMMITTED = Long.MIN_VALUE;
@@ -47,6 +55,13 @@ final class Region {
     final boolean[] everCommitted;
     /** Its index in {@link PageStore#regions}, set before it is published there. */
     int index = -1;
+    /**
+     * Shared slices: per slice of the region, whether memory was ever behind it, so that a slice with none now was
+     * purged; slice owner only. Else {@code null}.
+     */
+    final boolean[] sliceEverCommitted;
+    /** Shared slices: the highest block a run was claimed in, -1 before the first. */
+    private volatile int maxAccessed = -1;
 
     Region(AbstractByteBuf buffer, int slots) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -58,6 +73,102 @@ final class Region {
         freedAt = new long[slots];
         everCommitted = new boolean[slots];
         Arrays.fill(freedAt, UNCOMMITTED);
+        sliceEverCommitted = null;
+    }
+
+    /** With shared slices: every block made now, all slices free and uncommitted, no slot free. */
+    Region(AbstractByteBuf buffer, int slots, SegmentSource source, PageStoreConfig config) {
+        assert slots > 0 && slots <= Long.SIZE;
+        this.buffer = buffer;
+        this.slots = slots;
+        allSlots = slots == Long.SIZE ? -1L : (1L << slots) - 1;
+        segments = new Segment[slots];
+        freedAt = new long[0];
+        everCommitted = new boolean[0];
+        int size = config.segmentSize;
+        for (int slot = 0; slot < slots; slot++) {
+            Segment block = new Segment(source.span(buffer, slot * size, size), config.sliceSize, this, slot);
+            Arrays.fill(block.freedAt, UNCOMMITTED);
+            segments[slot] = block;
+        }
+        sliceEverCommitted = new boolean[slots * config.slicesPerSegment()];
+    }
+
+    /** Shared slices: the block of slot {@code slot}. */
+    Segment block(int slot) {
+        return segments[slot];
+    }
+
+    /**
+     * Shared slices, any thread: claims the lowest run of {@code n} free slices of one block, at most a block, and
+     * returns its first slice in the region, or -1 when no block has such a run. Lock-free: one CAS on the block's
+     * bitmap, again only if another thread changed it meanwhile.
+     * <p>
+     * As mimalloc v3's {@code mi_bbitmap_try_find_and_clear_generic} (bitmap.c): the blocks claimed in so far are
+     * visited from {@code seq} modulo their count, wrapping around, so that heaps with different sequences start in
+     * different blocks, then the blocks never claimed in, in order; within a block, the lowest fitting run (first fit,
+     * as {@code mi_bchunk_try_find_and_clearNX}). A run never crosses a block.
+     */
+    int claimSlices(int n, int seq) {
+        Segment[] blocks = segments;
+        int count = blocks.length;
+        int cycle = maxAccessed + 1;
+        int start = cycle == 0 ? 0 : seq % cycle;
+        for (int k = 0; k < count; k++) {
+            int slot = k >= cycle ? k : start + k < cycle ? start + k : start + k - cycle;
+            Segment block = blocks[slot];
+            if (Long.bitCount(block.free) >= n) {
+                int first = block.claimRun(n);
+                if (first >= 0) {
+                    accessed(slot);
+                    return slot * block.slices + first;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Shared slices, any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
+     * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk: from the start, whole blocks
+     * only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
+     */
+    int claimBlocks(int n) {
+        Segment[] blocks = segments;
+        int first = 0;
+        while (first + n <= blocks.length) {
+            int end = first;
+            while (end < first + n && blocks[end].isWhollyFree()) {
+                end++;
+            }
+            if (end < first + n) {
+                first = end + 1;
+                continue;
+            }
+            int claimed = 0;
+            while (claimed < n && blocks[first + claimed].claimWhole()) {
+                claimed++;
+            }
+            if (claimed == n) {
+                accessed(first + n - 1);
+                return first;
+            }
+            for (int i = 0; i < claimed; i++) {
+                Segment block = blocks[first + i];
+                block.giveBack(block.allFree);
+            }
+            first += claimed + 1;
+        }
+        return -1;
+    }
+
+    private void accessed(int slot) {
+        for (;;) {
+            int max = maxAccessed;
+            if (slot <= max || MAX_ACCESSED.compareAndSet(this, max, slot)) {
+                return;
+            }
+        }
     }
 
     /**

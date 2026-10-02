@@ -27,6 +27,10 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * Single writer: the {@link #owner} heap claims spans and releases them; their chunks read {@link #buffer} itself.
  * Once that heap is freed, the last releases of its spans may come from any thread, hence the CAS on {@link #free}.
  * Chunk creation and deallocation only, never per buffer.
+ * <p>
+ * A block of a region's shared slices (see {@link PageStore}) has no owner: any thread claims and releases runs of
+ * its slices by CAS ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it,
+ * which alone touches that slice's {@link #freedAt}; the CAS that sets the bit again publishes it.
  */
 final class Segment implements ChunkInfo {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -64,6 +68,11 @@ final class Segment implements ChunkInfo {
      * owner, dropped by whichever thread gives the segment back to the store (see {@link HeapSegments#dispose}).
      */
     AdaptivePoolingAllocator.SpanChunk spanChunk;
+    /**
+     * A block of shared slices only, else {@code null}: the chunk of every large-buffer span claimed in it, by any
+     * heap. Set before its region is published.
+     */
+    AdaptivePoolingAllocator.Chunk sharedSpans;
 
     Segment(AbstractByteBuf buffer, int sliceSize) {
         this(buffer, sliceSize, null, -1);
@@ -141,6 +150,68 @@ final class Segment implements ChunkInfo {
                     freedAt[i] = now;
                 }
                 return next;
+            }
+        }
+    }
+
+    /**
+     * Shared slices: claims the lowest run of {@code n} free slices, from any thread. Returns its first slice, or -1.
+     */
+    int claimRun(int n) {
+        if (n == slices) {
+            return claimWhole() ? 0 : -1;
+        }
+        for (;;) {
+            long current = free;
+            int start = firstFit(current, n);
+            if (start < 0) {
+                return -1;
+            }
+            if (FREE.compareAndSet(this, current, current & ~mask(start, n))) {
+                return start;
+            }
+        }
+    }
+
+    /** Shared slices: claims every slice if all are free. */
+    boolean claimWhole() {
+        return FREE.compareAndSet(this, allFree, 0);
+    }
+
+    /** Shared slices: claims the slices of {@code bits} that are still free, and returns them. */
+    long claimFree(long bits) {
+        for (;;) {
+            long current = free;
+            long claimed = current & bits;
+            if (claimed == 0 || FREE.compareAndSet(this, current, current & ~claimed)) {
+                return claimed;
+            }
+        }
+    }
+
+    /**
+     * Shared slices: the run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
+     * slices with memory behind them stamped with {@code now} first. Throws if any of them is free already.
+     */
+    void releaseRun(int start, int n, long now) {
+        long[] freedAt = this.freedAt;
+        for (int i = start; i < start + n; i++) {
+            if (freedAt[i] != Region.UNCOMMITTED) {
+                freedAt[i] = now;
+            }
+        }
+        giveBack(n == slices ? allFree : mask(start, n));
+    }
+
+    /** Shared slices: the slices of {@code bits}, which the caller claimed, are free again, unstamped. */
+    void giveBack(long bits) {
+        for (;;) {
+            long current = free;
+            if ((current & bits) != 0) {
+                throw new IllegalStateException("slices " + Long.toHexString(current & bits) + " are already free");
+            }
+            if (FREE.compareAndSet(this, current, current | bits)) {
+                return;
             }
         }
     }
