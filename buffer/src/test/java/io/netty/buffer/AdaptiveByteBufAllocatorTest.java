@@ -16,6 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.util.NettyRuntime;
+import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.test.DisabledForSlowLeakDetection;
 import org.junit.jupiter.api.RepeatedTest;
@@ -1216,22 +1217,27 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     // Regression: on the shared (striped) path a segment returned after the allocator was
     // freed was absorbed into the chunk's local free list by the lock-holding release path,
     // which skipped the deallocation accounting entirely -- so the chunk never deallocated.
+    // The chunk is abandoned to the page store, whose purger takes the dead stripe's lock to look.
     @Test
     void segmentReturnedAfterFreeMustStillDeallocateChunk() throws Exception {
         // useCacheForNonEventLoopThreads=false -> a plain thread takes the shared path
         AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
         ByteBuf buf = allocator.heapBuffer(256);
-        Segment block = chunkOf(buf).segment;
-        assertFalse(block.isWhollyFree());
+        SizeClassedChunk chunk = chunkOf(buf);
+        assertFalse(spanFree(chunk));
 
         freeHeap(allocator);
+        PageStore store = heap(allocator).pageStore;
+        assertEquals(1, store.abandonedCount());
 
         // last outstanding segment comes back from another thread
         Thread t = new Thread(buf::release);
         t.start();
         t.join();
 
-        assertTrue(block.isWhollyFree(), "chunk must deallocate once its last segment is returned");
+        runPurgePass(store);
+        assertEquals(0, store.abandonedCount());
+        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
     }
 
     // The thread-local counterpart: the owner thread exits (its FastThreadLocal heap is removed and freed) while
@@ -1260,14 +1266,97 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
         }
-        Segment block = chunkOf(live.get(0)).segment;
-        assertFalse(block.isWhollyFree(), "the live buffers still hold their chunk");
+        SizeClassedChunk chunk = chunkOf(live.get(0));
+        PageStore store = heap(allocator).pageStore;
+        assertFalse(spanFree(chunk), "the live buffers still hold their chunk");
+        assertEquals(1, store.abandonedCount());
 
         // The test thread is not the owner, so these take the cross-thread release path.
         live.remove(0).release();
-        assertFalse(block.isWhollyFree(), "one segment is still outstanding");
+        runPurgePass(store);
+        assertFalse(spanFree(chunk), "one segment is still outstanding");
         live.remove(0).release();
-        assertTrue(block.isWhollyFree(), "chunk must deallocate once its last segment is returned");
+        runPurgePass(store);
+        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
+    }
+
+    /**
+     * A thread-local heap dies with buffers out: their chunk is abandoned to the page store, and every later release
+     * takes the CAS path, the dying thread's own included (as from a later {@code FastThreadLocal}'s
+     * {@code onRemoval}). The span goes back at the first purge pass after the last release, not before.
+     */
+    @Test
+    void chunkOfADeadHeapGoesBackAtThePurgePassAfterItsLastRelease() throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+        final List<ByteBuf> handedOver = new ArrayList<ByteBuf>();
+        final AtomicReference<SizeClassedChunk> chunkRef = new AtomicReference<SizeClassedChunk>();
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        final int[] externalAfterOwnRelease = {-1};
+        Thread owner = new FastThreadLocalThread(() -> {
+            try {
+                for (int i = 0; i < 3; i++) {
+                    handedOver.add(allocator.heapBuffer(256));
+                }
+                ByteBuf own = allocator.heapBuffer(256);
+                SizeClassedChunk chunk = chunkOf(own);
+                chunkRef.set(chunk);
+                // The heap dies first, as when its FastThreadLocal is removed before another one whose onRemoval
+                // releases a buffer on this same thread.
+                threadLocalHeapVariable(allocator).remove();
+                assertNull(chunk.ownerThread(), "an abandoned chunk has no owner thread");
+                own.release();
+                externalAfterOwnRelease[0] = chunk.externalFreeCount();
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        });
+        owner.start();
+        owner.join();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        SizeClassedChunk chunk = chunkRef.get();
+        PageStore store = heap(allocator).pageStore;
+        assertEquals(1, externalAfterOwnRelease[0], "the dead heap's thread must push on the external list");
+        assertEquals(1, store.abandonedCount(), "the chunk had buffers out: abandoned");
+        assertFalse(spanFree(chunk));
+
+        // U, this thread, releases what it was handed, one buffer short of all.
+        handedOver.remove(0).release();
+        handedOver.remove(0).release();
+        runPurgePass(store);
+        assertEquals(1, store.abandonedCount(), "a buffer is still out: the chunk waits");
+        assertFalse(spanFree(chunk));
+
+        handedOver.remove(0).release();
+        assertFalse(spanFree(chunk), "the span goes back at a purge pass, not at the release");
+        runPurgePass(store);
+        assertEquals(0, store.abandonedCount());
+        assertTrue(spanFree(chunk), "the span must go back once its last buffer is back");
+    }
+
+    /** Runs a pass of {@code store}'s purge: one due at a time a purge delay and a check interval from its last. */
+    private static void runPurgePass(PageStore store) {
+        long passes = store.purges;
+        long now = Math.max(System.nanoTime(), store.lastPurgeNanos)
+                + store.config.purgeDelayNanos + store.config.purgeCheckNanos;
+        store.purgeIfDue(now);
+        assertEquals(passes + 1, store.purges, "the pass did not run");
+    }
+
+    /** Whether {@code chunk}'s span is back in the store: free in its block, or its region given back whole. */
+    private static boolean spanFree(SizeClassedChunk chunk) {
+        Segment block = chunk.segment;
+        long bits = block.bits(chunk.spanStart, chunk.spanSlices());
+        return block.region.released || (block.free & bits) == bits;
+    }
+
+    /** The allocator's {@code FastThreadLocal} of thread-local heaps. */
+    private static FastThreadLocal<?> threadLocalHeapVariable(AdaptiveByteBufAllocator allocator) throws Exception {
+        Field tlField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalSizeClassHeap");
+        tlField.setAccessible(true);
+        return (FastThreadLocal<?>) tlField.get(heap(allocator));
     }
 
     /**
@@ -1874,10 +1963,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     void segmentReturnedExternallyAfterFreeMustStillDeallocateChunk() throws Exception {
         AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
         ByteBuf buf = allocator.heapBuffer(256);
-        Segment block = chunkOf(buf).segment;
+        SizeClassedChunk chunk = chunkOf(buf);
         List<StampedLock> locks = stripeLocks(allocator);
         freeHeap(allocator);
-        assertFalse(block.isWhollyFree());
+        assertFalse(spanFree(chunk));
         List<Long> stamps = new ArrayList<Long>();
         for (StampedLock l : locks) {
             stamps.add(l.writeLock());
@@ -1889,7 +1978,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 locks.get(i).unlockWrite(stamps.get(i));
             }
         }
-        assertTrue(block.isWhollyFree(), "chunk must deallocate once its last segment is returned");
+        runPurgePass(heap(allocator).pageStore);
+        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
     }
 
     /**

@@ -15,6 +15,8 @@
  */
 package io.netty.buffer;
 
+import io.netty.buffer.AdaptivePoolingAllocator.Chunk;
+import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -22,6 +24,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
  * The units, largest first, and their names in the code:
@@ -60,6 +63,8 @@ final class PageStore {
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final AtomicIntegerFieldUpdater<PageStore> ARMED =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
+    private static final AtomicReferenceFieldUpdater<PageStore, SizeClassedChunk> ABANDONED =
+            AtomicReferenceFieldUpdater.newUpdater(PageStore.class, SizeClassedChunk.class, "abandoned");
     private static final Region[] NO_REGIONS = new Region[0];
     /**
      * The bytes a purge pass gives back, {@code madvise}d or released whole, past which it makes no more calls (see
@@ -100,6 +105,10 @@ final class PageStore {
     volatile long slicesCommitted;
     /** The next heap's sequence: see {@link #nextHeapSequence}. */
     private volatile int heapSequence;
+    /** Chunks abandoned since the last pass, a stack linked through {@code nextInQueue}: see {@link #abandon}. */
+    private volatile SizeClassedChunk abandoned;
+    /** Purger only: abandoned chunks with buffers still out, linked through {@code nextInQueue}. */
+    private SizeClassedChunk waiting;
     // Written by the purger only.
     long purges;
     long purgeCalls;
@@ -485,6 +494,7 @@ final class PageStore {
     private void purge(long now) {
         purges++;
         skipped = false;
+        releaseAbandoned(now);
         Region[] regions = this.regions;
         int count = regions.length;
         int first = nextRegion < count ? nextRegion : 0;
@@ -512,6 +522,60 @@ final class PageStore {
         if (skipped) {
             rearm(now, longestWait);
         }
+    }
+
+    /**
+     * Any thread, for a chunk whose heap died with buffers out: the purger owns it from now on, and gives its span back
+     * at the first pass that finds every buffer back (see {@link #releaseAbandoned}).
+     */
+    void abandon(SizeClassedChunk chunk) {
+        SizeClassedChunk head;
+        do {
+            head = abandoned;
+            chunk.nextInQueue = head;
+        } while (!ABANDONED.compareAndSet(this, head, chunk));
+        armPurge(System.nanoTime());
+    }
+
+    /**
+     * Purger: the abandoned chunks whose buffers are all back give their spans back; the others wait for a later
+     * pass, which this arms, a delay from now.
+     */
+    private void releaseAbandoned(long now) {
+        SizeClassedChunk taken = abandoned == null ? null : ABANDONED.getAndSet(this, null);
+        SizeClassedChunk kept = keepWaiting(waiting, null);
+        kept = keepWaiting(taken, kept);
+        waiting = kept;
+        if (kept != null) {
+            rearm(now, 0);
+        }
+    }
+
+    /** Purger: releases what it can of the chain from {@code chunk}, and returns the rest pushed on {@code kept}. */
+    private static SizeClassedChunk keepWaiting(SizeClassedChunk chunk, SizeClassedChunk kept) {
+        while (chunk != null) {
+            SizeClassedChunk next = (SizeClassedChunk) chunk.nextInQueue;
+            if (chunk.releaseIfAllFree()) {
+                chunk.nextInQueue = null;
+            } else {
+                chunk.nextInQueue = kept;
+                kept = chunk;
+            }
+            chunk = next;
+        }
+        return kept;
+    }
+
+    // Visible for testing: racy, the chunks abandoned and not given back yet.
+    int abandonedCount() {
+        int count = 0;
+        for (Chunk c = abandoned; c != null; c = c.nextInQueue) {
+            count++;
+        }
+        for (Chunk c = waiting; c != null; c = c.nextInQueue) {
+            count++;
+        }
+        return count;
     }
 
     /**

@@ -1048,7 +1048,7 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Drop every queued chunk; for a cache being freed, whose chunks are all about to be deallocated.
+         * Drop every queued chunk; for a cache being freed, whose chunks give their spans back or are abandoned.
          */
         void clear() {
             HEAD.lazySet(this, null);
@@ -1471,9 +1471,12 @@ final class AdaptivePoolingAllocator {
             offerChunk(chunk);
         }
 
+        /**
+         * The heap is gone: every chunk gives its span back, or is abandoned to the store until its buffers are back
+         * (see {@link SizeClassedChunk#releaseOrAbandon}). Outstanding notes are dropped: nobody drains this cache
+         * any more.
+         */
         void free() {
-            // Drop any outstanding notes: every chunk they point at is about to be marked for
-            // deallocation, and this cache is dead afterwards.
             pending.clear();
             // The magazine gives up its active chunk before it frees its cache.
             assert active == null : "free with an active chunk";
@@ -1485,7 +1488,7 @@ final class AdaptivePoolingAllocator {
             Chunk cur;
             while ((cur = queue.head) != null) {
                 queue.remove(cur);
-                ((SizeClassedChunk) cur).markToDeallocate();
+                ((SizeClassedChunk) cur).releaseOrAbandon();
             }
         }
 
@@ -1985,7 +1988,8 @@ final class AdaptivePoolingAllocator {
          * when it is on a queue, with one null check.
          */
         ChunkQueue queue;
-        // Links of the ChunkQueue this chunk is on, if any.
+        // Links of the ChunkQueue this chunk is on, if any. nextInQueue also links an abandoned chunk in its
+        // store's stack (see PageStore#abandon), which it joins off every queue.
         Chunk prevInQueue;
         Chunk nextInQueue;
         /**
@@ -2076,28 +2080,16 @@ final class AdaptivePoolingAllocator {
      * detected, and a release that reaches a chunk after it gave its span up writes into memory that is no longer its
      * own: neither can happen without using a buffer after releasing it.
      * <p>
-     * <b>Deallocation</b> replaces per-allocation retain()/release() with a count of the segments that are back, so
-     * atomics are only needed once a chunk is marked ({@link #markToDeallocate()}). {@code state} is
-     * <ul>
-     *   <li>{@link #AVAILABLE} (-1): in use, nothing to track;</li>
-     *   <li>0..N: the owner-side count when the chunk was marked, updated by every later release on that side. The
-     *       chunk is deallocated when it and the count in {@link #externalFree} add up to every segment;</li>
-     *   <li>{@link #DEALLOCATED} (Integer.MIN_VALUE): deallocated. No count can add up to every segment from
-     *       here, so a late release is harmless.</li>
-     * </ul>
-     * A release from another thread pushes on {@link #externalFree} (a CAS, a full barrier) and then reads
-     * {@code state}; {@link #markToDeallocate()} writes {@code state} and then reads {@link #externalFree}. One of the
-     * two always sees the other, so the last segment back always deallocates the chunk, and only once.
+     * <b>One owner.</b> Every field but {@link #externalFree} and {@code pendingNext} belongs to the chunk's owner: the
+     * owner thread, or the holder of the stripe lock, or, once the heap died with buffers out, the store's purger (see
+     * {@link #releaseOrAbandon}). Any other releaser writes its segment's link, pushes it with one CAS on
+     * {@link #externalFree}, and leaves a note for the owner; it reads nothing else of the chunk. Only the owner
+     * decides that every segment is back ({@link #hasFullCapacity}: one volatile read) and gives the span up, so a
+     * span goes back once and a late release cannot find it gone: before its CAS a segment is out, so the chunk is
+     * not all free.
      */
     static class SizeClassedChunk extends Chunk {
         static final int FREE_LIST_EMPTY = -1;
-        private static final int AVAILABLE = -1;
-        // Integer.MIN_VALUE so that `DEALLOCATED + the external count` can never equal `segments`,
-        // making late-arriving releaseSegment calls on external threads arithmetically harmless.
-        private static final int DEALLOCATED = Integer.MIN_VALUE;
-        private static final AtomicIntegerFieldUpdater<SizeClassedChunk> STATE =
-                AtomicIntegerFieldUpdater.newUpdater(SizeClassedChunk.class, "state");
-        private volatile int state;
         /** No segment and a count of zero: see {@link #externalFree}. */
         private static final long EXTERNAL_EMPTY = 0xFFFFFFFFL;
         private static final AtomicLongFieldUpdater<SizeClassedChunk> EXTERNAL_FREE =
@@ -2122,7 +2114,8 @@ final class AdaptivePoolingAllocator {
         private int lostFree;
         /** Segments released by other threads: their count in the high half, the first one's offset in the low. */
         private volatile long externalFree;
-        private final Thread ownerThread;
+        /** {@code null} on a stripe, and once abandoned: see {@link #releaseOrAbandon}. */
+        private Thread ownerThread;
         /**
          * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free counts.
          * Segments returned since then are not subtracted, so {@code capacity - allocatedBytes} never counts a
@@ -2172,7 +2165,6 @@ final class AdaptivePoolingAllocator {
             lastSegmentOffset = bumpLimit - segmentSize;
             localFree = segments;
             EXTERNAL_FREE.lazySet(this, EXTERNAL_EMPTY);
-            STATE.lazySet(this, AVAILABLE);
             ownerThread = magazine.ownerThread;
             owningCache = magazine.chunkCache;
         }
@@ -2197,7 +2189,6 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
-            assert state == AVAILABLE;
             final int startIndex = nextAvailableSegmentOffset();
             if (startIndex == FREE_LIST_EMPTY) {
                 return false;
@@ -2354,96 +2345,30 @@ final class AdaptivePoolingAllocator {
         void releaseSegment(int startIndex, int size) {
             if (ownerThread != null && Thread.currentThread() == ownerThread) {
                 pushLocalFree(startIndex);
-                afterLocalRelease();
-            } else {
-                final SizeClassedChunkCache cache = owningCache;
-                final long stamp = cache.tryLockForRelease();
-                if (stamp != 0) {
-                    try {
-                        pushLocalFree(startIndex);
-                        afterLockedRelease(cache);
-                    } finally {
-                        cache.unlockAfterRelease(stamp);
-                    }
-                } else {
-                    pushExternalFree(startIndex);
-                    // the CAS above is a full barrier
-                    int state = this.state;
-                    if (state != AVAILABLE) {
-                        deallocateIfNeeded(state);
-                    } else {
-                        // The chunk just gained capacity but we could not take the lock to apply the
-                        // resulting list transition. Leave a note instead; the next drain applies it.
-                        // A chunk whose state is not AVAILABLE is never on a cache list, so there is
-                        // nothing to notify about on that branch.
-                        cache.notifyHasCapacity(this);
-                    }
+                // Neither a chunk out of the cache nor the magazine's active chunk is ever moved or evicted
+                // by a segment return: the active chunk consumes its own returned segments.
+                if (queue != null) {
+                    owningCache.refile(this);
                 }
-            }
-        }
-
-        /**
-         * Cold: apply the deallocation bookkeeping or cache-list transition implied by a segment
-         * returned by the owner thread. Split out of {@link #releaseSegment} so the common case —
-         * push the segment, find nothing else to do — stays a few lines.
-         */
-        private void afterLocalRelease() {
-            int state = this.state;
-            if (state != AVAILABLE) {
-                updateStateOnLocalReleaseSegment(state);
                 return;
             }
-            // Neither a chunk out of the cache nor the magazine's active chunk is ever moved or evicted
-            // by a segment return: the active chunk consumes its own returned segments.
-            if (queue != null) {
-                owningCache.refile(this);
-            }
-        }
-
-        /** Locked counterpart of {@link #afterLocalRelease()}; caller holds the stripe lock. */
-        private void afterLockedRelease(SizeClassedChunkCache cache) {
-            int state = this.state;
-            if (state != AVAILABLE) {
-                updateStateOnLockedReleaseSegment(state);
+            final SizeClassedChunkCache cache = owningCache;
+            final long stamp = cache.tryLockForRelease();
+            if (stamp != 0) {
+                try {
+                    pushLocalFree(startIndex);
+                    if (queue != null) {
+                        cache.refile(this);
+                    }
+                } finally {
+                    cache.unlockAfterRelease(stamp);
+                }
                 return;
             }
-            if (queue != null) {
-                cache.refile(this);
-            }
-        }
-
-        /**
-         * Deallocation accounting for a segment pushed on {@link #head} while holding
-         * the stripe lock. Unlike the owner-thread variant, {@code state} may be concurrently
-         * advanced to {@link #DEALLOCATED} by a releaser on the lock-free external path, so the
-         * update is a CAS loop rather than an unconditional CAS.
-         */
-        private void updateStateOnLockedReleaseSegment(int observedState) {
-            int st = observedState;
-            while (st != DEALLOCATED) {
-                // Safe under the stripe lock: only lock holders push on head.
-                int newLocalSize = localFree + lostFree;
-                if (STATE.compareAndSet(this, st, newLocalSize)) {
-                    deallocateIfNeeded(newLocalSize);
-                    return;
-                }
-                st = state;
-            }
-        }
-
-        private void updateStateOnLocalReleaseSegment(int previousLocalSize) {
-            int newLocalSize = localFree + lostFree;
-            boolean alwaysTrue = STATE.compareAndSet(this, previousLocalSize, newLocalSize);
-            assert alwaysTrue : "this shouldn't happen unless double release in the local free list";
-            deallocateIfNeeded(newLocalSize);
-        }
-
-        private void deallocateIfNeeded(int localSize) {
-            // Check if all segments have been returned.
-            int totalFreeSegments = localSize + externalCount(externalFree);
-            if (totalFreeSegments == segments && STATE.compareAndSet(this, localSize, DEALLOCATED)) {
-                deallocate();
-            }
+            pushExternalFree(startIndex);
+            // The chunk just gained capacity but we could not take the lock to apply the resulting list
+            // transition. Leave a note instead; the next drain applies it.
+            cache.notifyHasCapacity(this);
         }
 
         /** The slices of the span this chunk is; its colour is less than one. */
@@ -2451,22 +2376,59 @@ final class AdaptivePoolingAllocator {
             return (capacity + segment.sliceSize - 1) / segment.sliceSize;
         }
 
-        /** Wholly free, with no segment outstanding: the span goes back to the store. */
+        /** Owner, with every segment back: the span goes back to the store's shared slices. */
         void releaseSpan() {
             assert hasFullCapacity();
-            STATE.set(this, DEALLOCATED);
-            deallocate();
-        }
-
-        /** The span goes back to the store's shared slices, from any thread (see {@link Segment#releaseRun}). */
-        protected void deallocate() {
             segment.releaseRun(spanStart, spanSlices(), System.nanoTime());
         }
 
-        void markToDeallocate() {
-            int localSize = localFree + lostFree;
-            STATE.set(this, localSize);
-            deallocateIfNeeded(localSize);
+        /**
+         * Owner, as its heap dies: the span goes back now if every segment is back; else the chunk is abandoned to
+         * the store, whose purger becomes its owner and gives the span back at the first pass that finds every
+         * segment back ({@link #releaseIfAllFree}). From here on every release, the dying thread's own included,
+         * takes the CAS path: the owner thread is forgotten.
+         */
+        void releaseOrAbandon() {
+            if (hasFullCapacity()) {
+                releaseSpan();
+                return;
+            }
+            ownerThread = null;
+            allocator.pageStore.abandon(this);
+        }
+
+        /**
+         * Purger, for an abandoned chunk: gives the span back if every segment is back. A release that wins a dead
+         * stripe's lock still counts on the owner's side, so the purger takes that lock to look, and looks again at
+         * its next pass when the lock is taken.
+         */
+        boolean releaseIfAllFree() {
+            SizeClassedChunkCache cache = owningCache;
+            long stamp = cache.tryLockForRelease();
+            if (stamp == 0 && cache.stripeLock != null) {
+                return false;
+            }
+            try {
+                if (!hasFullCapacity()) {
+                    return false;
+                }
+                releaseSpan();
+                return true;
+            } finally {
+                if (stamp != 0) {
+                    cache.unlockAfterRelease(stamp);
+                }
+            }
+        }
+
+        // Visible for testing.
+        int externalFreeCount() {
+            return externalCount(externalFree);
+        }
+
+        // Visible for testing.
+        Thread ownerThread() {
+            return ownerThread;
         }
     }
 

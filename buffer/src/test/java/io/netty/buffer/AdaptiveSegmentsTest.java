@@ -506,8 +506,9 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * A thread-local heap freed (its thread ended) while buffers are still out: their slices stay claimed, and the
-     * releases, on another thread, free them; the block goes back once idle for the purge delay.
+     * A thread-local heap freed (its thread ended) while buffers are still out: their chunks are abandoned to the page
+     * store, the releases, on another thread, bring every segment back, and the next purge pass frees their slices;
+     * the block goes back once idle for the purge delay.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
@@ -534,8 +535,9 @@ public class AdaptiveSegmentsTest {
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertTrue(segment.isWhollyFree());
+        assertFalse(segment.isWhollyFree(), "the spans go back at the next purge pass");
         purge(allocator, System.nanoTime());
+        assertEquals(0, allocator.pageStore.abandonedCount());
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
         assertAccounted(source, allocator);

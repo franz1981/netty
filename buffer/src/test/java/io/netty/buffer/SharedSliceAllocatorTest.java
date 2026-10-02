@@ -121,7 +121,7 @@ final class SharedSliceAllocatorTest {
 
     /**
      * A thread-local heap's buffers, of the size classes and above, released by another thread after the heap died:
-     * every slice comes back.
+     * every slice comes back, those of the size classes' chunks at the next purge pass.
      */
     @ParameterizedTest(name = "malloc: {0}")
     @ValueSource(booleans = {false, true})
@@ -142,7 +142,11 @@ final class SharedSliceAllocatorTest {
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertEquals(0, allocator.pageStore.sliceCounts()[0], "every slice is back");
+        PageStore store = allocator.pageStore;
+        assertTrue(store.abandonedCount() > 0, "chunks with buffers out when the heap died");
+        store.purgeIfDue(System.nanoTime() + 2 * store.config.purgeDelayNanos + store.config.purgeCheckNanos);
+        assertEquals(0, store.abandonedCount());
+        assertEquals(0, store.sliceCounts()[0], "every slice is back");
         assertSharedAccounted(segments, allocator);
     }
 

@@ -279,7 +279,7 @@ public class SizeClassedChunkCacheTest {
         }
 
         verify(chunk, never()).releaseSpan();
-        verify(chunk, never()).markToDeallocate();
+        verify(chunk, never()).releaseOrAbandon();
     }
 
     // --- The magazine's active chunk belongs to the cache but is on neither list ---
@@ -335,7 +335,7 @@ public class SizeClassedChunkCacheTest {
         assertSame(active, cache.active);
         assertNull(active.queue);
         verify(active, never()).releaseSpan();
-        verify(active, never()).markToDeallocate();
+        verify(active, never()).releaseOrAbandon();
     }
 
     @Test
@@ -745,9 +745,9 @@ public class SizeClassedChunkCacheTest {
         cache.free();
 
         assertTrue(cache.isEmpty());
-        verify(cap1, atLeastOnce()).markToDeallocate();
-        verify(cap2, atLeastOnce()).markToDeallocate();
-        verify(noCap1, atLeastOnce()).markToDeallocate();
-        verify(noCap2, atLeastOnce()).markToDeallocate();
+        verify(cap1, atLeastOnce()).releaseOrAbandon();
+        verify(cap2, atLeastOnce()).releaseOrAbandon();
+        verify(noCap1, atLeastOnce()).releaseOrAbandon();
+        verify(noCap2, atLeastOnce()).releaseOrAbandon();
     }
 }
