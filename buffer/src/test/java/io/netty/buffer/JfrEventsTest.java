@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledForJreRange;
 import org.junit.jupiter.api.condition.JRE;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.parallel.Isolated;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -48,12 +49,15 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 @EnabledForJreRange(min = JRE.JAVA_17) // RecordingStream
 @Isolated
 public class JfrEventsTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     PooledByteBufAllocator newPooledAllocator(boolean preferDirect) {
         return new PooledByteBufAllocator(preferDirect);
     }
 
     AdaptiveByteBufAllocator newAdaptiveAllocator(boolean preferDirect) {
-        return new AdaptiveByteBufAllocator(preferDirect, false);
+        return closer.add(new AdaptiveByteBufAllocator(preferDirect, false));
     }
 
     /**
@@ -69,7 +73,7 @@ public class JfrEventsTest {
         Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
-        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+        final AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, true));
         final int segmentSize = direct ? AdaptiveByteBufAllocatorTest.directSegmentSize(alloc) :
                 AdaptiveByteBufAllocatorTest.heapSegmentSize(alloc);
         assumeTrue(segmentSize > 0, "chunks are not carved out of segments");
@@ -129,7 +133,7 @@ public class JfrEventsTest {
             Thread releaser = new Thread(() -> heldPastTheEnd[0].release(), threadName + "-releaser");
             releaser.start();
             releaser.join();
-            new AdaptiveByteBufAllocator(false).heapBuffer(sentinel).release();
+            closer.add(new AdaptiveByteBufAllocator(false)).heapBuffer(sentinel).release();
             sentinelSeen.await();
         }
         assertTrue(segments[0] > 0, "segments are announced");
@@ -384,7 +388,7 @@ public class JfrEventsTest {
             stream.onEvent(AllocateChunkEvent.NAME, allocateFuture::complete);
             stream.startAsync();
 
-            AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, false);
+            AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, false));
             alloc.directBuffer(128).release();
 
             RecordedEvent allocate = allocateFuture.get();
@@ -473,7 +477,7 @@ public class JfrEventsTest {
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools no 512 KiB buffers");
         final int size = 512 * 1024;
-        AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+        AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, true));
         // With shared slices the page store's event is the span's own slices.
         final boolean shared = AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
         Callable<Void> allocateAndRelease = () -> {
@@ -521,7 +525,7 @@ public class JfrEventsTest {
             stream.onEvent(FreeBufferEvent.NAME, releaseFuture::complete);
             stream.startAsync();
 
-            AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, false);
+            AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, false));
             alloc.directBuffer(128).release();
 
             RecordedEvent allocate = allocateFuture.get();
@@ -543,7 +547,7 @@ public class JfrEventsTest {
     @SuppressWarnings("Since15")
     @Test
     public void adaptiveJfrBufferAllocationThreadLocal() throws Exception {
-        ByteBufAllocator alloc = new AdaptiveByteBufAllocator(true, true);
+        ByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, true));
 
         Callable<Void> allocateAndRelease = () -> {
             try (RecordingStream stream = new RecordingStream()) {

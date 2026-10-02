@@ -27,7 +27,7 @@ public class AdaptiveByteBufAllocatorUseCacheForNonEventLoopThreadsTest extends 
 
     @Override
     protected AdaptiveByteBufAllocator newAllocator(final boolean preferDirect) {
-        return new AdaptiveByteBufAllocator(preferDirect, true);
+        return closer.add(new AdaptiveByteBufAllocator(preferDirect, true));
     }
 
     @Override

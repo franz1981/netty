@@ -21,6 +21,7 @@ import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -53,6 +54,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * one block (direct or heap, as without {@code mmap}) or of many.
  */
 final class AdaptiveLargeSpansTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private CountingSegmentSource segments = new CountingSegmentSource();
@@ -69,12 +73,12 @@ final class AdaptiveLargeSpansTest {
     /** On regions of one heap block: one {@code byte[]} each. */
     private AdaptivePoolingAllocator heapAllocator() {
         segments = new CountingSegmentSource(true);
-        return newAllocator(segments, HEAP_BLOCK);
+        return closer.add(newAllocator(segments, HEAP_BLOCK));
     }
 
     private AdaptivePoolingAllocator allocator(boolean withRegions) {
-        return withRegions ? newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT)
-                : newAllocator(segments, SEGMENT_SIZE);
+        return withRegions ? closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT))
+                : closer.add(newAllocator(segments, SEGMENT_SIZE));
     }
 
     enum Mode { DIRECT, DIRECT_REGIONS, HEAP }

@@ -18,6 +18,7 @@ package io.netty.buffer;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -41,6 +42,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * regions.
  */
 final class PageStoreTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
     private static final int PER_BLOCK = SEGMENT_SIZE / SLICE_SIZE_BYTES;
     private static final int SPAN = PER_BLOCK - 1;
@@ -52,7 +56,7 @@ final class PageStoreTest {
     @Test
     void regionsAreAligned() {
         assumeTrue(regions.mmap != null, "aligned regions need mmap");
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
+        AdaptivePoolingAllocator allocator = closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
         PageStore store = allocator.pageStore;
         for (int i = 0; i < 3; i++) {
             long run = store.claimSlices(63, 0, false);
@@ -71,8 +75,8 @@ final class PageStoreTest {
     @ValueSource(booleans = {false, true})
     void accountingMatchesTheSourcesThroughARandomWorkload(boolean withRegions) {
         AdaptivePoolingAllocator allocator = withRegions ?
-                newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT) :
-                newAllocator(segments, SEGMENT_SIZE);
+                closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT)) :
+                closer.add(newAllocator(segments, SEGMENT_SIZE));
         PageStore store = allocator.pageStore;
         int heaps = 3;
         int capacity = 48;
@@ -123,7 +127,7 @@ final class PageStoreTest {
     /** The close unmaps every region, with runs still claimed, and accounts all of them as freed. */
     @Test
     void closeUnmapsEveryRegion() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
+        AdaptivePoolingAllocator allocator = closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
         PageStore store = allocator.pageStore;
         for (int i = 0; i < SLOTS + 2; i++) {
             store.claimSlices(PER_BLOCK, 0, false);
@@ -159,9 +163,9 @@ final class PageStoreTest {
         };
         CountingRegionSource malloc = new CountingRegionSource(true);
         segments.fallback = malloc;
-        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(segments, true, segments, failing,
+        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(segments, true, segments, failing,
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, REGION_SIZE, REGION_ALIGNMENT,
-                        SEGMENT_SIZE));
+                        SEGMENT_SIZE)));
         PageStore store = allocator.pageStore;
         Segment[] blocks = new Segment[SLOTS];
         for (int i = 0; i < SLOTS; i++) {

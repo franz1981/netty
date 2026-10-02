@@ -19,6 +19,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.parallel.Isolated;
 
 import java.util.concurrent.CountDownLatch;
@@ -40,6 +41,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Isolated("The claim's wait for the purger is bounded in time")
 final class SharedSlicePurgeWaitTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int PER_BLOCK = SEGMENT_SIZE / PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
@@ -52,7 +56,7 @@ final class SharedSlicePurgeWaitTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void aClaimWaitsForThePurgersRunInsteadOfMappingARegion() throws Exception {
-        final PageStore store = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL).pageStore;
+        final PageStore store = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL)).pageStore;
         int blocks = REGION_SIZE / SEGMENT_SIZE;
         assertEquals(0, (int) store.takeRun(blocks), "the whole region");
         Region region = store.regions[0];

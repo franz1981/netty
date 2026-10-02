@@ -18,6 +18,7 @@ package io.netty.buffer;
 import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -44,8 +45,11 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 public class ByteBufUtilTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final String PARAMETERIZED_NAME = "bufferType = {0}";
-    private final AdaptiveByteBufAllocator adaptiveByteBufAllocator = new AdaptiveByteBufAllocator();
+    private final AdaptiveByteBufAllocator adaptiveByteBufAllocator = closer.add(new AdaptiveByteBufAllocator());
 
     private enum BufferType {
         DIRECT_UNPOOLED, DIRECT_POOLED, DIRECT_ADAPTIVE, HEAP_POOLED, HEAP_UNPOOLED, HEAP_ADAPTIVE

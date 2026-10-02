@@ -19,6 +19,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -46,6 +47,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * thread, after their heap died too, give their slices back.
  */
 final class SharedSliceAllocatorTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
     private final CountingSegmentSource segments = new CountingSegmentSource();
@@ -54,8 +58,8 @@ final class SharedSliceAllocatorTest {
 
     /** On {@code mmap} regions where they can be had, or on {@code malloc}'d ones. */
     private void use(boolean malloc) {
-        allocator = newSharedAllocator(segments, malloc ? new CountingRegionSource(true) : regions, REGION_SIZE,
-                INTERVAL);
+        allocator = closer.add(newSharedAllocator(segments, malloc ? new CountingRegionSource(true) : regions,
+                REGION_SIZE, INTERVAL));
     }
 
     @BeforeEach

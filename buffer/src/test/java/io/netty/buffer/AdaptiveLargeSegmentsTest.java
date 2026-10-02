@@ -20,6 +20,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -51,6 +52,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * {@code byte[]} each).
  */
 final class AdaptiveLargeSegmentsTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     /** Eight spans of 512 KiB fill one 4 MiB segment. */
     private static final int POOLED = 512 * 1024;
     private static final int PER_CHUNK = SEGMENT_SIZE / POOLED;
@@ -67,11 +71,11 @@ final class AdaptiveLargeSegmentsTest {
 
     /** Regions of one block, from {@link #segments}. */
     private AdaptivePoolingAllocator withoutRegions() {
-        return newAllocator(segments, SEGMENT_SIZE);
+        return closer.add(newAllocator(segments, SEGMENT_SIZE));
     }
 
     private AdaptivePoolingAllocator withRegions() {
-        return newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
+        return closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
     }
 
     private AdaptivePoolingAllocator withoutRegions(boolean heap) {

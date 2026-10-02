@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledForJreRange;
 import org.junit.jupiter.api.condition.JRE;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.parallel.Isolated;
 
 import java.time.Duration;
@@ -47,6 +48,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 @EnabledForJreRange(min = JRE.JAVA_17) // RecordingStream
 @Isolated
 public class PageStoreJfrTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private final List<RecordedEvent> events = new CopyOnWriteArrayList<RecordedEvent>();
 
     /** Events of this test's thread only: other stores of the same JVM record theirs too. */
@@ -100,8 +104,8 @@ public class PageStoreJfrTest {
             });
             stream.enable(PageStoreStateEvent.NAME).withPeriod(Duration.ofMillis(50));
             stream.startAsync();
-            AdaptivePoolingAllocator allocator = PageStoreTestSupport.newSharedAllocator(new CountingSegmentSource(),
-                    regions, REGION_SIZE, INTERVAL);
+            AdaptivePoolingAllocator allocator = closer.add(PageStoreTestSupport.newSharedAllocator(
+                    new CountingSegmentSource(), regions, REGION_SIZE, INTERVAL));
             PageStore store = allocator.pageStore;
             final int id = System.identityHashCode(allocator);
             stream.onEvent(PageStoreStateEvent.NAME, event -> {

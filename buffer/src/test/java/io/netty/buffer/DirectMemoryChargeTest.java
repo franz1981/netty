@@ -21,6 +21,7 @@ import io.netty.util.internal.OutOfDirectMemoryError;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.parallel.Isolated;
 
 import java.lang.reflect.Field;
@@ -46,6 +47,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @Isolated("Fills PlatformDependent's direct memory counter past its limit, which concurrent allocations would hit")
 final class DirectMemoryChargeTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int SLOTS = REGION_SIZE / SEGMENT_SIZE;
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
 
@@ -60,7 +64,7 @@ final class DirectMemoryChargeTest {
     /** Shared slices: a slice is charged by the claim that commits it, credited by its purge or the close. */
     @Test
     void sharedSlicesAreChargedOnceAndCreditedByThePurgeAndTheClose() {
-        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
+        AdaptivePoolingAllocator allocator = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL));
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, false);
         assertEquals(9L * SLICE, allocator.usedMemory(), "the region is not charged, the slices are");
@@ -87,7 +91,7 @@ final class DirectMemoryChargeTest {
      */
     @Test
     void aSharedClaimPastTheLimitGivesItsSlicesBack() {
-        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL);
+        AdaptivePoolingAllocator allocator = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL));
         PageStore store = allocator.pageStore;
         store.claimSlices(9, 0, false);
         Segment block = store.regions[0].blocks[0];
@@ -116,7 +120,7 @@ final class DirectMemoryChargeTest {
     @Test
     void mallocRegionsAreChargedByTheirAllocation() {
         CountingRegionSource malloc = new CountingRegionSource(true);
-        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
+        AdaptivePoolingAllocator allocator = closer.add(newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL));
         PageStore store = allocator.pageStore;
         long run = store.claimSlices(9, 0, false);
         assertEquals(REGION_SIZE, allocator.usedMemory(), "the region, whole");
@@ -141,7 +145,7 @@ final class DirectMemoryChargeTest {
     @Test
     void aMallocRegionPastTheLimitFailsOnlyItsClaim() {
         CountingRegionSource malloc = new CountingRegionSource(true);
-        AdaptivePoolingAllocator allocator = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL);
+        AdaptivePoolingAllocator allocator = closer.add(newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL));
         PageStore store = allocator.pageStore;
         long filler = overfill();
         try {
@@ -159,7 +163,7 @@ final class DirectMemoryChargeTest {
     /** The direct allocator's regions of one block: each is charged by its allocation. */
     @Test
     void mallocBlocksAreChargedByTheirAllocation() throws Exception {
-        AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
+        AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
         Field direct = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
         direct.setAccessible(true);
         RegionSource source = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.segmentSource

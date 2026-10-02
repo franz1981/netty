@@ -19,6 +19,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -48,6 +49,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * free idle slices, coalesced across blocks. Then all of it at once from many threads.
  */
 final class SharedSlicesTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
     private static final int PER_BLOCK = SEGMENT_SIZE / SLICE;
     private static final int PER_REGION = REGION_SIZE / SLICE;
@@ -56,7 +60,7 @@ final class SharedSlicesTest {
     private final CountingRegionSource regions = new CountingRegionSource();
 
     private PageStore store(long purgeDelayNanos) {
-        return newSharedAllocator(segments, regions, REGION_SIZE, purgeDelayNanos).pageStore;
+        return closer.add(newSharedAllocator(segments, regions, REGION_SIZE, purgeDelayNanos)).pageStore;
     }
 
     /** The run's first slice in its region. */
@@ -201,10 +205,10 @@ final class SharedSlicesTest {
         final PageStore store;
         if (heap) {
             int block = PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES;
-            store = new AdaptivePoolingAllocator(segments, true, segments, source,
-                    new PageStoreConfig(block, SLICE, 1, 0, 0, block).withMallocRegions()).pageStore;
+            store = closer.add(new AdaptivePoolingAllocator(segments, true, segments, source,
+                    new PageStoreConfig(block, SLICE, 1, 0, 0, block).withMallocRegions())).pageStore;
         } else {
-            store = newSharedAllocator(segments, source, mmap ? REGION_SIZE : SEGMENT_SIZE, 1).pageStore;
+            store = closer.add(newSharedAllocator(segments, source, mmap ? REGION_SIZE : SEGMENT_SIZE, 1)).pageStore;
         }
         source.store = store;
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
@@ -276,7 +280,7 @@ final class SharedSlicesTest {
     @Test
     void aWhollyIdleMallocRegionGoesBackAndItsPlaceIsTaken() {
         CountingRegionSource malloc = new CountingRegionSource(true);
-        PageStore store = newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL).pageStore;
+        PageStore store = closer.add(newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL)).pageStore;
         long first = store.claimSlices(9, 0, false);
         assertEquals(REGION_SIZE, store.allocator.usedMemory(), "counted whole");
         release(store, first, 9);

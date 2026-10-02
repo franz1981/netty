@@ -22,6 +22,7 @@ import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.concurrent.MpscIntQueue;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -41,6 +42,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 public class SizeClassChunkRecyclerTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     // 2048 and 4096 share the MIN_CHUNK_SIZE pool; 8192 has a chunk size of its own (asserted below).
     private static final int SMALL = AdaptivePoolingAllocator.sizeClassIndexOf(2048);
     private static final int SMALL2 = AdaptivePoolingAllocator.sizeClassIndexOf(4096);
@@ -59,11 +63,11 @@ public class SizeClassChunkRecyclerTest {
         return new IntStack(new int[capacity]);
     }
 
-    private static AdaptivePoolingAllocator newAllocator() {
-        return AdaptiveByteBufAllocatorTest.heap(new AdaptiveByteBufAllocator(false));
+    private AdaptivePoolingAllocator newAllocator() {
+        return AdaptiveByteBufAllocatorTest.heap(closer.add(new AdaptiveByteBufAllocator(false)));
     }
 
-    private static SizeClassChunkRecycler newRecycler() {
+    private SizeClassChunkRecycler newRecycler() {
         return new SizeClassChunkRecycler(newAllocator());
     }
 
@@ -365,7 +369,7 @@ public class SizeClassChunkRecyclerTest {
         lowMem.setAccessible(true);
         assumeFalse(lowMem.getBoolean(null) && Math.max(freedSize, reusingSize) > 16896,
                 "low-memory mode pools the size classes up to 16896 only");
-        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false, threadLocal);
+        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
         Runnable test = () -> assertReusedAcrossSizeClasses(allocator, freedSize, reusingSize);
         if (threadLocal) {
             FastThreadLocalThread.runWithFastThreadLocal(test);

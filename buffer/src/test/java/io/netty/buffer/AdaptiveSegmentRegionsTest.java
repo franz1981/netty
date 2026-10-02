@@ -19,6 +19,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingSegmentSource;
 import io.netty.util.internal.PlatformDependent;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -38,13 +39,16 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * defaults.
  */
 public class AdaptiveSegmentRegionsTest {
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
     private final CountingSegmentSource segments = new CountingSegmentSource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
     /** Buffers of the size classes through the allocator's own heaps, with regions: data lands inside the region. */
     @Test
     void sizeClassBuffersLiveInRegions() {
-        AdaptivePoolingAllocator allocator = newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT);
+        AdaptivePoolingAllocator allocator = closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int size : new int[] {32, 1024, 4352, 16896}) { // size classes in low-memory mode too
             ByteBuf buf = allocator.allocate(size, size);
@@ -77,7 +81,7 @@ public class AdaptiveSegmentRegionsTest {
         PageStoreConfig direct = PageStoreConfig.directDefaults();
         assertEquals(Long.SIZE * direct.segmentSize, direct.regionSize);
         assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
-        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
+        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(true, false));
         assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.direct(allocator).pageStore
                 .regionSource instanceof MmapRegionSource);
     }
@@ -92,7 +96,7 @@ public class AdaptiveSegmentRegionsTest {
             assertFalse(MmapRegionSource.isAvailable());
         }
         assumeFalse(MmapRegionSource.isAvailable(), "mmap regions are available here");
-        AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(true, false);
+        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(true, false));
         PageStore store = AdaptiveByteBufAllocatorTest.direct(allocator).pageStore;
         assertTrue(store.regionSource instanceof MallocRegionSource);
         assertFalse(store.regionSource.canPurgeSlices());
@@ -111,14 +115,14 @@ public class AdaptiveSegmentRegionsTest {
      */
     @Test
     void aConfigWithoutMmapRegionsMallocsThem() {
-        AdaptiveByteBufAllocator adaptive = new AdaptiveByteBufAllocator(true, false);
+        AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
         AdaptivePoolingAllocator direct = AdaptiveByteBufAllocatorTest.direct(adaptive);
         SegmentSource source = direct.pageStore.segmentSource;
         PageStoreConfig noMmap = new PageStoreConfig(PageStoreConfig.SEGMENT_SIZE_BYTES,
                 PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
                 PageStoreConfig.SEGMENT_SIZE_BYTES);
-        AdaptivePoolingAllocator allocator = new AdaptivePoolingAllocator(
-                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, null, noMmap);
+        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(
+                (AdaptivePoolingAllocator.ChunkAllocator) source, true, source, null, noMmap));
         PageStore store = allocator.pageStore;
         assertTrue(store.regionSource instanceof MallocRegionSource);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);

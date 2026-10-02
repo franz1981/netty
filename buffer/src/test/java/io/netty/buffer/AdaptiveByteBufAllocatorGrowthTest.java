@@ -40,9 +40,11 @@ public class AdaptiveByteBufAllocatorGrowthTest {
     private static AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false);
 
     @AfterAll
-    static void cleanUp() {
-        allocator = null;
+    static void cleanUp() throws InterruptedException {
         THREAD_POOL.shutdown();
+        THREAD_POOL.awaitTermination(1, TimeUnit.MINUTES);
+        allocator.close();
+        allocator = null;
     }
 
     @DisabledForSlowLeakDetection
