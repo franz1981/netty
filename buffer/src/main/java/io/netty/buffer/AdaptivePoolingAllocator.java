@@ -27,7 +27,6 @@ import io.netty.util.concurrent.MpscIntQueue;
 import io.netty.util.internal.MathUtil;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
-import io.netty.util.internal.RefCnt;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.ThreadExecutorMap;
 import io.netty.util.internal.UnstableApi;
@@ -64,7 +63,7 @@ import java.util.concurrent.locks.StampedLock;
  *       others in a {@link SizeClassedChunkCache}, which files them by whether they have a free segment.</li>
  *   <li><b>Above it, up to a block</b>: a span of whole slices holding that buffer alone, see
  *       {@link SpanMagazine}.</li>
- *   <li><b>Larger still</b>, or when no span can be had: a one-shot {@link BuddyChunk}, holding that buffer alone and
+ *   <li><b>Larger still</b>, or when no span can be had: a one-shot {@link OneShotChunk}, holding that buffer alone and
  *       freed with it.</li>
  * </ul>
  * <p>
@@ -473,19 +472,20 @@ final class AdaptivePoolingAllocator {
         if (buf == null) {
             buf = newFallbackBuffer();
         }
-        // Create a one-shot chunk for this allocation: above a span, a run of the store's blocks if one fits.
-        BuddyChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
+        // Above a span, a run of the store's blocks if one fits; else an allocation of its own.
+        OneShotChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
         if (chunk == null) {
-            AbstractByteBuf innerChunk = chunkAllocator.allocate(size, maxCapacity);
-            chunk = new BuddyChunk(innerChunk, this);
+            chunk = new OneShotChunk(chunkAllocator.allocate(size, maxCapacity), this, null, 0, 0);
             chunkBufferAllocated(chunk, false, false);
         }
+        boolean initialized = false;
         try {
-            chunk.readInitOneShot(buf, size, maxCapacity);
+            buf.init(chunk.delegate, chunk, 0, 0, 0, size, size, maxCapacity);
+            initialized = true;
         } finally {
-            // Drop the reference the chunk got at construction: readInitOneShot(...) took one for the buffer
-            // when successful, so the chunk and its innerChunk are freed when the AdaptiveByteBuf is released.
-            chunk.release();
+            if (!initialized) {
+                chunk.releaseSegment(0, size);
+            }
         }
         return buf;
     }
@@ -506,7 +506,7 @@ final class AdaptivePoolingAllocator {
      * A one-shot chunk from the page store for a buffer above a block: a run of whole blocks. {@code null} when no run
      * fits: a buffer larger than a new region.
      */
-    private BuddyChunk newStoreOneShot(int size) {
+    private OneShotChunk newStoreOneShot(int size) {
         PageStore store = pageStore;
         // The heaps' decays drive the store's purge; these buffers count toward no heap's, so they drive it too.
         store.purgeIfDue(System.nanoTime());
@@ -521,7 +521,7 @@ final class AdaptivePoolingAllocator {
         boolean made = false;
         try {
             AbstractByteBuf view = store.segmentSource.span(region.buffer, start * segmentSize, slots * segmentSize);
-            BuddyChunk chunk = new BuddyChunk(view, region, start, slots, this);
+            OneShotChunk chunk = new OneShotChunk(view, this, region, start, slots);
             made = true;
             return chunk;
         } finally {
@@ -2310,11 +2310,6 @@ final class AdaptivePoolingAllocator {
             return false;
         }
 
-        protected void deallocate() {
-            allocator.chunkBufferFreed(this, pooled);
-            delegate.release();
-        }
-
         @Override
         public int capacity() {
             return capacity;
@@ -2719,7 +2714,6 @@ final class AdaptivePoolingAllocator {
         }
 
         /** The span goes back to the store's shared slices, from any thread (see {@link PageStore#releaseSlices}). */
-        @Override
         protected void deallocate() {
             allocator.pageStore.releaseSlices(segment, spanStart, spanSlices());
         }
@@ -2741,88 +2735,38 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A ref-counted chunk that holds exactly one buffer spanning the whole chunk, for allocations that are not pooled:
-     * a run of region blocks for a buffer larger than a block, or its own allocation. It belongs to no magazine, is
-     * never cached, and whichever thread drops the last reference gives the run back to the store, or frees the
-     * allocation.
+     * One buffer that owns its memory, freed with it by whichever thread releases it: a run of whole blocks of the
+     * store for a buffer above a block, else an allocation of its own (a buffer larger than a region, the busy-stripe
+     * fallback, low-memory mode).
      */
-    private static final class BuddyChunk extends Chunk {
-        // Always populate the refCnt field, so HotSpot doesn't emit `null` checks.
-        // This is safe to do even on native-image.
-        final RefCnt refCnt = new RefCnt();
+    private static final class OneShotChunk extends Chunk {
         /** The region whose blocks {@link #runStart} to {@link #runStart} + {@link #runSlots} this is, or null. */
         private final Region region;
         private final int runStart;
         private final int runSlots;
 
-        /**
-         * A one-shot chunk over its own allocation. The caller owns the reference it gets here and must
-         * {@link #release()} it once {@link #readInitOneShot} returned.
-         */
-        BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator) {
-            this(delegate, allocator, null, 0, 0);
-        }
-
-        /** A one-shot chunk over {@code slots} region blocks from {@code start}, {@code delegate} being their view. */
-        BuddyChunk(AbstractByteBuf delegate, Region region, int start, int slots, AdaptivePoolingAllocator allocator) {
-            this(delegate, allocator, region, start, slots);
-        }
-
-        private BuddyChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, Region region, int runStart,
-                           int runSlots) {
+        OneShotChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, Region region, int runStart,
+                     int runSlots) {
             super(delegate, allocator, false);
             this.region = region;
             this.runStart = runStart;
             this.runSlots = runSlots;
         }
 
-        /**
-         * Initialize {@code buf} over the whole of this one-shot chunk. On success the buffer holds a reference to
-         * this chunk.
-         */
-        void readInitOneShot(AdaptiveByteBuf buf, int size, int maxCapacity) {
-            retain();
-            boolean initialized = false;
-            try {
-                buf.init(delegate, this, 0, 0, 0, size, size, maxCapacity);
-                initialized = true;
-            } finally {
-                if (!initialized) {
-                    // buf.init(...) failed: drop the reference taken for the buffer.
-                    release();
-                }
-            }
-        }
-
-        /** Any thread: the buffer's reference is dropped. */
+        /** Any thread, once: the run goes back to the store, or the allocation is freed. */
         @Override
-        void releaseSegment(int startingIndex, int size) {
-            release();
-        }
-
-        /** Any thread, on the last reference: the store's memory goes back to the store, the rest is freed. */
-        @Override
-        protected void deallocate() {
+        void releaseSegment(int startIndex, int size) {
             if (region != null) {
                 allocator.pageStore.freeRun(region, runStart, runSlots);
             } else {
-                super.deallocate();
-            }
-        }
-
-        private void retain() {
-            RefCnt.retain(refCnt);
-        }
-
-        void release() {
-            if (RefCnt.release(refCnt)) {
-                deallocate();
+                allocator.chunkBufferFreed(this, false);
+                delegate.release();
             }
         }
 
         @Override
         public String toString() {
-            return "BuddyChunk[one-shot, capacity: " + delegate.capacity() + ']';
+            return "OneShotChunk[capacity: " + delegate.capacity() + ']';
         }
     }
 
