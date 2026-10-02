@@ -140,6 +140,9 @@ final class AdaptivePoolingAllocator {
     private static final int MAX_CHUNK_SIZE = IS_LOW_MEM ?
             2 * 1024 * 1024 : // 2 MiB for systems with small heaps.
             8 * 1024 * 1024; // 8 MiB.
+    static final boolean COLOUR_CHUNKS = SystemPropertyUtil.getBoolean("io.netty.allocator.colourChunks", false);
+    static int colourSeq;
+    static final int COLOUR_UNIT = SystemPropertyUtil.getInt("io.netty.allocator.colourUnit", 64);
     private static final int MAX_POOLED_BUF_SIZE = MAX_CHUNK_SIZE / BUFS_PER_CHUNK;
 
     /**
@@ -2172,20 +2175,30 @@ final class AdaptivePoolingAllocator {
         private SizeClassedChunk newSpanChunk(SizeClassMagazine magazine, SizeClassChunkRecycler recycler,
                                               HeapSegments heapSegments) {
             int slices = chunkSize / magazine.allocator.pageStore.config.sliceSize;
-            Segment segment = heapSegments.claim(slices);
+            int colour = COLOUR_CHUNKS ? (COLOUR_UNIT == 64 ? (colourSeq++ & 63) << 6 : (colourSeq++ & 7) << 3) : 0;
+            int claimed = colour == 0 ? slices : slices + 1;
+            Segment segment = heapSegments.claim(claimed);
             int start = heapSegments.claimedStart();
             try {
-                AbstractByteBuf span = segment.span(magazine.allocator.pageStore.segmentSource, start, slices);
+                AbstractByteBuf span = colour == 0 ?
+                        segment.span(magazine.allocator.pageStore.segmentSource, start, slices) :
+                        magazine.allocator.pageStore.segmentSource.span(
+                                segment.buffer, start * segment.sliceSize + colour, chunkSize);
                 if (recycler.poll(magazine.sizeClassIndex)) {
                     AbstractByteBuf none = recycler.takeBuffer();
                     assert none == null;
                     MpscIntQueue recycledFL = recycler.takeFreeList();
                     IntStack recycledLocal = recycler.takeLocalFreeList();
-                    return new SizeClassedChunk(span, recycledFL, recycledLocal, magazine, this, segment, start);
+                    SizeClassedChunk c = new SizeClassedChunk(span, recycledFL, recycledLocal, magazine, this, segment,
+                            start);
+                    c.spanExtra = claimed - slices;
+                    return c;
                 }
-                return new SizeClassedChunk(span, magazine, this, segment, start);
+                SizeClassedChunk c = new SizeClassedChunk(span, magazine, this, segment, start);
+                c.spanExtra = claimed - slices;
+                return c;
             } catch (Throwable t) {
-                heapSegments.release(segment, start, slices);
+                heapSegments.release(segment, start, claimed);
                 throw t;
             }
         }
@@ -3285,6 +3298,7 @@ final class AdaptivePoolingAllocator {
         // Visible for testing.
         final Segment segment;
         final int spanStart;
+        int spanExtra;
         private final HeapSegments heapSegments;
 
         /**
@@ -3555,7 +3569,7 @@ final class AdaptivePoolingAllocator {
 
         /** The slices of the span this chunk is; only for a chunk that is one. */
         int spanSlices() {
-            return capacity / segment.sliceSize;
+            return capacity / segment.sliceSize + spanExtra;
         }
 
         void recycleOrDeallocate(SizeClassChunkRecycler recycler, int sizeClassIndex) {
