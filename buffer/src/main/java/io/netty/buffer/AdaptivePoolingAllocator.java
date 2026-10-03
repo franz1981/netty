@@ -1165,8 +1165,7 @@ final class AdaptivePoolingAllocator {
      *       being evicted, so a burst does not have to re-allocate immediately after draining; a size class
      *       that stays idle through a whole decay interval gives up those too, see
      *       {@link SizeClassMagazine#decayIfIdle}.</li>
-     *   <li><b>Exhausted</b> — chunks with no free segments when they were filed, until more than an eighth of
-     *       their segments are back (see {@link SizeClassedChunk#hasReusableCapacity}). Primarily an
+     *   <li><b>Exhausted</b> — chunks with no free segments when they were filed. Primarily an
      *       ownership registry: it keeps chunks reachable for {@link #free()} and gives the
      *       notification drain somewhere to move a chunk out of. It is <em>not</em> the discovery
      *       mechanism, and is never walked.</li>
@@ -1418,10 +1417,8 @@ final class AdaptivePoolingAllocator {
         void refile(SizeClassedChunk chunk) {
             ChunkQueue queue = chunk.queue;
             if (queue == exhausted) {
-                // A note may be stale; a return by the owner or under the lock has just pushed the segment. A chunk
-                // with an eighth of its segments free or less stays: every later return looks at it again, inline or
-                // through its note, and the one that takes it past an eighth moves it.
-                if (!chunk.hasReusableCapacity()) {
+                // A note may be stale; a return by the owner or under the lock has just pushed the segment.
+                if (!chunk.hasRemainingCapacity()) {
                     return;
                 }
                 moveToReusable(chunk);
@@ -2416,18 +2413,6 @@ final class AdaptivePoolingAllocator {
 
         boolean hasFullCapacity() {
             return localFree + externalCount(externalFree) == segments;
-        }
-
-        /**
-         * Owner: whether more than an eighth of the segments are free, so that a chunk on the exhausted list is worth
-         * a slow path again; one with fewer is "mostly used" and stays exhausted until more come back. As mimalloc
-         * re-exposes an abandoned full page only once it is not mostly used: {@code mi_page_is_mostly_used},
-         * https://github.com/microsoft/mimalloc/blob/31d034d/include/mimalloc/internal.h#L993-L997, and
-         * {@code mi_abandoned_page_try_reabandon_to_mapped},
-         * https://github.com/microsoft/mimalloc/blob/31d034d/src/free.c#L421-L430.
-         */
-        boolean hasReusableCapacity() {
-            return localFree + externalCount(externalFree) > segments >>> 3;
         }
 
         /**
