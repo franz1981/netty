@@ -46,6 +46,7 @@ public class SizeClassedChunkCacheTest {
         when(chunk.remainingCapacity()).thenReturn(512);
         when(chunk.capacity()).thenReturn(4096);
         when(chunk.hasRemainingCapacity()).thenReturn(true);
+        when(chunk.hasReusableCapacity()).thenReturn(true);
         when(chunk.hasFullCapacity()).thenReturn(false);
         return chunk;
     }
@@ -64,8 +65,15 @@ public class SizeClassedChunkCacheTest {
         when(chunk.remainingCapacity()).thenReturn(4096);
         when(chunk.capacity()).thenReturn(4096);
         when(chunk.hasRemainingCapacity()).thenReturn(true);
+        when(chunk.hasReusableCapacity()).thenReturn(true);
         when(chunk.hasFullCapacity()).thenReturn(true);
         return chunk;
+    }
+
+    /** An exhausted chunk got enough segments back to be reusable again. */
+    private static void regains(SizeClassedChunk chunk) {
+        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        when(chunk.hasReusableCapacity()).thenReturn(true);
     }
 
     // --- Two-list structure: basic operations ---
@@ -141,7 +149,7 @@ public class SizeClassedChunkCacheTest {
 
         // Simulate a cross-thread segment return that could not take the lock: the segment lands in
         // the external free list, and the releaser leaves a note.
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
         cache.notifyHasCapacity(chunk);
 
         assertSame(chunk, cache.pollChunk());
@@ -158,7 +166,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithoutCapacity();
         cache.offerChunk(chunk);
         // gains capacity, but deliberately NO notifyHasCapacity - models a note racing the drain
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
 
         assertSame(chunk, cache.pollChunk(), "the probe must find a chunk with no pending note");
         assertEquals(0, cache.exhausted.size);
@@ -187,7 +195,7 @@ public class SizeClassedChunkCacheTest {
         assertEquals(0, cache.reusable.size);
 
         // Simulate external return giving capacity
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
         cache.notifyHasCapacity(chunk);
 
         SizeClassedChunk polled = cache.forcePurge();
@@ -329,7 +337,7 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(first);
 
         // A segment of the exhausted chunk comes back from another thread; the drain moves it.
-        when(regained.hasRemainingCapacity()).thenReturn(true);
+        regains(regained);
         cache.notifyHasCapacity(regained);
         cache.drainPending();
         assertSame(cache.reusable, regained.queue);
@@ -453,7 +461,7 @@ public class SizeClassedChunkCacheTest {
         when(active.owningCache()).thenReturn(cache);
         cache.activate(active);
 
-        when(active.hasRemainingCapacity()).thenReturn(true);
+        regains(active);
         cache.notifyHasCapacity(active);
         cache.drainPending();
         assertEquals(0, cache.pendingCount());
@@ -491,6 +499,7 @@ public class SizeClassedChunkCacheTest {
         cache.deactivate(active);
         assertSame(cache.exhausted, active.queue);
         assertEquals(1, cache.pendingCount(), "the return must leave a note behind");
+        when(active.hasReusableCapacity()).thenReturn(true);
 
         // Drain only: a poll would also find the chunk through the exhausted-list probe.
         cache.drainPending();
@@ -601,7 +610,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk notified = chunkWithoutCapacity();
         when(notified.owningCache()).thenReturn(cache);
         cache.offerChunk(notified);
-        when(notified.hasRemainingCapacity()).thenReturn(true);
+        regains(notified);
         cache.notifyHasCapacity(notified);
 
         for (SizeClassedChunk c : rest) {
@@ -630,7 +639,7 @@ public class SizeClassedChunkCacheTest {
         final SizeClassedChunk chunk = chunkWithoutCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
 
         final int threads = 8;
         final int notificationsPerThread = 10000;
@@ -677,7 +686,7 @@ public class SizeClassedChunkCacheTest {
 
         // A cross-thread return lands while the drain is inside refile. Re-arming the link
         // only after processing would swallow this notification and strand the chunk.
-        when(chunk.hasRemainingCapacity()).thenAnswer(new Answer<Boolean>() {
+        when(chunk.hasReusableCapacity()).thenAnswer(new Answer<Boolean>() {
             @Override
             public Boolean answer(InvocationOnMock invocation) {
                 cache.notifyHasCapacity(chunk);
@@ -701,7 +710,7 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(chunk);
         assertEquals(1, cache.exhausted.size);
 
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
         cache.notifyHasCapacity(chunk);
         cache.drainPending();
 
@@ -753,7 +762,7 @@ public class SizeClassedChunkCacheTest {
 
         // The first drain looks before the segment is visible, and the release completes while
         // refile is running -- so the drain must leave the chunk queued for another look.
-        when(chunk.hasRemainingCapacity()).thenAnswer(new Answer<Boolean>() {
+        when(chunk.hasReusableCapacity()).thenAnswer(new Answer<Boolean>() {
             private boolean landed;
 
             @Override
@@ -784,7 +793,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithoutCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        when(chunk.hasRemainingCapacity()).thenReturn(true);
+        regains(chunk);
         cache.notifyHasCapacity(chunk);
 
         // The poll drains first: the note moves the chunk to the reusable list, and the poll takes it.
