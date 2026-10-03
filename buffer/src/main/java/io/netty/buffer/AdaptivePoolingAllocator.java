@@ -780,6 +780,8 @@ final class AdaptivePoolingAllocator {
     // size-class magazines and its magazine for buffers above the size classes.
     private static final class StripedHeap {
         final StampedLock lock = new StampedLock();
+        /** The notes left for the stripe's size classes: see {@link PendingChunks}. */
+        final PendingChunks notes = new PendingChunks();
         final IdleDecay idleDecay;
         SizeClassMagazine[] magazines;
         SpanMagazine spanMagazine;
@@ -822,7 +824,7 @@ final class AdaptivePoolingAllocator {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                    sizeClassIndex, null, recycler, lock, magazines, seq);
+                    sizeClassIndex, null, recycler, lock, notes, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -912,6 +914,8 @@ final class AdaptivePoolingAllocator {
 
     private static final class ThreadLocalSizeClassHeap {
         private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
+        /** The notes left for the heap's size classes: see {@link PendingChunks}. */
+        private final PendingChunks notes = new PendingChunks();
         /** Where the heap's claims start in a region: see {@link PageStore#nextHeapSequence}. */
         private final int seq;
         /** Buffers above the size classes; {@code null} until the first one. */
@@ -975,7 +979,7 @@ final class AdaptivePoolingAllocator {
 
         private SizeClassMagazine createMagazine(int sizeClassIndex) {
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                                       sizeClassIndex, Thread.currentThread(), null, null, magazines, seq);
+                                       sizeClassIndex, Thread.currentThread(), null, null, notes, magazines, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -1034,9 +1038,10 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Chunks that a releasing thread asked their owner to look at, because it freed memory in a chunk whose queues
-     * it may not touch (see Invariant N in {@link SizeClassedChunkCache}, which both magazines follow). A lock-free
-     * (Treiber) stack that any thread pushes to and the owner takes whole. A chunk's {@code pendingNext} is both its
-     * link and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
+     * it may not touch (see Invariant N in {@link SizeClassedChunkCache}). One per heap, shared by the caches of all
+     * its size classes, so that applying every note of the heap reads one head, not one per size class. A lock-free
+     * (Treiber) stack that any thread pushes to and the heap's owner takes whole. A chunk's {@code pendingNext} is both
+     * its link and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
      * volatile read.
      */
     static final class PendingChunks {
@@ -1071,8 +1076,7 @@ final class AdaptivePoolingAllocator {
 
         /**
          * Take every queued chunk: the first one, whose successors {@link #rearm} returns, or {@code null}. Owner
-         * only. Cheap when nothing is queued: one volatile read, no atomic read-modify-write; the heap-wide drain
-         * pays this per size class.
+         * only. Cheap when nothing is queued: one volatile read, no atomic read-modify-write.
          */
         Chunk takeAll() {
             if (head == null) {
@@ -1099,18 +1103,20 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Drop every queued chunk; for a cache being freed, whose chunks give their spans back or are abandoned.
+         * Drop every queued chunk; for a heap being freed, whose chunks give their spans back or are abandoned.
          */
         void clear() {
             HEAD.lazySet(this, null);
         }
 
-        // Visible for testing: how many chunks are queued.
-        int size() {
+        // Visible for testing: how many chunks of {@code cache} are queued.
+        int count(SizeClassedChunkCache cache) {
             int count = 0;
             Chunk cur = head;
             while (cur != null && cur != END) {
-                count++;
+                if (((SizeClassedChunk) cur).owningCache() == cache) {
+                    count++;
+                }
                 cur = cur.pendingNext;
             }
             return count;
@@ -1123,7 +1129,9 @@ final class AdaptivePoolingAllocator {
      * <p><b>Access.</b> The queues and each chunk's {@code queue} are touched only by the
      * owner thread (thread-local magazines) or under the stripe write lock (shared magazines) —
      * one magazine's caches all share that one lock. The only exception is {@link #pending},
-     * which any releasing thread may push to; it is the sole concurrent structure here.
+     * which any releasing thread may push to; it is the sole concurrent structure here. It is the heap's: every
+     * cache of the heap shares it, and draining it from any of them applies the notes of all of them, which the
+     * one lock (or the one owner thread) of the heap allows.
      *
      * <p><b>The two lists.</b>
      * <ul>
@@ -1204,8 +1212,8 @@ final class AdaptivePoolingAllocator {
          * like any other chunk.
          */
         SizeClassedChunk active;
-        /** Treiber stack of chunks that a releasing thread asked us to look at. */
-        final PendingChunks pending = new PendingChunks();
+        /** Treiber stack of the chunks that a releasing thread asked the heap to look at: see {@link PendingChunks}. */
+        final PendingChunks pending;
         /**
          * Chunk objects given up with their spans, for this cache's next chunks (see {@link SizeClassedChunk#reinit}).
          * A chunk object never leaves the cache that made it, so a note left for an earlier incarnation still reaches
@@ -1230,7 +1238,13 @@ final class AdaptivePoolingAllocator {
         }
 
         SizeClassedChunkCache(StampedLock stripeLock) {
+            this(stripeLock, new PendingChunks());
+        }
+
+        /** @param pending the notes of the heap, shared by every cache of it */
+        SizeClassedChunkCache(StampedLock stripeLock, PendingChunks pending) {
             this.stripeLock = stripeLock;
+            this.pending = pending;
         }
 
         /** The queued chunks a size class keeps before it evicts one that empties: see {@link #atOrBelowFloor}. */
@@ -1302,7 +1316,9 @@ final class AdaptivePoolingAllocator {
         //     and the drain both run under the same stripe lock, or on the same owner thread. This is
         //     what covers a return landing right after offerChunk read the capacity but before the
         //     insert: the chunk is filed as exhausted while holding capacity, and the note -- which
-        //     cannot be consumed in between -- is what fixes it.
+        //     cannot be consumed in between -- is what fixes it. The notes stack is the heap's, so a drain
+        //     from any size class applies this cache's notes too: still under the one lock of the heap, or on
+        //     its one owner thread, which guard every cache of it.
         //
         // A drain that finds the active chunk and no-ops is benign, not a lost signal: the chunk is the
         // magazine's, which consumes its own returned segments through nextAvailableSegmentOffset, and
@@ -1331,22 +1347,24 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Apply every queued notification. Caller must hold the stripe lock, or be the owner thread of
-         * a thread-local cache.
+         * Apply every queued notification of the heap, each by the cache of its chunk: this one's and those of the
+         * other size classes of the heap. One volatile read when there is none. Caller must hold the stripe lock, or
+         * be the owner thread of a thread-local heap.
          */
         void drainPending() {
             Chunk cur = pending.takeAll();
             while (cur != null) {
                 // Re-arm BEFORE processing (property 3): see PendingChunks#rearm.
                 Chunk next = PendingChunks.rearm(cur);
-                refile((SizeClassedChunk) cur);
+                SizeClassedChunk chunk = (SizeClassedChunk) cur;
+                chunk.owningCache().refile(chunk);
                 cur = next;
             }
         }
 
-        // Visible for testing: how many chunks are queued for the next drain.
+        // Visible for testing: how many chunks of this cache are queued for the next drain.
         int pendingCount() {
-            return pending.size();
+            return pending.count(this);
         }
 
         /**
@@ -1462,8 +1480,14 @@ final class AdaptivePoolingAllocator {
 
         void tickPurge() {
             drainPending();
-            // Exhausted→reusable is applied by the drain above. All that is left is evicting
-            // fully-free reusable chunks above the retention floor.
+            evictAboveFloor();
+        }
+
+        /**
+         * Evict the fully free reusable chunks above the retention floor. Exhausted→reusable is applied by the
+         * drains, before this.
+         */
+        void evictAboveFloor() {
             SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
             while (cur != null && !atOrBelowFloor()) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
@@ -1542,8 +1566,8 @@ final class AdaptivePoolingAllocator {
 
         /**
          * The heap is gone: every chunk gives its span back, or is abandoned to the store until its buffers are back
-         * (see {@link SizeClassedChunk#releaseOrAbandon}). Outstanding notes are dropped: nobody drains this cache
-         * any more.
+         * (see {@link SizeClassedChunk#releaseOrAbandon}). Outstanding notes are dropped, those of the other caches of
+         * the heap too, which are freed with it: nobody drains them any more.
          */
         void free() {
             pending.clear();
@@ -1696,7 +1720,7 @@ final class AdaptivePoolingAllocator {
         /**
          * Every size-classed magazine of the heap this magazine belongs to, including this one. The whole array is
          * covered by the one lock (shared stripe) or the one owner thread (thread-local heap) that guards this
-         * magazine, which is what makes the heap-wide drain legal from here.
+         * magazine, which is what makes the heap-wide purge legal from here.
          */
         private final SizeClassMagazine[] heapMagazines;
         final int sizeClassIndex;
@@ -1713,7 +1737,7 @@ final class AdaptivePoolingAllocator {
 
         SizeClassMagazine(AdaptivePoolingAllocator allocator, IdleDecay idleDecay, int sizeClassIndex,
                           Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                          SizeClassMagazine[] heapMagazines, int seq) {
+                          PendingChunks heapNotes, SizeClassMagazine[] heapMagazines, int seq) {
             this.idleDecay = idleDecay;
             this.seq = seq;
             this.heapMagazines = heapMagazines;
@@ -1724,15 +1748,15 @@ final class AdaptivePoolingAllocator {
             int segmentSize = SIZE_CLASSES[sizeClassIndex];
             int chunkSize = allocator.pageSlices[sizeClassIndex] * allocator.pageStore.config.sliceSize;
             this.chunkController = new SizeClassChunkController(segmentSize, chunkSize);
-            this.chunkCache = new SizeClassedChunkCache(stripeLock);
+            this.chunkCache = new SizeClassedChunkCache(stripeLock, heapNotes);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
                     CHUNK_PURGE_INTERVAL * (chunkSize / segmentSize));
         }
 
         /**
-         * Count one successful allocation and, when the budget is spent, purge this magazine's cache
-         * and those of every other size class on this heap, then count the allocations for the heap's
-         * {@link IdleDecay}.
+         * Count one successful allocation and, when the budget is spent, apply the heap's notes, purge this
+         * magazine's cache and those of every other size class on this heap, then count the allocations for the
+         * heap's {@link IdleDecay}.
          *
          * <p>Call exactly once per successful {@link #allocate}.
          */
@@ -1770,39 +1794,16 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Purge the caches of the other size classes on this heap. A size class that has gone idle
-         * stops allocating, so it would never fire its own tick — and those are exactly the caches
-         * worth purging, because the spans they give up serve every size class of every heap.
+         * Purge the caches of the other size classes on this heap, whose notes the tick of this one applied. A size
+         * class that has gone idle stops allocating, so it would never fire its own tick — and those are exactly the
+         * caches worth purging, because the spans they give up serve every size class of every heap.
          */
         private void purgeHeapSiblings() {
             SizeClassMagazine[] mags = heapMagazines;
             for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
                 SizeClassMagazine sibling = mags[i];
                 if (sibling != null && sibling != this) {
-                    sibling.chunkCache.tickPurge();
-                }
-            }
-        }
-
-        /**
-         * Apply the notifications left by releasers on every size class of this heap, not just this
-         * magazine's. A size class that has gone idle stops allocating, so it would never drain its
-         * own notes — and those are exactly the chunks worth reclaiming, because the spans they give
-         * up serve every size class of every heap.
-         *
-         * <p>Called on the allocation slow path only, right before {@link SizeClassedChunkCache#pollChunk},
-         * which is once per chunk-worth of allocations. One volatile read per magazine when there are no notes.
-         *
-         * <p>This magazine's own cache is skipped: {@code pollChunk} drains it on the very next
-         * line, which is both the last moment before the poll and therefore the freshest - it also
-         * catches notes that landed while the other size classes were being drained.
-         */
-        private void drainHeapPending() {
-            SizeClassMagazine[] mags = heapMagazines;
-            for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-                SizeClassMagazine mag = mags[i];
-                if (mag != null && mag != this) {
-                    mag.chunkCache.drainPending();
+                    sibling.chunkCache.evictAboveFloor();
                 }
             }
         }
@@ -1838,8 +1839,9 @@ final class AdaptivePoolingAllocator {
             SizeClassedChunk curr;
             boolean polledChunkWithoutSegment = false;
 
-            // Now try to poll from the cache first
-            drainHeapPending();
+            // Poll the cache first. The poll applies the notes of the whole heap: those of a size class that has
+            // gone idle too, which never takes its own slow path again, and whose emptied chunks give their spans
+            // back to serve every size class of every heap. One volatile read when there is none.
             curr = chunkCache.pollChunk();
             if (curr != null) {
                 chunkCache.activate(curr);
@@ -2252,6 +2254,11 @@ final class AdaptivePoolingAllocator {
             localFree = segments;
             allocatedBytes = 0;
             externalFree = EXTERNAL_EMPTY;
+        }
+
+        /** {@link #owningCache}, for the heap's drain, which takes the notes of every cache of the heap at once. */
+        SizeClassedChunkCache owningCache() {
+            return owningCache;
         }
 
         /**

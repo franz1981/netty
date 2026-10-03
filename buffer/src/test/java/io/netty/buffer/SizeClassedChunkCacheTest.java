@@ -135,6 +135,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         assertEquals(1, cache.exhausted.size);
 
@@ -180,6 +181,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         assertEquals(1, cache.exhausted.size);
         assertEquals(0, cache.reusable.size);
@@ -322,6 +324,7 @@ public class SizeClassedChunkCacheTest {
             cache.offerChunk(chunkWithoutCapacity());
         }
         SizeClassedChunk active = fullChunk();
+        when(active.owningCache()).thenReturn(cache);
         cache.activate(active);
 
         // A foreign-thread return on the active chunk leaves a note; the drain must not act on it.
@@ -393,6 +396,7 @@ public class SizeClassedChunkCacheTest {
     void deactivateFilesTheChunkByCapacityAfterItsNoteWasDroppedWhileActive() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
         SizeClassedChunk active = chunkWithoutCapacity();
+        when(active.owningCache()).thenReturn(cache);
         cache.activate(active);
 
         when(active.hasRemainingCapacity()).thenReturn(true);
@@ -413,6 +417,7 @@ public class SizeClassedChunkCacheTest {
     void noteLeftDuringDeactivationMovesTheChunkBackToReusable() {
         final SizeClassedChunkCache cache = new SizeClassedChunkCache();
         final SizeClassedChunk active = chunkWithoutCapacity();
+        when(active.owningCache()).thenReturn(cache);
         cache.activate(active);
 
         when(active.hasRemainingCapacity()).thenAnswer(new Answer<Boolean>() {
@@ -539,6 +544,7 @@ public class SizeClassedChunkCacheTest {
         // Offered last, so it sits at the head of the exhausted list. It is classified as
         // exhausted, then gains capacity -- exactly what a cross-thread segment return does.
         SizeClassedChunk notified = chunkWithoutCapacity();
+        when(notified.owningCache()).thenReturn(cache);
         cache.offerChunk(notified);
         when(notified.hasRemainingCapacity()).thenReturn(true);
         cache.notifyHasCapacity(notified);
@@ -567,6 +573,7 @@ public class SizeClassedChunkCacheTest {
                 new SizeClassedChunkCache();
 
         final SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         when(chunk.hasRemainingCapacity()).thenReturn(true);
 
@@ -608,6 +615,7 @@ public class SizeClassedChunkCacheTest {
                 new SizeClassedChunkCache();
 
         final SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         cache.notifyHasCapacity(chunk);
         assertEquals(1, cache.pendingCount());
@@ -634,6 +642,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         assertEquals(1, cache.exhausted.size);
 
@@ -656,6 +665,7 @@ public class SizeClassedChunkCacheTest {
             cache.offerChunk(chunkWithCapacity());
         }
         SizeClassedChunk chunk = chunkWithCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         int countBefore = cache.reusable.size;
 
@@ -679,6 +689,7 @@ public class SizeClassedChunkCacheTest {
                 new SizeClassedChunkCache();
 
         final SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         // The releasing thread offered its segment just after offerChunk read the capacity, so the
         // chunk lands on the exhausted list, and the note is left behind.
         cache.offerChunk(chunk);
@@ -716,6 +727,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
         when(chunk.hasRemainingCapacity()).thenReturn(true);
         cache.notifyHasCapacity(chunk);

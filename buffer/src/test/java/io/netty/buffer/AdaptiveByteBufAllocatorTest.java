@@ -52,6 +52,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.StampedLock;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -1493,6 +1494,120 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 "after the burst went idle the caches must fall back to the chunks they keep: settled " + settled
                         + " > " + bound + " (" + caches + " caches, chunks of " + BURST_CHUNK_SIZE + "), peak was "
                         + peak);
+    }
+
+    /**
+     * One heap's owner allocates across many size classes, switching chunks all the time, while other threads
+     * release what it allocates: their notes land on the heap's notes while its slow paths drain them. Once every
+     * buffer is back and the owner drained once more, no note is left and no chunk sits on an exhausted list: every
+     * chunk was refiled. The purge then takes every cache down to the chunks it keeps.
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void noNoteIsLostWhileRemoteReleasesRaceChunkSwitches(final boolean threadLocal) throws Exception {
+        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
+        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
+        final int[] sizes = smallSizeClasses();
+        final BlockingQueue<ByteBuf> toRelease = new ArrayBlockingQueue<ByteBuf>(4096);
+        final AtomicBoolean done = new AtomicBoolean();
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        Thread[] releasers = new Thread[4];
+        for (int i = 0; i < releasers.length; i++) {
+            releasers[i] = new Thread(() -> {
+                try {
+                    for (;;) {
+                        ByteBuf buf = toRelease.poll(1, TimeUnit.MILLISECONDS);
+                        if (buf != null) {
+                            buf.release();
+                        } else if (done.get() && toRelease.isEmpty()) {
+                            return;
+                        }
+                    }
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                }
+            }, "releaser-" + i);
+            releasers[i].start();
+        }
+        // On stripes, a release that wins the stripe lock applies itself and leaves no note: hold every stripe lock
+        // on and off, so that many releases cannot, while the allocations go on between the holds.
+        final List<StampedLock> locks = threadLocal ? Collections.<StampedLock>emptyList() : stripeLocks(allocator);
+        Thread blocker = new Thread(() -> {
+            long[] stamps = new long[locks.size()];
+            while (!done.get()) {
+                for (int i = 0; i < stamps.length; i++) {
+                    stamps[i] = locks.get(i).writeLock();
+                }
+                LockSupport.parkNanos(50000);
+                for (int i = 0; i < stamps.length; i++) {
+                    locks.get(i).unlockWrite(stamps[i]);
+                }
+                LockSupport.parkNanos(50000);
+            }
+        }, "stripe-blocker");
+        blocker.start();
+        onHeapThread(threadLocal, () -> {
+            try {
+                SplittableRandom rng = new SplittableRandom(42);
+                for (int i = 0; i < 200000; i++) {
+                    toRelease.put(allocator.heapBuffer(sizes[rng.nextInt(sizes.length)]));
+                }
+            } finally {
+                done.set(true);
+            }
+            for (Thread t : releasers) {
+                t.join();
+            }
+            blocker.join();
+            List<SizeClassedChunkCache> caches = threadLocal ? threadLocalChunkCaches(allocator)
+                    : sizeClassChunkCaches(allocator);
+            assertTrue(caches.size() > 16, "many size classes must take part: " + caches.size());
+            underStripeLocks(allocator, !threadLocal, () -> {
+                for (SizeClassedChunkCache cache : caches) {
+                    cache.drainPending();
+                }
+                for (SizeClassedChunkCache cache : caches) {
+                    assertEquals(0, cache.pendingCount(), "a note was left after the last drain");
+                    assertEquals(0, cache.exhausted.size, "every buffer is back: no chunk may stay exhausted");
+                    for (AdaptivePoolingAllocator.Chunk c = cache.reusable.head; c != null; c = c.nextInQueue) {
+                        assertTrue(((SizeClassedChunk) c).hasFullCapacity(), "every buffer is back");
+                    }
+                    cache.tickPurge();
+                    assertTrue(cache.reusable.size <= SizeClassedChunkCache.FLOOR,
+                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size);
+                }
+            });
+        });
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    /** The size classes up to 16 KiB, whose chunks are a few slices at most: many chunk switches. */
+    private static int[] smallSizeClasses() {
+        int[] all = AdaptivePoolingAllocator.getSizeClasses();
+        int n = 0;
+        while (n < all.length && all[n] <= 16384) {
+            n++;
+        }
+        return Arrays.copyOf(all, n);
+    }
+
+    /** The size-class caches of the calling thread's thread-local heap. */
+    private static List<SizeClassedChunkCache> threadLocalChunkCaches(AdaptiveByteBufAllocator allocator)
+            throws Exception {
+        Object heap = threadLocalHeapVariable(allocator).get();
+        Field magsField = heap.getClass().getDeclaredField("magazines");
+        magsField.setAccessible(true);
+        List<SizeClassedChunkCache> caches = new ArrayList<SizeClassedChunkCache>();
+        for (Object magazine : (Object[]) magsField.get(heap)) {
+            if (magazine != null) {
+                Field cacheField = magazine.getClass().getDeclaredField("chunkCache");
+                cacheField.setAccessible(true);
+                caches.add((SizeClassedChunkCache) cacheField.get(magazine));
+            }
+        }
+        return caches;
     }
 
     /**
