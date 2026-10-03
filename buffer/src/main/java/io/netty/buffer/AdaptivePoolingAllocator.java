@@ -95,7 +95,7 @@ final class AdaptivePoolingAllocator {
             "io.netty.allocator.disableThreadLocalMagazinesOnLowMemory", true);
 
     /** A size class's page holds at least this many slots, unless only the largest page kind fits it. */
-    private static final int MIN_PAGE_SLOTS = 4;
+    private static final int MIN_PAGE_SLOTS = 16;
     /** At most this fraction of a page, as a right shift, stays unused at its end: an eighth. */
     private static final int MAX_PAGE_WASTE_SHIFT = 3;
     /** An exact fit with fewer slots takes the next page kind, for room to colour, unless that is the largest. */
