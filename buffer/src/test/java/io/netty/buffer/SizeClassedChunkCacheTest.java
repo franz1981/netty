@@ -287,7 +287,7 @@ public class SizeClassedChunkCacheTest {
     // --- The magazine's active chunk belongs to the cache but is on neither list ---
 
     @Test
-    void activeChunkIsOnNoListAndChunksFiledLaterGoToTheReusableFront() {
+    void activeChunkIsOnNoListAndChunksFiledLaterGoToTheReusableFrontOrBack() {
         SizeClassedChunkCache cache = new SizeClassedChunkCache();
         SizeClassedChunk older = chunkWithCapacity();
         cache.offerChunk(older);
@@ -300,20 +300,74 @@ public class SizeClassedChunkCacheTest {
         assertNull(active.nextInQueue);
         assertNull(active.prevInQueue);
 
-        // Filed while a chunk is active: at the front of the reusable list, newest first.
+        // Filed while a chunk is active: offered at the front of the reusable list, regained at the back.
         SizeClassedChunk offered = chunkWithCapacity();
         cache.offerChunk(offered);
         SizeClassedChunk unfull = chunkWithoutCapacity();
         cache.offerChunk(unfull);
         cache.moveToReusable(unfull);
 
-        assertSame(unfull, cache.reusable.head);
-        assertNull(unfull.prevInQueue);
-        assertSame(offered, unfull.nextInQueue);
+        assertSame(offered, cache.reusable.head);
+        assertNull(offered.prevInQueue);
         assertSame(older, offered.nextInQueue);
-        assertNull(older.nextInQueue);
+        assertSame(unfull, older.nextInQueue);
+        assertNull(unfull.nextInQueue);
+        assertSame(unfull, cache.reusable.tail);
         assertNull(active.nextInQueue);
         assertEquals(3, cache.reusable.size);
+    }
+
+    @Test
+    void aChunkThatRegainsCapacityJoinsTheReusableListAtTheBack() {
+        SizeClassedChunkCache cache = new SizeClassedChunkCache();
+        SizeClassedChunk regained = chunkWithoutCapacity();
+        when(regained.owningCache()).thenReturn(cache);
+        cache.offerChunk(regained);
+        SizeClassedChunk first = chunkWithCapacity();
+        SizeClassedChunk second = chunkWithCapacity();
+        cache.offerChunk(second);
+        cache.offerChunk(first);
+
+        // A segment of the exhausted chunk comes back from another thread; the drain moves it.
+        when(regained.hasRemainingCapacity()).thenReturn(true);
+        cache.notifyHasCapacity(regained);
+        cache.drainPending();
+        assertSame(cache.reusable, regained.queue);
+        assertSame(regained, cache.reusable.tail);
+
+        // The polls take the chunks filed before it first.
+        assertSame(first, cache.pollChunk());
+        assertSame(second, cache.pollChunk());
+        assertSame(regained, cache.pollChunk());
+        assertNull(cache.pollChunk());
+        assertNull(cache.reusable.head);
+        assertNull(cache.reusable.tail);
+    }
+
+    @Test
+    void theQueueKeepsItsTailAcrossRemovals() {
+        AdaptivePoolingAllocator.ChunkQueue queue = new AdaptivePoolingAllocator.ChunkQueue();
+        SizeClassedChunk a = chunkWithCapacity();
+        SizeClassedChunk b = chunkWithCapacity();
+        SizeClassedChunk c = chunkWithCapacity();
+        queue.pushBack(b);
+        queue.pushFront(a);
+        queue.pushBack(c);
+        assertSame(a, queue.head);
+        assertSame(c, queue.tail);
+        queue.remove(c);
+        assertSame(b, queue.tail);
+        assertNull(b.nextInQueue);
+        queue.remove(a);
+        assertSame(b, queue.head);
+        assertSame(b, queue.tail);
+        queue.remove(b);
+        assertNull(queue.head);
+        assertNull(queue.tail);
+        assertEquals(0, queue.size);
+        queue.pushBack(a);
+        assertSame(a, queue.head);
+        assertSame(a, queue.tail);
     }
 
     @Test

@@ -1001,13 +1001,14 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * An intrusive doubly linked list of chunks, newest first. The links live on the
+     * An intrusive doubly linked list of chunks, with a head and a tail. The links live on the
      * chunk, so removing any chunk is O(1), and so does the chunk's membership: {@code chunk.queue} is the queue it
      * is on, or {@code null}. Not concurrent: the magazine that owns it holds the stripe lock, or is the only thread
      * that touches it.
      */
     static final class ChunkQueue {
         Chunk head;
+        Chunk tail;
         int size;
 
         void pushFront(Chunk chunk) {
@@ -1016,8 +1017,24 @@ final class AdaptivePoolingAllocator {
             chunk.nextInQueue = head;
             if (head != null) {
                 head.prevInQueue = chunk;
+            } else {
+                tail = chunk;
             }
             this.head = chunk;
+            chunk.queue = this;
+            size++;
+        }
+
+        void pushBack(Chunk chunk) {
+            Chunk tail = this.tail;
+            chunk.nextInQueue = null;
+            chunk.prevInQueue = tail;
+            if (tail != null) {
+                tail.nextInQueue = chunk;
+            } else {
+                head = chunk;
+            }
+            this.tail = chunk;
             chunk.queue = this;
             size++;
         }
@@ -1032,6 +1049,8 @@ final class AdaptivePoolingAllocator {
             }
             if (next != null) {
                 next.prevInQueue = prev;
+            } else {
+                tail = prev;
             }
             chunk.prevInQueue = null;
             chunk.nextInQueue = null;
@@ -1140,7 +1159,9 @@ final class AdaptivePoolingAllocator {
      * <p><b>The two lists.</b>
      * <ul>
      *   <li><b>Reusable</b> — chunks known to have free segments. {@link #pollChunk} takes the
-     *       head, O(1). Fully-free chunks at or below the retention floor stay here rather than
+     *       head, O(1). {@link #offerChunk} files a chunk at the head, and a chunk that regains capacity on the
+     *       exhausted list joins at the tail (see {@link #moveToReusable}). Fully-free chunks at or below the
+     *       retention floor stay here rather than
      *       being evicted, so a burst does not have to re-allocate immediately after draining; a size class
      *       that stays idle through a whole decay interval gives up those too, see
      *       {@link SizeClassMagazine#decayIfIdle}.</li>
@@ -1276,10 +1297,16 @@ final class AdaptivePoolingAllocator {
             return exhausted.size + reusable.size <= FLOOR;
         }
 
-        // Signal A (see refile): exhausted → reusable
+        /**
+         * Signal A (see {@link #refile}): exhausted → reusable, at the tail. The polls take the chunks filed before it
+         * first, which leaves it time to gain more free segments before a poll hands it out: at the head, the next
+         * poll would take it with the one segment that moved it. As mimalloc puts a full page that regains a block at
+         * the end of its queue: {@code mi_page_queue_enqueue_from_full},
+         * https://github.com/microsoft/mimalloc/blob/31d034d/src/page-queue.c#L429-L432.
+         */
         void moveToReusable(SizeClassedChunk chunk) {
             exhausted.remove(chunk);
-            reusable.pushFront(chunk);
+            reusable.pushBack(chunk);
         }
 
         void evictIfAboveFloor(SizeClassedChunk chunk) {
