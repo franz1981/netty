@@ -665,7 +665,7 @@ public class SizeClassedChunkCacheTest {
         cache.drainPending();
 
         assertEquals(countBefore - 1, cache.reusable.size);
-        assertNull(chunk.queue);
+        assertSame(cache.idle, chunk.queue, "given up: its object waits idle for the next chunk");
         verify(chunk).releaseSpan();
     }
 

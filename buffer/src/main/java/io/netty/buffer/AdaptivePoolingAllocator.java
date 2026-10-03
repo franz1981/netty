@@ -1155,6 +1155,14 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk active;
         /** Treiber stack of chunks that a releasing thread asked us to look at. */
         final PendingChunks pending = new PendingChunks();
+        /**
+         * Chunk objects given up with their spans, for this cache's next chunks (see {@link SizeClassedChunk#reinit}).
+         * A chunk object never leaves the cache that made it, so a note left for an earlier incarnation still reaches
+         * the right cache. Unbounded: one object per chunk of the cache's peak, holding nothing else.
+         */
+        final ChunkQueue idle = new ChunkQueue();
+        // Visible for testing: the chunk objects this cache made.
+        int chunksMade;
 
         /**
          * The lock guarding this cache's lists, or {@code null} when there is nothing to guard.
@@ -1207,10 +1215,20 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /** {@code chunk}, wholly free and on the reusable list, gives its span back to the store. */
+        /** {@code chunk}, wholly free and on the reusable list, gives its span back to the store and waits idle. */
         private void evict(SizeClassedChunk chunk) {
             reusable.remove(chunk);
             chunk.releaseSpan();
+            idle.pushFront(chunk);
+        }
+
+        /** A chunk object given up earlier, or {@code null}: see {@link #idle}. */
+        SizeClassedChunk takeIdle() {
+            SizeClassedChunk chunk = (SizeClassedChunk) idle.head;
+            if (chunk != null) {
+                idle.remove(chunk);
+            }
+            return chunk;
         }
 
         // --- Notification queue: cross-thread segment returns that could not take the lock ---
@@ -1295,8 +1313,8 @@ final class AdaptivePoolingAllocator {
                 }
                 moveToReusable(chunk);
             } else if (queue != reusable) {
-                // On no queue: either gone (evicted, or its cache freed), not ours to move - its capacity is never
-                // read, because such a chunk may have given its span up - or
+                // Idle, or on no queue: either given up (idle, or its cache freed), not ours to move - its capacity is
+                // never read, because such a chunk gave its span up - or
                 // the active chunk, which consumes its own returned segments and is filed by capacity when the
                 // magazine gives it up (see deactivate). A polled chunk is activated before any drain can run.
                 return;
@@ -1515,9 +1533,9 @@ final class AdaptivePoolingAllocator {
         private SizeClassChunkController(int segmentSize, int chunkSize) {
             this.segmentSize = segmentSize;
             this.chunkSize = chunkSize;
-            // Slab colouring: each new span chunk starts its segments 64 bytes further into the span than the
-            // previous one of its heap's class, round robin over at most 16 offsets, so that segment k of consecutive
-            // chunks does not share its offset in a 4 KiB page. The room is the tail the segments leave unused; a
+            // Slab colouring: each chunk object of a heap's class starts its segments 64 bytes further into its spans
+            // than the previous one, round robin over at most 16 offsets, so that segment k of consecutive chunks does
+            // not share its offset in a 4 KiB page. The room is the tail the segments leave unused; a
             // class that fits exactly gives up one segment for it when it has 32 or more and the segment makes room for
             // a second colour (not the 32-byte class), else stays uncoloured. See
             // Bonwick, "The Slab Allocator: An Object-Caching Kernel Memory Allocator", USENIX Summer 1994, section
@@ -1536,7 +1554,7 @@ final class AdaptivePoolingAllocator {
             colours = Math.min(MAX_COLOURS, (room >>> COLOUR_SHIFT) + 1);
         }
 
-        /** The start offset of the next span chunk's segments; single writer, as the magazine. */
+        /** The start offset of the next chunk object's segments in its spans; single writer, as the magazine. */
         private int nextColourOffset() {
             int colour = nextColour;
             nextColour = colour + 1 == colours ? 0 : colour + 1;
@@ -1552,8 +1570,9 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * A new {@link SizeClassedChunk} for {@code magazine}: a span of shared slices (see
-         * {@link PageStore#claimSlices}). The store accounts the slices, so nothing is announced here.
+         * A new chunk for {@code magazine}: a span of shared slices (see {@link PageStore#claimSlices}), served by a
+         * chunk object its cache gave up earlier, or by a new one. The store accounts the slices, so nothing is
+         * announced here.
          */
         SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
             PageStore store = magazine.allocator.pageStore;
@@ -1563,13 +1582,14 @@ final class AdaptivePoolingAllocator {
             Segment segment = store.block(run);
             int start = store.start(run);
             try {
-                int colour = nextColourOffset();
-                // The chunk reads the segment's own buffer, as a large-buffer span does: its buffers start at the
-                // span's offset in it, coloured. No buffer object per chunk.
-                AbstractByteBuf span = segment.buffer;
-                int base = start * segment.sliceSize + colour;
-                int capacity = chunkSize - colour;
-                return new SizeClassedChunk(span, magazine, this, segment, start, base, capacity);
+                SizeClassedChunkCache cache = magazine.chunkCache;
+                SizeClassedChunk chunk = cache.takeIdle();
+                if (chunk == null) {
+                    chunk = new SizeClassedChunk(magazine, this, nextColourOffset());
+                    cache.chunksMade++;
+                }
+                chunk.reinit(segment, start);
+                return chunk;
             } catch (Throwable t) {
                 segment.releaseRun(start, slices, System.nanoTime());
                 throw t;
@@ -1998,7 +2018,8 @@ final class AdaptivePoolingAllocator {
          * the push, so no separate flag is needed.
          */
         volatile Chunk pendingNext;
-        protected final AbstractByteBuf delegate;
+        /** Final but for a size-class chunk, which has one per incarnation (see {@code SizeClassedChunk#reinit}). */
+        protected AbstractByteBuf delegate;
         // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
         final AdaptivePoolingAllocator allocator;
         final int capacity;
@@ -2080,13 +2101,18 @@ final class AdaptivePoolingAllocator {
      * detected, and a release that reaches a chunk after it gave its span up writes into memory that is no longer its
      * own: neither can happen without using a buffer after releasing it.
      * <p>
+     * <b>Incarnations.</b> A chunk object outlives its span: given up, it waits on its cache's idle list and serves the
+     * cache's next chunk on whatever span the store has ({@link #reinit}); its colour stays, so its capacity too.
+     * <p>
      * <b>One owner.</b> Every field but {@link #externalFree} and {@code pendingNext} belongs to the chunk's owner: the
      * owner thread, or the holder of the stripe lock, or, once the heap died with buffers out, the store's purger (see
      * {@link #releaseOrAbandon}). Any other releaser writes its segment's link, pushes it with one CAS on
      * {@link #externalFree}, and leaves a note for the owner; it reads nothing else of the chunk. Only the owner
      * decides that every segment is back ({@link #hasFullCapacity}: one volatile read) and gives the span up, so a
      * span goes back once and a late release cannot find it gone: before its CAS a segment is out, so the chunk is
-     * not all free.
+     * not all free. After its CAS a releaser touches only the final {@link #owningCache} and {@code pendingNext},
+     * which mean the same for every incarnation: its note may reach a later one, and is harmless, since a note only
+     * says "look at this chunk" and the owner files it by what it is now.
      */
     static class SizeClassedChunk extends Chunk {
         static final int FREE_LIST_EMPTY = -1;
@@ -2096,15 +2122,18 @@ final class AdaptivePoolingAllocator {
                 AtomicLongFieldUpdater.newUpdater(SizeClassedChunk.class, "externalFree");
         private final int segments;
         private final int segmentSize;
+        /** How far into each span the segments start: 64-byte steps, one per chunk object. */
+        private final int colour;
+        // Per incarnation, set by reinit.
         /** Offset of the first segment. */
-        private final int base;
+        private int base;
         /** Offset of the first segment released by the owner thread or under the stripe lock. */
-        private int head = FREE_LIST_EMPTY;
+        private int head;
         /** Offset of the first segment never handed out; they are taken in order up to {@link #bumpLimit}. */
         private int bump;
-        private final int bumpLimit;
+        private int bumpLimit;
         /** Offset of the last segment: the largest link a free segment can hold. */
-        private final int lastSegmentOffset;
+        private int lastSegmentOffset;
         /** The segments reachable from {@link #head} plus those never handed out. */
         private int localFree;
         /**
@@ -2126,8 +2155,8 @@ final class AdaptivePoolingAllocator {
         final SizeClassedChunkCache owningCache;
         /** The block this chunk is a span of, from slice {@link #spanStart}; {@code null} for the end marker. */
         // Visible for testing.
-        final Segment segment;
-        final int spanStart;
+        Segment segment;
+        int spanStart;
 
         /**
          * Constructor only used by {@link PendingChunks}' end marker.
@@ -2135,38 +2164,41 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk() {
             segmentSize = 0;
             segments = 0;
-            base = 0;
-            bumpLimit = 0;
-            lastSegmentOffset = 0;
-            EXTERNAL_FREE.lazySet(this, EXTERNAL_EMPTY);
+            colour = 0;
             ownerThread = null;
             owningCache = null;
-            segment = null;
-            spanStart = 0;
+        }
+
+        /** A chunk object of {@code magazine}'s cache, with no span until {@link #reinit}. */
+        SizeClassedChunk(SizeClassMagazine magazine, SizeClassChunkController controller, int colour) {
+            super(null, magazine.allocator, true, controller.chunkSize - colour);
+            segmentSize = controller.segmentSize;
+            segments = controller.buffers;
+            this.colour = colour;
+            ownerThread = magazine.ownerThread;
+            owningCache = magazine.chunkCache;
         }
 
         /**
-         * @param delegate  the buffer of {@code segment}, the block this chunk is a span of from slice
-         *                  {@code spanStart}
-         * @param base      where the chunk's buffers start in {@code delegate}: the span's offset, colour included
-         * @param capacity  the bytes of the span, less its colour
+         * Owner: this object becomes a chunk on the span of {@code segment} from slice {@code spanStart}, every segment
+         * free and none handed out; nothing is filled. Every release of an earlier incarnation pushed its segment
+         * before that one was given up, so none can push on this one.
          */
-        SizeClassedChunk(AbstractByteBuf delegate, SizeClassMagazine magazine,
-                         SizeClassChunkController controller, Segment segment, int spanStart, int base,
-                         int capacity) {
-            super(delegate, magazine.allocator, true, capacity);
+        void reinit(Segment segment, int spanStart) {
             this.segment = segment;
             this.spanStart = spanStart;
-            segmentSize = controller.segmentSize;
-            segments = controller.buffers;
+            // The block's own buffer, as a large-buffer span reads it: no buffer object per chunk.
+            delegate = segment.buffer;
+            int base = spanStart * segment.sliceSize + colour;
             this.base = base;
             bump = base;
             bumpLimit = base + segments * segmentSize;
             lastSegmentOffset = bumpLimit - segmentSize;
+            head = FREE_LIST_EMPTY;
             localFree = segments;
-            EXTERNAL_FREE.lazySet(this, EXTERNAL_EMPTY);
-            ownerThread = magazine.ownerThread;
-            owningCache = magazine.chunkCache;
+            lostFree = 0;
+            allocatedBytes = 0;
+            externalFree = EXTERNAL_EMPTY;
         }
 
         /**
@@ -2286,7 +2318,8 @@ final class AdaptivePoolingAllocator {
             localFree++;
         }
 
-        private void pushExternalFree(int offset) {
+        // Package-private for the tests that cut a release from another thread in two: this, then the note.
+        void pushExternalFree(int offset) {
             long current;
             long pushed;
             do {
@@ -2424,6 +2457,11 @@ final class AdaptivePoolingAllocator {
         // Visible for testing.
         int externalFreeCount() {
             return externalCount(externalFree);
+        }
+
+        // Visible for testing.
+        int freeSegmentCount() {
+            return localFree + lostFree + externalCount(externalFree);
         }
 
         // Visible for testing.
