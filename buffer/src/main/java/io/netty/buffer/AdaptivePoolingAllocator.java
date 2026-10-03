@@ -786,8 +786,6 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine[] magazines;
         SpanMagazine spanMagazine;
         AdaptiveRecycler recycler;
-        /** Where the stripe's claims start in a region: see {@link PageStore#nextHeapSequence}. */
-        int seq = -1;
 
         StripedHeap(PageStore store) {
             idleDecay = new IdleDecay(store);
@@ -808,15 +806,7 @@ final class AdaptivePoolingAllocator {
         private SizeClassMagazine createFirstMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
             magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
             idleDecay.magazines = magazines;
-            joinPageStore(allocator);
             return createMagazine(sizeClassIndex, allocator);
-        }
-
-        /** Once per stripe, by whichever magazine comes first. */
-        private void joinPageStore(AdaptivePoolingAllocator allocator) {
-            if (seq < 0) {
-                seq = allocator.pageStore.nextHeapSequence();
-            }
         }
 
         private SizeClassMagazine createMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
@@ -824,7 +814,7 @@ final class AdaptivePoolingAllocator {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                    sizeClassIndex, null, recycler, lock, notes, seq);
+                    sizeClassIndex, null, recycler, lock, notes);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -854,8 +844,7 @@ final class AdaptivePoolingAllocator {
                 if (recycler == null) {
                     recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
                 }
-                joinPageStore(allocator);
-                mag = new SpanMagazine(allocator, recycler, null, idleDecay, seq);
+                mag = new SpanMagazine(allocator, recycler, null, idleDecay);
                 spanMagazine = mag;
             }
             return mag;
@@ -918,8 +907,6 @@ final class AdaptivePoolingAllocator {
         private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
         /** The notes left for the heap's size classes: see {@link PendingChunks}. */
         private final PendingChunks notes = new PendingChunks();
-        /** Where the heap's claims start in a region: see {@link PageStore#nextHeapSequence}. */
-        private final int seq;
         /** Buffers above the size classes; {@code null} until the first one. */
         private SpanMagazine spanMagazine;
         // Visible for testing.
@@ -930,7 +917,6 @@ final class AdaptivePoolingAllocator {
             this.allocator = allocator;
             idleDecay = new IdleDecay(allocator.pageStore);
             idleDecay.magazines = magazines;
-            seq = allocator.pageStore.nextHeapSequence();
         }
 
         AdaptiveByteBuf allocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -952,7 +938,7 @@ final class AdaptivePoolingAllocator {
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf) {
             SpanMagazine mag = spanMagazine;
             if (mag == null) {
-                mag = new SpanMagazine(allocator, null, Thread.currentThread(), idleDecay, seq);
+                mag = new SpanMagazine(allocator, null, Thread.currentThread(), idleDecay);
                 spanMagazine = mag;
             }
             boolean reallocate = buf != null;
@@ -981,7 +967,7 @@ final class AdaptivePoolingAllocator {
 
         private SizeClassMagazine createMagazine(int sizeClassIndex) {
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                                       sizeClassIndex, Thread.currentThread(), null, null, notes, seq);
+                                       sizeClassIndex, Thread.currentThread(), null, null, notes);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -1704,8 +1690,7 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
             PageStore store = magazine.allocator.pageStore;
             int slices = chunkSize / store.config.sliceSize;
-            long run = store.claimSlices(slices, magazine.seq,
-                    magazine.ownerThread != null);
+            long run = store.claimSlices(slices, magazine.ownerThread != null);
             Segment segment = store.block(run);
             int start = store.start(run);
             try {
@@ -1785,8 +1770,6 @@ final class AdaptivePoolingAllocator {
         final int sizeClassIndex;
         private final IdleDecay idleDecay;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
-        /** The heap's sequence: see {@link PageStore#nextHeapSequence}. */
-        final int seq;
         private final int purgeTickThreshold;
         private int allocCount;
         /** Purge ticks so far; with {@link #allocCount} it tells whether the class allocated since the last decay. */
@@ -1796,9 +1779,8 @@ final class AdaptivePoolingAllocator {
 
         SizeClassMagazine(AdaptivePoolingAllocator allocator, IdleDecay idleDecay, int sizeClassIndex,
                           Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                          PendingChunks heapNotes, int seq) {
+                          PendingChunks heapNotes) {
             this.idleDecay = idleDecay;
-            this.seq = seq;
             this.allocator = allocator;
             this.ownerThread = ownerThread;
             this.sizeClassIndex = sizeClassIndex;
@@ -1960,8 +1942,6 @@ final class AdaptivePoolingAllocator {
         private static final int MAX_COLOURS = 64;
 
         final AdaptivePoolingAllocator allocator;
-        /** The heap's sequence: see {@link PageStore#nextHeapSequence}. */
-        private final int seq;
         private final AdaptiveRecycler bufRecycler;
         private final Thread ownerThread;
         private final IdleDecay idleDecay;
@@ -1971,12 +1951,11 @@ final class AdaptivePoolingAllocator {
         private int nextColour;
 
         SpanMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, Thread ownerThread,
-                     IdleDecay idleDecay, int seq) {
+                     IdleDecay idleDecay) {
             this.allocator = allocator;
             this.bufRecycler = bufRecycler;
             this.ownerThread = ownerThread;
             this.idleDecay = idleDecay;
-            this.seq = seq;
             int sliceSize = allocator.pageStore.config.sliceSize;
             assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
             sliceShift = Integer.numberOfTrailingZeros(sliceSize);
@@ -1992,7 +1971,7 @@ final class AdaptivePoolingAllocator {
                 return;
             }
             PageStore store = allocator.pageStore;
-            long run = store.claimSlices(slices, seq, ownerThread != null);
+            long run = store.claimSlices(slices, ownerThread != null);
             Segment segment = store.block(run);
             int start = store.start(run);
             // Colour, as the size classes' spans (see SizeClassChunkController) and as mimalloc does for its large

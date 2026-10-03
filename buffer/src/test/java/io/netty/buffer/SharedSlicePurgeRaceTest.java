@@ -84,7 +84,7 @@ final class SharedSlicePurgeRaceTest {
         purging.await();
         long run;
         try {
-            run = store.claimSlices(8, 0, false);
+            run = store.claimSlices(8, false);
         } finally {
             claimed.set(true);
         }
@@ -97,7 +97,7 @@ final class SharedSlicePurgeRaceTest {
         int regionsMapped = store.regionCount();
         assertTrue(region.blocks[blocks - 1].isWhollyFree(), "the purged block, given back");
         // Not 8 slices: the new region's block has a fit of that bin.
-        assertEquals(purgedBlock, (int) store.claimSlices(32, 0, false), "the lowest wholly free block");
+        assertEquals(purgedBlock, (int) store.claimSlices(32, false), "the lowest wholly free block");
         assertEquals(regionsMapped, store.regionCount());
         store.close();
     }

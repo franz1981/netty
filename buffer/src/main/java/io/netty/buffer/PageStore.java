@@ -61,8 +61,6 @@ final class PageStore {
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
     private static final AtomicLongFieldUpdater<PageStore> SLICES_COMMITTED =
             AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
-    private static final AtomicIntegerFieldUpdater<PageStore> HEAP_SEQUENCE =
-            AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "heapSequence");
     private static final AtomicIntegerFieldUpdater<PageStore> ARMED =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final AtomicReferenceFieldUpdater<PageStore, SizeClassedChunk> ABANDONED =
@@ -134,8 +132,6 @@ final class PageStore {
     // Read by tests and dumps.
     /** Shared slices claimed while no memory backed them. */
     volatile long slicesCommitted;
-    /** The next heap's sequence: see {@link #nextHeapSequence}. */
-    private volatile int heapSequence;
     /** Chunks abandoned since the last pass, a stack linked through {@code nextInQueue}: see {@link #abandon}. */
     private volatile SizeClassedChunk abandoned;
     /** Purger only: abandoned chunks with buffers still out, linked through {@code nextInQueue}. */
@@ -199,14 +195,6 @@ final class PageStore {
         if (PlatformDependent.isJfrEnabled()) {
             PageStoreStateEvent.register(this);
         }
-    }
-
-    /**
-     * As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. Unused by the claims, which go in
-     * address order (see {@link #claimSlices}).
-     */
-    int nextHeapSequence() {
-        return HEAP_SEQUENCE.getAndIncrement(this) & Integer.MAX_VALUE;
     }
 
     /**
@@ -306,11 +294,11 @@ final class PageStore {
      * Lowest first, so that the highest blocks drain and go back. As mimalloc v3's
      * {@code mi_bbitmap_try_find_and_clear_generic}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884), minus its other bins and its
-     * start at the thread's sequence: {@code seq} is unused. Returns the region's index in the high half and the
+     * start at the thread's sequence. Returns the region's index in the high half and the
      * run's first slice in the region in the low half. The run's slices are committed (see {@link #commitSlices});
      * give it back with {@link Segment#releaseRun}, from any thread.
      */
-    long claimSlices(int slices, int seq, boolean threadLocal) {
+    long claimSlices(int slices, boolean threadLocal) {
         int bin = binOf[slices];
         for (;;) {
             Region[] regions = this.regions;

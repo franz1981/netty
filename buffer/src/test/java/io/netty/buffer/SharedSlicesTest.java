@@ -84,10 +84,10 @@ final class SharedSlicesTest {
     @Test
     void firstFitWithinABlockNeverAcrossOne() {
         PageStore store = store(INTERVAL);
-        assertEquals(0, slice(store.claimSlices(40, 0, false)));
-        assertEquals(PER_BLOCK, slice(store.claimSlices(40, 0, false)), "24 left in block 0: block 1");
-        assertEquals(40, slice(store.claimSlices(24, 0, false)), "the tail of block 0 fits");
-        assertEquals(PER_BLOCK + 40, slice(store.claimSlices(2, 0, false)));
+        assertEquals(0, slice(store.claimSlices(40, false)));
+        assertEquals(PER_BLOCK, slice(store.claimSlices(40, false)), "24 left in block 0: block 1");
+        assertEquals(40, slice(store.claimSlices(24, false)), "the tail of block 0 fits");
+        assertEquals(PER_BLOCK + 40, slice(store.claimSlices(2, false)));
         assertEquals(1, regions.regions.size());
         assertEquals(0, segments.segmentsAllocated(), "no segment of its own");
     }
@@ -100,19 +100,19 @@ final class SharedSlicesTest {
     void claimsOfOneLengthShareBlocks() {
         PageStore store = store(INTERVAL);
         assertBins(store, 1, 8, 32);
-        long a = store.claimSlices(1, 0, false);
+        long a = store.claimSlices(1, false);
         assertEquals(0, slice(a));
-        long b = store.claimSlices(8, 0, false);
+        long b = store.claimSlices(8, false);
         assertEquals(PER_BLOCK, slice(b), "block 0 is the 1-slice bin's");
-        assertEquals(1, slice(store.claimSlices(1, 0, false)));
-        long d = store.claimSlices(8, 0, false);
+        assertEquals(1, slice(store.claimSlices(1, false)));
+        long d = store.claimSlices(8, false);
         assertEquals(PER_BLOCK + 8, slice(d));
         release(store, b, 8);
         release(store, d, 8);
-        assertEquals(PER_BLOCK, slice(store.claimSlices(32, 0, false)), "the lowest wholly free block");
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, 0, false)), "block 1 is the 32-slice bin's now");
+        assertEquals(PER_BLOCK, slice(store.claimSlices(32, false)), "the lowest wholly free block");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, false)), "block 1 is the 32-slice bin's now");
         release(store, a, 1);
-        assertEquals(0, slice(store.claimSlices(1, 0, false)), "the lowest fit of the bin");
+        assertEquals(0, slice(store.claimSlices(1, false)), "the lowest fit of the bin");
         assertMapsShowEveryFit(store);
     }
 
@@ -121,15 +121,15 @@ final class SharedSlicesTest {
     void aStaleBitIsClearedByTheClaimThatFindsIt() {
         PageStore store = store(INTERVAL);
         assertBins(store, 1, 8, 32);
-        Segment eights = block(store, store.claimSlices(8, 0, false));
-        Segment ones = block(store, store.claimSlices(1, 0, false));
+        Segment eights = block(store, store.claimSlices(8, false));
+        Segment ones = block(store, store.claimSlices(1, false));
         assertEquals(1, store.id(ones), "block 1 of region 0");
         int bin1 = store.binOf[1];
         store.mark(bin1, store.id(eights));
-        assertEquals(PER_BLOCK + 1, slice(store.claimSlices(1, 0, false)), "not in the 8-slice bin's block");
+        assertEquals(PER_BLOCK + 1, slice(store.claimSlices(1, false)), "not in the 8-slice bin's block");
         assertFalse(store.marked(bin1, eights));
         store.mark(store.emptyMap, store.id(eights));
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(32, 0, false)), "block 0 is not wholly free");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(32, false)), "block 0 is not wholly free");
         assertFalse(store.marked(store.emptyMap, eights));
         assertMapsShowEveryFit(store);
     }
@@ -165,7 +165,7 @@ final class SharedSlicesTest {
                             release(store, run[0], (int) run[1]);
                         } else {
                             int n = sizes[random.nextInt(sizes.length)];
-                            long[] run = {store.claimSlices(n, 0, false), n};
+                            long[] run = {store.claimSlices(n, false), n};
                             own(owners, run, 0, id, failure);
                             mine.add(run);
                         }
@@ -238,14 +238,14 @@ final class SharedSlicesTest {
     void aReleaseFromAnyThreadIsReusedAtOnce() throws Exception {
         final PageStore store = store(INTERVAL);
         final AtomicLong claimed = new AtomicLong(-1);
-        Thread claimer = new Thread(() -> claimed.set(store.claimSlices(9, 3, false)));
+        Thread claimer = new Thread(() -> claimed.set(store.claimSlices(9, false)));
         claimer.start();
         claimer.join();
         Thread releaser = new Thread(() -> release(store, claimed.get(), 9));
         releaser.start();
         releaser.join();
         assertEquals(0, store.sliceCounts()[0]);
-        long again = store.claimSlices(9, 7, false);
+        long again = store.claimSlices(9, false);
         assertEquals(slice(claimed.get()), slice(again), "the same slices");
         release(store, again, 9);
         assertThrows(IllegalStateException.class, () -> release(store, again, 9));
@@ -260,7 +260,7 @@ final class SharedSlicesTest {
         PageStore store = store(INTERVAL);
         long first = store.takeRun(2);
         assertEquals(0, (int) first);
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(1, 0, false)), "blocks 0 and 1 are taken");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(1, false)), "blocks 0 and 1 are taken");
         long second = store.takeRun(2);
         assertEquals(3, (int) second, "block 2 has a slice claimed");
         assertEquals(5, (int) store.takeRun(1));
@@ -282,9 +282,9 @@ final class SharedSlicesTest {
     void thePurgeTakesIdleFreeSlicesInRunsWithinBlocks() {
         PageStore store = store(INTERVAL);
         // 58, 6 and 10 slices: no chunk length, one bin.
-        long used = store.claimSlices(58, 0, false);
-        long tail = store.claimSlices(6, 0, false);
-        long next = store.claimSlices(10, 0, false);
+        long used = store.claimSlices(58, false);
+        long tail = store.claimSlices(6, false);
+        long next = store.claimSlices(10, false);
         assertEquals(58, slice(tail));
         assertEquals(PER_BLOCK, slice(next));
         assertEquals(74, store.slicesCommitted);
@@ -301,7 +301,7 @@ final class SharedSlicesTest {
         assertArrayEquals(new int[] {58, 0, PER_REGION - 58}, store.sliceCounts());
         store.purgeIfDue(now + 4 * INTERVAL);
         assertEquals(2, regions.purgeCalls(), "nothing left with memory behind it");
-        long again = store.claimSlices(14, 1, false);
+        long again = store.claimSlices(14, false);
         assertEquals(PER_BLOCK, slice(again), "block 1 from its start: block 0 has 6 free");
         assertEquals(88, store.slicesCommitted, "purged slices are committed again");
         assertSharedAccounted(segments, store.allocator);
@@ -413,12 +413,12 @@ final class SharedSlicesTest {
     void aWhollyIdleMallocRegionGoesBackAndItsPlaceIsTaken() {
         CountingRegionSource malloc = new CountingRegionSource(true);
         PageStore store = closer.add(newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL)).pageStore;
-        long first = store.claimSlices(9, 0, false);
+        long first = store.claimSlices(9, false);
         assertEquals(REGION_SIZE, store.allocator.usedMemory(), "counted whole");
         release(store, first, 9);
         store.purgeIfDue(System.nanoTime() + INTERVAL / 2);
         assertEquals(0, store.regionsReleased, "freed less than a delay ago");
-        first = store.claimSlices(9, 0, false);
+        first = store.claimSlices(9, false);
         store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
         assertEquals(0, store.regionsReleased, "a slice is claimed");
         release(store, first, 9);
@@ -428,7 +428,7 @@ final class SharedSlicesTest {
         assertEquals(0, malloc.released.get(0).refCnt(), "freed");
         assertEquals(0, store.allocator.usedMemory());
         assertEquals(0, store.purgeCalls, "no part of a malloc'd region is purged");
-        long again = store.claimSlices(9, 0, false);
+        long again = store.claimSlices(9, false);
         assertEquals(0, (int) (again >>> 32), "the released region's place");
         assertEquals(1, store.regionCount());
         assertEquals(2, malloc.regions.size());
@@ -486,7 +486,7 @@ final class SharedSlicesTest {
                 run = new int[] {(int) (taken >>> 32), (int) taken * perBlock, blocks * perBlock, 1};
             } else {
                 int n = SIZES[random.nextInt(SIZES.length)];
-                long claimed = store.claimSlices(n, id, false);
+                long claimed = store.claimSlices(n, false);
                 assertTrue(claimed >= 0);
                 run = new int[] {(int) (claimed >>> 32), (int) claimed, n, 0};
             }

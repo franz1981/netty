@@ -56,7 +56,7 @@ final class PageStorePurgePassTest {
         assertEquals(DELAY / 4, store.config.purgeCheckNanos);
         store.lastPurgeNanos = base;
         for (int i = 0; i < blocks; i++) {
-            assertEquals(i * PER_BLOCK, (int) store.claimSlices(PER_BLOCK, 0, false));
+            assertEquals(i * PER_BLOCK, (int) store.claimSlices(PER_BLOCK, false));
         }
         return store;
     }
@@ -245,7 +245,7 @@ final class PageStorePurgePassTest {
         long used = allocator.usedMemory();
         // 6 slices, as the whole block: no chunk length, one bin.
         block(store, 0).releaseRun(0, 6, released);
-        assertEquals(0, (int) store.claimSlices(6, 0, false));
+        assertEquals(0, (int) store.claimSlices(6, false));
         assertEquals(PER_BLOCK, store.slicesCommitted, "not charged again");
         assertEquals(used, allocator.usedMemory());
         block(store, 0).releaseRun(0, 6, released);

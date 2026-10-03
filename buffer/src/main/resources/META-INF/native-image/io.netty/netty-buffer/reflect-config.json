@@ -111,9 +111,6 @@
     "name": "io.netty.buffer.PageStore",
     "fields": [
       {
-        "name": "heapSequence"
-      },
-      {
         "name": "purging"
       },
       {
