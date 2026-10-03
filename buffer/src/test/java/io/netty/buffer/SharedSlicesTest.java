@@ -42,14 +42,15 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static io.netty.buffer.PageStoreTestSupport.purgeUntilDone;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The page store's shared slices (see {@link PageStore#claimSlices}): first fit within a block, never across one,
- * heaps spread by sequence, releases from any thread reused at once, whole-block runs, and a purge that only takes
- * free idle slices, coalesced across blocks. Then all of it at once from many threads.
+ * blocks shared by claims of one length, releases from any thread reused at once, whole-block runs, and a purge that
+ * only takes free idle slices, coalesced across blocks. Then all of it at once from many threads.
  */
 final class SharedSlicesTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
@@ -91,19 +92,145 @@ final class SharedSlicesTest {
         assertEquals(0, segments.segmentsAllocated(), "no segment of its own");
     }
 
-    /** As mimalloc's thread sequence: the blocks claimed in so far are visited from {@code seq} modulo their count. */
+    /**
+     * Claims of one length share blocks: the lowest block of their bin with a fit, else the lowest wholly free block,
+     * which takes their bin; a block wholly free again is any bin's.
+     */
     @Test
-    void heapsStartInTheBlockOfTheirSequence() {
+    void claimsOfOneLengthShareBlocks() {
         PageStore store = store(INTERVAL);
-        for (int block = 0; block < 3; block++) {
-            assertEquals(block * PER_BLOCK, slice(store.claimSlices(60, 0, false)));
+        assertBins(store, 2, 3, 8);
+        long a = store.claimSlices(2, 0, false);
+        assertEquals(0, slice(a));
+        long b = store.claimSlices(8, 0, false);
+        assertEquals(PER_BLOCK, slice(b), "block 0 is the 2-slice bin's");
+        assertEquals(2, slice(store.claimSlices(2, 0, false)));
+        long d = store.claimSlices(8, 0, false);
+        assertEquals(PER_BLOCK + 8, slice(d));
+        release(store, b, 8);
+        release(store, d, 8);
+        assertEquals(PER_BLOCK, slice(store.claimSlices(3, 0, false)), "the lowest wholly free block");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, 0, false)), "block 1 is the 3-slice bin's now");
+        release(store, a, 2);
+        assertEquals(0, slice(store.claimSlices(2, 0, false)), "the lowest fit of the bin");
+        assertMapsShowEveryFit(store);
+    }
+
+    /** A bit set for a block that does not earn it is cleared by the claim that finds it, which goes on. */
+    @Test
+    void aStaleBitIsClearedByTheClaimThatFindsIt() {
+        PageStore store = store(INTERVAL);
+        assertBins(store, 2, 3, 8);
+        Segment eights = block(store, store.claimSlices(8, 0, false));
+        Segment twos = block(store, store.claimSlices(2, 0, false));
+        assertEquals(1, store.id(twos), "block 1 of region 0");
+        int bin2 = store.binOf[2];
+        store.mark(bin2, store.id(eights));
+        assertEquals(PER_BLOCK + 2, slice(store.claimSlices(2, 0, false)), "not in the 8-slice bin's block");
+        assertFalse(store.marked(bin2, eights));
+        store.mark(store.emptyMap, store.id(eights));
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(3, 0, false)), "block 0 is not wholly free");
+        assertFalse(store.marked(store.emptyMap, eights));
+        assertMapsShowEveryFit(store);
+    }
+
+    /**
+     * Threads claim runs of every bin, and release some, while the claims add regions and the maps grow under them:
+     * no slice is claimed twice, and once the threads are done the maps show every fit and every wholly free block.
+     */
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void theMapsGrowWhileThreadsClaimAndRelease() throws Exception {
+        final PageStore store = store(INTERVAL);
+        // 64 ids a map word: a region of 9 blocks takes 16, so this many regions grow the maps three times.
+        final int regionsWanted = 17;
+        final int[] sizes = {2, 3, 4, 5, 8, 9, 17, 63};
+        final AtomicIntegerArray owners = new AtomicIntegerArray(64 * PER_REGION);
+        final AtomicReference<String> failure = new AtomicReference<String>();
+        final CountDownLatch start = new CountDownLatch(1);
+        final List<List<long[]>> held = new ArrayList<List<long[]>>();
+        List<Thread> threads = new ArrayList<Thread>();
+        for (int t = 0; t < 8; t++) {
+            final int id = t + 1;
+            final List<long[]> mine = new ArrayList<long[]>();
+            held.add(mine);
+            threads.add(new Thread(() -> {
+                SplittableRandom random = new SplittableRandom(id);
+                try {
+                    start.await();
+                    while (store.regionCount() < regionsWanted && failure.get() == null) {
+                        if (!mine.isEmpty() && random.nextInt(4) == 0) {
+                            long[] run = mine.remove(random.nextInt(mine.size()));
+                            own(owners, run, id, 0, failure);
+                            release(store, run[0], (int) run[1]);
+                        } else {
+                            int n = sizes[random.nextInt(sizes.length)];
+                            long[] run = {store.claimSlices(n, 0, false), n};
+                            own(owners, run, 0, id, failure);
+                            mine.add(run);
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, "thread " + id + ": " + e);
+                }
+            }));
         }
-        assertEquals(PER_BLOCK + 60, slice(store.claimSlices(2, 4, false)), "4 % 3: block 1");
-        assertEquals(2 * PER_BLOCK + 60, slice(store.claimSlices(2, 5, false)), "5 % 3: block 2");
-        assertEquals(60, slice(store.claimSlices(2, 3, false)), "3 % 3: block 0");
-        assertEquals(PER_BLOCK + 62, slice(store.claimSlices(2, 4, false)));
-        assertEquals(2 * PER_BLOCK + 62, slice(store.claimSlices(2, 4, false)), "block 1 full: on");
-        assertEquals(3 * PER_BLOCK, slice(store.claimSlices(3, 4, false)), "all full: a new block");
+        for (Thread thread : threads) {
+            thread.start();
+        }
+        start.countDown();
+        for (Thread thread : threads) {
+            thread.join();
+        }
+        assertNull(failure.get());
+        assertTrue(store.regionCount() >= regionsWanted);
+        assertMapsShowEveryFit(store);
+        for (List<long[]> mine : held) {
+            for (long[] run : mine) {
+                release(store, run[0], (int) run[1]);
+            }
+        }
+        assertEquals(0, store.sliceCounts()[0]);
+        assertMapsShowEveryFit(store);
+    }
+
+    /** The slices of {@code run}, {run, slices}, go from owner {@code from} to {@code to}. */
+    private static void own(AtomicIntegerArray owners, long[] run, int from, int to,
+                            AtomicReference<String> failure) {
+        int base = (int) (run[0] >>> 32) * PER_REGION + slice(run[0]);
+        for (int s = base; s < base + run[1]; s++) {
+            int owner = owners.getAndSet(s, to);
+            if (owner != from) {
+                failure.compareAndSet(null, "slice " + s + " held by " + owner + ", not " + from);
+            }
+        }
+    }
+
+    private static void assertBins(PageStore store, int... lengths) {
+        for (int n : lengths) {
+            assertTrue(store.binOf[n] != store.otherBin, n + " slices: not a chunk length");
+        }
+    }
+
+    /**
+     * Once no thread claims nor releases: every wholly free block, and every block with a fit for its bin, has its
+     * bit; a bit too many is only a hint.
+     */
+    static void assertMapsShowEveryFit(PageStore store) {
+        for (Region region : store.regions) {
+            if (region.released) {
+                continue;
+            }
+            for (Segment block : region.blocks) {
+                long free = block.free;
+                if (free == block.allFree) {
+                    assertTrue(store.marked(store.emptyMap, block), block + " of " + region + ": wholly free");
+                } else if (Segment.firstFit(free, store.binSlices[block.bin]) >= 0) {
+                    assertTrue(store.marked(block.bin, block), block + " of " + region + ": a fit of bin "
+                            + block.bin);
+                }
+            }
+        }
     }
 
     /** A run released by another thread is free for the next claim at once, and a second release throws. */
@@ -154,30 +281,31 @@ final class SharedSlicesTest {
     @Test
     void thePurgeTakesIdleFreeSlicesInRunsWithinBlocks() {
         PageStore store = store(INTERVAL);
-        long used = store.claimSlices(60, 0, false);
-        long tail = store.claimSlices(4, 0, false);
+        // 58, 6 and 10 slices: no chunk length, one bin.
+        long used = store.claimSlices(58, 0, false);
+        long tail = store.claimSlices(6, 0, false);
         long next = store.claimSlices(10, 0, false);
-        assertEquals(60, slice(tail));
+        assertEquals(58, slice(tail));
         assertEquals(PER_BLOCK, slice(next));
         assertEquals(74, store.slicesCommitted);
-        release(store, tail, 4);
+        release(store, tail, 6);
         release(store, next, 10);
         long now = System.nanoTime();
         store.purgeIfDue(now + INTERVAL / 2);
         assertEquals(0, regions.purgeCalls(), "not idle long enough");
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(2, regions.purgeCalls(), "a run in block 0 and one in block 1");
-        assertArrayEquals(new int[] {60 * SLICE, 4 * SLICE}, regions.purges.get(0));
+        assertArrayEquals(new int[] {58 * SLICE, 6 * SLICE}, regions.purges.get(0));
         assertArrayEquals(new int[] {64 * SLICE, 10 * SLICE}, regions.purges.get(1));
-        assertEquals(14, store.slicesPurged);
-        assertArrayEquals(new int[] {60, 0, PER_REGION - 60}, store.sliceCounts());
+        assertEquals(16, store.slicesPurged);
+        assertArrayEquals(new int[] {58, 0, PER_REGION - 58}, store.sliceCounts());
         store.purgeIfDue(now + 4 * INTERVAL);
         assertEquals(2, regions.purgeCalls(), "nothing left with memory behind it");
         long again = store.claimSlices(14, 1, false);
-        assertEquals(PER_BLOCK, slice(again), "block 1 from its start: block 0 has 4 free");
+        assertEquals(PER_BLOCK, slice(again), "block 1 from its start: block 0 has 6 free");
         assertEquals(88, store.slicesCommitted, "purged slices are committed again");
         assertSharedAccounted(segments, store.allocator);
-        release(store, used, 60);
+        release(store, used, 58);
         release(store, again, 14);
         assertSharedAccounted(segments, store.allocator);
         store.close();
@@ -252,6 +380,7 @@ final class SharedSlicesTest {
         assertTrue(store.regionCount() <= maxRegions);
         assertTrue(operations.get() > 1000, "too few claims to mean anything: " + operations.get());
         assertEquals(0, store.sliceCounts()[0], "a slice is still claimed");
+        assertMapsShowEveryFit(store);
         assertEquals(0, segments.segmentsAllocated());
         assertEquals(heap, source.delegate.regions.get(0).hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);

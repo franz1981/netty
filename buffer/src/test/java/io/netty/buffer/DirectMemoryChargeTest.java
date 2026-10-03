@@ -97,7 +97,8 @@ final class DirectMemoryChargeTest {
         assertEquals(6, store.slicesPurged);
         assertEquals(3L * SLICE, allocator.usedMemory(), "the purge credits them");
         assertChargedAtMost(base, regionCharge + 3L * SLICE, "the purge credits them");
-        assertEquals(3, (int) store.claimSlices(6, 0, false));
+        block.releaseRun(0, 3, System.nanoTime());
+        assertEquals(run, store.claimSlices(9, 0, false), "3 slices with memory behind them, 6 purged");
         assertEquals(9L * SLICE, allocator.usedMemory(), "purged: charged again");
         assertChargedAtMost(base, regionCharge + 9L * SLICE, "purged: charged again");
         assertEquals(15, store.slicesCommitted);

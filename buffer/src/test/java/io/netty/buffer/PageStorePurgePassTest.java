@@ -243,17 +243,18 @@ final class PageStorePurgePassTest {
         PageStore store = store(released - DELAY, 1);
         AdaptivePoolingAllocator allocator = store.allocator;
         long used = allocator.usedMemory();
-        block(store, 0).releaseRun(0, 4, released);
-        assertEquals(0, (int) store.claimSlices(4, 0, false));
+        // 6 slices, as the whole block: no chunk length, one bin.
+        block(store, 0).releaseRun(0, 6, released);
+        assertEquals(0, (int) store.claimSlices(6, 0, false));
         assertEquals(PER_BLOCK, store.slicesCommitted, "not charged again");
         assertEquals(used, allocator.usedMemory());
-        block(store, 0).releaseRun(0, 4, released);
+        block(store, 0).releaseRun(0, 6, released);
         store.purgeIfDue(released + DELAY - 1);
         assertEquals(0, store.purges, "not due");
         store.purgeIfDue(released + DELAY);
         assertEquals(1, regions.purgeCalls());
-        assertEquals(4 * SLICE, regions.purges.get(0)[1]);
-        assertEquals(used - 4L * SLICE, allocator.usedMemory());
+        assertEquals(6 * SLICE, regions.purges.get(0)[1]);
+        assertEquals(used - 6L * SLICE, allocator.usedMemory());
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
     }
 }

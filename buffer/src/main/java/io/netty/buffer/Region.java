@@ -16,7 +16,6 @@
 package io.netty.buffer;
 
 import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 /**
  * One piece of memory from a {@link RegionSource}, cut into {@link #slots} blocks at fixed offsets, all made with the
@@ -24,9 +23,6 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
  * any thread. A region lives as long as its {@link PageStore}, or until it goes back whole ({@link #released}).
  */
 final class Region {
-    private static final AtomicIntegerFieldUpdater<Region> MAX_ACCESSED =
-            AtomicIntegerFieldUpdater.newUpdater(Region.class, "maxAccessed");
-
     final PageStore store;
     final AbstractByteBuf buffer;
     /** Where {@link #buffer} comes from, and goes back to. */
@@ -49,8 +45,6 @@ final class Region {
     int index = -1;
     /** Given back to its source whole: every block stays claimed. Set by the purger under the store's monitor. */
     volatile boolean released;
-    /** The highest block a run was claimed in, -1 before the first. */
-    private volatile int maxAccessed = -1;
 
     /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
     Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots, MemorySource views,
@@ -79,38 +73,6 @@ final class Region {
     }
 
     /**
-     * Any thread: claims the lowest run of {@code n} free slices of one block, at most a block, for a claim of
-     * {@code bin} (see {@link Segment#claimRun}), and returns its first slice in the region, or -1 when no block has
-     * such a run. Lock-free: one CAS on the block's bitmap, again only if another thread changed it meanwhile.
-     * <p>
-     * As mimalloc v3's {@code mi_bbitmap_try_find_and_clear_generic}
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884): the blocks
-     * claimed in so far are visited from {@code seq} modulo their count, wrapping around, so that heaps with different
-     * sequences start in different blocks, then the blocks never claimed in, in order; within a block, the lowest
-     * fitting run (first fit, as {@code mi_bchunk_try_find_and_clearNX},
-     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849). A run never
-     * crosses a block.
-     */
-    int claimSlices(int n, int seq, int bin) {
-        Segment[] blocks = this.blocks;
-        int count = blocks.length;
-        int cycle = maxAccessed + 1;
-        int start = cycle == 0 ? 0 : seq % cycle;
-        for (int k = 0; k < count; k++) {
-            int slot = k >= cycle ? k : start + k < cycle ? start + k : start + k - cycle;
-            Segment block = blocks[slot];
-            if (Long.bitCount(block.free) >= n) {
-                int first = block.claimRun(n, bin);
-                if (first >= 0) {
-                    accessed(slot);
-                    return slot * block.slices + (first & Segment.START);
-                }
-            }
-        }
-        return -1;
-    }
-
-    /**
      * Any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
      * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1950-L1997): from the
@@ -133,7 +95,6 @@ final class Region {
                 claimed++;
             }
             if (claimed == n) {
-                accessed(first + n - 1);
                 return first;
             }
             for (int i = 0; i < claimed; i++) {
@@ -144,15 +105,6 @@ final class Region {
             first += claimed + 1;
         }
         return -1;
-    }
-
-    private void accessed(int slot) {
-        for (;;) {
-            int max = maxAccessed;
-            if (slot <= max || MAX_ACCESSED.compareAndSet(this, max, slot)) {
-                return;
-            }
-        }
     }
 
     @Override

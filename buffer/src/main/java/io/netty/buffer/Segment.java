@@ -127,6 +127,18 @@ final class Segment {
         }
     }
 
+    /**
+     * Any thread: claims the first {@code n} slices if every slice is free, and labels the block {@code bin}, as the
+     * first claim since it was wholly free.
+     */
+    boolean claimFirst(int n, int bin) {
+        if (!FREE.compareAndSet(this, allFree, allFree & ~bits(0, n))) {
+            return false;
+        }
+        this.bin = (byte) bin;
+        return true;
+    }
+
     /** Claims every slice if all are free. */
     boolean claimWhole() {
         return FREE.compareAndSet(this, allFree, 0);
@@ -157,7 +169,10 @@ final class Segment {
         region.store.armPurge(now);
     }
 
-    /** The slices of {@code bits}, which the caller claimed, are free again, unstamped. */
+    /**
+     * The slices of {@code bits}, which the caller claimed, are free again, unstamped, and the store's maps show it
+     * (see {@link PageStore#freed}).
+     */
     void giveBack(long bits) {
         for (;;) {
             long current = free;
@@ -165,6 +180,7 @@ final class Segment {
                 throw new IllegalStateException("slices " + Long.toHexString(current & bits) + " are already free");
             }
             if (FREE.compareAndSet(this, current, current | bits)) {
+                region.store.freed(this, current | bits);
                 return;
             }
         }

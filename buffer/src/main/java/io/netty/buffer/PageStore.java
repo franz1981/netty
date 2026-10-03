@@ -23,6 +23,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
@@ -41,8 +42,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link Segment#releaseRun}), as
  * mimalloc v3 claims a page's slices straight from its arena's bitmap
  * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
+ * Claims of one run length share blocks ({@link #binOf}), found through bitmaps over the blocks ({@link #maps}).
  * A buffer above a block takes a run of whole blocks ({@link #takeRun}). A new region is added under
- * this store's monitor, the only lock, when no region has a fit, and the claim that added it takes its run there
+ * this store's monitor, the only lock, when no block has a fit, and the claim that added it takes its run there
  * before any other thread sees the region.
  * <p>
  * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})
@@ -85,6 +87,26 @@ final class PageStore {
      */
     final byte[] binOf;
     final int otherBin;
+    /**
+     * Per bin, the run length whose fit its bit in {@link #maps} stands for: the chunk's slices; 1 for
+     * {@link #otherBin}, whose claims have many lengths.
+     */
+    final int[] binSlices;
+    /** The map of the wholly free blocks in {@link #maps}, after one per bin. */
+    final int emptyMap;
+    /** A block's id is its region's index shifted by this, or its slot: a region's blocks have consecutive ids. */
+    private final int idShift;
+    /**
+     * Bitmaps over the block ids, {@code emptyMap + 1} of them, each {@code maps.length() / (emptyMap + 1)} words,
+     * one after the other: per bin, a bit set when a block of that bin has a free run of the bin's length; and the
+     * wholly free blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
+     * its block now earns ({@link #freed}); a claim that finds a block without the fit its bit stood for clears it,
+     * then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}). As mimalloc v3's
+     * {@code chunkmap} and {@code chunkmap_bins} over its bitmap chunks
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L261-L270). Replaced by a larger copy under
+     * this store's monitor ({@link #growMaps}).
+     */
+    private volatile AtomicLongArray maps;
     final MemorySource memory;
     /** Where new regions come from. Replaced once, under this store's monitor, by {@link #fallbackSource}. */
     volatile RegionSource regionSource;
@@ -161,9 +183,15 @@ final class PageStore {
         otherBin = chunkSizes.length;
         binOf = new byte[perBlock + 1];
         Arrays.fill(binOf, (byte) otherBin);
+        binSlices = new int[otherBin + 1];
+        binSlices[otherBin] = 1;
         for (int bin = 0; bin < chunkSizes.length; bin++) {
             binOf[chunkSizes[bin] / config.sliceSize] = (byte) bin;
+            binSlices[bin] = chunkSizes[bin] / config.sliceSize;
         }
+        emptyMap = otherBin + 1;
+        idShift = Integer.SIZE - Integer.numberOfLeadingZeros(config.segmentsPerRegion() - 1);
+        maps = new AtomicLongArray(emptyMap + 1);
         this.regionSource = regionSource;
         regionBlocks = config.segmentsPerRegion();
         regionAlignment = config.regionAlignment;
@@ -175,8 +203,8 @@ final class PageStore {
     }
 
     /**
-     * As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. A heap's claims start in the block of
-     * its sequence (see {@link Region#claimSlices}).
+     * As mimalloc's thread sequence: 0, 1, 2... per heap made, never negative. Unused by the claims, which go in
+     * address order (see {@link #claimSlices}).
      */
     int nextHeapSequence() {
         return HEAP_SEQUENCE.getAndIncrement(this) & Integer.MAX_VALUE;
@@ -239,9 +267,19 @@ final class PageStore {
         // The place of a region given back is taken again: nothing claims in a released region.
         Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
         region.index = index;
-        int first = blocks != 0 ? region.claimBlocks(blocks) : region.claimSlices(slices, 0, binOf[slices]);
+        growMaps(index);
+        int first;
+        if (blocks != 0) {
+            first = region.claimBlocks(blocks);
+        } else {
+            Segment block = region.blocks[0];
+            first = block.claimFirst(slices, binOf[slices]) ? 0 : -1;
+        }
         grown[index] = region;
         regions = grown;
+        for (Segment block : region.blocks) {
+            freed(block, block.free);
+        }
         if (!region.purgesSlices) {
             // Its free slices have memory behind them, all of them if the claim failed.
             armPurge(System.nanoTime());
@@ -262,31 +300,234 @@ final class PageStore {
     }
 
     /**
-     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block, the first
-     * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, else in a new
-     * region (see {@link #addRegion}). Returns the region's index in the high half and the run's first slice in the
-     * region in the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
-     * {@link Segment#releaseRun}, from any thread.
+     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: the lowest
+     * fit (first fit, as {@code mi_bchunk_try_find_and_clearNX},
+     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849) in the lowest block of its bin that
+     * has one, else the lowest wholly free block, which takes its bin, else a new region (see {@link #addRegion}).
+     * Lowest first, so that the highest blocks drain and go back. As mimalloc v3's
+     * {@code mi_bbitmap_try_find_and_clear_generic}
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884), minus its other bins and its
+     * start at the thread's sequence: {@code seq} is unused. Returns the region's index in the high half and the
+     * run's first slice in the region in the low half. The run's slices are committed (see {@link #commitSlices});
+     * give it back with {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, int seq, boolean threadLocal) {
         int bin = binOf[slices];
         for (;;) {
             Region[] regions = this.regions;
-            for (int i = 0; i < regions.length; i++) {
-                Region region = regions[i];
-                int slice = region.claimSlices(slices, seq, bin);
-                if (slice >= 0) {
-                    int perBlock = config.slicesPerSegment();
-                    commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, threadLocal);
-                    return (long) i << 32 | slice;
-                }
+            long run = claimFit(regions, bin, slices);
+            if (run < 0) {
+                run = claimEmpty(regions, bin, slices);
             }
-            long run = addRegion(regions, threadLocal, slices, 0);
+            if (run < 0) {
+                run = addRegion(regions, threadLocal, slices, 0);
+            }
             if (run >= 0) {
                 commitSlices(block(run), start(run), slices, threadLocal);
                 return run;
             }
         }
+    }
+
+    /** The lowest fit of {@code n} slices in a block of {@code bin} that {@link #maps} shows, or -1. */
+    private long claimFit(Region[] regions, int bin, int n) {
+        AtomicLongArray maps = this.maps;
+        int words = maps.length() / (emptyMap + 1);
+        int base = bin * words;
+        int length = binSlices[bin];
+        for (int w = 0; w < words; w++) {
+            for (long bits = maps.get(base + w); bits != 0; bits &= bits - 1) {
+                int id = w << 6 | Long.numberOfTrailingZeros(bits);
+                Segment block = blockOf(regions, id);
+                if (block == null) {
+                    // A region not seen yet.
+                    continue;
+                }
+                if (block.bin == bin) {
+                    int claimed = block.claimRun(n, bin);
+                    if (claimed >= 0) {
+                        return claimed(block, id, bin, claimed);
+                    }
+                    if (length != n && Segment.firstFit(block.free, length) >= 0) {
+                        // A run of another length of the other bin.
+                        continue;
+                    }
+                }
+                unmark(bin, id);
+            }
+        }
+        return -1;
+    }
+
+    /** The first {@code n} slices of the lowest wholly free block {@link #maps} shows, for {@code bin}, or -1. */
+    private long claimEmpty(Region[] regions, int bin, int n) {
+        AtomicLongArray maps = this.maps;
+        int words = maps.length() / (emptyMap + 1);
+        int base = emptyMap * words;
+        for (int w = 0; w < words; w++) {
+            for (long bits = maps.get(base + w); bits != 0; bits &= bits - 1) {
+                int id = w << 6 | Long.numberOfTrailingZeros(bits);
+                Segment block = blockOf(regions, id);
+                if (block == null) {
+                    continue;
+                }
+                if (block.claimFirst(n, bin)) {
+                    return claimed(block, id, bin, Segment.FIRST);
+                }
+                unmark(emptyMap, id);
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * After a claim of {@code bin} in {@code block} that returned {@code claimed} (see {@link Segment#claimRun}): the
+     * maps show the block as it now is to the claims of its bin, and as not wholly free if it was. Returns the run as
+     * {@link #claimSlices} does.
+     */
+    private long claimed(Segment block, int id, int bin, int claimed) {
+        if ((claimed & Segment.FIRST) != 0) {
+            // This claim holds its run: the block cannot be wholly free again before the bit is clear.
+            clear(emptyMap, id);
+        }
+        if (Segment.firstFit(block.free, binSlices[bin]) >= 0) {
+            mark(bin, id);
+        } else {
+            unmark(bin, id);
+        }
+        return (long) block.region.index << 32 | block.slot * block.slices + (claimed & Segment.START);
+    }
+
+    /**
+     * Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit the block now earns, if
+     * not set, wholly free or a fit for its bin.
+     */
+    void freed(Segment block, long free) {
+        int id = id(block);
+        if (free == block.allFree) {
+            mark(emptyMap, id);
+        } else {
+            int bin = block.bin;
+            if (Segment.firstFit(free, binSlices[bin]) >= 0) {
+                mark(bin, id);
+            }
+        }
+    }
+
+    int id(Segment block) {
+        return block.region.index << idShift | block.slot;
+    }
+
+    /** Whether {@code block} earns its bit in {@code map}. Racy. */
+    private boolean earns(int map, Segment block) {
+        long free = block.free;
+        return map == emptyMap ? free == block.allFree :
+                block.bin == map && Segment.firstFit(free, binSlices[map]) >= 0;
+    }
+
+    /** The block of {@code id} in {@code regions}, or {@code null} when it has none. */
+    private Segment blockOf(Region[] regions, int id) {
+        int index = id >>> idShift;
+        if (index >= regions.length) {
+            return null;
+        }
+        Region region = regions[index];
+        int slot = id & (1 << idShift) - 1;
+        return slot < region.slots ? region.blocks[slot] : null;
+    }
+
+    /**
+     * Sets bit {@code id} of {@code map}, unless set, in the maps of now: again in the copy that replaced them
+     * meanwhile, if any (see {@link #growMaps}).
+     */
+    void mark(int map, int id) {
+        AtomicLongArray maps = this.maps;
+        long bit = 1L << id;
+        for (;;) {
+            int i = map * (maps.length() / (emptyMap + 1)) + (id >>> 6);
+            long word = maps.get(i);
+            if ((word & bit) != 0 || maps.compareAndSet(i, word, word | bit)) {
+                AtomicLongArray now = this.maps;
+                if (now == maps) {
+                    return;
+                }
+                maps = now;
+            }
+        }
+    }
+
+    /** Clears bit {@code id} of {@code map}, and returns whether it was set. A clear lost to a copy is a stale bit. */
+    private boolean clear(int map, int id) {
+        AtomicLongArray maps = this.maps;
+        int i = map * (maps.length() / (emptyMap + 1)) + (id >>> 6);
+        long bit = 1L << id;
+        for (;;) {
+            long word = maps.get(i);
+            if ((word & bit) == 0) {
+                return false;
+            }
+            if (maps.compareAndSet(i, word, word & ~bit)) {
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Clears bit {@code id} of {@code map}, which a claim found the block does not earn, then reads the block again and
+     * sets it again if it does: a release meanwhile may have found the bit still set. As mimalloc v3's
+     * {@code mi_bbitmap_chunkmap_try_clear}
+     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1679-L1693): "a concurrent set may have
+     * happened in between ... We check again".
+     */
+    private void unmark(int map, int id) {
+        if (clear(map, id)) {
+            Segment block = blockOf(regions, id);
+            if (block != null && earns(map, block)) {
+                mark(map, id);
+            }
+        }
+    }
+
+    /**
+     * Under this store's monitor, before region {@code index} is published: the maps hold its blocks' ids, doubled if
+     * they did not. A mark on the old maps after the copy read its word, by a thread that read {@link #maps} before
+     * the new ones were published, is copied by the second pass; a later one sees the new maps and marks them too.
+     */
+    private void growMaps(int index) {
+        AtomicLongArray old = maps;
+        int count = emptyMap + 1;
+        int words = old.length() / count;
+        int needed = ((index + 1 << idShift) + Long.SIZE - 1) >>> 6;
+        if (needed <= words) {
+            return;
+        }
+        int grownWords = Math.max(needed, 2 * words);
+        AtomicLongArray grown = new AtomicLongArray(grownWords * count);
+        copyMaps(old, words, grown, grownWords);
+        maps = grown;
+        copyMaps(old, words, grown, grownWords);
+    }
+
+    private static void copyMaps(AtomicLongArray from, int words, AtomicLongArray to, int toWords) {
+        for (int map = 0; map < from.length() / words; map++) {
+            for (int w = 0; w < words; w++) {
+                long bits = from.get(map * words + w);
+                int i = map * toWords + w;
+                for (;;) {
+                    long word = to.get(i);
+                    if ((word | bits) == word || to.compareAndSet(i, word, word | bits)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Visible for testing: racy, whether the bit of block is set in map.
+    boolean marked(int map, Segment block) {
+        AtomicLongArray maps = this.maps;
+        int id = id(block);
+        return (maps.get(map * (maps.length() / (emptyMap + 1)) + (id >>> 6)) & 1L << id) != 0;
     }
 
     /**

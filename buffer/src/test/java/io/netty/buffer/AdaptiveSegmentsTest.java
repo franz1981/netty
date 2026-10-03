@@ -355,7 +355,7 @@ public class AdaptiveSegmentsTest {
         assumeFalse(isLowMemory() && threadLocal, "low-memory mode has no thread-local heaps");
         final CountingMemorySource source = new CountingMemorySource(heap);
         final AdaptivePoolingAllocator allocator = closer.add(newAllocator(source, SEGMENT_SIZE));
-        final int small = 1024; // 2-slice chunks
+        final int small = 32768; // 8-slice chunks, as the large class's: one bin
         final int large = isLowMemory() ? 16384 : 65536; // 8-slice chunks
         Callable<Void> work = () -> {
             List<ByteBuf> bufs = new ArrayList<ByteBuf>();
@@ -366,8 +366,8 @@ public class AdaptiveSegmentsTest {
                 buf.release();
             }
             bufs.clear();
-            // The large class keeps one chunk: another class's chunks take the freed spans, at other offsets.
-            for (int i = 0; i < 3 * (2 * SLICE_SIZE_BYTES / small); i++) {
+            // The large class keeps one chunk: another class of its bin takes the freed spans, at other offsets.
+            for (int i = 0; i < 3 * (8 * SLICE_SIZE_BYTES / small); i++) {
                 bufs.add(allocator.allocate(small, small));
             }
             for (int i = 0; i < 3 * (8 * SLICE_SIZE_BYTES / large); i++) {
@@ -519,8 +519,9 @@ public class AdaptiveSegmentsTest {
         List<ByteBuf> bufs = onFastThreadLocalThread(() -> {
             List<ByteBuf> out = new ArrayList<ByteBuf>();
             for (int i = 0; i < 20; i++) {
+                // 8-slice chunks both: one bin, one block.
                 out.add(allocator.allocate(65536, 65536));
-                out.add(allocator.allocate(1024, 1024));
+                out.add(allocator.allocate(32768, 32768));
             }
             // Some released before the thread ends.
             for (int i = 0; i < 10; i++) {

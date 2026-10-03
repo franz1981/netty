@@ -40,8 +40,11 @@ final class SegmentTest {
         int size = slices * SLICE_SIZE_BYTES;
         CountingMemorySource source = new CountingMemorySource(true);
         PageStore store = newAllocator(source, size).pageStore;
-        return new Region(store, source.allocateSegment(size), source.fallback, 1, source, store.config, true, 0)
-                .blocks[0];
+        Region region = new Region(store, source.allocateSegment(size), source.fallback, 1, source, store.config, true,
+                0);
+        // Its releases mark the store's maps, which have room for one region; nothing claims through them.
+        region.index = 0;
+        return region.blocks[0];
     }
 
     /** The first slice of the lowest run of {@code n}, claimed for bin 0, or -1. */
