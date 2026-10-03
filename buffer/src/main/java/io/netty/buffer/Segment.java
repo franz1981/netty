@@ -29,9 +29,6 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * them.
  */
 final class Segment {
-    /** A slice's index in its block takes this many bits: a block has at most {@link Long#SIZE} slices. */
-    static final int SLICE_INDEX_BITS = 6;
-    static final int SLICE_INDEX_MASK = (1 << SLICE_INDEX_BITS) - 1;
     private static final AtomicLongFieldUpdater<Segment> FREE =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
     private static final AtomicLongFieldUpdater<Segment> COMMITTED =

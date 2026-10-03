@@ -16,7 +16,6 @@
 package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
-import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunkCache;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
@@ -232,78 +231,6 @@ public class ChunkReuseTest {
             }
             assertTrue(cache.chunksMade <= peak, cache.chunksMade + " chunk objects made, peak " + peak);
         });
-    }
-
-    /**
-     * A chunk given up leaves a hole its heap's next claim tries first: the chunk made again takes the same span, in
-     * one claim at the hint and no scan.
-     */
-    @ParameterizedTest
-    @CsvSource({"false", "true"})
-    void aChunkMadeAgainTakesTheHoleItsHeapLeft(boolean stripe) throws Throwable {
-        assumeFalse(!stripe && isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptivePoolingAllocator allocator = closer.add(newAllocator(new CountingMemorySource(true),
-                SEGMENT_SIZE));
-        onOwner(stripe, () -> {
-            List<ByteBuf> ofC = new ArrayList<ByteBuf>();
-            ofC.add(allocator.allocate(SIZE, SIZE));
-            SizeClassedChunk chunk = chunkOf(ofC.get(0));
-            SizeClassedChunkCache cache = chunk.owningCache;
-            int segments = segmentsOf(chunk);
-            for (int i = 1; i < segments; i++) {
-                ofC.add(allocator.allocate(SIZE, SIZE));
-            }
-            List<ByteBuf> ofD = new ArrayList<ByteBuf>();
-            ofD.add(allocator.allocate(SIZE, SIZE));
-            for (ByteBuf buf : ofC) {
-                buf.release();
-            }
-            Segment block = chunk.segment;
-            int start = chunk.spanStart;
-            asOwner(allocator, stripe, cache::evictWhollyFree);
-            assertSame(cache.idle, chunk.queue);
-
-            IdleDecay heap = cache.heap;
-            long hits = heap.hintHits;
-            long scans = heap.scans;
-            // Run D out: the next chunk is made again, at the hint.
-            for (int i = 1; i < segments; i++) {
-                ofD.add(allocator.allocate(SIZE, SIZE));
-            }
-            ByteBuf buf = allocator.allocate(SIZE, SIZE);
-            assertSame(chunk, chunkOf(buf));
-            assertEquals(hits + 1, heap.hintHits, "claimed at the hint");
-            assertEquals(scans, heap.scans, "no scan");
-            assertSame(block, chunk.segment);
-            assertEquals(start, chunk.spanStart, "the hole the chunk left");
-            buf.release();
-            for (ByteBuf b : ofD) {
-                b.release();
-            }
-        });
-    }
-
-    /** A claim whose hinted block has no fit scans, and the hint moves to where it claimed. */
-    @Test
-    void aClaimScansWhenItsHintHasNoFit() {
-        AdaptivePoolingAllocator allocator = closer.add(newAllocator(new CountingMemorySource(true), SEGMENT_SIZE));
-        PageStore store = allocator.pageStore;
-        IdleDecay heap = new IdleDecay(store);
-        long first = store.claimSlices(60, 0, false, heap);
-        assertEquals(0, heap.hintHits);
-        assertEquals(1, heap.scans, "no hint yet");
-        assertSame(store.block(first), store.regions[heap.hintRegion].blocks[heap.hintBlock]);
-
-        long tail = store.claimSlices(4, 0, false, heap);
-        assertSame(store.block(first), store.block(tail), "the hinted block's tail fits");
-        assertEquals(1, heap.hintHits);
-
-        long next = store.claimSlices(10, 0, false, heap);
-        assertNotSame(store.block(first), store.block(next), "the hinted block is full");
-        assertEquals(2, heap.scans);
-        assertSame(store.block(next), store.regions[heap.hintRegion].blocks[heap.hintBlock]);
-        assertEquals(1, store.claimSlices(1, 0, false, heap) >>> 32, "at the moved hint");
-        assertEquals(2, heap.hintHits);
     }
 
     // --- helpers ---

@@ -56,7 +56,7 @@ final class PageStorePurgePassTest {
         assertEquals(DELAY / 4, store.config.purgeCheckNanos);
         store.lastPurgeNanos = base;
         for (int i = 0; i < blocks; i++) {
-            assertEquals(i * PER_BLOCK, (int) store.claimSlices(PER_BLOCK, 0, false, null));
+            assertEquals(i * PER_BLOCK, (int) store.claimSlices(PER_BLOCK, 0, false));
         }
         return store;
     }
@@ -244,7 +244,7 @@ final class PageStorePurgePassTest {
         AdaptivePoolingAllocator allocator = store.allocator;
         long used = allocator.usedMemory();
         block(store, 0).releaseRun(0, 4, released);
-        assertEquals(0, (int) store.claimSlices(4, 0, false, null));
+        assertEquals(0, (int) store.claimSlices(4, 0, false));
         assertEquals(PER_BLOCK, store.slicesCommitted, "not charged again");
         assertEquals(used, allocator.usedMemory());
         block(store, 0).releaseRun(0, 4, released);
