@@ -84,7 +84,7 @@ final class SharedSlicePurgeRaceTest {
         purging.await();
         long run;
         try {
-            run = store.claimSlices(9, 0, false);
+            run = store.claimSlices(9, 0, false, null);
         } finally {
             claimed.set(true);
         }
@@ -95,7 +95,7 @@ final class SharedSlicePurgeRaceTest {
         assertNotEquals((long) purgedBlock, run, "the run the purger held");
         assertTrue(store.regionCount() <= 2, store.regionCount() + " regions");
         int regionsMapped = store.regionCount();
-        assertEquals(purgedBlock, (int) store.claimSlices(9, 0, false), "the purged block, given back");
+        assertEquals(purgedBlock, (int) store.claimSlices(9, 0, false, null), "the purged block, given back");
         assertEquals(regionsMapped, store.regionCount());
         store.close();
     }

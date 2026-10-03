@@ -16,6 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.Chunk;
+import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
@@ -244,30 +245,73 @@ final class PageStore {
     }
 
     /**
-     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block, the first
-     * fit from block {@code seq} on (see {@link Region#claimSlices}) in the first region that has one, else in a new
-     * region (see {@link #addRegion}). Returns the region's index in the high half and the run's first slice in the
-     * region in the low half. The run's slices are committed (see {@link #commitSlices}); give it back with
+     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: in the block
+     * of {@code heap}'s hint if it has a fit, else the first fit from block {@code seq} on (see
+     * {@link Region#claimSlices}) in the first region that has one, else in a new region (see {@link #addRegion}).
+     * Returns the region's index in the high half and the run's block and first slice in it in the low half (see
+     * {@link #block}, {@link #start}). The run's slices are committed (see {@link #commitSlices}); give it back with
      * {@link Segment#releaseRun}, from any thread.
+     *
+     * @param heap the claiming heap, by its owner (the owner thread or the stripe lock holder), whose hint names the
+     *             block of its last claim or of the last span it gave up, and is moved to this claim's block; or
+     *             {@code null}
      */
-    long claimSlices(int slices, int seq, boolean threadLocal) {
+    long claimSlices(int slices, int seq, boolean threadLocal, IdleDecay heap) {
+        if (heap != null) {
+            long run = claimAtHint(slices, threadLocal, heap);
+            if (run >= 0) {
+                heap.hintHits++;
+                return run;
+            }
+            heap.scans++;
+        }
         for (;;) {
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
                 int slice = region.claimSlices(slices, seq);
                 if (slice >= 0) {
-                    int perBlock = config.slicesPerSegment();
-                    commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, threadLocal);
-                    return (long) i << 32 | slice;
+                    return claimed(region.blocks[slice >>> Segment.SLICE_INDEX_BITS],
+                            (long) i << 32 | slice, slices, threadLocal, heap);
                 }
             }
             long run = addRegion(regions, threadLocal, slices, 0);
             if (run >= 0) {
-                commitSlices(block(run), start(run), slices, threadLocal);
-                return run;
+                return claimed(block(run), run, slices, threadLocal, heap);
             }
         }
+    }
+
+    private long claimed(Segment block, long run, int slices, boolean threadLocal, IdleDecay heap) {
+        commitSlices(block, start(run), slices, threadLocal);
+        if (heap != null) {
+            heap.hint(block);
+        }
+        return run;
+    }
+
+    /**
+     * The run claimed in the block of {@code heap}'s hint, or -1 when it has no fit or names no block any more. A
+     * region that took the place of the hint's is as good a place to claim in.
+     */
+    private long claimAtHint(int slices, boolean threadLocal, IdleDecay heap) {
+        int index = heap.hintRegion;
+        Region[] regions = this.regions;
+        if (index < 0 || index >= regions.length) {
+            return -1;
+        }
+        Region region = regions[index];
+        int slot = heap.hintBlock;
+        if (slot >= region.slots) {
+            return -1;
+        }
+        Segment block = region.blocks[slot];
+        int first = block.claimRun(slices);
+        if (first < 0) {
+            return -1;
+        }
+        commitSlices(block, first, slices, threadLocal);
+        return (long) index << 32 | slot << Segment.SLICE_INDEX_BITS | first;
     }
 
     /**
@@ -356,12 +400,12 @@ final class PageStore {
 
     /** The block of a run {@link #claimSlices} returned. */
     Segment block(long run) {
-        return regions[(int) (run >>> 32)].blocks[(int) run / config.slicesPerSegment()];
+        return regions[(int) (run >>> 32)].blocks[(int) run >>> Segment.SLICE_INDEX_BITS];
     }
 
     /** The first slice in its block of a run {@link #claimSlices} returned. */
-    int start(long run) {
-        return (int) run % config.slicesPerSegment();
+    static int start(long run) {
+        return (int) run & Segment.SLICE_INDEX_MASK;
     }
 
     /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */

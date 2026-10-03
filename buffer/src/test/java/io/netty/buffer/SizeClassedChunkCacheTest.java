@@ -211,7 +211,7 @@ public class SizeClassedChunkCacheTest {
 
         // Purge should evict the fully-free chunk (above floor)
         cache.tickPurge();
-        verify(idle).releaseSpan();
+        verify(idle).giveUp();
     }
 
     @Test
@@ -223,7 +223,7 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(idle);
 
         cache.tickPurge();
-        verify(idle, never()).releaseSpan();
+        verify(idle, never()).giveUp();
     }
 
     @Test
@@ -251,9 +251,9 @@ public class SizeClassedChunkCacheTest {
         cache.tickPurge();
 
         for (SizeClassedChunk chunk : excessChunks) {
-            verify(chunk, atLeastOnce()).releaseSpan();
+            verify(chunk, atLeastOnce()).giveUp();
         }
-        verify(workingSet, never()).releaseSpan();
+        verify(workingSet, never()).giveUp();
     }
 
     // --- A chunk that is not fully free is never evicted ---
@@ -278,7 +278,7 @@ public class SizeClassedChunkCacheTest {
             cache.offerChunk(chunk);
         }
 
-        verify(chunk, never()).releaseSpan();
+        verify(chunk, never()).giveUp();
         verify(chunk, never()).releaseOrAbandon();
     }
 
@@ -334,7 +334,7 @@ public class SizeClassedChunkCacheTest {
         cache.tickPurge();
         assertSame(active, cache.active);
         assertNull(active.queue);
-        verify(active, never()).releaseSpan();
+        verify(active, never()).giveUp();
         verify(active, never()).releaseOrAbandon();
     }
 
@@ -352,15 +352,15 @@ public class SizeClassedChunkCacheTest {
 
         // floor chunks besides the active one: at the floor, nothing is evicted.
         cache.tickPurge();
-        verify(idle, never()).releaseSpan();
+        verify(idle, never()).giveUp();
 
         // Once the magazine gives it up, the same chunk counts, and the cache is above the floor.
         cache.deactivate(active);
         assertNull(cache.active);
         assertSame(cache.reusable, active.queue);
         cache.tickPurge();
-        verify(idle).releaseSpan();
-        verify(active, never()).releaseSpan();
+        verify(idle).giveUp();
+        verify(active, never()).giveUp();
     }
 
     @Test
@@ -480,7 +480,7 @@ public class SizeClassedChunkCacheTest {
         cache.evictIfAboveFloor(chunk);
 
         assertEquals(countBefore - 1, cache.reusable.size);
-        verify(chunk).releaseSpan();
+        verify(chunk).giveUp();
     }
 
     @Test
@@ -495,7 +495,7 @@ public class SizeClassedChunkCacheTest {
 
         // Chunk stays in reusable list
         assertEquals(1, cache.reusable.size);
-        verify(chunk, never()).releaseSpan();
+        verify(chunk, never()).giveUp();
     }
 
     // --- free: draining all chunks ---
@@ -666,7 +666,7 @@ public class SizeClassedChunkCacheTest {
 
         assertEquals(countBefore - 1, cache.reusable.size);
         assertSame(cache.idle, chunk.queue, "given up: its object waits idle for the next chunk");
-        verify(chunk).releaseSpan();
+        verify(chunk).giveUp();
     }
 
     // Regression for Invariant N property 4: offerChunk classifies a chunk by reading

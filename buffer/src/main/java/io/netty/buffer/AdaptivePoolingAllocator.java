@@ -677,6 +677,15 @@ final class AdaptivePoolingAllocator {
         private final PageStore store;
         /** The heap's size-class magazines, set once the heap has them; see {@link SizeClassMagazine#decayIfIdle}. */
         SizeClassMagazine[] magazines;
+        /**
+         * Where the heap's next claim of slices looks first (see {@link PageStore#claimSlices}): the region's index and
+         * the block of its last claim, or of the last span it gave up; -1 before the first. Owner only.
+         */
+        int hintRegion = -1;
+        int hintBlock;
+        // Visible for testing: the heap's claims of slices served at its hint, and those that scanned the regions.
+        long hintHits;
+        long scans;
         // Visible for testing.
         long allocationsSinceCheck;
         // Visible for testing.
@@ -684,6 +693,12 @@ final class AdaptivePoolingAllocator {
 
         IdleDecay(PageStore store) {
             this.store = store;
+        }
+
+        /** Owner: the heap's next claim looks in {@code block} first. */
+        void hint(Segment block) {
+            hintRegion = block.region.index;
+            hintBlock = block.slot;
         }
 
         /**
@@ -1163,6 +1178,8 @@ final class AdaptivePoolingAllocator {
         final ChunkQueue idle = new ChunkQueue();
         // Visible for testing: the chunk objects this cache made.
         int chunksMade;
+        /** The heap of this cache, whose claim hint each chunk given up moves (see {@link SizeClassedChunk#giveUp}). */
+        final IdleDecay heap;
 
         /**
          * The lock guarding this cache's lists, or {@code null} when there is nothing to guard.
@@ -1175,10 +1192,11 @@ final class AdaptivePoolingAllocator {
         final StampedLock stripeLock;
 
         SizeClassedChunkCache() {
-            this(null);
+            this(new IdleDecay(null), null);
         }
 
-        SizeClassedChunkCache(StampedLock stripeLock) {
+        SizeClassedChunkCache(IdleDecay heap, StampedLock stripeLock) {
+            this.heap = heap;
             this.stripeLock = stripeLock;
         }
 
@@ -1215,10 +1233,10 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /** {@code chunk}, wholly free and on the reusable list, gives its span back to the store and waits idle. */
+        /** {@code chunk}, wholly free and on the reusable list, gives its span up and waits idle. */
         private void evict(SizeClassedChunk chunk) {
             reusable.remove(chunk);
-            chunk.releaseSpan();
+            chunk.giveUp();
             idle.pushFront(chunk);
         }
 
@@ -1577,10 +1595,9 @@ final class AdaptivePoolingAllocator {
         SizeClassedChunk newChunkAllocation(SizeClassMagazine magazine) {
             PageStore store = magazine.allocator.pageStore;
             int slices = chunkSize / store.config.sliceSize;
-            long run = store.claimSlices(slices, magazine.seq,
-                    magazine.ownerThread != null);
+            long run = store.claimSlices(slices, magazine.seq, magazine.ownerThread != null, magazine.idleDecay);
             Segment segment = store.block(run);
-            int start = store.start(run);
+            int start = PageStore.start(run);
             try {
                 SizeClassedChunkCache cache = magazine.chunkCache;
                 SizeClassedChunk chunk = cache.takeIdle();
@@ -1686,7 +1703,7 @@ final class AdaptivePoolingAllocator {
             int segmentSize = SIZE_CLASSES[sizeClassIndex];
             int chunkSize = allocator.chunkSizes[allocator.sizeClassToChunkPool[sizeClassIndex]];
             this.chunkController = new SizeClassChunkController(segmentSize, chunkSize);
-            this.chunkCache = new SizeClassedChunkCache(stripeLock);
+            this.chunkCache = new SizeClassedChunkCache(idleDecay, stripeLock);
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
                     CHUNK_PURGE_INTERVAL * (chunkSize / segmentSize));
         }
@@ -1909,9 +1926,11 @@ final class AdaptivePoolingAllocator {
                 return;
             }
             PageStore store = allocator.pageStore;
-            long run = store.claimSlices(slices, seq, ownerThread != null);
+            // No claim hint: a span goes back from any thread, so the hint would only follow the claims, filling the
+            // last block's slices with no memory behind them while earlier blocks have free ones that have.
+            long run = store.claimSlices(slices, seq, ownerThread != null, null);
             Segment segment = store.block(run);
-            int start = store.start(run);
+            int start = PageStore.start(run);
             // Colour, as the size classes' spans (see SizeClassChunkController) and as mimalloc does for its large
             // allocations (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to
             // 4032 bytes into its span, in 64-byte steps taken round robin, out of the tail the span leaves unused
@@ -2407,6 +2426,12 @@ final class AdaptivePoolingAllocator {
         /** The slices of the span this chunk is; its colour is less than one. */
         int spanSlices() {
             return (capacity + segment.sliceSize - 1) / segment.sliceSize;
+        }
+
+        /** Owner, with every segment back: the span goes back, and the heap's next claim tries that hole first. */
+        void giveUp() {
+            releaseSpan();
+            owningCache.heap.hint(segment);
         }
 
         /** Owner, with every segment back: the span goes back to the store's shared slices. */
