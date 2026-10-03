@@ -277,6 +277,12 @@ final class PageStoreTestSupport {
         throw new AssertionError("the purge never stops");
     }
 
+    /** The bytes of a chunk of {@code size}'s class under {@code config}: its page kind's slices. */
+    static int chunkSizeOf(int size, PageStoreConfig config) {
+        int index = AdaptivePoolingAllocator.sizeClassIndexOf(size);
+        return AdaptivePoolingAllocator.pageSlices(config)[index] * config.sliceSize;
+    }
+
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
     static AdaptivePoolingAllocator newAllocator(CountingMemorySource source, int segmentSize) {
         return new AdaptivePoolingAllocator(source, true, null,

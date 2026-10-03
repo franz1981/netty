@@ -40,11 +40,12 @@ class AdaptivePoolingAllocatorTest {
      */
     @Test
     void segmentIndexIsExactForEverySizeClassAndColour() {
-        int slice = PageStoreConfig.SLICE_SIZE_BYTES;
-        int block = PageStoreConfig.SEGMENT_SIZE_BYTES;
+        PageStoreConfig config = PageStoreConfig.directDefaults();
+        int slice = config.sliceSize;
+        int block = config.segmentSize;
         int mostSegments = 0;
         for (int sizeClass : AdaptivePoolingAllocator.getSizeClasses()) {
-            int chunkSize = AdaptivePoolingAllocator.chunkSizeOf(sizeClass, slice, block);
+            int chunkSize = PageStoreTestSupport.chunkSizeOf(sizeClass, config);
             int segments = chunkSize / sizeClass;
             mostSegments = Math.max(mostSegments, segments);
             long recip = SizeClassedChunk.indexReciprocal(sizeClass);
@@ -60,7 +61,7 @@ class AdaptivePoolingAllocatorTest {
                 }
             }
         }
-        assertEquals(4096, mostSegments);
+        assertEquals(2048, mostSegments);
         assertTrue(mostSegments <= SizeClassedChunk.MAX_SEGMENTS);
     }
 

@@ -87,7 +87,7 @@ final class SharedSlicesTest {
         assertEquals(0, slice(store.claimSlices(40, 0, false)));
         assertEquals(PER_BLOCK, slice(store.claimSlices(40, 0, false)), "24 left in block 0: block 1");
         assertEquals(40, slice(store.claimSlices(24, 0, false)), "the tail of block 0 fits");
-        assertEquals(PER_BLOCK + 40, slice(store.claimSlices(1, 0, false)));
+        assertEquals(PER_BLOCK + 40, slice(store.claimSlices(2, 0, false)));
         assertEquals(1, regions.regions.size());
         assertEquals(0, segments.segmentsAllocated(), "no segment of its own");
     }
@@ -99,20 +99,20 @@ final class SharedSlicesTest {
     @Test
     void claimsOfOneLengthShareBlocks() {
         PageStore store = store(INTERVAL);
-        assertBins(store, 2, 3, 8);
-        long a = store.claimSlices(2, 0, false);
+        assertBins(store, 1, 8, 32);
+        long a = store.claimSlices(1, 0, false);
         assertEquals(0, slice(a));
         long b = store.claimSlices(8, 0, false);
-        assertEquals(PER_BLOCK, slice(b), "block 0 is the 2-slice bin's");
-        assertEquals(2, slice(store.claimSlices(2, 0, false)));
+        assertEquals(PER_BLOCK, slice(b), "block 0 is the 1-slice bin's");
+        assertEquals(1, slice(store.claimSlices(1, 0, false)));
         long d = store.claimSlices(8, 0, false);
         assertEquals(PER_BLOCK + 8, slice(d));
         release(store, b, 8);
         release(store, d, 8);
-        assertEquals(PER_BLOCK, slice(store.claimSlices(3, 0, false)), "the lowest wholly free block");
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, 0, false)), "block 1 is the 3-slice bin's now");
-        release(store, a, 2);
-        assertEquals(0, slice(store.claimSlices(2, 0, false)), "the lowest fit of the bin");
+        assertEquals(PER_BLOCK, slice(store.claimSlices(32, 0, false)), "the lowest wholly free block");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, 0, false)), "block 1 is the 32-slice bin's now");
+        release(store, a, 1);
+        assertEquals(0, slice(store.claimSlices(1, 0, false)), "the lowest fit of the bin");
         assertMapsShowEveryFit(store);
     }
 
@@ -120,16 +120,16 @@ final class SharedSlicesTest {
     @Test
     void aStaleBitIsClearedByTheClaimThatFindsIt() {
         PageStore store = store(INTERVAL);
-        assertBins(store, 2, 3, 8);
+        assertBins(store, 1, 8, 32);
         Segment eights = block(store, store.claimSlices(8, 0, false));
-        Segment twos = block(store, store.claimSlices(2, 0, false));
-        assertEquals(1, store.id(twos), "block 1 of region 0");
-        int bin2 = store.binOf[2];
-        store.mark(bin2, store.id(eights));
-        assertEquals(PER_BLOCK + 2, slice(store.claimSlices(2, 0, false)), "not in the 8-slice bin's block");
-        assertFalse(store.marked(bin2, eights));
+        Segment ones = block(store, store.claimSlices(1, 0, false));
+        assertEquals(1, store.id(ones), "block 1 of region 0");
+        int bin1 = store.binOf[1];
+        store.mark(bin1, store.id(eights));
+        assertEquals(PER_BLOCK + 1, slice(store.claimSlices(1, 0, false)), "not in the 8-slice bin's block");
+        assertFalse(store.marked(bin1, eights));
         store.mark(store.emptyMap, store.id(eights));
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(3, 0, false)), "block 0 is not wholly free");
+        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(32, 0, false)), "block 0 is not wholly free");
         assertFalse(store.marked(store.emptyMap, eights));
         assertMapsShowEveryFit(store);
     }
@@ -144,7 +144,7 @@ final class SharedSlicesTest {
         final PageStore store = store(INTERVAL);
         // 64 ids a map word: a region of 9 blocks takes 16, so this many regions grow the maps three times.
         final int regionsWanted = 17;
-        final int[] sizes = {2, 3, 4, 5, 8, 9, 17, 63};
+        final int[] sizes = {1, 2, 3, 5, 8, 9, 32, 63};
         final AtomicIntegerArray owners = new AtomicIntegerArray(64 * PER_REGION);
         final AtomicReference<String> failure = new AtomicReference<String>();
         final CountDownLatch start = new CountDownLatch(1);
@@ -208,7 +208,7 @@ final class SharedSlicesTest {
 
     private static void assertBins(PageStore store, int... lengths) {
         for (int n : lengths) {
-            assertTrue(store.binOf[n] != store.otherBin, n + " slices: not a chunk length");
+            assertTrue(store.binOf[n] != store.otherBin, n + " slices: not a page kind");
         }
     }
 

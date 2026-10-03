@@ -85,12 +85,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     @Override
     protected long expectedUsedMemory(AdaptiveByteBufAllocator allocator, int capacity) {
-        return 128 * 1024; // Min chunk size
+        return PageStoreTestSupport.chunkSizeOf(capacity, direct(allocator).pageStore.config);
     }
 
     @Override
     protected long expectedUsedMemoryAfterRelease(AdaptiveByteBufAllocator allocator, int capacity) {
-        return 128 * 1024; // Min chunk size
+        return expectedUsedMemory(allocator, capacity);
     }
 
     @Override
@@ -138,7 +138,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             buffer.release();
         }
         // Memory is still held by the magazines
-        assertEquals(perSegment ? unit : 2 * 128 * 1024, metric.usedDirectMemory());
+        assertEquals(perSegment ? unit : expectedUsedMemory(allocator, 1024) + expectedUsedMemory(allocator, 2048),
+                metric.usedDirectMemory());
     }
 
     static AdaptivePoolingAllocator direct(AdaptiveByteBufAllocator allocator) {
@@ -149,6 +150,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
+    }
+
+    /** The bytes of a heap chunk of {@code size}'s class under the heap defaults. */
+    private static int heapChunkSizeOf(int size) {
+        return PageStoreTestSupport.chunkSizeOf(size, PageStoreConfig.heapDefaults());
     }
 
     /** The size of the direct allocator's blocks. */
@@ -756,7 +762,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     private static IdleSizeClass leaveNotes(AdaptiveByteBufAllocator allocator, boolean sharedStripe)
             throws Exception {
-        int chunkSize = AdaptivePoolingAllocator.chunkSizeOf(NOTE_IDLE_SIZE);
+        int chunkSize = heapChunkSizeOf(NOTE_IDLE_SIZE);
         final List<ByteBuf> released = new ArrayList<ByteBuf>();
         List<ByteBuf> stillHeld = new ArrayList<ByteBuf>();
         released.add(allocator.heapBuffer(NOTE_IDLE_SIZE, NOTE_IDLE_SIZE));
@@ -823,7 +829,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             ByteBuf first = null;
             try {
                 long used = allocator.usedHeapMemory();
-                assertEquals(AdaptivePoolingAllocator.chunkSizeOf(NOTE_ALLOCATING_SIZE), idle.chunkSize,
+                assertEquals(heapChunkSizeOf(NOTE_ALLOCATING_SIZE), idle.chunkSize,
                         "both size classes must share a chunk size");
 
                 first = allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE);
@@ -856,7 +862,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             try {
                 long used = allocator.usedHeapMemory();
                 int interval = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
-                        * (AdaptivePoolingAllocator.chunkSizeOf(NOTE_ALLOCATING_SIZE) / NOTE_ALLOCATING_SIZE);
+                        * (heapChunkSizeOf(NOTE_ALLOCATING_SIZE) / NOTE_ALLOCATING_SIZE);
 
                 // One allocation is counted already; the tick comes with the interval-th.
                 for (int i = 1; i < interval - 1; i++) {
@@ -995,7 +1001,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             IdleDecay idleDecay = threadLocalIdleDecay(allocator);
             idleDecay.decay(System.nanoTime());
             int threshold = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
-                    * (AdaptivePoolingAllocator.chunkSizeOf(size) / size);
+                    * (heapChunkSizeOf(size) / size);
             for (int i = 0; i < threshold; i++) {
                 allocator.heapBuffer(size, size).release();
             }
@@ -1438,11 +1444,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     // the chunk stays on the exhausted list forever: it has capacity nobody can find, and it is never
     // fully free either, so the purge sweep will not evict it. Both tests below are about that.
 
-    /** Buffer size whose size class has a 128 KiB chunk of 32 segments. */
+    /** Buffer size whose size class has a 64 KiB chunk of 16 segments. */
     private static final int BURST_BUF_SIZE = 4096;
-    /** A 128 KiB chunk fits 32, less the one an exact fit gives up for its colours. */
-    private static final int BURST_SEGMENTS_PER_CHUNK = 31;
-    private static final int BURST_CHUNK_SIZE = 128 * 1024;
+    /** A 64 KiB chunk fits 16, less the one an exact fit gives up for its colours. */
+    private static final int BURST_SEGMENTS_PER_CHUNK = 15;
+    private static final int BURST_CHUNK_SIZE = 64 * 1024;
     private static final int BURST_CHUNKS = 400;
 
     /**

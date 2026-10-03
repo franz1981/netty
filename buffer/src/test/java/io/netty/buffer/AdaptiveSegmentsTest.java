@@ -40,6 +40,7 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.offsetIn;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -60,27 +61,18 @@ public class AdaptiveSegmentsTest {
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();
 
-    /** Slices of the chunk of each size class, as the page-store plan's table has them. */
+    /** The page kinds of this test's blocks: 64 slices of 64 KiB. */
+    private static final int[] KINDS = AdaptivePoolingAllocator.pageKinds(SEGMENT_SIZE / SLICE_SIZE_BYTES,
+            SLICE_SIZE_BYTES);
+
+    /** Slices of the chunk of each size class in this test's blocks. */
     private static int expectedSlices(int sizeClass) {
-        if (sizeClass <= 4096) {
-            return 2;
-        }
-        switch (sizeClass) {
-            case 4352: return 3;
-            case 8192: return 4;
-            case 8704: return 5;
-            case 16896: case 33792: case 67584: case 135168: return 9;
-            default: return 8; // 16384, 32768, 65536, 131072
-        }
+        return AdaptivePoolingAllocator.chunkSlicesOf(sizeClass, KINDS, SLICE_SIZE_BYTES);
     }
 
-    /** The buffers a chunk hands out: an exact fit of 32 or more gives one up for its colours. */
+    /** The buffers a chunk hands out: an exact fit gives one up for its colours. */
     private static int expectedBuffers(int sizeClass) {
-        int span = expectedSlices(sizeClass) * SLICE_SIZE_BYTES;
-        int fit = span / sizeClass;
-        int room = span - fit * sizeClass;
-        // An exact fit gives up a buffer only when that buffer makes room for a second colour: not the 32-byte class.
-        return room < 64 && fit >= 32 && room + sizeClass >= 64 ? fit - 1 : fit;
+        return AdaptivePoolingAllocator.chunkBuffersOf(sizeClass, expectedSlices(sizeClass) * SLICE_SIZE_BYTES);
     }
 
     private static boolean isLowMemory() throws Exception {
@@ -228,7 +220,7 @@ public class AdaptiveSegmentsTest {
         int slices = expectedSlices(size);
         int perChunk = expectedBuffers(size);
         int colours = Math.min(16, (slices * SLICE_SIZE_BYTES - perChunk * size) / 64 + 1);
-        assertEquals(size == 640 ? 9 : 16, colours);
+        assertEquals(size == 640 ? 5 : 16, colours);
         int chunks = 40;
         Object stripe = null;
         for (int round = 0; round < 2; round++) {
@@ -441,11 +433,11 @@ public class AdaptiveSegmentsTest {
         assertEquals(32, usedSlices(allocator, 1));
         assertEquals(2, source.segmentsLive());
         // Another class, another chunk size: from the free slices.
-        int other = 1024; // 2-slice chunks
+        int other = 1024; // 1-slice chunks
         for (int i = 0; i < 16 * expectedBuffers(other); i++) {
             bufs.add(allocator.allocate(other, other));
         }
-        assertEquals(2, source.segmentsAllocated(), "32 slices fit in the free ones");
+        assertEquals(2, source.segmentsAllocated(), "16 slices fit in the free ones");
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -544,18 +536,20 @@ public class AdaptiveSegmentsTest {
         assertAccounted(source, allocator);
     }
 
-    /** 2 MiB segments: 32 slices, the same chunks, three 9-slice chunks per segment. */
+    /** 2 MiB segments: 32 slices, page kinds of 1, 4 and 16 slices; 16896 takes 4-slice chunks of 15 buffers. */
     @Test
     void twoMebibyteSegments() throws Exception {
         CountingMemorySource source = new CountingMemorySource();
         AdaptivePoolingAllocator allocator = closer.add(newAllocator(source, 2 * 1024 * 1024));
         int size = 16896;
-        int perChunk = 9 * SLICE_SIZE_BYTES / size; // 34
+        int perChunk = 15;
+        assertEquals(4 * SLICE_SIZE_BYTES, PageStoreTestSupport.chunkSizeOf(size,
+                new PageStoreConfig(2 * 1024 * 1024, SLICE_SIZE_BYTES, INTERVAL, 0, 0, 2 * 1024 * 1024)));
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
-        for (int i = 0; i < 4 * perChunk; i++) {
+        for (int i = 0; i < 9 * perChunk; i++) {
             bufs.add(allocator.allocate(size, size));
         }
-        assertEquals(2, source.segmentsAllocated(), "three 9-slice chunks per 32-slice segment");
+        assertEquals(2, source.segmentsAllocated(), "eight 4-slice chunks per 32-slice segment");
         assertEquals(4L * 1024 * 1024, allocator.usedMemory());
         for (ByteBuf buf : bufs) {
             buf.release();
@@ -581,8 +575,8 @@ public class AdaptiveSegmentsTest {
         ByteBuf buf = allocator.directBuffer(1024, 1024);
         assertNotNull(chunkOf(buf).segment);
         assertNotNull(chunkOf(buf).segment.region);
-        // mmap'd: the chunk's slices, 128 KiB for 1 KiB buffers; malloc'd: the whole region.
-        long directUsed = AdaptiveByteBufAllocatorTest.directSharesSlices(allocator) ? 128 * 1024 :
+        // mmap'd: the chunk's slices, 64 KiB for 1 KiB buffers; malloc'd: the whole region.
+        long directUsed = AdaptiveByteBufAllocatorTest.directSharesSlices(allocator) ? 64 * 1024 :
                 PageStoreConfig.SEGMENT_SIZE_BYTES;
         assertEquals(directUsed, allocator.metric().usedDirectMemory());
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
@@ -602,12 +596,11 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * The chunk-to-span table comes from the allocator's own slice size: with 32 KiB slices the 4352-byte class gets
-     * 160 KiB chunks (136 KiB rounded up to 5 slices), with 64 KiB slices 192 KiB; and each allocator's spans are
-     * slices of its own size.
+     * The page kinds come from the allocator's own slice size: the 4352-byte class gets one slice either way, 7
+     * buffers in 32 KiB, 15 in 64 KiB; and each allocator's spans are slices of its own size.
      */
     @Test
-    void chunkSizesFollowTheInstanceSliceSize() {
+    void chunkSizesFollowTheInstanceSliceSize() throws Exception {
         CountingMemorySource source = new CountingMemorySource();
         AdaptivePoolingAllocator small = closer.add(new AdaptivePoolingAllocator(source, true, null,
                 new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, INTERVAL, 0, 0, 2 * 1024 * 1024)));
@@ -615,10 +608,12 @@ public class AdaptiveSegmentsTest {
         ByteBuf a = small.allocate(4352, 4352);
         ByteBuf b = large.allocate(4352, 4352);
         try {
-            assertEquals(160 * 1024, chunkOf(a).capacity());
+            assertEquals(32 * 1024, chunkOf(a).capacity());
+            assertEquals(7, field(chunkOf(a), "segments"));
             assertEquals(32 * 1024, chunkOf(a).segment.sliceSize);
             assertEquals(64, chunkOf(a).segment.slices);
-            assertEquals(192 * 1024, chunkOf(b).capacity());
+            assertEquals(64 * 1024, chunkOf(b).capacity());
+            assertEquals(15, field(chunkOf(b), "segments"));
             assertEquals(SLICE_SIZE_BYTES, chunkOf(b).segment.sliceSize);
             assertEquals(2L * 1024 * 1024, small.usedMemory());
             assertEquals(SEGMENT_SIZE, large.usedMemory());
@@ -638,15 +633,16 @@ public class AdaptiveSegmentsTest {
     }
 
     /**
-     * Segments smaller than the largest size-class chunk (9 slices), as heap segments under G1 with 1 MiB regions
-     * (7 slices): the chunks are cut to a segment, every size class still allocates, and every buffer stays inside
-     * its segment.
+     * Segments of 7 slices, as heap segments under G1 with 1 MiB regions: page kinds of 1 and 7 slices, every size
+     * class still allocates, and every buffer stays inside its segment.
      */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void chunksAreCutToSegmentsSmallerThanThem(boolean heap) throws Exception {
+    void sevenSliceSegmentsHoldEverySizeClass(boolean heap) throws Exception {
         CountingMemorySource source = new CountingMemorySource(heap);
         int segmentSize = 7 * SLICE_SIZE_BYTES;
+        int[] kinds = AdaptivePoolingAllocator.pageKinds(7, SLICE_SIZE_BYTES);
+        assertArrayEquals(new int[] {1, 7}, kinds);
         AdaptivePoolingAllocator allocator = closer.add(newAllocator(source, segmentSize));
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         for (int i = 0; i < pooledSizeClassesCount(); i++) {
@@ -654,7 +650,8 @@ public class AdaptiveSegmentsTest {
             for (int j = 0; j < 2; j++) {
                 ByteBuf buf = allocator.allocate(size, size);
                 SizeClassedChunk chunk = chunkOf(buf);
-                assertEquals(Math.min(expectedSlices(size), 7) * SLICE_SIZE_BYTES, chunk.capacity(), "size " + size);
+                int slices = AdaptivePoolingAllocator.chunkSlicesOf(size, kinds, SLICE_SIZE_BYTES);
+                assertEquals(slices * SLICE_SIZE_BYTES, chunk.capacity(), "size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= 0 && offset + size <= segmentSize, "size " + size + " outside its segment");
                 buf.setLong(size - 8, size);

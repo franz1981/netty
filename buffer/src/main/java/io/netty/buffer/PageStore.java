@@ -80,15 +80,15 @@ final class PageStore {
     final PageStoreConfig config;
     /**
      * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the short
-     * runs do not cut the holes the long ones leave. A chunk length's bin is its index in
-     * {@link AdaptivePoolingAllocator#distinctChunkSizes}; every other length is in {@link #otherBin}. As mimalloc v3's
+     * runs do not cut the holes the long ones leave. A page kind's bin is its index in
+     * {@link AdaptivePoolingAllocator#pageKinds}; every other length is in {@link #otherBin}. As mimalloc v3's
      * size bins of its bitmap chunks ({@code mi_chunkbin_of},
      * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L249-L257), by exact length.
      */
     final byte[] binOf;
     final int otherBin;
     /**
-     * Per bin, the run length whose fit its bit in {@link #maps} stands for: the chunk's slices; 1 for
+     * Per bin, the run length whose fit its bit in {@link #maps} stands for: the page kind; 1 for
      * {@link #otherBin}, whose claims have many lengths.
      */
     final int[] binSlices;
@@ -178,16 +178,15 @@ final class PageStore {
         this.config = config;
         this.memory = memory;
         int perBlock = config.slicesPerSegment();
-        int[] chunkSizes = AdaptivePoolingAllocator.distinctChunkSizes(AdaptivePoolingAllocator.getSizeClasses(),
-                config.sliceSize, config.segmentSize);
-        otherBin = chunkSizes.length;
+        int[] kinds = AdaptivePoolingAllocator.pageKinds(perBlock, config.sliceSize);
+        otherBin = kinds.length;
         binOf = new byte[perBlock + 1];
         Arrays.fill(binOf, (byte) otherBin);
         binSlices = new int[otherBin + 1];
         binSlices[otherBin] = 1;
-        for (int bin = 0; bin < chunkSizes.length; bin++) {
-            binOf[chunkSizes[bin] / config.sliceSize] = (byte) bin;
-            binSlices[bin] = chunkSizes[bin] / config.sliceSize;
+        for (int bin = 0; bin < kinds.length; bin++) {
+            binOf[kinds[bin]] = (byte) bin;
+            binSlices[bin] = kinds[bin];
         }
         emptyMap = otherBin + 1;
         idShift = Integer.SIZE - Integer.numberOfLeadingZeros(config.segmentsPerRegion() - 1);

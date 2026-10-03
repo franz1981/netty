@@ -29,7 +29,7 @@ final class PageStoreConfig {
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
     static final int MAX_SEGMENT_SIZE_BYTES = Long.SIZE * SLICE_SIZE_BYTES;
-    /** Room for the largest size-class chunk (9 slices) with some to spare. */
+    /** Room for the largest size class (3 slices) with some to spare. */
     static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
     /**
      * {@code io.netty.allocator.segmentSize}: a multiple of {@link #SLICE_SIZE_BYTES} from
@@ -189,11 +189,11 @@ final class PageStoreConfig {
 
     /**
      * {@code io.netty.allocator.heapSegmentSize}: the size of a heap allocator's segments, rounded down to whole
-     * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them. Below 9 slices the size-class chunks
-     * are cut to a segment. Default: one slice less than {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose
-     * regions are powers of two, its {@code byte[]} with the header fits in whole regions with a slice to spare, and
-     * in half a region from 8 MiB regions up (a humongous object takes regions of its own: a 4 MiB array would take
-     * two 4 MiB regions, or a whole 8 MiB one).
+     * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them, which set the page kinds of the
+     * size-class chunks (see {@link AdaptivePoolingAllocator#pageKinds}). Default: one slice less than
+     * {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose regions are powers of two, its {@code byte[]} with the
+     * header fits in whole regions with a slice to spare, and in half a region from 8 MiB regions up (a humongous
+     * object takes regions of its own: a 4 MiB array would take two 4 MiB regions, or a whole 8 MiB one).
      */
     static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));

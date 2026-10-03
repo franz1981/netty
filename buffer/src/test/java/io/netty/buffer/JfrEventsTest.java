@@ -398,8 +398,8 @@ public class JfrEventsTest {
             int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
             // With shared slices, the event is the chunk's slices.
             boolean perSegment = !AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
-            assertEquals(perSegment ? segmentSize : AdaptivePoolingAllocator.MIN_CHUNK_SIZE,
-                    allocate.getInt("capacity"));
+            int chunkSize = PageStoreTestSupport.chunkSizeOf(128, PageStoreConfig.directDefaults());
+            assertEquals(perSegment ? segmentSize : chunkSize, allocate.getInt("capacity"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
             assertTrue(allocate.getBoolean("direct"));
