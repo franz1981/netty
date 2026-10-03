@@ -76,6 +76,15 @@ final class PageStore {
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
+    /**
+     * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the short
+     * runs do not cut the holes the long ones leave. A chunk length's bin is its index in
+     * {@link AdaptivePoolingAllocator#distinctChunkSizes}; every other length is in {@link #otherBin}. As mimalloc v3's
+     * size bins of its bitmap chunks ({@code mi_chunkbin_of},
+     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L249-L257), by exact length.
+     */
+    final byte[] binOf;
+    final int otherBin;
     final MemorySource memory;
     /** Where new regions come from. Replaced once, under this store's monitor, by {@link #fallbackSource}. */
     volatile RegionSource regionSource;
@@ -146,6 +155,15 @@ final class PageStore {
         this.allocator = allocator;
         this.config = config;
         this.memory = memory;
+        int perBlock = config.slicesPerSegment();
+        int[] chunkSizes = AdaptivePoolingAllocator.distinctChunkSizes(AdaptivePoolingAllocator.getSizeClasses(),
+                config.sliceSize, config.segmentSize);
+        otherBin = chunkSizes.length;
+        binOf = new byte[perBlock + 1];
+        Arrays.fill(binOf, (byte) otherBin);
+        for (int bin = 0; bin < chunkSizes.length; bin++) {
+            binOf[chunkSizes[bin] / config.sliceSize] = (byte) bin;
+        }
         this.regionSource = regionSource;
         regionBlocks = config.segmentsPerRegion();
         regionAlignment = config.regionAlignment;
@@ -221,7 +239,7 @@ final class PageStore {
         // The place of a region given back is taken again: nothing claims in a released region.
         Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
         region.index = index;
-        int first = blocks != 0 ? region.claimBlocks(blocks) : region.claimSlices(slices, 0);
+        int first = blocks != 0 ? region.claimBlocks(blocks) : region.claimSlices(slices, 0, binOf[slices]);
         grown[index] = region;
         regions = grown;
         if (!region.purgesSlices) {
@@ -251,11 +269,12 @@ final class PageStore {
      * {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, int seq, boolean threadLocal) {
+        int bin = binOf[slices];
         for (;;) {
             Region[] regions = this.regions;
             for (int i = 0; i < regions.length; i++) {
                 Region region = regions[i];
-                int slice = region.claimSlices(slices, seq);
+                int slice = region.claimSlices(slices, seq, bin);
                 if (slice >= 0) {
                     int perBlock = config.slicesPerSegment();
                     commitSlices(region.blocks[slice / perBlock], slice % perBlock, slices, threadLocal);

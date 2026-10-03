@@ -33,6 +33,10 @@ final class Segment {
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
     private static final AtomicLongFieldUpdater<Segment> COMMITTED =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "committed");
+    /** Set in what {@link #claimRun} returns when the block was wholly free: the claim labelled it. */
+    static final int FIRST = 1 << 8;
+    /** The first slice of a run, in what {@link #claimRun} returns. */
+    static final int START = Long.SIZE - 1;
 
     final AbstractByteBuf buffer;
     final int sliceSize;
@@ -49,6 +53,12 @@ final class Segment {
     final int slot;
     /** Per slice, slice owner only: the {@link System#nanoTime()} of its last release. */
     final long[] freedAt;
+    /**
+     * The bin of the first claim since the block was last wholly free (see {@link PageStore#binOf}), written by that
+     * claim alone: its run is held until after the write, so the block cannot be wholly free again before it. A hint:
+     * the claims that go by it check the bitmap.
+     */
+    volatile byte bin;
     /** The chunk of every large-buffer span a stripe claimed in it. Set before its region is published. */
     AdaptivePoolingAllocator.Chunk sharedSpans;
     /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
@@ -89,10 +99,17 @@ final class Segment {
         return n == slices ? allFree : mask(start, n);
     }
 
-    /** Any thread: claims the lowest run of {@code n} free slices. Returns its first slice, or -1. */
-    int claimRun(int n) {
+    /**
+     * Any thread: claims the lowest run of {@code n} free slices, for a claim of {@code bin}. Returns its first slice,
+     * with {@link #FIRST} set if the block was wholly free, which labels it {@code bin}; or -1.
+     */
+    int claimRun(int n, int bin) {
         if (n == slices) {
-            return claimWhole() ? 0 : -1;
+            if (!claimWhole()) {
+                return -1;
+            }
+            this.bin = (byte) bin;
+            return FIRST;
         }
         for (;;) {
             long current = free;
@@ -101,7 +118,11 @@ final class Segment {
                 return -1;
             }
             if (FREE.compareAndSet(this, current, current & ~mask(start, n))) {
-                return start;
+                if (current != allFree) {
+                    return start;
+                }
+                this.bin = (byte) bin;
+                return start | FIRST;
             }
         }
     }

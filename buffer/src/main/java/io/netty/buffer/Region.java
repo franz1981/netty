@@ -79,9 +79,9 @@ final class Region {
     }
 
     /**
-     * Any thread: claims the lowest run of {@code n} free slices of one block, at most a block, and
-     * returns its first slice in the region, or -1 when no block has such a run. Lock-free: one CAS on the block's
-     * bitmap, again only if another thread changed it meanwhile.
+     * Any thread: claims the lowest run of {@code n} free slices of one block, at most a block, for a claim of
+     * {@code bin} (see {@link Segment#claimRun}), and returns its first slice in the region, or -1 when no block has
+     * such a run. Lock-free: one CAS on the block's bitmap, again only if another thread changed it meanwhile.
      * <p>
      * As mimalloc v3's {@code mi_bbitmap_try_find_and_clear_generic}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884): the blocks
@@ -91,7 +91,7 @@ final class Region {
      * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849). A run never
      * crosses a block.
      */
-    int claimSlices(int n, int seq) {
+    int claimSlices(int n, int seq, int bin) {
         Segment[] blocks = this.blocks;
         int count = blocks.length;
         int cycle = maxAccessed + 1;
@@ -100,10 +100,10 @@ final class Region {
             int slot = k >= cycle ? k : start + k < cycle ? start + k : start + k - cycle;
             Segment block = blocks[slot];
             if (Long.bitCount(block.free) >= n) {
-                int first = block.claimRun(n);
+                int first = block.claimRun(n, bin);
                 if (first >= 0) {
                     accessed(slot);
-                    return slot * block.slices + first;
+                    return slot * block.slices + (first & Segment.START);
                 }
             }
         }
