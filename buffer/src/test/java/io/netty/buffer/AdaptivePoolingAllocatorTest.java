@@ -15,9 +15,11 @@
  */
 package io.netty.buffer;
 
+import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AdaptivePoolingAllocatorTest {
     @Test
@@ -30,6 +32,36 @@ class AdaptivePoolingAllocatorTest {
         // beyond the last size class, we return the size class array's length
         assertSizeClassOf(sizeClasses.length, sizeClasses[sizeClasses.length - 1] + 1,
                           sizeClasses[sizeClasses.length - 1] + 1);
+    }
+
+    /**
+     * A released segment's offset becomes its index by a multiply and a shift: exact for every segment of every size
+     * class, whatever the span's start in its block and the chunk's colour.
+     */
+    @Test
+    void segmentIndexIsExactForEverySizeClassAndColour() {
+        int slice = PageStoreConfig.SLICE_SIZE_BYTES;
+        int block = PageStoreConfig.SEGMENT_SIZE_BYTES;
+        int mostSegments = 0;
+        for (int sizeClass : AdaptivePoolingAllocator.getSizeClasses()) {
+            int chunkSize = AdaptivePoolingAllocator.chunkSizeOf(sizeClass, slice, block);
+            int segments = chunkSize / sizeClass;
+            mostSegments = Math.max(mostSegments, segments);
+            long recip = SizeClassedChunk.indexReciprocal(sizeClass);
+            int lastSpanStart = block / slice - (chunkSize + slice - 1) / slice;
+            for (int colour = 0; colour < 16 * 64; colour += 64) {
+                for (int spanStart : new int[] {0, lastSpanStart}) {
+                    int base = spanStart * slice + colour;
+                    for (int i = 0; i < segments; i++) {
+                        int offset = base + i * sizeClass;
+                        assertEquals(i, SizeClassedChunk.index(offset - base, recip),
+                                "size class " + sizeClass + ", colour " + colour + ", segment " + i);
+                    }
+                }
+            }
+        }
+        assertEquals(4096, mostSegments);
+        assertTrue(mostSegments <= SizeClassedChunk.MAX_SEGMENTS);
     }
 
     private static void assertSizeClassOf(int expectedSizeClass, int previousSizeIncluded, int maxSizeIncluded) {

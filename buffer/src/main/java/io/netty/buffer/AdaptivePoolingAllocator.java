@@ -286,13 +286,23 @@ final class AdaptivePoolingAllocator {
         };
     }
 
-    /** A chunk is at most a segment (see {@link #chunkSizeOf(int, int, int)}): it must hold the largest class. */
+    /**
+     * A chunk is at most a segment (see {@link #chunkSizeOf(int, int, int)}): it must hold the largest class, and
+     * no chunk may hold more than {@link SizeClassedChunk#MAX_SEGMENTS}.
+     */
     private static void checkSizeClassSpansFit(PageStoreConfig config) {
         int largest = SIZE_CLASSES[SIZE_CLASSES_COUNT - 1];
         int slices = (largest + config.sliceSize - 1) / config.sliceSize;
         if (slices * config.sliceSize > config.segmentSize) {
             throw new IllegalArgumentException("segmentSize " + config.segmentSize
                     + " cannot hold a buffer of " + largest + " (slices of " + config.sliceSize + ')');
+        }
+        for (int sizeClass : SIZE_CLASSES) {
+            int segments = chunkSizeOf(sizeClass, config.sliceSize, config.segmentSize) / sizeClass;
+            if (segments > SizeClassedChunk.MAX_SEGMENTS) {
+                throw new IllegalArgumentException("chunks of " + sizeClass + "-byte buffers would hold " + segments
+                        + ", more than " + SizeClassedChunk.MAX_SEGMENTS + " (slices of " + config.sliceSize + ')');
+            }
         }
     }
 
@@ -2077,29 +2087,22 @@ final class AdaptivePoolingAllocator {
     /**
      * A chunk cut into segments of one size class, a span of its block from slice {@link #spanStart}.
      * <p>
-     * <b>Free segments</b> are not listed anywhere outside the block: a free segment holds, in its own first four
-     * bytes, the offset of the next free one (mimalloc's block free list). Offsets are the block's, from {@link #base}.
-     * The chunk keeps
+     * <b>Free segments</b> are linked by index through {@link #next}, one entry per segment: the allocator never
+     * reads nor writes the memory it hands out, and a buffer written after its release cannot break a list. Segment
+     * {@code i} is at offset {@code base + i * segmentSize} of the block. The chunk keeps
      * <ul>
      *   <li>{@link #head}: the first segment released by the owner thread, or by a thread holding the stripe lock.
      *       The last segment released is the first handed out again;</li>
      *   <li>{@link #bump}: the first segment never handed out. These are taken in order and need no link, so a new
-     *       chunk fills nothing, and whatever the memory holds is ignored;</li>
+     *       chunk fills nothing, and {@link #next} is never cleared;</li>
      *   <li>{@link #localFree}: how many segments those two account for;</li>
      *   <li>{@link #externalFree}: the segments released by any other thread, as one {@code long} holding their
-     *       count above the offset of the first. A releaser writes its link and then publishes the new first and the
+     *       count above the index of the first. A releaser writes its link and then publishes the new first and the
      *       count with one CAS; the owner takes the whole list, and its count, with one {@code getAndSet} when
      *       {@link #head} and {@link #bump} have run out. Only pushes race with each other and the list is only ever
      *       taken whole, so there is no ABA.</li>
      * </ul>
      * Every question about capacity is arithmetic on the counts: nothing walks a list.
-     * <p>
-     * <b>A corrupted link.</b> A link is checked when it is read: it must be another segment of this chunk, or the
-     * end. Anything else means that a buffer was written after it was released. The allocation fails, the chain is
-     * forgotten ({@link #corruptedFreeList}) and its segments, still free, are counted in {@link #lostFree}, so the
-     * chunk keeps working and is still given up. A link overwritten with the offset of another segment cannot be
-     * detected, and a release that reaches a chunk after it gave its span up writes into memory that is no longer its
-     * own: neither can happen without using a buffer after releasing it.
      * <p>
      * <b>Incarnations.</b> A chunk object outlives its span: given up, it waits on its cache's idle list and serves the
      * cache's next chunk on whatever span the store has ({@link #reinit}); its colour stays, so its capacity too.
@@ -2116,6 +2119,8 @@ final class AdaptivePoolingAllocator {
      */
     static class SizeClassedChunk extends Chunk {
         static final int FREE_LIST_EMPTY = -1;
+        /** {@link #next} holds indexes as {@code short}s. */
+        static final int MAX_SEGMENTS = Short.MAX_VALUE + 1;
         /** No segment and a count of zero: see {@link #externalFree}. */
         private static final long EXTERNAL_EMPTY = 0xFFFFFFFFL;
         private static final AtomicLongFieldUpdater<SizeClassedChunk> EXTERNAL_FREE =
@@ -2124,24 +2129,20 @@ final class AdaptivePoolingAllocator {
         private final int segmentSize;
         /** How far into each span the segments start: 64-byte steps, one per chunk object. */
         private final int colour;
+        /** For each free segment, the index of the next free one on its list, or {@link #FREE_LIST_EMPTY}. */
+        private final short[] next;
+        /** {@link #indexReciprocal} of {@link #segmentSize}: an offset becomes an index without a division. */
+        private final long indexRecip;
         // Per incarnation, set by reinit.
         /** Offset of the first segment. */
         private int base;
-        /** Offset of the first segment released by the owner thread or under the stripe lock. */
+        /** Index of the first segment released by the owner thread or under the stripe lock. */
         private int head;
-        /** Offset of the first segment never handed out; they are taken in order up to {@link #bumpLimit}. */
+        /** Index of the first segment never handed out; they are taken in order up to {@link #segments}. */
         private int bump;
-        private int bumpLimit;
-        /** Offset of the last segment: the largest link a free segment can hold. */
-        private int lastSegmentOffset;
         /** The segments reachable from {@link #head} plus those never handed out. */
         private int localFree;
-        /**
-         * Free segments that can no longer be reached, because the chain they were on held a corrupted link
-         * ({@link #corruptedFreeList}). Never handed out again, but counted as free, so that the chunk empties.
-         */
-        private int lostFree;
-        /** Segments released by other threads: their count in the high half, the first one's offset in the low. */
+        /** Segments released by other threads: their count in the high half, the first one's index in the low. */
         private volatile long externalFree;
         /** {@code null} on a stripe, and once abandoned: see {@link #releaseOrAbandon}. */
         private Thread ownerThread;
@@ -2165,6 +2166,8 @@ final class AdaptivePoolingAllocator {
             segmentSize = 0;
             segments = 0;
             colour = 0;
+            next = null;
+            indexRecip = 0;
             ownerThread = null;
             owningCache = null;
         }
@@ -2174,9 +2177,35 @@ final class AdaptivePoolingAllocator {
             super(null, magazine.allocator, true, controller.chunkSize - colour);
             segmentSize = controller.segmentSize;
             segments = controller.buffers;
+            assert segments <= MAX_SEGMENTS : segments;
             this.colour = colour;
+            next = new short[segments];
+            indexRecip = indexReciprocal(segmentSize);
             ownerThread = magazine.ownerThread;
             owningCache = magazine.chunkCache;
+        }
+
+        /**
+         * {@code ceil(2^40 / segmentSize)}: for {@code d = i * segmentSize},
+         * {@code d * indexReciprocal(segmentSize) >>> 40} is {@code i} plus {@code i * e / 2^40}, with
+         * {@code e < segmentSize}, so exactly {@code i} while {@code d < 2^40}, and the product stays below
+         * {@code 2^63} while {@code i < 2^23}.
+         */
+        static long indexReciprocal(int segmentSize) {
+            return ((1L << 40) + segmentSize - 1) / segmentSize;
+        }
+
+        /** The index of the segment {@code distance} bytes past the first one. */
+        static int index(int distance, long indexRecip) {
+            return (int) ((long) distance * indexRecip >>> 40);
+        }
+
+        private int index(int offset) {
+            return index(offset - base, indexRecip);
+        }
+
+        private int offset(int index) {
+            return base + index * segmentSize;
         }
 
         /**
@@ -2189,14 +2218,10 @@ final class AdaptivePoolingAllocator {
             this.spanStart = spanStart;
             // The block's own buffer, as a large-buffer span reads it: no buffer object per chunk.
             delegate = segment.buffer;
-            int base = spanStart * segment.sliceSize + colour;
-            this.base = base;
-            bump = base;
-            bumpLimit = base + segments * segmentSize;
-            lastSegmentOffset = bumpLimit - segmentSize;
+            base = spanStart * segment.sliceSize + colour;
+            bump = 0;
             head = FREE_LIST_EMPTY;
             localFree = segments;
-            lostFree = 0;
             allocatedBytes = 0;
             externalFree = EXTERNAL_EMPTY;
         }
@@ -2238,16 +2263,16 @@ final class AdaptivePoolingAllocator {
 
         private int nextAvailableSegmentOffset() {
             int head = this.head;
-            if (head != FREE_LIST_EMPTY) {
-                this.head = nextFreeAfter(head);
+            if (head >= 0) {
+                this.head = next[head];
                 localFree--;
-                return head;
+                return offset(head);
             }
             int bump = this.bump;
-            if (bump < bumpLimit) {
-                this.bump = bump + segmentSize;
+            if (bump < segments) {
+                this.bump = bump + 1;
                 localFree--;
-                return bump;
+                return offset(bump);
             }
             return takeExternalFree();
         }
@@ -2268,64 +2293,31 @@ final class AdaptivePoolingAllocator {
             }
             long taken = EXTERNAL_FREE.getAndSet(this, EXTERNAL_EMPTY);
             int head = (int) taken;
-            // Counted before the first link is read, so that a corrupted one forgets exactly these segments.
-            localFree += externalCount(taken);
-            this.head = nextFreeAfter(head);
-            localFree--;
-            return head;
+            localFree += externalCount(taken) - 1;
+            this.head = next[head];
+            return offset(head);
         }
 
         private static int externalCount(long externalFree) {
             return (int) (externalFree >>> 32);
         }
 
-        /** The link a free segment holds: the offset of the next free segment, or {@link #FREE_LIST_EMPTY}. */
-        private int nextFreeAfter(int offset) {
-            int next = delegate._getIntLE(offset);
-            if (isCorruptedLink(offset, next)) {
-                throw corruptedFreeList(offset);
-            }
-            return next;
-        }
-
-        // Apart from nextFreeAfter so that each stays within 35 bytes of bytecode, the size C1 and cold C2 call sites
-        // inline.
-        private boolean isCorruptedLink(int offset, int next) {
-            return next != FREE_LIST_EMPTY && (next < base || next > lastSegmentOffset) || next == offset;
-        }
-
-        /**
-         * A link that is not another segment of this chunk. The chain it belongs to cannot be trusted, so it is
-         * forgotten, and the exception to throw is returned: its segments are never handed out again, but they
-         * stay counted as free ({@link #lostFree}), so the chunk is still given up once the segments in use are back,
-         * and it keeps serving the segments never handed out and those released from now on. The capacity snapshot is
-         * dropped with the chain, so that the next query counts again.
-         */
-        private IllegalStateException corruptedFreeList(int offset) {
-            int next = delegate._getIntLE(offset);
-            int reachable = (bumpLimit - bump) / segmentSize;
-            lostFree += localFree - reachable;
-            localFree = reachable;
-            head = FREE_LIST_EMPTY;
-            allocatedBytes = capacity;
-            return new IllegalStateException("free segment at " + offset + " links to " + next
-                    + ": a buffer was written after it was released");
-        }
-
         private void pushLocalFree(int offset) {
-            delegate._setIntLE(offset, head);
-            head = offset;
+            int index = index(offset);
+            next[index] = (short) head;
+            head = index;
             localFree++;
         }
 
         // Package-private for the tests that cut a release from another thread in two: this, then the note.
         void pushExternalFree(int offset) {
+            int index = index(offset);
             long current;
             long pushed;
             do {
                 current = externalFree;
-                delegate._setIntLE(offset, (int) current);
-                pushed = (long) externalCount(current) + 1 << 32 | offset & 0xFFFFFFFFL;
+                next[index] = (short) current;
+                pushed = (long) externalCount(current) + 1 << 32 | index;
             } while (!EXTERNAL_FREE.compareAndSet(this, current, pushed));
         }
 
@@ -2342,7 +2334,7 @@ final class AdaptivePoolingAllocator {
         }
 
         boolean hasFullCapacity() {
-            return localFree + lostFree + externalCount(externalFree) == segments;
+            return localFree + externalCount(externalFree) == segments;
         }
 
         /**
@@ -2461,7 +2453,7 @@ final class AdaptivePoolingAllocator {
 
         // Visible for testing.
         int freeSegmentCount() {
-            return localFree + lostFree + externalCount(externalFree);
+            return localFree + externalCount(externalFree);
         }
 
         // Visible for testing.

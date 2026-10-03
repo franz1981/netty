@@ -1749,210 +1749,31 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * A free segment holds the link to the next free one in its own first bytes, so writing to a buffer after
-     * releasing it can destroy that link. The allocation that reads it must fail instead of handing out memory that
-     * is not a segment, and the allocator must keep working afterwards.
+     * The free lists live outside the memory they list: writing to a buffer after releasing it changes nothing for
+     * the allocator, which hands every segment out once.
      */
     @Test
-    void writeAfterReleaseIsDetectedAndTheAllocatorKeepsWorking() {
+    void writeAfterReleaseDoesNotReachTheFreeLists() {
         AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
         ByteBuf first = allocator.heapBuffer(256, 256);
         ByteBuf second = allocator.heapBuffer(256, 256);
         byte[] chunk = second.array();
+        int firstOffset = first.arrayOffset();
         int secondOffset = second.arrayOffset();
         first.release();
         second.release();
-        // Use after release: the last segment released is the next handed out, and its link is read then.
-        for (int i = 0; i < 4; i++) {
-            chunk[secondOffset + i] = 0x7f;
-        }
-        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(256, 256));
-
-        ByteBuf next = allocator.heapBuffer(256, 256);
-        assertSame(chunk, next.array());
-        assertNotEquals(secondOffset, next.arrayOffset());
-        next.writeLong(42).release();
-    }
-
-    /**
-     * A link to an offset below the chunk's first segment is corrupted too: segments are offsets in the block, and
-     * the block holds other chunks below this one.
-     */
-    @Test
-    void aLinkBelowTheChunkIsDetected() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        List<ByteBuf> fill = new ArrayList<ByteBuf>();
-        fill.add(allocator.heapBuffer(256, 256));
-        SizeClassedChunk firstChunk = chunkOf(fill.get(0));
-        for (int i = 1; i < segmentsOf(firstChunk); i++) {
-            fill.add(allocator.heapBuffer(256, 256));
-        }
-        // The second chunk of the class: above the first one in the block.
-        ByteBuf first = allocator.heapBuffer(256, 256);
-        ByteBuf second = allocator.heapBuffer(256, 256);
-        assertNotSame(firstChunk, chunkOf(first));
-        assertSame(firstChunk.segment, chunkOf(first).segment);
-        byte[] chunk = second.array();
-        int offset = second.arrayOffset();
-        int below = first.arrayOffset() - 256;
-        assertTrue(below >= 0);
-        first.release();
-        second.release();
-        writeIntLE(chunk, offset, below);
-        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(256, 256));
-        allocator.heapBuffer(256, 256).release();
-        for (ByteBuf buf : fill) {
-            buf.release();
-        }
-    }
-
-    /**
-     * The corruption is found on a chunk that ran out of segments, got some back and refreshed its capacity
-     * snapshot: the chain that is forgotten must leave the chunk's capacity consistent, so the size class keeps
-     * allocating, and its segments must still count as free, so the chunk gives its span back like any other.
-     */
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void writeAfterReleaseOnAnExhaustedChunkNeitherBreaksTheSizeClassNorLeaksTheChunk(boolean threadLocal)
-            throws Exception {
-        assumeFalse(threadLocal && isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
-        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
-        Runnable body = () -> {
-            try {
-                corruptAnExhaustedChunkAndKeepAllocating(allocator);
-            } catch (Throwable t) {
-                failure.set(t);
-            }
-        };
-        if (threadLocal) {
-            // The thread's heap is freed when it exits.
-            Thread thread = new FastThreadLocalThread(body);
-            thread.start();
-            thread.join();
-        } else {
-            body.run();
-        }
-        if (failure.get() != null) {
-            throw new AssertionError(failure.get());
-        }
-        freeHeap(allocator);
-        assertEquals(0, claimedHeapBytes(allocator), "the chunk with the forgotten chain kept its span");
-    }
-
-    private static void corruptAnExhaustedChunkAndKeepAllocating(final AdaptiveByteBufAllocator allocator) {
-        List<ByteBuf> held = new ArrayList<ByteBuf>();
-        // Chunk A: every segment handed out. Chunk B: the active chunk, one segment handed out.
-        for (int i = 0; i <= BURST_SEGMENTS_PER_CHUNK; i++) {
-            held.add(allocator.heapBuffer(BURST_BUF_SIZE));
-        }
-        byte[] arrayA = held.get(0).array();
-        SizeClassedChunk chunkA = chunkOf(held.get(0));
-        int corrupted = held.get(2).arrayOffset();
-        // Three segments of A come back; the last one released is the first read.
-        held.get(0).release();
-        held.get(1).release();
-        held.get(2).release();
-        for (int i = 0; i < 4; i++) {
-            arrayA[corrupted + i] = 0x7f;
-        }
-        List<ByteBuf> later = new ArrayList<ByteBuf>();
-        // Run B out of segments; the next allocation polls A and reads the destroyed link.
-        for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
-            later.add(allocator.heapBuffer(BURST_BUF_SIZE));
-        }
-        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(BURST_BUF_SIZE));
-        // The size class keeps working, and never from the chunk whose chain was forgotten.
-        for (int i = 0; i < 2 * BURST_SEGMENTS_PER_CHUNK; i++) {
-            ByteBuf buf = allocator.heapBuffer(BURST_BUF_SIZE);
-            assertNotSame(chunkA, chunkOf(buf));
-            later.add(buf);
-        }
-        for (ByteBuf buf : held.subList(3, held.size())) {
-            buf.release();
-        }
-        for (ByteBuf buf : later) {
-            buf.release();
-        }
-    }
-
-    /**
-     * The same on the list of the segments released by other threads: the link is destroyed after they pushed it,
-     * and found when the owner takes their list over. The chunk must still give its span back.
-     */
-    @Test
-    void writeAfterReleaseOnTheExternalListNeitherBreaksTheSizeClassNorLeaksTheChunk() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        List<ByteBuf> held = new ArrayList<ByteBuf>();
-        // Chunk A: every segment handed out. Chunk B: the active chunk, one segment handed out.
-        for (int i = 0; i <= BURST_SEGMENTS_PER_CHUNK; i++) {
-            held.add(allocator.heapBuffer(BURST_BUF_SIZE));
-        }
-        byte[] arrayA = held.get(0).array();
-        SizeClassedChunk chunkA = chunkOf(held.get(0));
-        int corrupted = held.get(2).arrayOffset();
-        List<StampedLock> locks = stripeLocks(allocator);
-        List<Long> stamps = new ArrayList<Long>();
-        for (StampedLock l : locks) {
-            stamps.add(l.writeLock());
-        }
-        try {
-            // Nobody can take the lock, so these go on A's external list; the last one pushed is the first read.
-            release(held.get(0), true);
-            release(held.get(1), true);
-            release(held.get(2), true);
-            for (int i = 0; i < 4; i++) {
-                arrayA[corrupted + i] = 0x7f;
-            }
-        } finally {
-            for (int i = 0; i < locks.size(); i++) {
-                locks.get(i).unlockWrite(stamps.get(i));
-            }
-        }
-        List<ByteBuf> later = new ArrayList<ByteBuf>();
-        // Run B out of segments; the next allocation polls A and takes its external list over.
-        for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
-            later.add(allocator.heapBuffer(BURST_BUF_SIZE));
-        }
-        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(BURST_BUF_SIZE));
-        for (int i = 0; i < 2 * BURST_SEGMENTS_PER_CHUNK; i++) {
-            ByteBuf buf = allocator.heapBuffer(BURST_BUF_SIZE);
-            assertNotSame(chunkA, chunkOf(buf));
-            later.add(buf);
-        }
-        for (ByteBuf buf : held.subList(3, held.size())) {
-            buf.release();
-        }
-        for (ByteBuf buf : later) {
-            buf.release();
-        }
-        freeHeap(allocator);
-        assertEquals(0, claimedHeapBytes(allocator), "the chunk with the forgotten chain kept its span");
-    }
-
-    /**
-     * A segment released twice would link to itself and be handed out for ever; it is a corrupted link like any
-     * other value that is not the next free segment.
-     */
-    @Test
-    void aFreeSegmentLinkingToItselfIsDetected() {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        ByteBuf first = allocator.heapBuffer(256, 256);
-        ByteBuf second = allocator.heapBuffer(256, 256);
-        byte[] chunk = second.array();
-        int offset = second.arrayOffset();
-        first.release();
-        second.release();
-        writeIntLE(chunk, offset, offset);
-        assertThrows(IllegalStateException.class, () -> allocator.heapBuffer(256, 256));
-        allocator.heapBuffer(256, 256).release();
-    }
-
-    private static void writeIntLE(byte[] array, int offset, int value) {
-        array[offset] = (byte) value;
-        array[offset + 1] = (byte) (value >>> 8);
-        array[offset + 2] = (byte) (value >>> 16);
-        array[offset + 3] = (byte) (value >>> 24);
+        Arrays.fill(chunk, firstOffset, firstOffset + 256, (byte) 0x7f);
+        Arrays.fill(chunk, secondOffset, secondOffset + 256, (byte) 0x7f);
+        ByteBuf again = allocator.heapBuffer(256, 256);
+        ByteBuf andAgain = allocator.heapBuffer(256, 256);
+        assertEquals(secondOffset, again.arrayOffset());
+        assertEquals(firstOffset, andAgain.arrayOffset());
+        ByteBuf fresh = allocator.heapBuffer(256, 256);
+        assertNotEquals(firstOffset, fresh.arrayOffset());
+        assertNotEquals(secondOffset, fresh.arrayOffset());
+        again.release();
+        andAgain.release();
+        fresh.release();
     }
 
     /**
