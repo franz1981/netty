@@ -15,6 +15,8 @@
  */
 package io.netty.buffer;
 
+import io.netty.buffer.AdaptivePoolingAllocator.HeapPurge;
+import io.netty.buffer.AdaptivePoolingAllocator.PendingChunks;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunkCache;
 import org.junit.jupiter.api.Test;
@@ -761,5 +763,110 @@ public class SizeClassedChunkCacheTest {
         verify(cap2, atLeastOnce()).releaseOrAbandon();
         verify(noCap1, atLeastOnce()).releaseOrAbandon();
         verify(noCap2, atLeastOnce()).releaseOrAbandon();
+    }
+
+    // --- The heap's purge: it visits only the caches that keep a wholly free chunk ---
+
+    private static SizeClassedChunkCache cacheOf(HeapPurge heap, int sizeClassIndex) {
+        return new SizeClassedChunkCache(null, new PendingChunks(), heap, sizeClassIndex);
+    }
+
+    @Test
+    void aWhollyFreeChunkKeptAtTheFloorIsGivenUpByTheHeapPurgeOnceAboveIt() {
+        HeapPurge heap = new HeapPurge();
+        SizeClassedChunkCache cache = cacheOf(heap, 3);
+        SizeClassedChunk kept = fullChunk();
+        cache.offerChunk(kept);
+        for (int i = 1; i < RETENTION_FLOOR; i++) {
+            cache.offerChunk(chunkWithCapacity());
+        }
+        assertEquals(1L << 3, heap.keptFree, "kept at the floor: the purge must look at this cache");
+
+        heap.purge();
+        verify(kept, never()).releaseSpan();
+        assertEquals(1L << 3, heap.keptFree, "still kept, still looked at");
+
+        cache.offerChunk(chunkWithoutCapacity());
+        heap.purge();
+        verify(kept).releaseSpan();
+        assertSame(cache.idle, kept.queue);
+        assertEquals(0, heap.keptFree, "no wholly free chunk is left");
+    }
+
+    @Test
+    void aChunkThatEmptiesAtTheFloorIsKeptForTheHeapPurge() {
+        HeapPurge heap = new HeapPurge();
+        SizeClassedChunkCache cache = cacheOf(heap, 5);
+        SizeClassedChunk chunk = chunkWithCapacity();
+        when(chunk.owningCache()).thenReturn(cache);
+        cache.offerChunk(chunk);
+        assertEquals(0, heap.keptFree);
+
+        // Its last segment comes back from another thread.
+        when(chunk.hasFullCapacity()).thenReturn(true);
+        cache.notifyHasCapacity(chunk);
+        cache.drainPending();
+        verify(chunk, never()).releaseSpan();
+        assertEquals(1L << 5, heap.keptFree);
+    }
+
+    @Test
+    void theHeapPurgeVisitsOnlyTheCachesThatKeepAWhollyFreeChunk() {
+        HeapPurge heap = new HeapPurge();
+        SizeClassedChunkCache busy = cacheOf(heap, 0);
+        SizeClassedChunk[] inUse = new SizeClassedChunk[RETENTION_FLOOR + 4];
+        for (int i = 0; i < inUse.length; i++) {
+            inUse[i] = chunkWithCapacity();
+            busy.offerChunk(inUse[i]);
+        }
+        SizeClassedChunkCache keeping = cacheOf(heap, 1);
+        SizeClassedChunk kept = fullChunk();
+        keeping.offerChunk(kept);
+        for (int i = 0; i < RETENTION_FLOOR; i++) {
+            keeping.offerChunk(chunkWithoutCapacity());
+        }
+        assertEquals(1L << 1, heap.keptFree);
+        for (SizeClassedChunk c : inUse) {
+            clearInvocations(c);
+        }
+
+        heap.purge();
+        verify(kept).releaseSpan();
+        for (SizeClassedChunk c : inUse) {
+            assertEquals(0, mockingDetails(c).getInvocations().size(), "a cache with nothing to give up was walked");
+        }
+        assertEquals(0, heap.keptFree);
+    }
+
+    @Test
+    void theHeapPurgesOnceEveryHeapPurgeSlowPaths() {
+        HeapPurge heap = new HeapPurge();
+        SizeClassedChunkCache cache = cacheOf(heap, 2);
+        for (int i = 0; i < RETENTION_FLOOR; i++) {
+            cache.offerChunk(chunkWithoutCapacity());
+        }
+        SizeClassedChunk kept = fullChunk();
+        cache.offerChunk(kept);
+        for (int i = 1; i < AdaptivePoolingAllocator.HEAP_PURGE_SLOW_PATHS; i++) {
+            heap.slowPath();
+        }
+        verify(kept, never()).releaseSpan();
+        heap.slowPath();
+        verify(kept).releaseSpan();
+    }
+
+    @Test
+    void decayAndFreeForgetTheKeptChunks() {
+        HeapPurge heap = new HeapPurge();
+        SizeClassedChunkCache decayed = cacheOf(heap, 7);
+        decayed.offerChunk(fullChunk());
+        SizeClassedChunkCache freed = cacheOf(heap, 9);
+        freed.offerChunk(fullChunk());
+        assertEquals(1L << 7 | 1L << 9, heap.keptFree);
+
+        decayed.evictWhollyFree();
+        assertEquals(1L << 9, heap.keptFree);
+        freed.free();
+        assertEquals(0, heap.keptFree);
     }
 }

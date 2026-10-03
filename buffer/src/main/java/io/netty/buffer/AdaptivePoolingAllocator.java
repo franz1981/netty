@@ -113,16 +113,24 @@ final class AdaptivePoolingAllocator {
     private static final int MAX_POOLED_BUF_SIZE = IS_LOW_MEM ? 256 * 1024 : 1024 * 1024;
 
     /**
-     * {@code io.netty.allocator.chunkPurgeInterval}: how often a size-class magazine gives up idle chunks, counted in
-     * chunks' worth of allocations. After this many times the segments of one of its chunks have been allocated,
-     * the magazine applies the notes left by other threads and gives up its wholly free chunks, except the ones each
-     * size class in use keeps, and does the same for every other size class of its heap, including the idle ones that
-     * no longer allocate. Default: 4. Read from
-     * {@code io.netty.allocator.chunkPurgePollsThreadLocal} when only that, its former name, is set.
+     * {@code io.netty.allocator.chunkPurgeInterval}: how often a size-class magazine applies the notes left by other
+     * threads on its heap, and counts its allocations for the heap's {@link IdleDecay}, counted in chunks' worth of
+     * allocations. A note that makes a chunk wholly free gives it up at once, unless its size class is down to the
+     * chunks it keeps. Default: 4. Read from {@code io.netty.allocator.chunkPurgePollsThreadLocal} when only that, its
+     * former name, is set. The wholly free chunks a size class kept are given up by the heap's purge, every
+     * {@link #HEAP_PURGE_SLOW_PATHS} slow paths of the heap.
      */
     static final long CHUNK_PURGE_INTERVAL = Math.max(1, SystemPropertyUtil.getLong(
             "io.netty.allocator.chunkPurgeInterval",
             SystemPropertyUtil.getLong("io.netty.allocator.chunkPurgePollsThreadLocal", 4L)));
+
+    /**
+     * How many slow paths of a heap, its size classes switching chunks, between two purges of the heap: each gives up
+     * the wholly free chunks its size classes keep above the ones each size class keeps (see {@link HeapPurge}).
+     * Counted in slow paths as mimalloc counts its collections in generic allocations, not in allocations, so that
+     * smaller chunks or more size classes do not make the heap purge more often per allocation.
+     */
+    static final int HEAP_PURGE_SLOW_PATHS = 8;
 
     /**
      * {@code io.netty.allocator.magazineBufferQueueCapacity}: how many {@link AdaptiveByteBuf} instances a stripe, and
@@ -224,6 +232,7 @@ final class AdaptivePoolingAllocator {
             throw new IllegalArgumentException("MAGAZINE_BUFFER_QUEUE_CAPACITY: " + MAGAZINE_BUFFER_QUEUE_CAPACITY
                     + " (expected: >= " + 2 + ')');
         }
+        assert SIZE_CLASSES_COUNT <= Long.SIZE : "HeapPurge has one bit per size class";
         int lastIndex = 0;
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
             int sizeClass = SIZE_CLASSES[i];
@@ -776,12 +785,49 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    /**
+     * Which size classes of a heap keep a wholly free chunk on their reusable list, and when the heap next gives those
+     * up. A cache sets its bit when it files or keeps a wholly free chunk without giving it up, because it is down to
+     * the chunks it keeps (see {@link SizeClassedChunkCache#atOrBelowFloor}); its walk clears it when no such chunk is
+     * left. Every other wholly free chunk is given up as soon as its cache sees it so (see
+     * {@link SizeClassedChunkCache#refile}), so the purge visits only the caches whose bit is set, not every size class
+     * of the heap. One bit per size class: there are at most 64.
+     * <p>
+     * Guarded like the heap: by the stripe lock, or by the owner thread of a thread-local heap.
+     */
+    static final class HeapPurge {
+        /** The cache of each size class of the heap, by size class index; set by each cache as it is made. */
+        final SizeClassedChunkCache[] caches = new SizeClassedChunkCache[SIZE_CLASSES_COUNT];
+        /** Bit {@code i}: size class {@code i} may keep a wholly free chunk on its reusable list. */
+        long keptFree;
+        private int slowPaths;
+
+        /** A slow path of the heap: every {@link #HEAP_PURGE_SLOW_PATHS} of them, {@link #purge}. */
+        void slowPath() {
+            if (++slowPaths >= HEAP_PURGE_SLOW_PATHS) {
+                slowPaths = 0;
+                purge();
+            }
+        }
+
+        /** Give up the wholly free chunks above the floor of every size class whose bit is set. */
+        void purge() {
+            long kept = keptFree;
+            while (kept != 0) {
+                int i = Long.numberOfTrailingZeros(kept);
+                kept &= kept - 1;
+                caches[i].evictAboveFloor();
+            }
+        }
+    }
+
     // A stripe: the heap of the threads without a thread-local one that pick it. One StampedLock covers all its
     // size-class magazines and its magazine for buffers above the size classes.
     private static final class StripedHeap {
         final StampedLock lock = new StampedLock();
         /** The notes left for the stripe's size classes: see {@link PendingChunks}. */
         final PendingChunks notes = new PendingChunks();
+        final HeapPurge purge = new HeapPurge();
         final IdleDecay idleDecay;
         SizeClassMagazine[] magazines;
         SpanMagazine spanMagazine;
@@ -824,7 +870,7 @@ final class AdaptivePoolingAllocator {
                 recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
             }
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                    sizeClassIndex, null, recycler, lock, notes, magazines, seq);
+                    sizeClassIndex, null, recycler, lock, notes, purge, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -916,6 +962,7 @@ final class AdaptivePoolingAllocator {
         private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
         /** The notes left for the heap's size classes: see {@link PendingChunks}. */
         private final PendingChunks notes = new PendingChunks();
+        private final HeapPurge purge = new HeapPurge();
         /** Where the heap's claims start in a region: see {@link PageStore#nextHeapSequence}. */
         private final int seq;
         /** Buffers above the size classes; {@code null} until the first one. */
@@ -979,7 +1026,7 @@ final class AdaptivePoolingAllocator {
 
         private SizeClassMagazine createMagazine(int sizeClassIndex) {
             SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                                       sizeClassIndex, Thread.currentThread(), null, null, notes, magazines, seq);
+                                       sizeClassIndex, Thread.currentThread(), null, null, notes, purge, seq);
             magazines[sizeClassIndex] = mag;
             return mag;
         }
@@ -1232,19 +1279,29 @@ final class AdaptivePoolingAllocator {
          * {@link #tryLockForRelease()}, which reports "not available" for both cases alike.
          */
         final StampedLock stripeLock;
+        private final HeapPurge heapPurge;
+        private final long keptFreeBit;
 
         SizeClassedChunkCache() {
             this(null);
         }
 
         SizeClassedChunkCache(StampedLock stripeLock) {
-            this(stripeLock, new PendingChunks());
+            this(stripeLock, new PendingChunks(), new HeapPurge(), 0);
         }
 
-        /** @param pending the notes of the heap, shared by every cache of it */
-        SizeClassedChunkCache(StampedLock stripeLock, PendingChunks pending) {
+        /**
+         * @param pending        the notes of the heap, shared by every cache of it
+         * @param heapPurge      the purge of the heap, shared by every cache of it
+         * @param sizeClassIndex this cache's bit in {@code heapPurge}
+         */
+        SizeClassedChunkCache(StampedLock stripeLock, PendingChunks pending, HeapPurge heapPurge,
+                              int sizeClassIndex) {
             this.stripeLock = stripeLock;
             this.pending = pending;
+            this.heapPurge = heapPurge;
+            keptFreeBit = 1L << sizeClassIndex;
+            heapPurge.caches[sizeClassIndex] = this;
         }
 
         /** The queued chunks a size class keeps before it evicts one that empties: see {@link #atOrBelowFloor}. */
@@ -1275,9 +1332,18 @@ final class AdaptivePoolingAllocator {
         void evictIfAboveFloor(SizeClassedChunk chunk) {
             // Every caller filters on the reusable queue, which the active chunk is never on.
             assert chunk != active : "the active chunk must never be evicted";
-            if (chunk.hasFullCapacity() && !atOrBelowFloor()) {
-                evict(chunk);
+            if (chunk.hasFullCapacity()) {
+                if (atOrBelowFloor()) {
+                    keepFree();
+                } else {
+                    evict(chunk);
+                }
             }
+        }
+
+        /** A wholly free chunk stays on the reusable list: the heap's purge looks at this cache again. */
+        private void keepFree() {
+            heapPurge.keptFree |= keptFreeBit;
         }
 
         /** {@code chunk}, wholly free and on the reusable list, gives its span back to the store and waits idle. */
@@ -1415,7 +1481,7 @@ final class AdaptivePoolingAllocator {
             stripeLock.unlockWrite(stamp);
         }
 
-        /** Visible for testing: runs a purge tick without waiting for {@link #CHUNK_PURGE_INTERVAL}, then polls. */
+        /** Visible for testing: applies the notes and purges this cache without waiting for the heap, then polls. */
         SizeClassedChunk forcePurge() {
             tickPurge();
             return pollChunkInternal();
@@ -1478,6 +1544,7 @@ final class AdaptivePoolingAllocator {
             return null;
         }
 
+        /** Apply the heap's notes, then give up this cache's wholly free chunks above the floor. */
         void tickPurge() {
             drainPending();
             evictAboveFloor();
@@ -1485,17 +1552,22 @@ final class AdaptivePoolingAllocator {
 
         /**
          * Evict the fully free reusable chunks above the retention floor. Exhausted→reusable is applied by the
-         * drains, before this.
+         * drains, before this. Once it walked the whole list, no wholly free chunk is left on it: the heap's purge
+         * stops looking at this cache. Stopped by the floor, it may keep some, and the purge looks again.
          */
         void evictAboveFloor() {
             SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
-            while (cur != null && !atOrBelowFloor()) {
+            while (cur != null) {
+                if (atOrBelowFloor()) {
+                    return;
+                }
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
                     evict(cur);
                 }
                 cur = next;
             }
+            heapPurge.keptFree &= ~keptFreeBit;
         }
 
         /**
@@ -1512,11 +1584,15 @@ final class AdaptivePoolingAllocator {
                 }
                 cur = next;
             }
+            heapPurge.keptFree &= ~keptFreeBit;
         }
 
         void offerChunk(SizeClassedChunk chunk) {
             if (chunk.hasRemainingCapacity()) {
                 reusable.pushFront(chunk);
+                if (chunk.hasFullCapacity()) {
+                    keepFree();
+                }
             } else {
                 exhausted.pushFront(chunk);
             }
@@ -1575,6 +1651,7 @@ final class AdaptivePoolingAllocator {
             assert active == null : "free with an active chunk";
             freeAll(exhausted);
             freeAll(reusable);
+            heapPurge.keptFree &= ~keptFreeBit;
         }
 
         private static void freeAll(ChunkQueue queue) {
@@ -1717,12 +1794,7 @@ final class AdaptivePoolingAllocator {
         final Thread ownerThread;
         private final SizeClassChunkController chunkController;
         private final SizeClassedChunkCache chunkCache;
-        /**
-         * Every size-classed magazine of the heap this magazine belongs to, including this one. The whole array is
-         * covered by the one lock (shared stripe) or the one owner thread (thread-local heap) that guards this
-         * magazine, which is what makes the heap-wide purge legal from here.
-         */
-        private final SizeClassMagazine[] heapMagazines;
+        private final HeapPurge heapPurge;
         final int sizeClassIndex;
         private final IdleDecay idleDecay;
         final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
@@ -1737,10 +1809,9 @@ final class AdaptivePoolingAllocator {
 
         SizeClassMagazine(AdaptivePoolingAllocator allocator, IdleDecay idleDecay, int sizeClassIndex,
                           Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                          PendingChunks heapNotes, SizeClassMagazine[] heapMagazines, int seq) {
+                          PendingChunks heapNotes, HeapPurge heapPurge, int seq) {
             this.idleDecay = idleDecay;
             this.seq = seq;
-            this.heapMagazines = heapMagazines;
             this.allocator = allocator;
             this.ownerThread = ownerThread;
             this.sizeClassIndex = sizeClassIndex;
@@ -1748,15 +1819,18 @@ final class AdaptivePoolingAllocator {
             int segmentSize = SIZE_CLASSES[sizeClassIndex];
             int chunkSize = allocator.pageSlices[sizeClassIndex] * allocator.pageStore.config.sliceSize;
             this.chunkController = new SizeClassChunkController(segmentSize, chunkSize);
-            this.chunkCache = new SizeClassedChunkCache(stripeLock, heapNotes);
+            this.chunkCache = new SizeClassedChunkCache(stripeLock, heapNotes, heapPurge, sizeClassIndex);
+            this.heapPurge = heapPurge;
             this.purgeTickThreshold = (int) Math.min(Integer.MAX_VALUE,
                     CHUNK_PURGE_INTERVAL * (chunkSize / segmentSize));
         }
 
         /**
-         * Count one successful allocation and, when the budget is spent, apply the heap's notes, purge this
-         * magazine's cache and those of every other size class on this heap, then count the allocations for the
-         * heap's {@link IdleDecay}.
+         * Count one successful allocation and, when the budget is spent, apply the heap's notes, then count the
+         * allocations for the heap's {@link IdleDecay}. A size class that keeps allocating from its active chunk
+         * takes no slow path, so this is what applies the notes of the other size classes of its heap then, and what
+         * reads the clock for the decays and the store's purge. Giving up kept chunks is the heap's purge, on its slow
+         * paths (see {@link HeapPurge}).
          *
          * <p>Call exactly once per successful {@link #allocate}.
          */
@@ -1764,8 +1838,7 @@ final class AdaptivePoolingAllocator {
             if (++allocCount >= purgeTickThreshold) {
                 allocCount = 0;
                 purgeTicks++;
-                chunkCache.tickPurge();
-                purgeHeapSiblings();
+                chunkCache.drainPending();
                 idleDecay.count(purgeTickThreshold);
             }
         }
@@ -1791,21 +1864,6 @@ final class AdaptivePoolingAllocator {
                 curr.releaseFromMagazine();
             }
             chunkCache.evictWhollyFree();
-        }
-
-        /**
-         * Purge the caches of the other size classes on this heap, whose notes the tick of this one applied. A size
-         * class that has gone idle stops allocating, so it would never fire its own tick — and those are exactly the
-         * caches worth purging, because the spans they give up serve every size class of every heap.
-         */
-        private void purgeHeapSiblings() {
-            SizeClassMagazine[] mags = heapMagazines;
-            for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-                SizeClassMagazine sibling = mags[i];
-                if (sibling != null && sibling != this) {
-                    sibling.chunkCache.evictAboveFloor();
-                }
-            }
         }
 
         boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -1861,6 +1919,9 @@ final class AdaptivePoolingAllocator {
             // The active chunk stays the cache's (see SizeClassedChunkCache#active); current is only the fast
             // path's alias of it.
             current = curr;
+            // With the new chunk active, so that the purge cannot give up a chunk the poll would have taken. It
+            // gives up the chunks of an idle size class too, whose spans serve every size class of every heap.
+            heapPurge.slowPath();
             // Checked only now, with the fallback chunk active and aliased, so that with assertions enabled the
             // failure leaves the magazine and its cache consistent.
             assert !polledChunkWithoutSegment : "the cache handed out a chunk without a free segment";
