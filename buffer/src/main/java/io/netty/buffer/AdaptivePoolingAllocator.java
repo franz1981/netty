@@ -164,28 +164,54 @@ final class AdaptivePoolingAllocator {
      * On the conflicting requirements of both having as few chunks as possible, and having as little wasted
      * memory within each chunk as possible, this seems to strike a surprisingly good balance for the use cases
      * tested so far.
+     * <p>
+     * Between them, from 256 bytes up to 16 KiB, each doubling has four steps a quarter apart (256, 320, 384, 448):
+     * a buffer leaves at most a fifth of its class unused, where the power-of-2 steps alone leave up to half. Up to
+     * 16 KiB most classes take one-slice chunks, so a class in use costs a heap 64 KiB. Above 16896 the steps are
+     * half a doubling apart (24576, 49152, 98304): those classes take chunks of 8 slices or more, at least 512 KiB
+     * per class in use and heap, so a finer step there costs more than the rounding it saves.
      */
     private static final int[] SIZE_CLASSES = {
             32,
             64,
             128,
             256,
+            320,
+            384,
+            448,
             512,
             640, // 512 + 128
+            768,
+            896,
             1024,
             1152, // 1024 + 128
+            1280,
+            1536,
+            1792,
             2048,
             2304, // 2048 + 256
+            2560,
+            3072,
+            3584,
             4096,
             4352, // 4096 + 256
+            5120,
+            6144,
+            7168,
             8192,
             8704, // 8192 + 512
+            10240,
+            12288,
+            14336,
             16384,
             16896, // 16384 + 512
+            24576,
             32768,
             33792, // 32768 + 1024
+            49152,
             65536,
             67584, // 65536 + 2048
+            98304,
             131072,
             135168, // 131072 + 4096
     };
