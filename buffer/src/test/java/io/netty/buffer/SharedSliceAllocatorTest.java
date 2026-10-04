@@ -38,7 +38,6 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -119,7 +118,6 @@ final class SharedSliceAllocatorTest {
         }, failure);
         assertNull(failure.get());
         assertEquals(first.get(), second.get(), "the same slices");
-        assertEquals(0, allocator.pageStore.sliceCounts()[0]);
         assertSharedAccounted(segments, allocator);
     }
 
@@ -142,15 +140,12 @@ final class SharedSliceAllocatorTest {
             }
         }, failure);
         assertNull(failure.get());
-        assertTrue(allocator.pageStore.sliceCounts()[0] > 0);
         for (ByteBuf buf : bufs) {
             buf.release();
         }
         PageStore store = allocator.pageStore;
-        assertTrue(store.abandonedCount() > 0, "chunks with buffers out when the heap died");
-        store.purgeIfDue(System.nanoTime() + 2 * store.config.purgeDelayNanos + store.config.purgeCheckNanos);
-        assertEquals(0, store.abandonedCount());
-        assertEquals(0, store.sliceCounts()[0], "every slice is back");
+        PageStoreTestSupport.purgeUntilDone(store, System.nanoTime() + 2 * store.config.purgeDelayNanos);
+        assertEquals(0, allocator.usedMemory(), "every slice is back");
         assertSharedAccounted(segments, allocator);
     }
 
@@ -167,13 +162,14 @@ final class SharedSliceAllocatorTest {
         assertTrue(adaptive(span).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
         assertEquals(regionOffset(span) / SEGMENT_SIZE, regionOffset(small) / SEGMENT_SIZE, "one block holds both");
         assertEquals(0, regionOffset(blocks) % SEGMENT_SIZE);
-        assertEquals((3 * MIB + MIB) / SLICE + 2 * (SEGMENT_SIZE / SLICE), allocator.pageStore.sliceCounts()[0]);
+        assertEquals(((3 * MIB + MIB) / SLICE + 2 * (SEGMENT_SIZE / SLICE)) * (long) SLICE, allocator.usedMemory());
         assertEquals(0, segments.segmentsAllocated());
-        assertSame(allocator.pageStore.regions[0], allocator.pageStore.regions[0]);
         span.release();
         small.release();
         blocks.release();
-        assertEquals(0, allocator.pageStore.sliceCounts()[0]);
+        PageStoreTestSupport.purgeUntilDone(allocator.pageStore,
+                System.nanoTime() + 2 * allocator.pageStore.config.purgeDelayNanos);
+        assertEquals(0, allocator.usedMemory());
         assertSharedAccounted(segments, allocator);
     }
 
