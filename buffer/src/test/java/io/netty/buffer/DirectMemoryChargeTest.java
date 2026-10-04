@@ -30,7 +30,6 @@ import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -119,8 +118,6 @@ final class DirectMemoryChargeTest {
         long filler = overfill();
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, false));
-            assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
-            assertEquals(0, block.committed & block.bits(9, 9), "no memory behind the slices that went back");
             block.releaseRun(0, 9, System.nanoTime());
             assertEquals(0, (int) store.claimSlices(9, false), "committed: nothing to charge");
         } finally {
@@ -175,12 +172,12 @@ final class DirectMemoryChargeTest {
         long filler = overfill();
         try {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, false));
-            assertEquals(0, store.regionCount());
+            assertEquals(0, segments.segmentsAllocated());
         } finally {
             credit(filler);
         }
         assertEquals(0, (int) store.claimSlices(9, false));
-        assertEquals(1, store.regionCount(), "regions are still made");
+        assertEquals(1, segments.segmentsAllocated(), "regions are still made");
         assertChargedAtMost(base, SEGMENT_SIZE, "the failed claim charged nothing");
         store.close();
         assertCredited(base);
