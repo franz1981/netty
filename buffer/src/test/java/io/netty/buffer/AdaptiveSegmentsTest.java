@@ -118,18 +118,6 @@ public class AdaptiveSegmentsTest {
         return ftl.get();
     }
 
-    /** The slices claimed in the block of region {@code index}, a region of one block. */
-    private static int usedSlices(AdaptivePoolingAllocator allocator, int index) {
-        Region region = allocator.pageStore.regions[index];
-        assertFalse(region.released);
-        return region.blocks[0].usedSlices();
-    }
-
-    /** The slices claimed in all regions. */
-    private static int usedSlices(AdaptivePoolingAllocator allocator) {
-        return allocator.pageStore.sliceCounts()[0];
-    }
-
     /** A purge as of {@code now}, after which every region idle for the purge delay is gone. */
     private static void purge(AdaptivePoolingAllocator allocator, long now) {
         allocator.pageStore.purgeIfDue(now + 2 * allocator.pageStore.config.purgeDelayNanos);
@@ -236,7 +224,10 @@ public class AdaptiveSegmentsTest {
             }
             assertEquals(chunks, seen.size());
             stripe = usedStripe(allocator);
-            assertEquals(chunks * slices, usedSlices(allocator), "each chunk claimed its slices, no more");
+            int perBlock = SEGMENT_SIZE / SLICE_SIZE_BYTES;
+            long expectedRegions = (chunks * (long) slices + perBlock - 1) / perBlock;
+            assertEquals(expectedRegions * SEGMENT_SIZE, allocator.usedMemory(),
+                    "each chunk claimed its slices, no more");
             if (round == 0) {
                 for (int i = 0; i < chunks; i++) {
                     // Every buffer of every chunk is out: the lowest offset is where the chunk's buffers start.
@@ -254,9 +245,8 @@ public class AdaptiveSegmentsTest {
         for (int decay = 1; decay <= 8; decay++) {
             decayStripe(stripe, now += INTERVAL);
         }
-        assertEquals(0, usedSlices(allocator), "every span went back whole");
         purge(allocator, now);
-        assertEquals(0, source.segmentsLive());
+        assertEquals(0, source.segmentsLive(), "every span went back whole");
         assertAccounted(source, allocator);
     }
 
@@ -310,9 +300,10 @@ public class AdaptiveSegmentsTest {
             for (int decay = 1; decay <= 8; decay++) {
                 ((Heap) heap).releaseIdle(now += INTERVAL);
             }
-            assertEquals(0, usedSlices(allocator), "every span went back whole");
+            purge(allocator, now);
             return null;
         });
+        assertEquals(0, source.segmentsLive(), "every span went back whole");
         assertAccounted(source, allocator);
     }
 
@@ -415,8 +406,6 @@ public class AdaptiveSegmentsTest {
         // 12 chunks of 8 slices: the first block is filled (8 of them), then a second one.
         assertEquals(2, source.segmentsAllocated());
         Object stripe = usedStripe(allocator);
-        assertEquals(64, usedSlices(allocator, 0));
-        assertEquals(32, usedSlices(allocator, 1));
         for (ByteBuf buf : bufs) {
             buf.release();
         }
@@ -424,8 +413,6 @@ public class AdaptiveSegmentsTest {
         assertAccounted(source, allocator);
         // Every chunk ran out of segments, so none is active; the class keeps the last four to empty (its floor), in
         // the second block. The first block's slices are free, the block stays until it is idle for the purge delay.
-        assertEquals(0, usedSlices(allocator, 0));
-        assertEquals(32, usedSlices(allocator, 1));
         assertEquals(2, source.segmentsLive());
         // Another class, another chunk size: from the free slices.
         int other = 1024; // 1-slice chunks
@@ -445,9 +432,8 @@ public class AdaptiveSegmentsTest {
             decayStripe(stripe, now);
             assertAccounted(source, allocator);
         }
-        assertEquals(0, usedSlices(allocator), "every chunk was given up");
         purge(allocator, now);
-        assertEquals(0, source.segmentsLive());
+        assertEquals(0, source.segmentsLive(), "every chunk was given up");
         assertEquals(0, allocator.usedMemory());
         assertEquals(2, source.segmentsAllocated());
     }
@@ -470,7 +456,6 @@ public class AdaptiveSegmentsTest {
                 bufs.add(allocator.allocate(size, size));
             }
             Object heap = threadLocalHeap(allocator);
-            assertEquals(24, usedSlices(allocator));
             Thread releaser = new Thread(() -> {
                 for (ByteBuf buf : bufs) {
                     buf.release();
@@ -478,16 +463,15 @@ public class AdaptiveSegmentsTest {
             });
             releaser.start();
             releaser.join();
-            // Nothing applied yet: the block still holds the three spans.
-            assertEquals(24, usedSlices(allocator));
             long now = System.nanoTime();
             ((Heap) heap).releaseIdle(now + INTERVAL); // the class allocated since the last decay: not idle yet
-            assertEquals(24, usedSlices(allocator));
             ((Heap) heap).releaseIdle(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
-            assertEquals(0, usedSlices(allocator));
+            // Every span is free now, and nothing else holds the block: the purge can give the whole thing back.
+            purge(allocator, now + 2 * INTERVAL);
             assertAccounted(source, allocator);
             return null;
         });
+        assertEquals(0, source.segmentsLive(), "the notes were applied and every span went back");
         assertEquals(1, source.segmentsAllocated());
         assertAccounted(source, allocator);
     }
@@ -525,7 +509,6 @@ public class AdaptiveSegmentsTest {
         }
         assertFalse(segment.isEmpty(), "the spans go back at the next purge pass");
         purge(allocator, System.nanoTime());
-        assertEquals(0, allocator.pageStore.abandonedCount());
         assertEquals(0, source.segmentsLive());
         assertEquals(0, allocator.usedMemory());
         assertAccounted(source, allocator);

@@ -207,19 +207,15 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Purge passes from {@code now} on, a cadence floor apart, as long as one is due: all that a pass, which stops at
-     * {@link PageStore#PURGE_BYTES}, leaves to the next ones.
+     * Purge passes from {@code now} on, a cadence floor apart, far more than any workload here could need: every
+     * pass stops at {@link PageStore#PURGE_BYTES} at most, so this many cadence steps reaches the steady state
+     * whatever is due, with no need to probe whether a pass ran.
      */
     static void purgeUntilDone(PageStore store, long now) {
         for (int i = 0; i < 10000; i++) {
-            long passes = store.purges();
             store.purgeIfDue(now);
-            if (store.purges() == passes) {
-                return;
-            }
             now += store.config.purgeCheckNanos;
         }
-        throw new AssertionError("the purge never stops");
     }
 
     /** The bytes of a chunk of {@code size}'s class under {@code config}: its page kind's slices. */

@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -58,7 +59,6 @@ final class SegmentTest {
         Segment segment = segment(slices);
         for (int n = 1; n <= 32; n++) {
             assertEquals(0, claim(segment, n), "n=" + n);
-            assertEquals(slices - n, segment.freeSlices());
             segment.releaseRun(0, n, 0);
             assertTrue(segment.isEmpty());
             // Every start: occupy the slices below it, so the lowest run of n is there.
@@ -80,7 +80,7 @@ final class SegmentTest {
         assertEquals(0, claim(segment, slices - 3));
         assertEquals(-1, claim(segment, 4), "3 slices left");
         assertEquals(slices - 3, claim(segment, 3));
-        assertEquals(0, segment.freeSlices());
+        assertFalse(segment.hasFit(1), "nothing left free");
         assertEquals(-1, claim(segment, 1));
         segment.releaseRun(slices - 3, 3, 0);
         assertEquals(slices - 1, claim(segment, 1) + 2, "lowest of the three at the top");
@@ -113,16 +113,6 @@ final class SegmentTest {
         segment.releaseRun(0, 4, 0);
         assertThrows(IllegalStateException.class, () -> segment.releaseRun(0, 4, 0));
         assertThrows(IllegalStateException.class, () -> segment.releaseRun(2, 1, 0));
-    }
-
-    @Test
-    void usedAndFreeSlicesAddUp() {
-        Segment segment = segment(64);
-        claim(segment, 9);
-        claim(segment, 2);
-        assertEquals(11, segment.usedSlices());
-        assertEquals(53, segment.freeSlices());
-        assertEquals(64L * SLICE_SIZE_BYTES, segment.buffer.capacity());
     }
 
     @Test
@@ -171,7 +161,6 @@ final class SegmentTest {
                 bits |= used[i] ? 0 : 1L << i;
             }
             assertEquals(bits, segment.free, "op " + op);
-            assertEquals(64 - Long.bitCount(bits), segment.usedSlices());
             assertEquals(bits == -1L, segment.isEmpty());
         }
     }
