@@ -233,7 +233,7 @@ final class AdaptivePoolingAllocator {
                 if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
                     heap = threadLocalHeap.get();
                 }
-                allocated = heap != null ? heap.allocate(index, size, maxCapacity, buf)
+                allocated = heap != null ? allocateOwned(heap, index, size, maxCapacity, buf)
                         : allocateShared(index, size, maxCapacity, currentThread, buf);
             }
         }
@@ -243,6 +243,22 @@ final class AdaptivePoolingAllocator {
         return allocated;
     }
 
+    /** The owner thread's heap, no lock: the same size-class/large split a stripe makes under its lock. */
+    private static AdaptiveByteBuf allocateOwned(Heap heap, int sizeClassIndex, int size, int maxCapacity,
+                                                  AdaptiveByteBuf buf) {
+        if (sizeClassIndex < SIZE_CLASSES_COUNT) {
+            AdaptiveByteBuf result = heap.allocateSizeClass(sizeClassIndex, size, maxCapacity, buf);
+            assert result != null : "owner allocation must always succeed";
+            return result;
+        }
+        return heap.allocateLarge(size, maxCapacity, buf, buf != null);
+    }
+
+    /**
+     * A stripe's size-class slot or span: this takes the stripe's lock itself, calling the same {@link Heap} method
+     * the owner thread calls without one, and unlocks in a finally block. A stripe whose lock is busy is skipped;
+     * a stripe whose allocation fails moves on to the next one, same as a busy stripe.
+     */
     private AdaptiveByteBuf allocateShared(int sizeClassIndex, int size, int maxCapacity,
                                              Thread currentThread, AdaptiveByteBuf buf) {
         boolean reallocate = buf != null;
@@ -255,9 +271,19 @@ final class AdaptivePoolingAllocator {
             int start = threadIdx & mask;
             for (int i = 0, m = currentScanLen << 1; i < m; i++) {
                 Heap stripe = stripedHeaps[(start + i) & mask];
-                AdaptiveByteBuf result = stripe.tryAllocate(sizeClassIndex, size, maxCapacity, buf, reallocate);
-                if (result != null) {
-                    return result;
+                long stamp = stripe.lock.tryWriteLock();
+                if (stamp == 0) {
+                    continue;
+                }
+                try {
+                    AdaptiveByteBuf result = sizeClassIndex < SIZE_CLASSES_COUNT
+                            ? stripe.allocateSizeClass(sizeClassIndex, size, maxCapacity, buf)
+                            : stripe.allocateLarge(size, maxCapacity, buf, reallocate);
+                    if (result != null) {
+                        return result;
+                    }
+                } finally {
+                    stripe.lock.unlockWrite(stamp);
                 }
             }
             expansions++;
@@ -323,7 +349,7 @@ final class AdaptivePoolingAllocator {
         if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
             Heap heap = threadLocalHeap.get();
             if (heap != null) {
-                return heap.allocate(SIZE_CLASSES_COUNT, size, maxCapacity, buf);
+                return heap.allocateLarge(size, maxCapacity, buf, buf != null);
             }
         }
         return allocateShared(SIZE_CLASSES_COUNT, size, maxCapacity, current, buf);
@@ -450,9 +476,10 @@ final class AdaptivePoolingAllocator {
     /**
      * One thread's heap, or one stripe shared by the threads without one: {@code lock} is {@code null} for a
      * thread-local heap (the owner thread needs none) and a real {@link StampedLock} for a stripe ({@code owner} is
-     * then {@code null} too). Two entry points: {@link #allocate} on the owner thread, without a lock; and
-     * {@link #tryAllocate}, under the stripe's {@code tryWriteLock}. Every release path takes the same lock, if any,
-     * reading {@link #lock} directly.
+     * then {@code null} too). {@link #allocateSizeClass} and {@link #allocateLarge} are its two entry points: the
+     * owner thread calls them directly, without a lock; the router ({@link AdaptivePoolingAllocator#allocateShared})
+     * takes the stripe's {@code tryWriteLock} itself and calls the same methods. Every release path takes the same
+     * lock, if any, reading {@link #lock} directly.
      */
     static final class Heap {
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
@@ -474,7 +501,10 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine[] magazines;
         /** The notes left for this heap's size classes: see {@link PendingChunks}. */
         final PendingChunks notes = new PendingChunks();
-        private AdaptiveRecycler recycler;
+        /** The buffer-object recycler every magazine of this heap shares: the event loop's own pool for an owned
+         *  heap, a pool exclusive to this stripe otherwise. Fixed at construction so {@link #newBuffer} carries no
+         *  branch. */
+        private final AdaptiveRecycler recycler;
         /** Round robin over the colours of the spans; single writer, as the heap's owner or lock holder. */
         private int nextSpanColour;
         private long allocationsSinceCheck;
@@ -486,89 +516,66 @@ final class AdaptivePoolingAllocator {
             this.lock = lock;
             this.owner = owner;
             segmentSlices = store.config.slicesPerSegment();
+            recycler = owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL
+                    : AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
         }
 
         /** The magazine of {@code sizeClassIndex}, made on first use. */
         SizeClassMagazine magazine(int sizeClassIndex) {
             SizeClassMagazine[] mags = magazines;
-            if (mags == null) {
-                mags = new SizeClassMagazine[SIZE_CLASSES_COUNT];
-                magazines = mags;
-            }
-            SizeClassMagazine mag = mags[sizeClassIndex];
-            if (mag == null) {
-                mag = new SizeClassMagazine(this, sizeClassIndex);
-                mags[sizeClassIndex] = mag;
+            SizeClassMagazine mag;
+            if (mags == null || (mag = mags[sizeClassIndex]) == null) {
+                mag = newMagazine(sizeClassIndex);
             }
             return mag;
         }
 
-        /** The buffer-object recycler shared by every magazine of a stripe, made on first use. */
-        private AdaptiveRecycler buffers() {
-            AdaptiveRecycler r = recycler;
-            if (r == null) {
-                r = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-                recycler = r;
+        // Out of line: the allocation fast path must not carry the magazine's construction.
+        private SizeClassMagazine newMagazine(int sizeClassIndex) {
+            SizeClassMagazine[] mags = magazines;
+            if (mags == null) {
+                mags = new SizeClassMagazine[SIZE_CLASSES_COUNT];
+                magazines = mags;
             }
-            return r;
+            SizeClassMagazine mag = new SizeClassMagazine(this, sizeClassIndex);
+            mags[sizeClassIndex] = mag;
+            return mag;
         }
 
         AdaptiveByteBuf newBuffer() {
-            return AdaptivePoolingAllocator.newBuffer(owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL : buffers());
+            return AdaptivePoolingAllocator.newBuffer(recycler);
         }
 
-        /** Owner entry point: no lock. */
-        AdaptiveByteBuf allocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
-            if (sizeClassIndex < SIZE_CLASSES_COUNT) {
-                SizeClassMagazine mag = magazine(sizeClassIndex);
-                boolean reallocate = buf != null;
-                if (!reallocate) {
-                    buf = newBuffer();
-                }
-                boolean success = mag.allocate(size, maxCapacity, buf);
-                assert success : "owner allocation must always succeed";
+        /**
+         * The size-class slot in {@code sizeClassIndex}'s magazine: no lock, no kind check. The owner thread calls
+         * it directly and always succeeds; the router calls it under the stripe's {@code tryWriteLock} and, on
+         * failure, releases a fresh {@code buf} (unless reallocating) and returns {@code null} so its scan can move
+         * to another stripe.
+         */
+        AdaptiveByteBuf allocateSizeClass(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
+            SizeClassMagazine mag = magazine(sizeClassIndex);
+            boolean reallocate = buf != null;
+            if (!reallocate) {
+                buf = newBuffer();
+            }
+            if (mag.allocate(size, maxCapacity, buf)) {
                 mag.tick();
                 return buf;
             }
-            return allocateLarge(size, maxCapacity, buf, buf != null);
-        }
-
-        /** Stripe entry point: under {@code tryWriteLock}; {@code null} when busy. */
-        AdaptiveByteBuf tryAllocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf,
-                                    boolean reallocate) {
-            long stamp = lock.tryWriteLock();
-            if (stamp == 0) {
-                return null;
+            if (!reallocate) {
+                buf.release();
             }
-            try {
-                if (sizeClassIndex < SIZE_CLASSES_COUNT) {
-                    SizeClassMagazine mag = magazine(sizeClassIndex);
-                    if (buf == null) {
-                        buf = newBuffer();
-                    }
-                    if (mag.allocate(size, maxCapacity, buf)) {
-                        mag.tick();
-                        return buf;
-                    }
-                    if (!reallocate) {
-                        buf.release();
-                    }
-                    return null;
-                }
-                // No purge tick here: allocateLarge counts its own allocations.
-                return allocateLarge(size, maxCapacity, buf, reallocate);
-            } finally {
-                lock.unlockWrite(stamp);
-            }
+            return null;
         }
 
         /**
          * Above the size classes, up to a block: a span of whole slices of the store's shared slices (see
          * {@link PageStore#claimSlices}), sized to the buffer rounded up to slices, as mimalloc's large pages. No
          * chunk, nothing kept for reuse: a release, from any thread, gives the span back to the store at once (see
-         * {@link SharedSpanChunk}).
+         * {@link SharedSpanChunk}). No lock: the owner thread calls it directly, the router under the stripe's
+         * {@code tryWriteLock}.
          */
-        private AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
+        AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
             if (buf == null) {
                 buf = newBuffer();
             }
