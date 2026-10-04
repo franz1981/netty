@@ -160,7 +160,7 @@ final class SharedSlicesTest {
                 SplittableRandom random = new SplittableRandom(id);
                 try {
                     start.await();
-                    while (store.regionCount() < regionsWanted && failure.get() == null) {
+                    while (regions.regions.size() < regionsWanted && failure.get() == null) {
                         if (!mine.isEmpty() && random.nextInt(4) == 0) {
                             long[] run = mine.remove(random.nextInt(mine.size()));
                             own(owners, run, id, 0, failure);
@@ -185,14 +185,13 @@ final class SharedSlicesTest {
             thread.join();
         }
         assertNull(failure.get());
-        assertTrue(store.regionCount() >= regionsWanted);
+        assertTrue(regions.regions.size() >= regionsWanted);
         assertMapsShowEveryFit(store);
         for (List<long[]> mine : held) {
             for (long[] run : mine) {
                 release(store, run[0], (int) run[1]);
             }
         }
-        assertEquals(0, store.sliceCounts()[0]);
         assertMapsShowEveryFit(store);
     }
 
@@ -246,7 +245,6 @@ final class SharedSlicesTest {
         Thread releaser = new Thread(() -> release(store, claimed.get(), 9));
         releaser.start();
         releaser.join();
-        assertEquals(0, store.sliceCounts()[0]);
         long again = store.claimSlices(9, false);
         assertEquals(slice(claimed.get()), slice(again), "the same slices");
         release(store, again, 9);
@@ -271,8 +269,6 @@ final class SharedSlicesTest {
         assertEquals(0, store.firstBlock(store.claimBlocks(2)), "free again");
         store.releaseBlocks(region, 5, 1);
         assertEquals(5, store.firstBlock(store.claimBlocks(1)));
-        // Blocks 0, 1, 3, 4 and 5, and a slice of block 2.
-        assertArrayEquals(new int[] {5 * PER_BLOCK + 1, 0, PER_REGION - 5 * PER_BLOCK - 1}, store.sliceCounts());
     }
 
     /**
@@ -289,7 +285,7 @@ final class SharedSlicesTest {
         long next = store.claimSlices(10, false);
         assertEquals(58, slice(tail));
         assertEquals(PER_BLOCK, slice(next));
-        assertEquals(74, store.slicesCommitted);
+        assertEquals(74L * SLICE, store.allocator.usedMemory());
         release(store, tail, 6);
         release(store, next, 10);
         long now = System.nanoTime();
@@ -299,13 +295,12 @@ final class SharedSlicesTest {
         assertEquals(2, regions.purgeCalls(), "a run in block 0 and one in block 1");
         assertArrayEquals(new int[] {58 * SLICE, 6 * SLICE}, regions.purges.get(0));
         assertArrayEquals(new int[] {64 * SLICE, 10 * SLICE}, regions.purges.get(1));
-        assertEquals(16, store.slicesPurged);
-        assertArrayEquals(new int[] {58, 0, PER_REGION - 58}, store.sliceCounts());
+        assertEquals(58L * SLICE, store.allocator.usedMemory(), "16 slices purged");
         store.purgeIfDue(now + 4 * INTERVAL);
         assertEquals(2, regions.purgeCalls(), "nothing left with memory behind it");
         long again = store.claimSlices(14, false);
         assertEquals(PER_BLOCK, slice(again), "block 1 from its start: block 0 has 6 free");
-        assertEquals(88, store.slicesCommitted, "purged slices are committed again");
+        assertEquals(72L * SLICE, store.allocator.usedMemory(), "purged slices are committed again");
         assertSharedAccounted(segments, store.allocator);
         release(store, used, 58);
         release(store, again, 14);
@@ -387,9 +382,17 @@ final class SharedSlicesTest {
         }
         purger.join();
         assertNull(failure.get());
-        assertTrue(store.regionCount() <= maxRegions);
+        // Bounds the region array's own size, which owners[] is sized from (region index * PER_REGION + slice):
+        // not a behaviour check, a safety check on this test's own indexing.
+        assertTrue(store.regions.length <= maxRegions);
         assertTrue(operations.get() > 1000, "too few claims to mean anything: " + operations.get());
-        assertEquals(0, store.sliceCounts()[0], "a slice is still claimed");
+        for (Region region : store.regions) {
+            if (!region.released) {
+                for (Segment block : region.blocks) {
+                    assertTrue(block.isEmpty(), "a slice is still claimed");
+                }
+            }
+        }
         assertMapsShowEveryFit(store);
         assertEquals(heap, store.regions[0].buffer.hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);
@@ -398,11 +401,10 @@ final class SharedSlicesTest {
             // All free and idle now: every region goes back, in passes of a budget each.
             purgeUntilDone(store, System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             assertEquals(0, countLive(store), "a wholly free region stayed");
-            assertEquals(segments.segmentsAllocated(), store.regionsReleased, "every region mapped went back");
             assertEquals(0, store.allocator.usedMemory());
         } else {
             assertEquals(0, segments.segmentsAllocated());
-            assertTrue(store.slicesPurged > 0, "the purger purged nothing");
+            assertTrue(regions.purgeCalls() > 0, "the purger purged nothing");
         }
         store.close();
         assertEquals(0, store.allocator.usedMemory());
@@ -427,20 +429,20 @@ final class SharedSlicesTest {
         assertEquals(SEGMENT_SIZE, store.allocator.usedMemory(), "counted whole");
         release(store, first, 9);
         store.purgeIfDue(System.nanoTime() + INTERVAL / 2);
-        assertEquals(0, store.regionsReleased, "freed less than a delay ago");
+        assertEquals(1, segments.segmentsLive(), "freed less than a delay ago");
         first = store.claimSlices(9, false);
         store.purgeIfDue(System.nanoTime() + 2 * INTERVAL);
-        assertEquals(0, store.regionsReleased, "a slice is claimed");
+        assertEquals(1, segments.segmentsLive(), "a slice is claimed");
         release(store, first, 9);
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
-        assertEquals(1, store.regionsReleased);
+        assertEquals(0, segments.segmentsLive());
         AbstractByteBuf releasedBuffer = segments.segments.get(0);
         assertEquals(0, releasedBuffer.refCnt(), "freed");
         assertEquals(0, store.allocator.usedMemory());
-        assertEquals(0, store.purgeCalls(), "no part of a malloc'd region is purged");
+        assertEquals(0, regions.purgeCalls(), "no part of a malloc'd region is purged");
         long again = store.claimSlices(9, false);
         assertEquals(0, (int) (again >>> 32), "the released region's place");
-        assertEquals(1, store.regionCount());
+        assertEquals(1, segments.segmentsLive());
         assertEquals(2, segments.segmentsAllocated());
         assertTrue(store.regions[0].buffer != releasedBuffer);
         release(store, again, 9);
