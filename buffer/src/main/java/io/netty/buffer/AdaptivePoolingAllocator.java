@@ -517,7 +517,7 @@ final class AdaptivePoolingAllocator {
         OneShotChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
         if (chunk == null) {
             chunk = new OneShotChunk(memory.allocate(size, maxCapacity), this, null, 0, 0);
-            chunkBufferAllocated(chunk, false, false);
+            memoryCommitted(chunk.delegate._memoryAddress(), chunk.capacity, chunk.delegate.isDirect(), false, false);
         }
         boolean initialized = false;
         try {
@@ -589,7 +589,7 @@ final class AdaptivePoolingAllocator {
     /**
      * The bytes this allocator holds: the {@link PageStore} regions' committed slices or whole regions, from their
      * commit or allocation to their purge or release (see {@link PageStore}), and the one-shot chunks of their own
-     * allocation, from {@link #chunkBufferAllocated} to {@link #chunkBufferFreed}. These are the only places that fire
+     * allocation, from {@link #memoryCommitted} to {@link #memoryReleased}. These are the only places that fire
      * the {@link AllocateChunkEvent} and the {@link FreeChunkEvent}, so the bytes allocated minus the bytes freed in a
      * JFR recording equal this number. The size-class chunks and spans carved out of the regions fire no event, since
      * their memory never leaves the allocator.
@@ -599,35 +599,21 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * A chunk buffer was just taken from {@link #memory} for {@code chunk}.
+     * {@code bytes} of memory at {@code address} were just committed: a one-shot chunk's own allocation, or a
+     * region's shared slices that the {@link PageStore} committed.
      *
-     * @param pooled      whether the chunk serves many buffers, or is a one-shot chunk for a single one
-     * @param threadLocal whether the chunk belongs to a thread-local heap
+     * @param pooled      whether the memory serves many buffers, or is a one-shot chunk for a single one
+     * @param threadLocal whether the memory belongs to a thread-local heap
      */
-    void chunkBufferAllocated(ChunkInfo chunk, boolean pooled, boolean threadLocal) {
-        usedMemory.add(chunk.capacity());
-        MemoryEvents.allocated(chunk.memoryAddress(), chunk.capacity(), chunk.isDirect(), pooled, threadLocal);
-    }
-
-    /** The chunk buffer behind {@code chunk} is about to be released back to {@link #memory} by its chunk. */
-    void chunkBufferFreed(ChunkInfo chunk, boolean pooled) {
-        usedMemory.add(-chunk.capacity());
-        MemoryEvents.freed(chunk.memoryAddress(), chunk.capacity(), chunk.isDirect(), pooled);
-    }
-
-    /**
-     * As {@link #chunkBufferAllocated}, for {@code bytes} of a region's shared slices from {@code address} that the
-     * {@link PageStore} just committed: allocates nothing unless a JFR event is committed.
-     */
-    void storeBytesCommitted(long address, int bytes, boolean direct, boolean threadLocal) {
+    void memoryCommitted(long address, int bytes, boolean direct, boolean pooled, boolean threadLocal) {
         usedMemory.add(bytes);
-        MemoryEvents.allocated(address, bytes, direct, true, threadLocal);
+        MemoryEvents.allocated(address, bytes, direct, pooled, threadLocal);
     }
 
-    /** As {@link #chunkBufferFreed}, for {@code bytes} of shared slices whose memory the {@link PageStore} purged. */
-    void storeBytesReleased(long address, int bytes, boolean direct) {
+    /** As {@link #memoryCommitted}, for memory about to be released back to the OS or the {@link PageStore}. */
+    void memoryReleased(long address, int bytes, boolean direct, boolean pooled) {
         usedMemory.add(-bytes);
-        MemoryEvents.freed(address, bytes, direct, true);
+        MemoryEvents.freed(address, bytes, direct, pooled);
     }
 
     // Ensure that we release all previous pooled resources when this object is finalized. This is needed as otherwise
@@ -685,7 +671,7 @@ final class AdaptivePoolingAllocator {
      * thread-local heap (the owner thread needs none) and a real {@link StampedLock} for a stripe ({@code owner} is
      * then {@code null} too). Two entry points: {@link #allocate} on the owner thread, without a lock; and
      * {@link #tryAllocate}, under the stripe's {@code tryWriteLock}. Every release path takes the same lock, if any,
-     * through {@link #tryOwn()}/{@link #unown}.
+     * reading {@link #lock} directly.
      */
     static final class Heap {
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
@@ -894,17 +880,6 @@ final class AdaptivePoolingAllocator {
             store.purgeIfDue(now);
         }
 
-        /** Act as the owner for one release, if the lock is free; 0 when there is no lock or it is busy. */
-        long tryOwn() {
-            return lock == null ? 0 : lock.tryWriteLock();
-        }
-
-        /** Release the ownership taken by {@link #tryOwn()}; {@code stamp} must be non-zero. */
-        void unown(long stamp) {
-            assert stamp != 0 : "unown(0): tryOwn did not grant the lock";
-            lock.unlockWrite(stamp);
-        }
-
         /** The heap is gone: every magazine's chunks give their spans back, or are abandoned. */
         void close() {
             final StampedLock l = lock;
@@ -936,14 +911,9 @@ final class AdaptivePoolingAllocator {
      * that touches it.
      */
     static final class ChunkQueue {
-        private Chunk head;
+        Chunk head;
         private Chunk tail;
-        private int size;
-
-        /** The head, or {@code null}; does not remove it. */
-        Chunk peek() {
-            return head;
-        }
+        int size;
 
         /** Remove and return the head, or {@code null} when empty. */
         Chunk pollFront() {
@@ -952,10 +922,6 @@ final class AdaptivePoolingAllocator {
                 remove(chunk);
             }
             return chunk;
-        }
-
-        int size() {
-            return size;
         }
 
         void pushFront(Chunk chunk) {
@@ -1022,7 +988,12 @@ final class AdaptivePoolingAllocator {
         /**
          * Ends the stack, so that a {@code null} link keeps its meaning of "not queued". Never a usable chunk.
          */
-        private static final Chunk END = new SizeClassedChunk();
+        private static final Chunk END = new Chunk(null, null, false, 0) {
+            @Override
+            void releaseSlot(int offset, int size) {
+                throw new IllegalStateException();
+            }
+        };
 
         private volatile Chunk head;
 
@@ -1243,7 +1214,7 @@ final class AdaptivePoolingAllocator {
             drainPending();
             SizeClassedChunk curr = (SizeClassedChunk) reusable.pollFront();
             if (curr == null) {
-                SizeClassedChunk probed = (SizeClassedChunk) full.peek();
+                SizeClassedChunk probed = (SizeClassedChunk) full.head;
                 for (int visited = 0; curr == null && probed != null && visited < MAX_FULL_PROBE; visited++) {
                     SizeClassedChunk next = (SizeClassedChunk) probed.nextInQueue;
                     if (probed.hasRemainingCapacity()) {
@@ -1360,7 +1331,7 @@ final class AdaptivePoolingAllocator {
          * {@link #dropIfIdle}).
          */
         void returnFreeSpans(boolean keepFloor) {
-            SizeClassedChunk cur = (SizeClassedChunk) reusable.peek();
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
             while (cur != null) {
                 if (keepFloor && atFloor()) {
                     return;
@@ -1382,7 +1353,7 @@ final class AdaptivePoolingAllocator {
          * {@code _mi_page_retire}, https://github.com/microsoft/mimalloc/blob/31d034d/src/page.c#L596-L638).
          */
         private boolean atFloor() {
-            return full.size() + reusable.size() <= FLOOR;
+            return full.size + reusable.size <= FLOOR;
         }
 
         /**
@@ -1463,7 +1434,7 @@ final class AdaptivePoolingAllocator {
      * What every chunk has in common, pooled or not: the buffer it carves allocations out of and the allocator that
      * owns it. Accounting and JFR events follow the buffer, not the chunk: see {@link #usedMemory()}.
      */
-    abstract static class Chunk implements ChunkInfo {
+    abstract static class Chunk {
         /**
          * The {@link ChunkQueue} of its magazine's cache this chunk is filed on, or {@code null}: the magazine's
          * active chunk, a chunk just polled, or one that left the cache. The release paths take a cache decision only
@@ -1486,14 +1457,6 @@ final class AdaptivePoolingAllocator {
         final int capacity;
         /** Whether this chunk serves many buffers, or is a one-shot chunk for a single one: for the JFR events. */
         final boolean pooled;
-
-        Chunk() {
-            // Constructor only used by the PendingChunks end marker.
-            delegate = null;
-            allocator = null;
-            capacity = 0;
-            pooled = false;
-        }
 
         /** @param pooled whether the chunk serves many buffers, or is a one-shot chunk for a single buffer */
         Chunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, boolean pooled) {
@@ -1518,21 +1481,6 @@ final class AdaptivePoolingAllocator {
          */
         boolean inThreadLocalMagazine() {
             return false;
-        }
-
-        @Override
-        public int capacity() {
-            return capacity;
-        }
-
-        @Override
-        public boolean isDirect() {
-            return delegate.isDirect();
-        }
-
-        @Override
-        public long memoryAddress() {
-            return delegate._memoryAddress();
         }
     }
 
@@ -1629,19 +1577,6 @@ final class AdaptivePoolingAllocator {
         // Visible for testing.
         Segment segment;
         int spanStart;
-
-        /**
-         * Constructor only used by {@link PendingChunks}' end marker.
-         */
-        SizeClassedChunk() {
-            slotSize = 0;
-            slots = 0;
-            colour = 0;
-            next = null;
-            indexRecip = 0;
-            ownerThread = null;
-            magazine = null;
-        }
 
         /** A chunk object of {@code magazine}, with no span until {@link #takeSpan}. */
         SizeClassedChunk(SizeClassMagazine magazine, int colour) {
@@ -1805,7 +1740,7 @@ final class AdaptivePoolingAllocator {
             int freeSlots = remoteCount(remoteFree) + localFree;
             int updated = freeSlots * slotSize;
             if (updated != snapshotted) {
-                allocatedBytes = capacity() - updated;
+                allocatedBytes = capacity - updated;
             }
             return updated;
         }
@@ -1819,34 +1754,40 @@ final class AdaptivePoolingAllocator {
         }
 
         @Override
-        void releaseSlot(int startIndex, int size) {
+        void releaseSlot(int offset, int size) {
             if (ownerThread != null && Thread.currentThread() == ownerThread) {
-                pushLocalFree(startIndex);
-                // Neither a chunk out of the magazine's lists nor its current chunk is ever moved or evicted by a
-                // slot return: the current chunk consumes its own returned slots.
-                if (queue != null) {
-                    magazine.slotReturned(this);
-                }
+                releasedByOwner(offset);
                 return;
             }
-            final SizeClassMagazine mag = magazine;
-            final Heap heap = mag.heap;
-            final long stamp = heap.tryOwn();
-            if (stamp != 0) {
-                try {
-                    pushLocalFree(startIndex);
-                    if (queue != null) {
-                        mag.slotReturned(this);
-                    }
-                } finally {
-                    heap.unown(stamp);
-                }
+            StampedLock lock = magazine.heap.lock;
+            long stamp = lock == null ? 0 : lock.tryWriteLock();
+            if (stamp == 0) {
+                releasedRemotely(offset);
                 return;
             }
-            pushRemoteFree(startIndex);
+            try {
+                releasedByOwner(offset);
+            } finally {
+                lock.unlockWrite(stamp);
+            }
+        }
+
+        /** Owner side: the slot goes on the local list and a filed chunk is refiled. */
+        private void releasedByOwner(int offset) {
+            pushLocalFree(offset);
+            // Neither a chunk out of the magazine's lists nor its current chunk is ever moved or evicted by a
+            // slot return: the current chunk consumes its own returned slots.
+            if (queue != null) {
+                magazine.slotReturned(this);
+            }
+        }
+
+        /** Any thread: the slot goes on the remote list and the owner gets a note. */
+        private void releasedRemotely(int offset) {
+            pushRemoteFree(offset);
             // The chunk just gained capacity but we could not take the lock to apply the resulting list
             // transition. Leave a note instead; the next drain applies it.
-            heap.notes.push(this);
+            magazine.heap.notes.push(this);
         }
 
         /** The slices of the span this chunk is; its colour is less than one. */
@@ -1881,9 +1822,9 @@ final class AdaptivePoolingAllocator {
          * its next pass when the lock is taken.
          */
         boolean returnSpanIfAllFree() {
-            Heap heap = magazine.heap;
-            long stamp = heap.tryOwn();
-            if (stamp == 0 && heap.lock != null) {
+            StampedLock lock = magazine.heap.lock;
+            long stamp = lock == null ? 0 : lock.tryWriteLock();
+            if (stamp == 0 && lock != null) {
                 return false;
             }
             try {
@@ -1894,7 +1835,7 @@ final class AdaptivePoolingAllocator {
                 return true;
             } finally {
                 if (stamp != 0) {
-                    heap.unown(stamp);
+                    lock.unlockWrite(stamp);
                 }
             }
         }
@@ -1929,14 +1870,14 @@ final class AdaptivePoolingAllocator {
             if (region != null) {
                 allocator.pageStore.releaseBlocks(region, runStart, runSlots);
             } else {
-                allocator.chunkBufferFreed(this, false);
+                allocator.memoryReleased(delegate._memoryAddress(), capacity, delegate.isDirect(), false);
                 delegate.release();
             }
         }
 
         @Override
         public String toString() {
-            return "OneShotChunk[capacity: " + capacity() + ']';
+            return "OneShotChunk[capacity: " + capacity + ']';
         }
     }
 

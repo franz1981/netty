@@ -182,7 +182,7 @@ public class AdaptiveSegmentsTest {
                 SizeClassedChunk chunk = chunkOf(buf);
                 assertNotNull(chunk.segment, "size " + size);
                 assertSame(chunk.segment.buffer, field(chunk, "delegate"), "reads the segment's own buffer: no view");
-                assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity(), "chunk of size " + size);
+                assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity, "chunk of size " + size);
                 assertEquals(expectedBuffers(size), field(chunk, "slots"), "segments of size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES
@@ -604,11 +604,11 @@ public class AdaptiveSegmentsTest {
         ByteBuf a = small.allocate(4352, 4352);
         ByteBuf b = large.allocate(4352, 4352);
         try {
-            assertEquals(32 * 1024, chunkOf(a).capacity());
+            assertEquals(32 * 1024, chunkOf(a).capacity);
             assertEquals(7, field(chunkOf(a), "slots"));
             assertEquals(32 * 1024, chunkOf(a).segment.sliceSize);
             assertEquals(64, chunkOf(a).segment.slices);
-            assertEquals(64 * 1024, chunkOf(b).capacity());
+            assertEquals(64 * 1024, chunkOf(b).capacity);
             assertEquals(15, field(chunkOf(b), "slots"));
             assertEquals(SLICE_SIZE_BYTES, chunkOf(b).segment.sliceSize);
             assertEquals(2L * 1024 * 1024, small.usedMemory());
@@ -647,7 +647,7 @@ public class AdaptiveSegmentsTest {
                 ByteBuf buf = allocator.allocate(size, size);
                 SizeClassedChunk chunk = chunkOf(buf);
                 int slices = AdaptivePoolingAllocator.chunkSlicesOf(size, kinds, SLICE_SIZE_BYTES);
-                assertEquals(slices * SLICE_SIZE_BYTES, chunk.capacity(), "size " + size);
+                assertEquals(slices * SLICE_SIZE_BYTES, chunk.capacity, "size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= 0 && offset + size <= segmentSize, "size " + size + " outside its segment");
                 buf.setLong(size - 8, size);

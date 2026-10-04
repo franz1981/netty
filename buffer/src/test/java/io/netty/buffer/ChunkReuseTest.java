@@ -89,7 +89,7 @@ public class ChunkReuseTest {
         held.add(allocator.allocate(SIZE, SIZE));
         final SizeClassedChunk chunk = chunkOf(held.get(0));
         final SizeClassMagazine magazine = chunk.magazine;
-        assertEquals(SizeClassMagazine.FLOOR + 1, magazine.full.size());
+        assertEquals(SizeClassMagazine.FLOOR + 1, magazine.full.size);
         for (int i = 1; i < segments; i++) {
             held.add(allocator.allocate(SIZE, SIZE));
         }
@@ -220,7 +220,7 @@ public class ChunkReuseTest {
                 for (ByteBuf buf : burst) {
                     buf.release();
                 }
-                assertTrue(magazine.spare.size() > 0, "round " + round + ": chunks given up to the spare list");
+                assertTrue(magazine.spare.size > 0, "round " + round + ": chunks given up to the spare list");
             }
         });
     }

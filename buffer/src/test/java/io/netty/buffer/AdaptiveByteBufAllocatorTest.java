@@ -746,8 +746,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
         /** The two emptied chunks left the cache, which keeps the ones still in use. */
         void assertNotesApplied(String when) {
-            assertEquals(0, cache.reusable.size(), when);
-            assertEquals(NOTE_KEPT_CHUNKS, cache.full.size(), when + ": only the chunks still in use stay");
+            assertEquals(0, cache.reusable.size, when);
+            assertEquals(NOTE_KEPT_CHUNKS, cache.full.size, when + ": only the chunks still in use stay");
         }
 
         void releaseRest() {
@@ -776,7 +776,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             (i < 2 * perChunk ? released : stillHeld).add(buf);
         }
         SizeClassMagazine cache = chunkOf(stillHeld.get(0)).magazine;
-        assertEquals(chunks, cache.full.size(), "full chunks only");
+        assertEquals(chunks, cache.full.size, "full chunks only");
         underStripeLocks(allocator, sharedStripe, () -> {
             try {
                 Thread t = new Thread(() -> {
@@ -790,7 +790,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 throw new AssertionError(e);
             }
         });
-        assertEquals(chunks, cache.full.size(), "nothing applied the notes yet");
+        assertEquals(chunks, cache.full.size, "nothing applied the notes yet");
         return new IdleSizeClass(cache, stillHeld, chunkSize);
     }
 
@@ -870,7 +870,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 for (int i = 1; i < interval - 1; i++) {
                     allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
                 }
-                assertEquals(NOTE_KEPT_CHUNKS + 2, idle.cache.full.size(),
+                assertEquals(NOTE_KEPT_CHUNKS + 2, idle.cache.full.size,
                         "one allocation before the tick, the notes must still wait");
 
                 allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
@@ -1360,7 +1360,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // Every worker has been joined, so the lists are quiescent and safe to walk from here.
         for (SizeClassMagazine cache : sizeClassChunkCaches(allocator)) {
             int stranded = 0;
-            for (AdaptivePoolingAllocator.Chunk c = cache.full.peek(); c != null; c = c.nextInQueue) {
+            for (AdaptivePoolingAllocator.Chunk c = cache.full.head; c != null; c = c.nextInQueue) {
                 if (((SizeClassedChunk) c).hasRemainingCapacity()) {
                     stranded++;
                 }
@@ -1460,14 +1460,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                     cache.drainPending();
                 }
                 for (SizeClassMagazine cache : caches) {
-                    assertEquals(0, cache.full.size(), "every buffer is back: no chunk may stay exhausted");
-                    for (AdaptivePoolingAllocator.Chunk c = cache.reusable.peek(); c != null; c = c.nextInQueue) {
+                    assertEquals(0, cache.full.size, "every buffer is back: no chunk may stay exhausted");
+                    for (AdaptivePoolingAllocator.Chunk c = cache.reusable.head; c != null; c = c.nextInQueue) {
                         assertTrue(((SizeClassedChunk) c).allFree(), "every buffer is back");
                     }
                     cache.drainPending();
                     cache.returnFreeSpans(true);
-                    assertTrue(cache.reusable.size() <= SizeClassMagazine.FLOOR,
-                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size());
+                    assertTrue(cache.reusable.size <= SizeClassMagazine.FLOOR,
+                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size);
                 }
             });
         });

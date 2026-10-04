@@ -47,12 +47,12 @@ public class ChunkQueueTest {
         assertSame(b, queue.pollFront());
         assertSame(d, queue.pollFront());
         assertNull(queue.pollFront());
-        assertEquals(0, queue.size());
+        assertEquals(0, queue.size);
 
         // Removing the only chunk clears both ends too: the next push starts a fresh queue.
         queue.pushBack(a);
         queue.remove(a);
-        assertEquals(0, queue.size());
+        assertEquals(0, queue.size);
         queue.pushBack(b);
         assertSame(b, queue.pollFront());
         assertNull(queue.pollFront());

@@ -232,7 +232,7 @@ final class PageStore {
         Region region = new Region(this, buffer, mmap, slots, config, mmap == null, System.nanoTime(), index);
         if (!region.purgesSlices) {
             // Charged by its allocation, counted whole from now on.
-            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
+            allocator.memoryCommitted(buffer._memoryAddress(), size, buffer.isDirect(), true, threadLocal);
         }
         // The place of a region given back is taken again: nothing claims in a released region.
         Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
@@ -567,7 +567,7 @@ final class PageStore {
                 block.commit(fresh);
                 SLICES_COMMITTED.addAndGet(this, freshCount);
                 long address = block.address() + (long) start * sliceSize;
-                allocator.storeBytesCommitted(address, freshCount * sliceSize, block.buffer.isDirect(), threadLocal);
+                allocator.memoryCommitted(address, freshCount * sliceSize, block.buffer.isDirect(), true, threadLocal);
             }
             committed = true;
         } finally {
@@ -626,7 +626,7 @@ final class PageStore {
             if (region.purgesSlices) {
                 closeSlices(region);
             } else {
-                allocator.storeBytesReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect());
+                allocator.memoryReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect(), true);
             }
             releaseRegion(region);
         }
@@ -661,7 +661,7 @@ final class PageStore {
             int committed = block.takeCommitted();
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
-                allocator.storeBytesReleased(block.address(), committed * sliceSize, block.buffer.isDirect());
+                allocator.memoryReleased(block.address(), committed * sliceSize, block.buffer.isDirect(), true);
             }
         }
     }
@@ -921,7 +921,7 @@ final class PageStore {
             return false;
         }
         region.released = true;
-        allocator.storeBytesReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect());
+        allocator.memoryReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect(), true);
         releaseRegion(region);
         regionsReleased++;
         return true;
@@ -964,7 +964,7 @@ final class PageStore {
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     long address = block.address() + start * sliceSize;
-                    allocator.storeBytesReleased(address, length, block.buffer.isDirect());
+                    allocator.memoryReleased(address, length, block.buffer.isDirect(), true);
                 }
             } finally {
                 block.unclaim(bits);
