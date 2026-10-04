@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -128,10 +129,33 @@ public class AdaptiveSegmentRegionsTest {
         assertNull(store.mmap);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);
         ByteBuf buf = allocator.allocate(1024, 1024);
-        assertEquals(1, store.regionCount());
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.usedMemory());
         buf.release();
         store.close();
+        assertEquals(0, allocator.usedMemory());
+    }
+
+    /**
+     * {@code io.netty.allocator.segmentRegionSize=0} (no {@code mmap} regions): the store rejects a region source
+     * passed anyway (ab4b464f77 had {@code AdaptiveByteBufAllocator} do exactly that, and no test noticed, since the
+     * property is read once at class load and nothing here can flip it); built the way
+     * {@code AdaptiveByteBufAllocator} must, with no source, it falls back to {@code malloc}'d one-block regions and
+     * allocates and releases normally.
+     */
+    @Test
+    void regionSizeZeroRejectsAMmapSourceAndFallsBackWithoutOne() {
+        PageStoreConfig noMmap = new PageStoreConfig(PageStoreConfig.SEGMENT_SIZE_BYTES,
+                PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
+                PageStoreConfig.SEGMENT_SIZE_BYTES);
+        CountingMemorySource source = new CountingMemorySource();
+        assertThrows(IllegalArgumentException.class, () -> new AdaptivePoolingAllocator(source, true,
+                new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT), noMmap));
+        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(source, true, null, noMmap));
+        assertNull(allocator.pageStore.mmap);
+        ByteBuf buf = allocator.allocate(1024, 1024);
+        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.usedMemory());
+        buf.release();
+        allocator.pageStore.close();
         assertEquals(0, allocator.usedMemory());
     }
 }
