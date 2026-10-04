@@ -54,10 +54,12 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
         DirectChunkAllocator directChunks = new DirectChunkAllocator(this);
-        // mmap regions where libc can be bound (Java 22+ on Linux with native access), else one-block regions.
-        MmapRegionSource mmap = MmapRegionSource.isAvailable() ? new MmapRegionSource(this) : null;
-        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, mmap,
-                PageStoreConfig.directDefaults());
+        PageStoreConfig directConfig = PageStoreConfig.directDefaults();
+        // mmap regions where configured and libc can be bound (Java 22+ on Linux with native access), else one-block
+        // regions.
+        MmapRegionSource mmap = directConfig.regionSize > 0 && MmapRegionSource.isAvailable() ?
+                new MmapRegionSource(this) : null;
+        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, mmap, directConfig);
         HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
         heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, null,
                 PageStoreConfig.heapDefaults());
