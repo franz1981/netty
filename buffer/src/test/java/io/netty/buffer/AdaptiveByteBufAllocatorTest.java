@@ -686,11 +686,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             long used = claimedHeapBytes(allocator);
             assertEquals((long) (floor + 2) * BURST_CHUNK_SIZE, used);
             release(probe, foreignRelease);
-            underStripeLocks(allocator, sharedStripe, cache::drainPending);
+            underStripeLocks(allocator, sharedStripe, cache.heap::applyNotes);
             assertEquals(used, claimedHeapBytes(allocator),
                     "a fully free active chunk must not be evicted on release");
             underStripeLocks(allocator, sharedStripe, () -> {
-                cache.drainPending();
+                cache.heap.applyNotes();
                 cache.returnFreeSpans(true);
             });
             assertEquals(used, claimedHeapBytes(allocator),
@@ -710,7 +710,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 release(held.get(i), foreignRelease);
             }
             held.subList(0, BURST_SEGMENTS_PER_CHUNK).clear();
-            underStripeLocks(allocator, sharedStripe, cache::drainPending);
+            underStripeLocks(allocator, sharedStripe, cache.heap::applyNotes);
             assertEquals(used - BURST_CHUNK_SIZE, claimedHeapBytes(allocator), "evicted");
         } finally {
             for (ByteBuf buf : held) {
@@ -1457,14 +1457,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assertTrue(caches.size() > 16, "many size classes must take part: " + caches.size());
             underStripeLocks(allocator, !threadLocal, () -> {
                 for (SizeClassMagazine cache : caches) {
-                    cache.drainPending();
+                    cache.heap.applyNotes();
                 }
                 for (SizeClassMagazine cache : caches) {
                     assertEquals(0, cache.full.size, "every buffer is back: no chunk may stay exhausted");
                     for (AdaptivePoolingAllocator.Chunk c = cache.reusable.head; c != null; c = c.nextInQueue) {
                         assertTrue(((SizeClassedChunk) c).allFree(), "every buffer is back");
                     }
-                    cache.drainPending();
+                    cache.heap.applyNotes();
                     cache.returnFreeSpans(true);
                     assertTrue(cache.reusable.size <= SizeClassMagazine.FLOOR,
                             "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size);

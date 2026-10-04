@@ -225,7 +225,7 @@ final class PageStoreTestSupport {
     /** The bytes of a chunk of {@code size}'s class under {@code config}: its page kind's slices. */
     static int chunkSizeOf(int size, PageStoreConfig config) {
         int index = AdaptivePoolingAllocator.sizeClassIndexOf(size);
-        return AdaptivePoolingAllocator.pageSlices(config)[index] * config.sliceSize;
+        return AdaptivePoolingAllocator.chunkSlices(config)[index] * config.sliceSize;
     }
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */

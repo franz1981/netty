@@ -98,6 +98,8 @@ final class PageStoreConfig {
     /** 1 to {@link Long#SIZE} whole slices. */
     final int segmentSize;
     final int sliceSize;
+    /** {@code numberOfTrailingZeros(sliceSize)}: a byte offset to a slice index without a division. */
+    final int sliceShift;
     /** How long free memory stays before it is purged: see {@link #PURGE_DELAY_MILLIS}. */
     final long purgeDelayNanos;
     /**
@@ -134,8 +136,10 @@ final class PageStoreConfig {
         if (purgeDelayNanos <= 0) {
             throw new IllegalArgumentException("purgeDelayNanos: " + purgeDelayNanos);
         }
+        assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
         this.segmentSize = segmentSize;
         this.sliceSize = sliceSize;
+        sliceShift = Integer.numberOfTrailingZeros(sliceSize);
         this.purgeDelayNanos = purgeDelayNanos;
         purgeCheckNanos = Math.max(1, purgeDelayNanos >>> 2);
         // A region of one block is a malloc'd one (see withMallocRegions); mmap'd ones hold 2 or more.

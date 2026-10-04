@@ -142,7 +142,7 @@ public class ChunkReuseTest {
 
         // Second half: the note, on whatever the chunk is now; the owner drains it.
         runOnAnotherThread(() -> magazine.heap.notes.push(chunk));
-        asOwner(allocator, stripe, magazine::drainPending);
+        asOwner(allocator, stripe, magazine.heap::applyNotes);
 
         if ("idle".equals(variant)) {
             assertSame(magazine.spare, chunk.queue, "a spare chunk stays spare");

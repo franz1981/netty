@@ -251,7 +251,7 @@ final class AdaptivePoolingAllocator {
     private final FastThreadLocal<Heap> threadLocalHeap;
 
     /** Per size class, the slices of its chunks: a page kind of the store's blocks (see {@link #pageKinds}). */
-    final int[] pageSlices;
+    final int[] chunkSlices;
     final PageStore pageStore;
     /**
      * Outside low-memory mode: the largest buffer that is a span of the page store's shared slices, a whole block;
@@ -269,7 +269,7 @@ final class AdaptivePoolingAllocator {
         pageStore = new PageStore(this, config, memory, mmap);
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         this.memory = ObjectUtil.checkNotNull(memory, "memory");
-        pageSlices = pageSlices(pageStore.config);
+        chunkSlices = chunkSlices(pageStore.config);
         stripedHeaps = new Heap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new Heap(this, new StampedLock(), null);
@@ -306,7 +306,7 @@ final class AdaptivePoolingAllocator {
             throw new IllegalArgumentException("segmentSize " + config.segmentSize + " cannot hold a buffer of "
                     + largest + " (slices of " + config.sliceSize + ')');
         }
-        int[] slices = pageSlices(config);
+        int[] slices = chunkSlices(config);
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
             int segments = chunkBuffersOf(SIZE_CLASSES[i], slices[i] * config.sliceSize);
             if (segments > SizeClassedChunk.MAX_SEGMENTS) {
@@ -476,7 +476,7 @@ final class AdaptivePoolingAllocator {
     }
 
     /** Per size class, {@link #chunkSlicesOf} under {@code config}'s page kinds. */
-    static int[] pageSlices(PageStoreConfig config) {
+    static int[] chunkSlices(PageStoreConfig config) {
         int[] kinds = pageKinds(config.slicesPerSegment(), config.sliceSize);
         int[] slices = new int[SIZE_CLASSES_COUNT];
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
@@ -572,7 +572,12 @@ final class AdaptivePoolingAllocator {
     }
 
     private AdaptiveByteBuf newFallbackBuffer() {
-        AdaptiveByteBuf buf = fallbackRecycler.get();
+        return newBuffer(fallbackRecycler);
+    }
+
+    /** {@code r.get()}, reset and ready: {@link #newFallbackBuffer} and {@link Heap#newBuffer} share this. */
+    private static AdaptiveByteBuf newBuffer(AdaptiveRecycler r) {
+        AdaptiveByteBuf buf = r.get();
         buf.resetRefCnt();
         buf.discardMarks();
         return buf;
@@ -688,7 +693,6 @@ final class AdaptivePoolingAllocator {
         final Thread owner;
         final AdaptivePoolingAllocator allocator;
         final PageStore store;
-        private final int sliceShift;
         private final int segmentSlices;
 
         SizeClassMagazine[] magazines;
@@ -705,9 +709,6 @@ final class AdaptivePoolingAllocator {
             this.store = allocator.pageStore;
             this.lock = lock;
             this.owner = owner;
-            int sliceSize = store.config.sliceSize;
-            assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
-            sliceShift = Integer.numberOfTrailingZeros(sliceSize);
             segmentSlices = store.config.slicesPerSegment();
         }
 
@@ -737,10 +738,7 @@ final class AdaptivePoolingAllocator {
         }
 
         AdaptiveByteBuf newBuffer() {
-            AdaptiveByteBuf buf = owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL.get() : buffers().get();
-            buf.resetRefCnt();
-            buf.discardMarks();
-            return buf;
+            return AdaptivePoolingAllocator.newBuffer(owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL : buffers());
         }
 
         /** Owner entry point: no lock. */
@@ -811,7 +809,7 @@ final class AdaptivePoolingAllocator {
         }
 
         private void allocateSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            int shift = sliceShift;
+            int shift = store.config.sliceShift;
             int slices = (int) ((size + (1L << shift) - 1) >>> shift);
             if (slices > segmentSlices) {
                 // Slices smaller than the buffer (a small configured segment size): a buffer of its own.
@@ -862,6 +860,21 @@ final class AdaptivePoolingAllocator {
                 releaseIdle(now);
             } else {
                 store.purgeIfDue(now);
+            }
+        }
+
+        /**
+         * Apply every queued note, each by the magazine of its chunk. Caller holds the stripe lock, or is the owner
+         * thread.
+         */
+        void applyNotes() {
+            Chunk cur = notes.takeAll();
+            while (cur != null) {
+                // Re-arm BEFORE processing: see PendingChunks#rearm.
+                Chunk next = PendingChunks.rearm(cur);
+                SizeClassedChunk chunk = (SizeClassedChunk) cur;
+                chunk.magazine.slotReturned(chunk);
+                cur = next;
             }
         }
 
@@ -1078,7 +1091,7 @@ final class AdaptivePoolingAllocator {
             return new AdaptiveByteBuf((EnhancedHandle<AdaptiveByteBuf>) handle);
         }
 
-        public static AdaptiveRecycler threadLocal() {
+        static AdaptiveRecycler threadLocal() {
             // Interval 0: pool every recycled buffer object, as the stripes' pools do, instead of the
             // io.netty.recycler.ratio default, which admits one in eight at the cost of a counter and a
             // data-dependent branch per allocation; retention is already bounded by the recycler's
@@ -1086,11 +1099,11 @@ final class AdaptivePoolingAllocator {
             return new AdaptiveRecycler(true, 0);
         }
 
-        public static AdaptiveRecycler sharedWith(int maxCapacity) {
+        static AdaptiveRecycler sharedWith(int maxCapacity) {
             return new AdaptiveRecycler(maxCapacity, true);
         }
 
-        public static AdaptiveRecycler sharedExclusiveGet(int maxCapacity) {
+        static AdaptiveRecycler sharedExclusiveGet(int maxCapacity) {
             return new AdaptiveRecycler(maxCapacity, true, true);
         }
     }
@@ -1111,10 +1124,11 @@ final class AdaptivePoolingAllocator {
         static final int FLOOR = 4;
 
         final Heap heap;
-        final int sizeClassIndex;
 
         private final int slotSize;
         final int chunkSize;
+        /** {@link #chunkSize} in slices: a span's length, for a fresh claim and {@code SizeClassedChunk}'s release. */
+        final int slices;
         final int slots;
         /** The chunk size's tail its slots leave unused: the room {@code colourOffset} rotates a chunk's start in. */
         private final int room;
@@ -1137,9 +1151,9 @@ final class AdaptivePoolingAllocator {
 
         SizeClassMagazine(Heap heap, int sizeClassIndex) {
             this.heap = heap;
-            this.sizeClassIndex = sizeClassIndex;
             slotSize = SIZE_CLASSES[sizeClassIndex];
-            chunkSize = heap.allocator.pageSlices[sizeClassIndex] * heap.store.config.sliceSize;
+            slices = heap.allocator.chunkSlices[sizeClassIndex];
+            chunkSize = slices * heap.store.config.sliceSize;
             slots = chunkBuffersOf(slotSize, chunkSize);
             room = chunkSize - slots * slotSize;
             tickThreshold = (int) Math.min(Integer.MAX_VALUE, CHUNK_PURGE_INTERVAL * (chunkSize / slotSize));
@@ -1157,7 +1171,7 @@ final class AdaptivePoolingAllocator {
             if (++allocCount >= tickThreshold) {
                 allocCount = 0;
                 ticks++;
-                drainPending();
+                heap.applyNotes();
                 heap.countAllocations(tickThreshold);
             }
         }
@@ -1180,7 +1194,7 @@ final class AdaptivePoolingAllocator {
             if (current != null && current.allFree()) {
                 retireCurrent();
             }
-            drainPending();
+            heap.applyNotes();
             returnFreeSpans(false);
         }
 
@@ -1211,7 +1225,7 @@ final class AdaptivePoolingAllocator {
          */
         private boolean allocateSlow(int size, int maxCapacity, AdaptiveByteBuf buf, int startingCapacity) {
             assert current == null;
-            drainPending();
+            heap.applyNotes();
             SizeClassedChunk curr = (SizeClassedChunk) reusable.pollFront();
             if (curr == null) {
                 SizeClassedChunk probed = (SizeClassedChunk) full.head;
@@ -1229,7 +1243,6 @@ final class AdaptivePoolingAllocator {
                 // earlier or a new one, coloured round robin so that slot k of consecutive chunks does not share
                 // its offset in a 4 KiB page (Bonwick, "The Slab Allocator", USENIX Summer 1994, section 4.3).
                 PageStore store = heap.store;
-                int slices = chunkSize / store.config.sliceSize;
                 long run = store.claimSlices(slices, heap.owner != null);
                 Segment segment = store.block(run);
                 int start = store.start(run);
@@ -1357,21 +1370,6 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Apply every queued note of the heap, each by the magazine of its chunk. Caller holds the stripe lock, or
-         * is the owner thread.
-         */
-        void drainPending() {
-            Chunk cur = heap.notes.takeAll();
-            while (cur != null) {
-                // Re-arm BEFORE processing: see PendingChunks#rearm.
-                Chunk next = PendingChunks.rearm(cur);
-                SizeClassedChunk chunk = (SizeClassedChunk) cur;
-                chunk.magazine.slotReturned(chunk);
-                cur = next;
-            }
-        }
-
-        /**
          * The heap is gone: the current chunk and every queued one give their spans back, or are abandoned to the
          * store until their buffers are back (see {@link SizeClassedChunk#releaseOrAbandon}).
          */
@@ -1399,7 +1397,6 @@ final class AdaptivePoolingAllocator {
      */
     static final class SharedSpanChunk extends Chunk {
         final Segment block;
-        private final int sliceShift;
         private final boolean threadLocal;
 
         /** @param threadLocal whether the heaps whose spans this chunk holds are thread-local ones, for JFR */
@@ -1407,14 +1404,12 @@ final class AdaptivePoolingAllocator {
             super(block.buffer, store.allocator, true, store.config.segmentSize);
             this.block = block;
             this.threadLocal = threadLocal;
-            assert (block.sliceSize & block.sliceSize - 1) == 0 : "slices of a power of two";
-            sliceShift = Integer.numberOfTrailingZeros(block.sliceSize);
         }
 
         /** Any thread: the span of {@code length} bytes at {@code offset}, colour included, is free. */
         @Override
         void releaseSlot(int offset, int length) {
-            int shift = sliceShift;
+            int shift = block.region.store.config.sliceShift;
             int relative = offset - block.base;
             block.releaseRun(relative >>> shift, length + (1 << shift) - 1 >>> shift, System.nanoTime());
         }
@@ -1712,7 +1707,7 @@ final class AdaptivePoolingAllocator {
          * Whether this chunk has a free slot, as the magazine files it (reusable or full) and probes it. Unlike
          * {@link #remainingCapacity()} it never refreshes the snapshot.
          */
-        public boolean hasRemainingCapacity() {
+        boolean hasRemainingCapacity() {
             int remaining = capacity - allocatedBytes;
             if (remaining > 0) {
                 return true;
@@ -1731,7 +1726,7 @@ final class AdaptivePoolingAllocator {
          * counted and the snapshot refreshed. Before the first refresh the snapshot also counts the tail of the
          * chunk that is too small for a slot, when the chunk size is not a multiple of the slot size.
          */
-        public int remainingCapacity() {
+        int remainingCapacity() {
             int remaining = capacity - allocatedBytes;
             return remaining > slotSize ? remaining : updateRemainingCapacity(remaining);
         }
@@ -1790,15 +1785,15 @@ final class AdaptivePoolingAllocator {
             magazine.heap.notes.push(this);
         }
 
-        /** The slices of the span this chunk is; its colour is less than one. */
+        /** The slices of the span this chunk is: its magazine's, every incarnation the same. */
         int spanSlices() {
-            return (capacity + segment.sliceSize - 1) / segment.sliceSize;
+            return magazine.slices;
         }
 
         /** Owner, with every slot back: the span goes back to the store's shared slices. */
         void releaseSpan() {
             assert allFree();
-            segment.releaseRun(spanStart, spanSlices(), System.nanoTime());
+            segment.releaseRun(spanStart, magazine.slices, System.nanoTime());
         }
 
         /**
