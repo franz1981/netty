@@ -55,7 +55,7 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * back by the purge, and the defaults per memory mode.
  */
 public class AdaptiveSegmentsTest {
-    private static final int[] SIZE_CLASSES = AdaptivePoolingAllocator.getSizeClasses();
+    private static final int[] SIZE_CLASSES = SizeClassTable.SIZES.clone();
 
     @RegisterExtension
     final AllocatorCloser closer = new AllocatorCloser();

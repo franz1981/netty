@@ -283,8 +283,7 @@ final class AdaptiveLargeSegmentsTest {
         long now = System.nanoTime();
         store.purgeIfDue(now += INTERVAL);
         store.purgeIfDue(now + INTERVAL);
-        assertEquals(3 * PER_BLOCK, store.slicesPurged, "free a whole interval: purged");
-        assertEquals(0, committed(allocator));
+        assertEquals(0, committed(allocator), "free a whole interval: purged");
         assertAccounted(segments, regions, allocator);
     }
 

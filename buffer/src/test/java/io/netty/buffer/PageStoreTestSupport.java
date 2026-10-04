@@ -212,9 +212,9 @@ final class PageStoreTestSupport {
      */
     static void purgeUntilDone(PageStore store, long now) {
         for (int i = 0; i < 10000; i++) {
-            long passes = store.purges;
+            long passes = store.purges();
             store.purgeIfDue(now);
-            if (store.purges == passes) {
+            if (store.purges() == passes) {
                 return;
             }
             now += store.config.purgeCheckNanos;

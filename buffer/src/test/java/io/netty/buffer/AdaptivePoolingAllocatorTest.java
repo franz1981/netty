@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AdaptivePoolingAllocatorTest {
     @Test
     void sizeClassComputations() throws Exception {
-        final int[] sizeClasses = AdaptivePoolingAllocator.getSizeClasses();
+        final int[] sizeClasses = SizeClassTable.SIZES.clone();
         for (int sizeClassIndex = 0; sizeClassIndex < sizeClasses.length; sizeClassIndex++) {
             final int previousSizeIncluded = sizeClassIndex == 0? 0 : sizeClasses[sizeClassIndex - 1] + 1;
             assertSizeClassOf(sizeClassIndex, previousSizeIncluded, sizeClasses[sizeClassIndex]);
@@ -44,7 +44,7 @@ class AdaptivePoolingAllocatorTest {
         int slice = config.sliceSize;
         int block = config.segmentSize;
         int mostSegments = 0;
-        for (int sizeClass : AdaptivePoolingAllocator.getSizeClasses()) {
+        for (int sizeClass : SizeClassTable.SIZES) {
             int chunkSize = PageStoreTestSupport.chunkSizeOf(sizeClass, config);
             int segments = chunkSize / sizeClass;
             mostSegments = Math.max(mostSegments, segments);

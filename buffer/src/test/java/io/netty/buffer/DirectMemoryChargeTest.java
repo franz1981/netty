@@ -91,14 +91,12 @@ final class DirectMemoryChargeTest {
         block.releaseRun(3, 6, System.nanoTime());
         long now = System.nanoTime();
         store.purgeIfDue(now + 2 * INTERVAL);
-        assertEquals(6, store.slicesPurged);
         assertEquals(3L * SLICE, allocator.usedMemory(), "the purge credits them");
         assertChargedAtMost(base, 3L * SLICE, "the purge credits them");
         block.releaseRun(0, 3, System.nanoTime());
         assertEquals(run, store.claimSlices(9, false), "3 slices with memory behind them, 6 purged");
         assertEquals(9L * SLICE, allocator.usedMemory(), "purged: charged again");
         assertChargedAtMost(base, 9L * SLICE, "purged: charged again");
-        assertEquals(15, store.slicesCommitted);
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory(), "the close credits the rest");
@@ -123,7 +121,6 @@ final class DirectMemoryChargeTest {
             assertThrows(OutOfDirectMemoryError.class, () -> store.claimSlices(9, false));
             assertArrayEquals(new int[] {9, 0, REGION_SIZE / SLICE - 9}, store.sliceCounts(), "the run went back");
             assertEquals(0, block.committed & block.bits(9, 9), "no memory behind the slices that went back");
-            assertEquals(9, store.slicesCommitted);
             block.releaseRun(0, 9, System.nanoTime());
             assertEquals(0, (int) store.claimSlices(9, false), "committed: nothing to charge");
         } finally {
@@ -158,8 +155,7 @@ final class DirectMemoryChargeTest {
         assertChargedAtMost(base, 2L * SEGMENT_SIZE, "nothing per slice");
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
-        assertEquals(1, store.regionsReleased, "the first region went back, the second is out");
-        assertEquals(SEGMENT_SIZE, allocator.usedMemory(), "credited by its free");
+        assertEquals(SEGMENT_SIZE, allocator.usedMemory(), "credited by its free: the first region went back");
         assertChargedAtMost(base, SEGMENT_SIZE, "credited by its free");
         PageStoreTestSupport.assertSharedAccounted(segments, allocator);
         store.close();

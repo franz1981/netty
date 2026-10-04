@@ -115,7 +115,7 @@ final class PageStore {
     private boolean closed;
     /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
-    /** Set by tests. */
+    /** When the last pass ran, or started: see {@link #isDue}. */
     volatile long lastPurgeNanos = System.nanoTime();
     // Read by every run release, written once per arming by a release and by the purger. HotSpot packs this object's
     // fields into about 150 bytes, so these share lines with regions, slicesCommitted and the purger's counters.
@@ -131,9 +131,8 @@ final class PageStore {
     /** Purger only: abandoned chunks with buffers still out, linked through {@code nextInQueue}. */
     private SizeClassedChunk waiting;
     // Written by the purger only.
-    long purges;
-    long purgeCalls;
-    long bytesPurged;
+    private long purges;
+    private long purgeCalls;
     long purgeFailures;
     /** Shared slices purged. */
     long slicesPurged;
@@ -924,7 +923,6 @@ final class PageStore {
                     block.uncommit(bits);
                     // Credited before a claim can find the slices uncommitted and charge them again.
                     purgeCalls++;
-                    bytesPurged += length;
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     allocator.memoryReleased(address, length, block.buffer.isDirect(), true);
@@ -970,6 +968,16 @@ final class PageStore {
 
     int regionCount() {
         return regions.length;
+    }
+
+    /** How many passes ran: see {@link #purge}. */
+    long purges() {
+        return purges;
+    }
+
+    /** How many purge calls were made across every pass: see {@link #purgeSliceRun}. */
+    long purgeCalls() {
+        return purgeCalls;
     }
 
 }

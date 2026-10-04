@@ -283,10 +283,6 @@ final class AdaptivePoolingAllocator {
         return SizeClassTable.indexOf(size);
     }
 
-    static int[] getSizeClasses() {
-        return SizeClassTable.SIZES.clone();
-    }
-
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
         if (size > MAX_POOLED_BUF_SIZE && size <= largeSpanLimit) {
             // Above the pooled sizes, up to a block: a span of shared slices, as smaller large buffers.
@@ -924,7 +920,7 @@ final class AdaptivePoolingAllocator {
         private final int room;
         private int nextColour;
 
-        // Visible for testing.
+        /** The chunk this magazine allocates from, or {@code null} once closed. */
         SizeClassedChunk current;
         final ChunkQueue reusable = new ChunkQueue();
         final ChunkQueue full = new ChunkQueue();
@@ -1359,7 +1355,6 @@ final class AdaptivePoolingAllocator {
 
         final SizeClassMagazine magazine;
         /** The block this chunk is a span of, from slice {@link #spanStart}; {@code null} for the end marker. */
-        // Visible for testing.
         Segment segment;
         int spanStart;
 

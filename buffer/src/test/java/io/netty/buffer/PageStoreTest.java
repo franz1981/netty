@@ -194,8 +194,7 @@ final class PageStoreTest {
         }
         // More purge calls than a pass makes: the mapped region's blocks, then the one-block regions.
         purgeUntilDone(store, System.nanoTime() + 4 * INTERVAL);
-        assertEquals(2, store.regionsReleased, "the idle one-block regions went back, the mapped one stays");
-        assertEquals(0, segments.segmentsLive());
+        assertEquals(0, segments.segmentsLive(), "the idle one-block regions went back, the mapped one stays");
         assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());

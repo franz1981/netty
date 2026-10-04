@@ -1310,11 +1310,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** Runs a pass of {@code store}'s purge: one due at a time a purge delay and a check interval from its last. */
     private static void runPurgePass(PageStore store) {
-        long passes = store.purges;
+        long passes = store.purges();
         long now = Math.max(System.nanoTime(), store.lastPurgeNanos)
                 + store.config.purgeDelayNanos + store.config.purgeCheckNanos;
         store.purgeIfDue(now);
-        assertEquals(passes + 1, store.purges, "the pass did not run");
+        assertEquals(passes + 1, store.purges(), "the pass did not run");
     }
 
     /** Whether {@code chunk}'s span is back in the store: free in its block, or its region given back whole. */
@@ -1478,7 +1478,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** The size classes up to 16 KiB, whose chunks are a few slices at most: many chunk switches. */
     private static int[] smallSizeClasses() {
-        int[] all = AdaptivePoolingAllocator.getSizeClasses();
+        int[] all = SizeClassTable.SIZES.clone();
         int n = 0;
         while (n < all.length && all[n] <= 16384) {
             n++;

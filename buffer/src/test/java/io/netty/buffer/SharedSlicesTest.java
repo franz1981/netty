@@ -437,7 +437,7 @@ final class SharedSlicesTest {
         AbstractByteBuf releasedBuffer = segments.segments.get(0);
         assertEquals(0, releasedBuffer.refCnt(), "freed");
         assertEquals(0, store.allocator.usedMemory());
-        assertEquals(0, store.purgeCalls, "no part of a malloc'd region is purged");
+        assertEquals(0, store.purgeCalls(), "no part of a malloc'd region is purged");
         long again = store.claimSlices(9, false);
         assertEquals(0, (int) (again >>> 32), "the released region's place");
         assertEquals(1, store.regionCount());

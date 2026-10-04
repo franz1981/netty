@@ -88,7 +88,7 @@ public class AdaptivePageKindsTest {
 
     @Test
     void everySizeClassIsInTheTable() {
-        int[] sizeClasses = AdaptivePoolingAllocator.getSizeClasses();
+        int[] sizeClasses = SizeClassTable.SIZES.clone();
         assertEquals(TABLE.length, sizeClasses.length);
         for (int i = 0; i < TABLE.length; i++) {
             assertEquals(TABLE[i][0], sizeClasses[i]);
@@ -119,7 +119,7 @@ public class AdaptivePageKindsTest {
     void endWasteIsAtMostAnEighthButADroppedBuffer() {
         for (int blockSlices : new int[] {64, 63, 32}) {
             int[] kinds = SizeClassTable.pageKinds(blockSlices, SLICE_SIZE_BYTES);
-            for (int sizeClass : AdaptivePoolingAllocator.getSizeClasses()) {
+            for (int sizeClass : SizeClassTable.SIZES) {
                 int page = SizeClassTable.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES)
                         * SLICE_SIZE_BYTES;
                 int fit = page / sizeClass;
