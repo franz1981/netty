@@ -49,8 +49,6 @@ final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
     private static final AtomicIntegerFieldUpdater<PageStore> PURGING =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "purging");
-    private static final AtomicLongFieldUpdater<PageStore> SLICES_COMMITTED =
-            AtomicLongFieldUpdater.newUpdater(PageStore.class, "slicesCommitted");
     private static final AtomicIntegerFieldUpdater<PageStore> ARMED =
             AtomicIntegerFieldUpdater.newUpdater(PageStore.class, "armed");
     private static final AtomicReferenceFieldUpdater<PageStore, SizeClassedChunk> ABANDONED =
@@ -107,21 +105,12 @@ final class PageStore {
     private volatile int armed;
     /** When {@link #armed} was set, as {@link System#nanoTime()}: a pass waits the purge delay from then. */
     private volatile long armedAt;
-    // Read by tests and dumps.
-    /** Shared slices claimed while no memory backed them. */
-    volatile long slicesCommitted;
     /** Chunks abandoned since the last pass, a stack linked through {@code nextInQueue}: see {@link #abandon}. */
     private volatile SizeClassedChunk abandoned;
     /** Purger only: abandoned chunks with buffers still out, linked through {@code nextInQueue}. */
     private SizeClassedChunk waiting;
     // Written by the purger only.
-    private long purges;
-    private long purgeCalls;
     long purgeFailures;
-    /** Shared slices purged. */
-    long slicesPurged;
-    /** Regions given back whole: see {@link #releaseIfIdle}. */
-    long regionsReleased;
     /** Whether the pass left free slices that were not idle for the delay yet, and the longest any of them waited. */
     private boolean skipped;
     private long longestWait;
@@ -537,7 +526,6 @@ final class PageStore {
             if (freshCount != 0) {
                 PlatformDependent.incrementMemoryCounter(freshCount * sliceSize);
                 block.commit(fresh);
-                SLICES_COMMITTED.addAndGet(this, freshCount);
                 long address = block.address() + (long) start * sliceSize;
                 allocator.memoryCommitted(address, freshCount * sliceSize, block.buffer.isDirect(), true, threadLocal);
             }
@@ -700,7 +688,6 @@ final class PageStore {
      * next pass, after the cadence floor, goes on from where this one stopped.
      */
     private void purge(long now) {
-        purges++;
         skipped = false;
         releaseAbandoned(now);
         Region[] regions = this.regions;
@@ -774,18 +761,6 @@ final class PageStore {
         return kept;
     }
 
-    // Visible for testing: racy, the chunks abandoned and not given back yet.
-    int abandonedCount() {
-        int count = 0;
-        for (SizeClassedChunk c = abandoned; c != null; c = c.nextAbandoned) {
-            count++;
-        }
-        for (SizeClassedChunk c = waiting; c != null; c = c.nextAbandoned) {
-            count++;
-        }
-        return count;
-    }
-
     /**
      * Shared slices: purges the free slices of {@code block} with memory behind them freed
      * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, until the calls
@@ -851,7 +826,6 @@ final class PageStore {
             return false;
         }
         releaseRegion(region);
-        regionsReleased++;
         return true;
     }
 
@@ -887,8 +861,6 @@ final class PageStore {
                 if (purged) {
                     block.uncommit(bits);
                     // Credited before a claim can find the slices uncommitted and charge them again.
-                    purgeCalls++;
-                    slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
                     allocator.memoryReleased(address, length, block.buffer.isDirect(), true);
                 }
@@ -912,37 +884,6 @@ final class PageStore {
         } else {
             logger.debug("Cannot purge free slices ({} failures).", purgeFailures, cause);
         }
-    }
-
-    /**
-     * Racy, for tests and dumps, shared slices only: the slices of all regions {@code {claimed, free with memory
-     * behind, free without}}. A slice the purger claimed counts as claimed.
-     */
-    int[] sliceCounts() {
-        int[] counts = new int[3];
-        for (Region region : regions) {
-            if (region.released) {
-                continue;
-            }
-            for (Segment block : region.blocks) {
-                block.addSliceCounts(counts);
-            }
-        }
-        return counts;
-    }
-
-    int regionCount() {
-        return regions.length;
-    }
-
-    /** How many passes ran: see {@link #purge}. */
-    long purges() {
-        return purges;
-    }
-
-    /** How many purge calls were made across every pass: see {@link #purgeSliceRun}. */
-    long purgeCalls() {
-        return purgeCalls;
     }
 
 }

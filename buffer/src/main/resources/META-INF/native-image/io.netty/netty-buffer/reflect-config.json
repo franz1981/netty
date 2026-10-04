@@ -112,9 +112,6 @@
     "fields": [
       {
         "name": "purging"
-      },
-      {
-        "name": "slicesCommitted"
       }
     ]
   },

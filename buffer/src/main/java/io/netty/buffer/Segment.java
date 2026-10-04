@@ -298,29 +298,12 @@ final class Segment {
         return everCommitted[i] ? SLICE_PURGED : SLICE_UNTOUCHED;
     }
 
-    /** Adds this block's {claimed, free with memory behind, free without} slice counts to {@code counts}. Racy. */
-    void addSliceCounts(int[] counts) {
-        long free = this.free;
-        long committed = this.committed;
-        counts[0] += Long.bitCount(~free & allFree);
-        counts[1] += Long.bitCount(free & committed);
-        counts[2] += Long.bitCount(free & ~committed);
-    }
-
     boolean isEmpty() {
         return free == allFree;
     }
 
-    int freeSlices() {
-        return Long.bitCount(free);
-    }
-
-    int usedSlices() {
-        return slices - freeSlices();
-    }
-
     @Override
     public String toString() {
-        return "Segment[slices: " + slices + ", used: " + usedSlices() + ']';
+        return "Segment[slices: " + slices + ", used: " + (slices - Long.bitCount(free)) + ']';
     }
 }
