@@ -15,8 +15,6 @@
  */
 package io.netty.buffer;
 
-import java.util.Arrays;
-
 /**
  * One piece of memory, cut into {@link #slots} blocks at fixed offsets, all made with the region: {@code mmap}d by
  * {@link #source}, or, where it is {@code null}, one plain block from the store's {@link MemorySource}. Each block's
@@ -37,39 +35,26 @@ final class Region {
     /** {@link #slots} blocks, in bytes. */
     final int length;
     final Segment[] blocks;
-    /**
-     * Per slice of the region, slice owner only: whether memory was ever behind it, so that a slice with none now was
-     * purged.
-     */
-    final boolean[] sliceEverCommitted;
-    /** Its index in {@link PageStore#regions}, set before it is published there. */
-    int index = -1;
+    /** Its index in {@link PageStore#regions}, published with the region. */
+    final int index;
     /** Given back to its source whole: every block stays claimed. Set by the purger under the store's monitor. */
     volatile boolean released;
 
     /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
     Region(PageStore store, AbstractByteBuf buffer, MmapRegionSource source, int slots,
-           PageStoreConfig config, boolean committed, long committedAt) {
+           PageStoreConfig config, boolean committed, long committedAt, int index) {
         assert slots > 0 && slots <= Long.SIZE;
         this.store = store;
         this.buffer = buffer;
         this.source = source;
         purgesSlices = source != null;
         this.slots = slots;
+        this.index = index;
         int size = config.segmentSize;
         length = slots * size;
         blocks = new Segment[slots];
         for (int slot = 0; slot < slots; slot++) {
-            Segment block = new Segment(buffer, slot * size, size, config.sliceSize, this, slot);
-            if (committed) {
-                block.committed = block.allFree;
-                Arrays.fill(block.freedAt, committedAt);
-            }
-            blocks[slot] = block;
-        }
-        sliceEverCommitted = new boolean[slots * config.slicesPerSegment()];
-        if (committed) {
-            Arrays.fill(sliceEverCommitted, true);
+            blocks[slot] = new Segment(buffer, slot * size, size, config.sliceSize, this, slot, committed, committedAt);
         }
     }
 
@@ -84,7 +69,7 @@ final class Region {
         int first = 0;
         while (first + n <= blocks.length) {
             int end = first;
-            while (end < first + n && blocks[end].isWhollyFree()) {
+            while (end < first + n && blocks[end].isEmpty()) {
                 end++;
             }
             if (end < first + n) {

@@ -230,18 +230,18 @@ final class PageStore {
         if (event != null) {
             AbstractPageStoreEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
         }
-        Region region = sharedRegion(buffer, mmap, slots);
-        if (!region.purgesSlices) {
-            // Charged by its allocation, counted whole from now on.
-            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
-        }
         int index = 0;
         while (index < seen.length && !seen[index].released) {
             index++;
         }
+        // A region charged whole has memory behind all of it, free since now.
+        Region region = new Region(this, buffer, mmap, slots, config, mmap == null, System.nanoTime(), index);
+        if (!region.purgesSlices) {
+            // Charged by its allocation, counted whole from now on.
+            allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
+        }
         // The place of a region given back is taken again: nothing claims in a released region.
         Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
-        region.index = index;
         growMaps(index);
         int first;
         if (blocks != 0) {
@@ -260,17 +260,6 @@ final class PageStore {
             armPurge(System.nanoTime());
         }
         return first < 0 ? -1 : (long) index << 32 | first;
-    }
-
-    /** A region charged whole has memory behind all of it, free since now. */
-    private Region sharedRegion(AbstractByteBuf buffer, MmapRegionSource mmap, int blocks) {
-        Region region = new Region(this, buffer, mmap, blocks, config, mmap == null, System.nanoTime());
-        for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.blocks[slot];
-            block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, false);
-            block.threadLocalSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, true);
-        }
-        return region;
     }
 
     /**
@@ -322,7 +311,7 @@ final class PageStore {
                     if (claimed >= 0) {
                         return claimed(block, id, bin, claimed);
                     }
-                    if (length != n && Segment.firstFit(block.free, length) >= 0) {
+                    if (length != n && block.hasFit(length)) {
                         // A run of another length of the other bin.
                         continue;
                     }
@@ -364,7 +353,7 @@ final class PageStore {
             // This claim holds its run: the block cannot be wholly free again before the bit is clear.
             clear(emptyMap, id);
         }
-        if (Segment.firstFit(block.free, binSlices[bin]) >= 0) {
+        if (block.hasFit(binSlices[bin])) {
             mark(bin, id);
         } else {
             unmark(bin, id);
@@ -382,7 +371,7 @@ final class PageStore {
             mark(emptyMap, id);
         } else {
             int bin = block.bin;
-            if (Segment.firstFit(free, binSlices[bin]) >= 0) {
+            if (Segment.hasFit(free, binSlices[bin])) {
                 mark(bin, id);
             }
         }
@@ -394,9 +383,7 @@ final class PageStore {
 
     /** Whether {@code block} earns its bit in {@code map}. Racy. */
     private boolean earns(int map, Segment block) {
-        long free = block.free;
-        return map == emptyMap ? free == block.allFree :
-                block.bin == map && Segment.firstFit(free, binSlices[map]) >= 0;
+        return map == emptyMap ? block.isEmpty() : block.bin == map && block.hasFit(binSlices[map]);
     }
 
     /** The block of {@code id} in {@code regions}, or {@code null} when it has none. */
@@ -563,22 +550,17 @@ final class PageStore {
      * any slice charged meanwhile staying charged and free, until it is purged.
      */
     private void commitSlices(Segment block, int start, int n, boolean threadLocal) {
-        Region region = block.region;
         int sliceSize = block.sliceSize;
-        long bits = block.bits(start, n) & ~block.committed;
-        int fresh = Long.bitCount(bits);
-        long address = block.buffer._memoryAddress() + block.base + (long) start * sliceSize;
+        long fresh = block.fresh(block.bits(start, n));
+        int freshCount = Long.bitCount(fresh);
         boolean committed = false;
         try {
-            if (fresh != 0) {
-                PlatformDependent.incrementMemoryCounter(fresh * sliceSize);
-                block.commit(bits);
-                int base = block.slot * block.slices;
-                for (; bits != 0; bits &= bits - 1) {
-                    region.sliceEverCommitted[base + Long.numberOfTrailingZeros(bits)] = true;
-                }
-                SLICES_COMMITTED.addAndGet(this, fresh);
-                allocator.storeBytesCommitted(address, fresh * sliceSize, block.buffer.isDirect(), threadLocal);
+            if (freshCount != 0) {
+                PlatformDependent.incrementMemoryCounter(freshCount * sliceSize);
+                block.commit(fresh);
+                SLICES_COMMITTED.addAndGet(this, freshCount);
+                long address = block.address() + (long) start * sliceSize;
+                allocator.storeBytesCommitted(address, freshCount * sliceSize, block.buffer.isDirect(), threadLocal);
             }
             committed = true;
         } finally {
@@ -648,14 +630,11 @@ final class PageStore {
     /** Credits every committed slice of {@code region}: the close only. */
     private void closeSlices(Region region) {
         int sliceSize = config.sliceSize;
-        for (int slot = 0; slot < region.slots; slot++) {
-            Segment block = region.blocks[slot];
-            int committed = Long.bitCount(block.committed);
-            block.committed = 0;
+        for (Segment block : region.blocks) {
+            int committed = block.takeCommitted();
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
-                allocator.storeBytesReleased(block.buffer._memoryAddress() + block.base, committed * sliceSize,
-                        block.buffer.isDirect());
+                allocator.storeBytesReleased(block.address(), committed * sliceSize, block.buffer.isDirect());
             }
         }
     }
@@ -833,14 +812,20 @@ final class PageStore {
     private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;
         long bytes = 0;
-        long candidates = purgeable(block, block.free, now, delay);
+        long candidates = block.purgeCandidates(now, delay);
+        long notYetIdle = block.notYetIdle(now, delay);
+        if (notYetIdle != 0) {
+            skip(block.longestWait(notYetIdle, now));
+        }
         while (candidates != 0 && bytes < budget) {
             long run = lowestRun(candidates);
             candidates &= ~run;
             long claimed = block.claimFree(run);
-            long exact = purgeable(block, claimed, now, delay);
-            if (exact != claimed) {
-                block.giveBack(claimed & ~exact);
+            long exact = block.idleOf(claimed, now, delay);
+            long stillNotIdle = block.notIdle(claimed, now, delay);
+            if (stillNotIdle != 0) {
+                block.giveBack(stillNotIdle);
+                skip(block.longestWait(stillNotIdle, now));
             }
             while (exact != 0) {
                 if (bytes >= budget) {
@@ -890,7 +875,7 @@ final class PageStore {
     /** Racy: whether every slice of {@code region} is free. */
     private static boolean whollyFree(Region region) {
         for (Segment block : region.blocks) {
-            if (!block.isWhollyFree()) {
+            if (!block.isEmpty()) {
                 return false;
             }
         }
@@ -904,9 +889,7 @@ final class PageStore {
     private static long shortestWait(Region region, long now) {
         long shortest = Long.MAX_VALUE;
         for (Segment block : region.blocks) {
-            for (long freed : block.freedAt) {
-                shortest = Math.min(shortest, now - freed);
-            }
+            shortest = Math.min(shortest, block.shortestWait(now));
         }
         return shortest;
     }
@@ -937,27 +920,6 @@ final class PageStore {
     }
 
     /**
-     * Free slices with memory behind them of {@code slices}, freed {@code delay} before {@code now} or earlier; the
-     * others with memory behind them are skipped (see {@link #skip}). Racy for slices the caller does not own, exact
-     * for those it does. {@code slices} is read from {@link Segment#free} before {@link Segment#committed}: a free bit
-     * seen set shows the committed bit its releaser left.
-     */
-    private long purgeable(Segment block, long slices, long now, long delay) {
-        long purgeable = 0;
-        long[] freedAt = block.freedAt;
-        for (long bits = slices & block.committed; bits != 0; bits &= bits - 1) {
-            int slice = Long.numberOfTrailingZeros(bits);
-            long waited = now - freedAt[slice];
-            if (waited >= delay) {
-                purgeable |= 1L << slice;
-            } else {
-                skip(waited);
-            }
-        }
-        return purgeable;
-    }
-
-    /**
      * Purges the contiguous slices {@code bits} of {@code block}, which the purger claimed, with one call, then gives
      * them back. A run whose call fails keeps its memory, and stays purgeable.
      */
@@ -980,7 +942,7 @@ final class PageStore {
                 failure = t;
             }
             if (event != null) {
-                AbstractPageStoreEvent.end(event, region.buffer._memoryAddress() + offset, length, region.index,
+                AbstractPageStoreEvent.end(event, block.address() + start * sliceSize, length, region.index,
                         failure);
             }
             if (failure != null) {
@@ -997,7 +959,7 @@ final class PageStore {
                     bytesPurged += length;
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
-                    long address = region.buffer._memoryAddress() + offset;
+                    long address = block.address() + start * sliceSize;
                     allocator.storeBytesReleased(address, length, block.buffer.isDirect());
                 }
             } finally {
@@ -1032,13 +994,8 @@ final class PageStore {
             if (region.released) {
                 continue;
             }
-            for (int slot = 0; slot < region.slots; slot++) {
-                Segment block = region.blocks[slot];
-                long free = block.free;
-                long committed = block.committed;
-                counts[0] += Long.bitCount(~free & block.allFree);
-                counts[1] += Long.bitCount(free & committed);
-                counts[2] += Long.bitCount(free & ~committed);
+            for (Segment block : region.blocks) {
+                block.addSliceCounts(counts);
             }
         }
         return counts;

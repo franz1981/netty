@@ -40,9 +40,8 @@ final class SegmentTest {
         int size = slices * SLICE_SIZE_BYTES;
         CountingMemorySource source = new CountingMemorySource(true);
         PageStore store = newAllocator(source, size).pageStore;
-        Region region = new Region(store, source.allocateSegment(size), null, 1, store.config, true, 0);
+        Region region = new Region(store, source.allocateSegment(size), null, 1, store.config, true, 0, 0);
         // Its releases mark the store's maps, which have room for one region; nothing claims through them.
-        region.index = 0;
         return region.blocks[0];
     }
 
@@ -61,14 +60,14 @@ final class SegmentTest {
             assertEquals(0, claim(segment, n), "n=" + n);
             assertEquals(slices - n, segment.freeSlices());
             segment.releaseRun(0, n, 0);
-            assertTrue(segment.isWhollyFree());
+            assertTrue(segment.isEmpty());
             // Every start: occupy the slices below it, so the lowest run of n is there.
             for (int start = 1; start + n <= slices; start++) {
                 assertEquals(0, claim(segment, start));
                 assertEquals(start, claim(segment, n), "n=" + n + " start=" + start);
                 segment.releaseRun(0, start, 0);
                 segment.releaseRun(start, n, 0);
-                assertTrue(segment.isWhollyFree());
+                assertTrue(segment.isEmpty());
             }
         }
     }
@@ -104,7 +103,7 @@ final class SegmentTest {
         assertEquals(0, claim(segment, 7), "0..6 merged");
         segment.releaseRun(0, 7, 0);
         segment.releaseRun(7, 57, 0);
-        assertTrue(segment.isWhollyFree());
+        assertTrue(segment.isEmpty());
     }
 
     @Test
@@ -173,7 +172,7 @@ final class SegmentTest {
             }
             assertEquals(bits, segment.free, "op " + op);
             assertEquals(64 - Long.bitCount(bits), segment.usedSlices());
-            assertEquals(bits == -1L, segment.isWhollyFree());
+            assertEquals(bits == -1L, segment.isEmpty());
         }
     }
 
@@ -256,7 +255,7 @@ final class SegmentTest {
             thread.join();
         }
         assertNull(failure.get());
-        assertTrue(segment.isWhollyFree());
+        assertTrue(segment.isEmpty());
         assertTrue(firsts.get() > 100, "too few epochs to mean anything: " + firsts.get());
     }
 

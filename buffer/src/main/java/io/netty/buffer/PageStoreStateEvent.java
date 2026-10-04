@@ -143,15 +143,15 @@ final class PageStoreStateEvent extends Event {
                         long bytes = (slot - runStart) * sliceSize;
                         long start = event.base + runStart * sliceSize;
                         switch (runState) {
-                            case OUT:
+                            case Segment.OUT:
                                 event.outBytes += bytes;
                                 range(out, start, bytes);
                                 break;
-                            case COMMITTED:
+                            case Segment.COMMITTED_STATE:
                                 event.freeCommittedBytes += bytes;
                                 range(committed, start, bytes);
                                 break;
-                            case PURGED:
+                            case Segment.PURGED:
                                 event.purgedBytes += bytes;
                                 range(purged, start, bytes);
                                 break;
@@ -170,21 +170,8 @@ final class PageStoreStateEvent extends Event {
         }
     }
 
-    private static final int OUT = 0;
-    private static final int COMMITTED = 1;
-    private static final int PURGED = 2;
-    private static final int UNTOUCHED = 3;
-
     private static int sliceStateOf(Region region, int slice, int perBlock) {
-        Segment block = region.blocks[slice / perBlock];
-        int i = slice % perBlock;
-        if ((block.free & 1L << i) == 0) {
-            return OUT;
-        }
-        if ((block.committed & 1L << i) != 0) {
-            return COMMITTED;
-        }
-        return region.sliceEverCommitted[slice] ? PURGED : UNTOUCHED;
+        return region.blocks[slice / perBlock].sliceState(slice % perBlock);
     }
 
     private static void range(StringBuilder ranges, long start, long bytes) {

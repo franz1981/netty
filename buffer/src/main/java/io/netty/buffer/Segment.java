@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
@@ -56,18 +57,22 @@ final class Segment {
     final int slot;
     /** Per slice, slice owner only: the {@link System#nanoTime()} of its last release. */
     final long[] freedAt;
+    /** Per slice, slice owner only: whether it ever had memory behind it, so that free with none now was purged. */
+    final boolean[] everCommitted;
     /**
      * The bin of the first claim since the block was last wholly free (see {@link PageStore#binOf}), written by that
      * claim alone: its run is held until after the write, so the block cannot be wholly free again before it. A hint:
      * the claims that go by it check the bitmap.
      */
     volatile byte bin;
-    /** The chunk of every large-buffer span a stripe claimed in it. Set before its region is published. */
-    AdaptivePoolingAllocator.Chunk sharedSpans;
+    /** The chunk of every large-buffer span a stripe claimed in it. */
+    final AdaptivePoolingAllocator.Chunk sharedSpans;
     /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
-    AdaptivePoolingAllocator.Chunk threadLocalSpans;
+    final AdaptivePoolingAllocator.Chunk threadLocalSpans;
 
-    Segment(AbstractByteBuf buffer, int base, int size, int sliceSize, Region region, int slot) {
+    /** Every slice free; committed and freed at {@code committedAt} already if {@code committed} (charged whole). */
+    Segment(AbstractByteBuf buffer, int base, int size, int sliceSize, Region region, int slot,
+            boolean committed, long committedAt) {
         this.region = region;
         this.slot = slot;
         this.base = base;
@@ -79,6 +84,14 @@ final class Segment {
         allFree = slices == Long.SIZE ? -1L : (1L << slices) - 1;
         free = allFree;
         freedAt = new long[slices];
+        everCommitted = new boolean[slices];
+        if (committed) {
+            this.committed = allFree;
+            Arrays.fill(freedAt, committedAt);
+            Arrays.fill(everCommitted, true);
+        }
+        sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(this, region.store, false);
+        threadLocalSpans = new AdaptivePoolingAllocator.SharedSpanChunk(this, region.store, true);
     }
 
     /**
@@ -91,6 +104,16 @@ final class Segment {
             m &= m >>> 1;
         }
         return m == 0 ? -1 : Long.numberOfTrailingZeros(m);
+    }
+
+    /** Whether {@code free} has a run of {@code n} contiguous free slices. */
+    static boolean hasFit(long free, int n) {
+        return firstFit(free, n) >= 0;
+    }
+
+    /** Whether this block, as it is now, has a run of {@code n} contiguous free slices. */
+    boolean hasFit(int n) {
+        return hasFit(free, n);
     }
 
     private static long mask(int start, int n) {
@@ -190,13 +213,22 @@ final class Segment {
         }
     }
 
-    /** The caller's claimed slices of {@code bits} have memory behind them now. */
+    /** Of {@code bits}, those not committed yet. */
+    long fresh(long bits) {
+        return bits & ~committed;
+    }
+
+    /**
+     * The caller's claimed slices of {@code bits} have memory behind them now, marked {@link #everCommitted} for
+     * good. No other caller can own the same bits meanwhile.
+     */
     void commit(long bits) {
-        for (;;) {
-            long current = committed;
-            if (COMMITTED.compareAndSet(this, current, current | bits)) {
-                return;
-            }
+        long current;
+        do {
+            current = committed;
+        } while (!COMMITTED.compareAndSet(this, current, current | bits));
+        for (long b = bits; b != 0; b &= b - 1) {
+            everCommitted[Long.numberOfTrailingZeros(b)] = true;
         }
     }
 
@@ -210,7 +242,93 @@ final class Segment {
         }
     }
 
-    boolean isWhollyFree() {
+    /** Every slice still committed, as a count, and uncommitted: only once nothing else touches this block. */
+    int takeCommitted() {
+        int n = Long.bitCount(committed);
+        committed = 0;
+        return n;
+    }
+
+    /**
+     * Of {@code bits}, those committed, freed {@code delay} or more before {@code now}: {@code now - freedAt[i]} by
+     * subtraction, wraparound-safe as {@link System#nanoTime()} is.
+     */
+    long idleOf(long bits, long now, long delay) {
+        long idle = 0;
+        for (long b = bits & committed; b != 0; b &= b - 1) {
+            int slice = Long.numberOfTrailingZeros(b);
+            if (now - freedAt[slice] >= delay) {
+                idle |= 1L << slice;
+            }
+        }
+        return idle;
+    }
+
+    /** This block's free, committed slices freed {@code delay} or more before {@code now}: ready to purge. */
+    long purgeCandidates(long now, long delay) {
+        return idleOf(free, now, delay);
+    }
+
+    /** Of {@code bits}, those committed but not idle long enough yet, {@code delay} at {@code now}. */
+    long notIdle(long bits, long now, long delay) {
+        return bits & committed & ~idleOf(bits, now, delay);
+    }
+
+    /** This block's own free, committed slices not idle long enough yet, {@code delay} at {@code now}. */
+    long notYetIdle(long now, long delay) {
+        return notIdle(free, now, delay);
+    }
+
+    /** The longest, at {@code now}, any of {@code bits} has been free: {@code now - freedAt[i]}, maxed over bits. */
+    long longestWait(long bits, long now) {
+        long longest = Long.MIN_VALUE;
+        for (long b = bits; b != 0; b &= b - 1) {
+            longest = Math.max(longest, now - freedAt[Long.numberOfTrailingZeros(b)]);
+        }
+        return longest;
+    }
+
+    /** The shortest, at {@code now}, any slice of this block has been free: {@code now - freedAt[i]}, minimized. */
+    long shortestWait(long now) {
+        long shortest = Long.MAX_VALUE;
+        for (long freedAt : this.freedAt) {
+            shortest = Math.min(shortest, now - freedAt);
+        }
+        return shortest;
+    }
+
+    /** The start of this block in memory. */
+    long address() {
+        return buffer._memoryAddress() + base;
+    }
+
+    static final int OUT = 0;
+    static final int COMMITTED_STATE = 1;
+    static final int PURGED = 2;
+    static final int UNTOUCHED = 3;
+
+    /** Of slice {@code i}: claimed, free with memory behind it, purged since used, or never used. */
+    int sliceState(int i) {
+        long bit = 1L << i;
+        if ((free & bit) == 0) {
+            return OUT;
+        }
+        if ((committed & bit) != 0) {
+            return COMMITTED_STATE;
+        }
+        return everCommitted[i] ? PURGED : UNTOUCHED;
+    }
+
+    /** Adds this block's {claimed, free with memory behind, free without} slice counts to {@code counts}. Racy. */
+    void addSliceCounts(int[] counts) {
+        long free = this.free;
+        long committed = this.committed;
+        counts[0] += Long.bitCount(~free & allFree);
+        counts[1] += Long.bitCount(free & committed);
+        counts[2] += Long.bitCount(free & ~committed);
+    }
+
+    boolean isEmpty() {
         return free == allFree;
     }
 

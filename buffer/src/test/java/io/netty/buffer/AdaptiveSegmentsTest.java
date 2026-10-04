@@ -528,7 +528,7 @@ public class AdaptiveSegmentsTest {
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertFalse(segment.isWhollyFree(), "the spans go back at the next purge pass");
+        assertFalse(segment.isEmpty(), "the spans go back at the next purge pass");
         purge(allocator, System.nanoTime());
         assertEquals(0, allocator.pageStore.abandonedCount());
         assertEquals(0, source.segmentsLive());
