@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.NativeCallException;
 import jdk.jfr.Category;
 import jdk.jfr.DataAmount;
 import jdk.jfr.Description;
@@ -49,8 +50,24 @@ abstract class AbstractPageStoreEvent extends Event {
             e.address = address;
             e.length = length;
             e.region = region;
-            e.errno = failure == null ? 0 : MmapRegionSource.errnoOf(failure);
+            e.errno = failure == null ? 0 : errnoOf(failure);
             e.commit();
         }
+    }
+
+    /** The errno of the {@link NativeCallException} behind {@code failure}, or one it caused or suppressed; else -1. */
+    private static int errnoOf(Throwable failure) {
+        for (Throwable t = failure; t != null; t = t.getCause()) {
+            if (t instanceof NativeCallException) {
+                return ((NativeCallException) t).errno();
+            }
+            for (Throwable suppressed : t.getSuppressed()) {
+                int errno = errnoOf(suppressed);
+                if (errno != -1) {
+                    return errno;
+                }
+            }
+        }
+        return -1;
     }
 }

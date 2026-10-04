@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.NativeCallException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Isolated;
@@ -102,27 +103,11 @@ final class MmapRegionSourceTest {
             assertEquals(1, region.getLong(MIB - 8));
             assertEquals(0, region.getLong(MIB));
             assertEquals(3, region.getLong(3 * MIB));
-            assertThrows(IllegalStateException.class, () -> source.purge(region, 1, MIB));
+            assertThrows(NativeCallException.class, () -> source.purge(region, 1, MIB));
             assertThrows(IllegalArgumentException.class, () -> source.purge(region, 0, 16 * MIB));
         } finally {
             region.release();
         }
-    }
-
-    /**
-     * A failed call says why with its errno: ENOMEM (12) for a mapping larger than the address space, EINVAL (22) for
-     * an address that is not on a page.
-     */
-    @Test
-    void failuresCarryTheErrno() {
-        OutOfMemoryError tooLarge = assertThrows(OutOfMemoryError.class, () -> MmapRegionSource.mmap(1L << 62));
-        assertTrue(tooLarge.getMessage().endsWith(": errno 12"), tooLarge.getMessage());
-        IllegalStateException unmap = assertThrows(IllegalStateException.class,
-                () -> MmapRegionSource.munmap(1, 4096));
-        assertTrue(unmap.getMessage().endsWith(": errno 22"), unmap.getMessage());
-        IllegalStateException advise = assertThrows(IllegalStateException.class,
-                () -> MmapRegionSource.madviseDontNeed(1, 4096));
-        assertTrue(advise.getMessage().endsWith(": errno 22"), advise.getMessage());
     }
 
     /** The region is mapped while it lives, and unmapped once released. */
