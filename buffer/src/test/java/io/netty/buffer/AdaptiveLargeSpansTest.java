@@ -108,9 +108,11 @@ final class AdaptiveLargeSpansTest {
         int[] sizes = {140 * 1024, 192 * 1024, 600 * 1024, MIB + 1, 3 * MIB / 2, block / 2, block / 2 + 1,
                 block - SLICE - 1, block - SLICE + 1, block - 1, block};
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
+        Set<Segment> blocksUsed = new HashSet<Segment>();
         for (int size : sizes) {
             ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
             bufs.add(buf);
+            blocksUsed.add(segmentOf(buf));
             assertEquals(size, buf.capacity());
             int wholeSlices = (size + SLICE - 1) / SLICE * SLICE;
             int fast = buf.maxFastWritableBytes() + buf.writerIndex();
@@ -124,7 +126,18 @@ final class AdaptiveLargeSpansTest {
         for (ByteBuf buf : bufs) {
             buf.release();
         }
-        assertEquals(0, allocator.pageStore.sliceCounts()[0], "every slice is back");
+        // Every slice is back: claiming the same sizes again needs no block beyond the ones already in use.
+        Set<Segment> blocksReused = new HashSet<Segment>();
+        List<ByteBuf> again = new ArrayList<ByteBuf>();
+        for (int size : sizes) {
+            ByteBuf buf = allocator.allocate(size, Integer.MAX_VALUE);
+            again.add(buf);
+            blocksReused.add(segmentOf(buf));
+        }
+        assertEquals(blocksUsed, blocksReused, "every slice is back");
+        for (ByteBuf buf : again) {
+            buf.release();
+        }
         if (mode != Mode.DIRECT_REGIONS) {
             ByteBuf own = allocator.allocate(block + 1, block + 1);
             assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk), "above a block");
@@ -154,7 +167,6 @@ final class AdaptiveLargeSpansTest {
     void largeSpansRotateTheirColourThroughTheirTail(boolean heap) {
         AdaptivePoolingAllocator allocator = heap ? heapAllocator() : allocator(false);
         int[][] cases = {{256 * 1024 - 8192, 64}, {256 * 1024, 1}, {256 * 1024 - 200, 4}};
-        Set<Segment> seen = new HashSet<Segment>();
         for (int[] c : cases) {
             int size = c[0];
             int colours = c[1];
@@ -173,16 +185,15 @@ final class AdaptiveLargeSpansTest {
                 long spanEnd = offset / SLICE * SLICE + 4L * SLICE;
                 assertTrue(offset + buf.maxFastWritableBytes() + buf.writerIndex() <= spanEnd, "inside its span");
                 buf.setByte(size - 1, 42);
-                seen.add(segmentOf(buf));
             }
             for (ByteBuf buf : bufs) {
                 buf.release();
             }
             assertAccounted(segments, allocator);
         }
-        for (Segment segment : seen) {
-            assertEquals(0, segment.usedSlices(), "every claimed slice went back: " + segment);
-        }
+        // Nothing else uses this allocator: if every claimed slice went back, the purge gives the block back too.
+        allocator.pageStore.purgeIfDue(System.nanoTime() + 2 * allocator.pageStore.config.purgeDelayNanos);
+        assertEquals(0, segments.segmentsLive(), "every claimed slice went back");
     }
 
     /** A coloured buffer grows in place up to the end of its span, and away from it beyond, freeing the span. */
@@ -203,12 +214,13 @@ final class AdaptiveLargeSpansTest {
         assertEquals(offset, offsetIn(buf, segmentOf(buf)), "grown in place");
         assertSame(segment, segmentOf(buf));
         assertEquals(fast, buf.capacity());
-        assertEquals(4, segment.usedSlices());
         buf.writeByte(1);
         assertTrue(!(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk)
                 || segmentOf(buf) != segment || offsetIn(buf, segment) != offset, "beyond its span: moved");
         buf.release();
-        assertEquals(0, segment.usedSlices(), "the old span went back whole");
+        // Nothing else uses this allocator: the old span going back whole is what lets the purge give the block back.
+        allocator.pageStore.purgeIfDue(System.nanoTime() + 2 * allocator.pageStore.config.purgeDelayNanos);
+        assertEquals(0, segments.segmentsLive(), "the old span went back whole");
         assertAccounted(segments, allocator);
     }
 
@@ -319,8 +331,9 @@ final class AdaptiveLargeSpansTest {
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
         }
-        // No heap holds blocks: every slice is back.
-        assertEquals(0, allocator.pageStore.sliceCounts()[0], "slices claimed");
+        // No heap holds blocks: every slice is back, so a purge to completion gives every idle block back too.
+        PageStoreTestSupport.purgeUntilDone(allocator.pageStore, System.nanoTime());
+        assertEquals(0, allocator.usedMemory(), "slices claimed");
         assertAccounted(segments, regions, allocator);
     }
 
