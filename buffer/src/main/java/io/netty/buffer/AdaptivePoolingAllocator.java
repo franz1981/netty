@@ -2070,8 +2070,7 @@ final class AdaptivePoolingAllocator {
          * when it is on a queue, with one null check.
          */
         ChunkQueue queue;
-        // Links of the ChunkQueue this chunk is on, if any. nextInQueue also links an abandoned chunk in its
-        // store's stack (see PageStore#abandon), which it joins off every queue.
+        // Links of the ChunkQueue this chunk is on, if any.
         Chunk prevInQueue;
         Chunk nextInQueue;
         /**
@@ -2198,6 +2197,8 @@ final class AdaptivePoolingAllocator {
         private volatile long externalFree;
         /** {@code null} on a stripe, and once abandoned: see {@link #releaseOrAbandon}. */
         private Thread ownerThread;
+        /** Link of the store's abandoned-chunk stack, written only there (see {@code PageStore#abandon}). */
+        SizeClassedChunk nextAbandoned;
         /**
          * Snapshot behind {@link #remainingCapacity()}: bytes handed out since the last refresh from the free counts.
          * Segments returned since then are not subtracted, so {@code capacity - allocatedBytes} never counts a

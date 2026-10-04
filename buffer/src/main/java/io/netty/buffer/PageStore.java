@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.Chunk;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.logging.InternalLogger;
@@ -606,23 +605,31 @@ final class PageStore {
             } else {
                 allocator.storeBytesReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect());
             }
-            long address = region.buffer._memoryAddress();
-            Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
-                    PageStoreUnmapEvent.start() : null;
-            Throwable failure = null;
-            try {
-                if (region.source != null) {
-                    region.source.releaseRegion(region.buffer);
-                } else {
-                    region.buffer.release();
-                }
-            } catch (RuntimeException | Error e) {
-                failure = e;
-                throw e;
-            } finally {
-                if (event != null) {
-                    AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
-                }
+            releaseRegion(region);
+        }
+    }
+
+    /**
+     * {@code region}'s buffer goes back to its source, or releases itself with none; one JFR event. Shared by
+     * {@link #close()} and the purger's {@link #release(Region)}, both under this store's monitor.
+     */
+    private void releaseRegion(Region region) {
+        long address = region.buffer._memoryAddress();
+        Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
+                PageStoreUnmapEvent.start() : null;
+        Throwable failure = null;
+        try {
+            if (region.source != null) {
+                region.source.releaseRegion(region.buffer);
+            } else {
+                region.buffer.release();
+            }
+        } catch (RuntimeException | Error e) {
+            failure = e;
+            throw e;
+        } finally {
+            if (event != null) {
+                AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
             }
         }
     }
@@ -749,7 +756,7 @@ final class PageStore {
         SizeClassedChunk head;
         do {
             head = abandoned;
-            chunk.nextInQueue = head;
+            chunk.nextAbandoned = head;
         } while (!ABANDONED.compareAndSet(this, head, chunk));
         armPurge(System.nanoTime());
     }
@@ -771,11 +778,11 @@ final class PageStore {
     /** Purger: releases what it can of the chain from {@code chunk}, and returns the rest pushed on {@code kept}. */
     private static SizeClassedChunk keepWaiting(SizeClassedChunk chunk, SizeClassedChunk kept) {
         while (chunk != null) {
-            SizeClassedChunk next = (SizeClassedChunk) chunk.nextInQueue;
+            SizeClassedChunk next = chunk.nextAbandoned;
             if (chunk.releaseIfAllFree()) {
-                chunk.nextInQueue = null;
+                chunk.nextAbandoned = null;
             } else {
-                chunk.nextInQueue = kept;
+                chunk.nextAbandoned = kept;
                 kept = chunk;
             }
             chunk = next;
@@ -786,10 +793,10 @@ final class PageStore {
     // Visible for testing: racy, the chunks abandoned and not given back yet.
     int abandonedCount() {
         int count = 0;
-        for (Chunk c = abandoned; c != null; c = c.nextInQueue) {
+        for (SizeClassedChunk c = abandoned; c != null; c = c.nextAbandoned) {
             count++;
         }
-        for (Chunk c = waiting; c != null; c = c.nextInQueue) {
+        for (SizeClassedChunk c = waiting; c != null; c = c.nextAbandoned) {
             count++;
         }
         return count;
@@ -899,23 +906,10 @@ final class PageStore {
         if (closed) {
             return false;
         }
-        long address = region.buffer._memoryAddress();
         region.released = true;
-        allocator.storeBytesReleased(address, region.length, region.buffer.isDirect());
-        Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
-                PageStoreUnmapEvent.start() : null;
-        Throwable failure = null;
-        try {
-            region.buffer.release();
-            regionsReleased++;
-        } catch (RuntimeException | Error e) {
-            failure = e;
-            throw e;
-        } finally {
-            if (event != null) {
-                AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
-            }
-        }
+        allocator.storeBytesReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect());
+        releaseRegion(region);
+        regionsReleased++;
         return true;
     }
 
