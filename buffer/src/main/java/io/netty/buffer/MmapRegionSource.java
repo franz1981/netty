@@ -98,30 +98,12 @@ class MmapRegionSource {
     }
 
     /**
-     * {@code madvise(MADV_DONTNEED)} on {@code length} bytes of {@code region} from {@code offset}, whole pages: the
-     * kernel rejects an unaligned start but rounds a partial last page up, discarding the next page's data. One
-     * system call, and one TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
+     * {@code madvise(MADV_DONTNEED)} on {@code length} bytes from {@code address}, whole pages: the kernel rejects an
+     * unaligned start but rounds a partial last page up, discarding the next page's data. One system call, and one
+     * TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
      */
-    void purge(AbstractByteBuf region, int offset, int length) {
-        if (offset < 0 || length <= 0 || offset > region.capacity() - length) {
-            throw new IllegalArgumentException("offset: " + offset + ", length: " + length + " of "
-                    + region.capacity() + " bytes");
-        }
-        PlatformDependent.madviseDontNeed(mappingOf(region).address + offset, length);
-    }
-
-    /** An empty region, out of use for good, goes back. */
-    void releaseRegion(AbstractByteBuf region) {
-        region.release();
-    }
-
-    /** The start of {@code region}'s mapping. */
-    static long addressOf(AbstractByteBuf region) {
-        return mappingOf(region).address;
-    }
-
-    private static Mapping mappingOf(AbstractByteBuf region) {
-        return (Mapping) ((UnpooledDirectByteBuf) region).cleanable;
+    void purge(long address, int length) {
+        PlatformDependent.madviseDontNeed(address, length);
     }
 
     /** One region's mapping: {@link #clean()} unmaps it. */

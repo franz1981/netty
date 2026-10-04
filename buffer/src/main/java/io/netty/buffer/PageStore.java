@@ -230,7 +230,7 @@ final class PageStore {
         }
         // A region charged whole has memory behind all of it, free since now.
         Region region = new Region(this, buffer, mmap, slots, config, mmap == null, System.nanoTime(), index);
-        if (!region.purgesSlices) {
+        if (region.source == null) {
             // Charged by its allocation, counted whole from now on.
             allocator.memoryCommitted(buffer._memoryAddress(), size, buffer.isDirect(), true, threadLocal);
         }
@@ -252,7 +252,7 @@ final class PageStore {
         for (Segment block : region.blocks) {
             slicesReleased(block, block.free);
         }
-        if (!region.purgesSlices) {
+        if (region.source == null) {
             // Its free slices have memory behind them, all of them if the claim failed.
             armPurge(System.nanoTime());
         }
@@ -542,10 +542,7 @@ final class PageStore {
                     Segment block = region.blocks[first + slot];
                     block.releaseRun(0, block.slices, now);
                 }
-                for (int slot = committed + 1; slot < blocks; slot++) {
-                    Segment block = region.blocks[first + slot];
-                    block.unclaim(block.allFree);
-                }
+                region.unclaimBlocks(first + committed + 1, blocks - committed - 1);
                 armPurge(now);
             }
         }
@@ -623,29 +620,26 @@ final class PageStore {
             if (region.released) {
                 continue;
             }
-            if (region.purgesSlices) {
-                closeSlices(region);
-            } else {
-                allocator.memoryReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect(), true);
-            }
             releaseRegion(region);
         }
     }
 
     /**
-     * {@code region}'s buffer goes back to its source, or releases itself with none; one JFR event. Shared by
-     * {@link #close()} and the purger's {@link #release(Region)}, both under this store's monitor.
+     * Credits {@code region}'s committed slices back, and its buffer goes to {@link Region#release()}; one JFR
+     * event. Shared by {@link #close()} and the purger's {@link #releaseIdleRegion}, both under this store's
+     * monitor.
      */
     private void releaseRegion(Region region) {
+        if (region.source != null) {
+            closeSlices(region);
+        } else {
+            allocator.memoryReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect(), true);
+        }
         long address = region.buffer._memoryAddress();
         AbstractPageStoreEvent event = PageStoreEvents.beginUnmap();
         Throwable failure = null;
         try {
-            if (region.source != null) {
-                region.source.releaseRegion(region.buffer);
-            } else {
-                region.buffer.release();
-            }
+            region.release();
         } catch (RuntimeException | Error e) {
             failure = e;
             throw e;
@@ -750,9 +744,9 @@ final class PageStore {
             Region region = regions[index];
             int start = k == 0 ? from : 0;
             // A region given back whole is visited once, as its first block.
-            int end = Math.min(k < count ? region.slots : from, region.purgesSlices ? region.slots : 1);
+            int end = Math.min(k < count ? region.slots : from, region.source != null ? region.slots : 1);
             for (int slot = start; slot < end && !region.released; slot++) {
-                budget -= region.purgesSlices ? purgeBlock(region.blocks[slot], now, budget) :
+                budget -= region.source != null ? purgeBlock(region.blocks[slot], now, budget) :
                         releaseIfIdle(region, now);
                 if (budget <= 0) {
                     // This block may have more.
@@ -871,57 +865,27 @@ final class PageStore {
      */
     private long releaseIfIdle(Region region, long now) {
         long delay = config.purgeDelayNanos;
-        if (!regionIsEmpty(region)) {
+        if (!region.isEmpty()) {
             return 0;
         }
-        long waited = shortestWait(region, now);
+        long waited = region.shortestWait(now);
         if (waited < delay) {
             skip(waited);
             return 0;
         }
-        int claimed = 0;
-        while (claimed < region.slots && region.blocks[claimed].claimWhole()) {
-            claimed++;
-        }
-        if (claimed == region.slots && shortestWait(region, now) >= delay && release(region)) {
+        int claimed = region.claimAll();
+        if (claimed == region.slots && region.shortestWait(now) >= delay && releaseIdleRegion(region)) {
             return region.length;
         }
-        for (int slot = 0; slot < claimed; slot++) {
-            Segment block = region.blocks[slot];
-            block.unclaim(block.allFree);
-        }
+        region.unclaimBlocks(0, claimed);
         return 0;
     }
 
-    /** Racy: whether every slice of {@code region} is free. */
-    private static boolean regionIsEmpty(Region region) {
-        for (Segment block : region.blocks) {
-            if (!block.isEmpty()) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * How long, at {@code now}, the slice of {@code region} freed last has been free: the region is idle once this
-     * reaches the delay. Racy unless the caller claimed every block.
-     */
-    private static long shortestWait(Region region, long now) {
-        long shortest = Long.MAX_VALUE;
-        for (Segment block : region.blocks) {
-            shortest = Math.min(shortest, block.shortestWait(now));
-        }
-        return shortest;
-    }
-
     /** {@code region}, which the purger holds whole, goes back to its source, unless the store was closed. */
-    private synchronized boolean release(Region region) {
+    private synchronized boolean releaseIdleRegion(Region region) {
         if (closed) {
             return false;
         }
-        region.released = true;
-        allocator.memoryReleased(region.buffer._memoryAddress(), region.length, region.buffer.isDirect(), true);
         releaseRegion(region);
         regionsReleased++;
         return true;
@@ -936,19 +900,19 @@ final class PageStore {
         int sliceSize = block.sliceSize;
         int start = Long.numberOfTrailingZeros(bits);
         int n = Long.bitCount(bits);
-        int offset = block.slot * config.segmentSize + start * sliceSize;
+        long address = block.address() + start * sliceSize;
         int length = n * sliceSize;
         boolean purged = false;
         try {
             AbstractPageStoreEvent event = PageStoreEvents.beginPurge();
             Throwable failure = null;
             try {
-                region.source.purge(region.buffer, offset, length);
+                region.source.purge(address, length);
                 purged = true;
             } catch (Throwable t) {
                 failure = t;
             }
-            PageStoreEvents.end(event, block.address() + start * sliceSize, length, region.index, failure);
+            PageStoreEvents.end(event, address, length, region.index, failure);
             if (failure != null) {
                 purgeFailed(failure);
                 // Still purgeable: the next pass tries again.
@@ -963,7 +927,6 @@ final class PageStore {
                     bytesPurged += length;
                     slicesPurged += n;
                     PlatformDependent.decrementMemoryCounter(length);
-                    long address = block.address() + start * sliceSize;
                     allocator.memoryReleased(address, length, block.buffer.isDirect(), true);
                 }
             } finally {

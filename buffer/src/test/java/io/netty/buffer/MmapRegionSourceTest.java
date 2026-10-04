@@ -55,7 +55,7 @@ final class MmapRegionSourceTest {
     void regionsAreAlignedExactAndZero() {
         AbstractByteBuf region = source.allocateRegion(REGION_SIZE, ALIGNMENT);
         try {
-            long address = MmapRegionSource.addressOf(region);
+            long address = region._memoryAddress();
             assertEquals(0, address & ALIGNMENT - 1);
             assertEquals(REGION_SIZE, region.capacity());
             assertTrue(region.isDirect());
@@ -78,7 +78,7 @@ final class MmapRegionSourceTest {
                 region.setLong(offset, offset + 1L);
             }
             long touched = residentKiB();
-            source.purge(region, 0, REGION_SIZE);
+            source.purge(region._memoryAddress(), REGION_SIZE);
             long purged = residentKiB();
             long droppedKiB = touched - purged;
             assertTrue(droppedKiB >= REGION_SIZE / 1024 * 3 / 4,
@@ -91,20 +91,20 @@ final class MmapRegionSourceTest {
         }
     }
 
-    /** A purge of a part leaves the rest as it was; an out-of-bounds range is rejected, a misaligned address fails. */
+    /** A purge of a part leaves the rest as it was; a misaligned address fails. */
     @Test
     void purgeOfAPartLeavesTheRest() {
         AbstractByteBuf region = source.allocateRegion(8 * MIB, ALIGNMENT);
+        long address = region._memoryAddress();
         try {
             region.setLong(MIB - 8, 1);
             region.setLong(MIB, 2);
             region.setLong(3 * MIB, 3);
-            source.purge(region, MIB, 2 * MIB);
+            source.purge(address + MIB, 2 * MIB);
             assertEquals(1, region.getLong(MIB - 8));
             assertEquals(0, region.getLong(MIB));
             assertEquals(3, region.getLong(3 * MIB));
-            assertThrows(NativeCallException.class, () -> source.purge(region, 1, MIB));
-            assertThrows(IllegalArgumentException.class, () -> source.purge(region, 0, 16 * MIB));
+            assertThrows(NativeCallException.class, () -> source.purge(address + 1, MIB));
         } finally {
             region.release();
         }
@@ -114,7 +114,7 @@ final class MmapRegionSourceTest {
     @Test
     void releaseUnmaps() throws IOException {
         AbstractByteBuf region = source.allocateRegion(REGION_SIZE, ALIGNMENT);
-        long start = MmapRegionSource.addressOf(region);
+        long start = region._memoryAddress();
         long end = start + REGION_SIZE;
         assertTrue(mapped(start, end), "mapped while it lives");
         region.release();

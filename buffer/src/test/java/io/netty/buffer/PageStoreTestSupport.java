@@ -22,7 +22,6 @@ import io.netty.util.internal.PlatformDependent;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Consumer;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -141,11 +140,7 @@ final class PageStoreTestSupport {
      */
     static final class CountingRegionSource extends MmapRegionSource {
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
-        /** Regions given back, in call order. */
-        final List<AbstractByteBuf> released = new ArrayList<AbstractByteBuf>();
-        /** Runs inside each release, before it releases, when set. */
-        volatile Consumer<AbstractByteBuf> onRelease;
-        /** {offset, length} of each purge call, in call order. */
+        /** {offset, length} of each purge call, relative to the region it fell in, in call order. */
         final List<int[]> purges = new ArrayList<int[]>();
         /** Runs inside each purge call, before it purges, when set. */
         volatile Runnable onPurge;
@@ -164,27 +159,26 @@ final class PageStoreTestSupport {
         }
 
         @Override
-        void purge(AbstractByteBuf region, int offset, int length) {
+        void purge(long address, int length) {
             Runnable hook = onPurge;
             if (hook != null) {
                 hook.run();
             }
             synchronized (this) {
-                purges.add(new int[] {offset, length});
+                purges.add(new int[] {offsetInRegion(address), length});
             }
-            super.purge(region, offset, length);
+            super.purge(address, length);
         }
 
-        @Override
-        void releaseRegion(AbstractByteBuf region) {
-            Consumer<AbstractByteBuf> hook = onRelease;
-            if (hook != null) {
-                hook.accept(region);
+        /** The offset of {@code address} in whichever tracked region's mapping holds it. */
+        private synchronized int offsetInRegion(long address) {
+            for (AbstractByteBuf region : regions) {
+                long base = region._memoryAddress();
+                if (address >= base && address < base + region.capacity()) {
+                    return (int) (address - base);
+                }
             }
-            synchronized (this) {
-                released.add(region);
-            }
-            super.releaseRegion(region);
+            throw new AssertionError("purge address 0x" + Long.toHexString(address) + " is in no tracked region");
         }
 
         synchronized int purgeCalls() {
@@ -267,7 +261,7 @@ final class PageStoreTestSupport {
         long stored = 0;
         for (Region region : store.regions) {
             if (!region.released) {
-                stored += region.purgesSlices ? committedSlices(region) * (long) SLICE_SIZE_BYTES : region.length;
+                stored += region.source != null ? committedSlices(region) * (long) SLICE_SIZE_BYTES : region.length;
             }
         }
         assertEquals(segments.unreleasedChunkBytes() + stored, allocator.usedMemory(),

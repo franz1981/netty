@@ -24,13 +24,12 @@ package io.netty.buffer;
 final class Region {
     final PageStore store;
     final AbstractByteBuf buffer;
-    /** Where {@link #buffer} comes from, and goes back to; {@code null}: one plain block, goes back whole. */
-    final MmapRegionSource source;
     /**
-     * Whether {@link #source} purges idle free slices in place; else the region is charged and counted whole, and
+     * Where {@link #buffer} comes from, and goes back to; {@code null}: one plain block, goes back whole. Whether it
+     * purges idle free slices in place is {@code source != null}; else the region is charged and counted whole, and
      * goes back whole once idle.
      */
-    final boolean purgesSlices;
+    final MmapRegionSource source;
     final int slots;
     /** {@link #slots} blocks, in bytes. */
     final int length;
@@ -47,7 +46,6 @@ final class Region {
         this.store = store;
         this.buffer = buffer;
         this.source = source;
-        purgesSlices = source != null;
         this.slots = slots;
         this.index = index;
         int size = config.segmentSize;
@@ -83,14 +81,56 @@ final class Region {
             if (claimed == n) {
                 return first;
             }
-            for (int i = 0; i < claimed; i++) {
-                Segment block = blocks[first + i];
-                block.unclaim(block.allFree);
-            }
+            unclaimBlocks(first, claimed);
             store.armPurge(System.nanoTime());
             first += claimed + 1;
         }
         return -1;
+    }
+
+    /** Gives {@code n} blocks from {@code first}, claimed whole and never committed, back unclaimed. */
+    void unclaimBlocks(int first, int n) {
+        for (int i = first; i < first + n; i++) {
+            Segment block = blocks[i];
+            block.unclaim(block.allFree);
+        }
+    }
+
+    /** Claims every block whole, one CAS at a time; returns how many, stopping at the first already claimed. */
+    int claimAll() {
+        int claimed = 0;
+        while (claimed < slots && blocks[claimed].claimWhole()) {
+            claimed++;
+        }
+        return claimed;
+    }
+
+    /** Racy: whether every slice is free. */
+    boolean isEmpty() {
+        for (Segment block : blocks) {
+            if (!block.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * How long, at {@code now}, the slice freed last has been free: the region is idle once this reaches the purge
+     * delay. Racy unless the caller claimed every block.
+     */
+    long shortestWait(long now) {
+        long shortest = Long.MAX_VALUE;
+        for (Segment block : blocks) {
+            shortest = Math.min(shortest, block.shortestWait(now));
+        }
+        return shortest;
+    }
+
+    /** Marks the region released and gives its buffer back. */
+    void release() {
+        released = true;
+        buffer.release();
     }
 
     @Override

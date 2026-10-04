@@ -338,7 +338,7 @@ final class SharedSlicesTest {
         // malloc'd and byte[] regions are one block each, as the direct and heap allocators', with no region source
         // at all: the store falls back to one-block regions from the memory source directly.
         final CountingMemorySource segments = heap ? new CountingMemorySource(true) : this.segments;
-        final CheckingRegionSource source = mmap ? new CheckingRegionSource(regions, claimedIn, owners, failure) :
+        final CheckingRegionSource source = mmap ? new CheckingRegionSource(regions, owners, failure) :
                 null;
         final PageStore store;
         if (heap) {
@@ -542,16 +542,14 @@ final class SharedSlicesTest {
     /** Checks that no purged slice has an owner, then purges: {@code mmap} regions only. */
     private static final class CheckingRegionSource extends MmapRegionSource {
         private final CountingRegionSource delegate;
-        private final Set<Region> claimedIn;
         private final AtomicIntegerArray owners;
         private final AtomicReference<String> failure;
         volatile PageStore store;
 
-        CheckingRegionSource(CountingRegionSource delegate, Set<Region> claimedIn, AtomicIntegerArray owners,
+        CheckingRegionSource(CountingRegionSource delegate, AtomicIntegerArray owners,
                              AtomicReference<String> failure) {
             super(UnpooledByteBufAllocator.DEFAULT);
             this.delegate = delegate;
-            this.claimedIn = claimedIn;
             this.owners = owners;
             this.failure = failure;
         }
@@ -562,33 +560,26 @@ final class SharedSlicesTest {
         }
 
         @Override
-        void releaseRegion(AbstractByteBuf region) {
-            Region r = check(region, 0, REGION_SIZE, "given back");
-            if (r != null && !claimedIn.contains(r)) {
-                // Mapped for a claim, and given back before that claim had its run.
-                failure.compareAndSet(null, "region " + r.index + " given back before any claim had a run in it");
-            }
-            delegate.releaseRegion(region);
+        void purge(long address, int length) {
+            check(address, length, "purged");
+            delegate.purge(address, length);
         }
 
-        @Override
-        void purge(AbstractByteBuf region, int offset, int length) {
-            check(region, offset, length, "purged");
-            delegate.purge(region, offset, length);
-        }
-
-        /** The region of {@code region}, or {@code null} at the close. */
-        private Region check(AbstractByteBuf region, int offset, int length, String what) {
+        /** The region holding {@code address}, or {@code null} at the close. */
+        private Region check(long address, int length, String what) {
             Region found = null;
             for (Region r : store.regions) {
-                if (r.buffer == region) {
+                long base = r.buffer._memoryAddress();
+                if (address >= base && address < base + r.buffer.capacity()) {
                     found = r;
+                    break;
                 }
             }
             if (found == null) {
                 return null; // the close: nothing claims any more
             }
             int index = found.index;
+            int offset = (int) (address - found.buffer._memoryAddress());
             for (int s = offset / SLICE; s < (offset + length) / SLICE; s++) {
                 int owner = owners.get(index * PER_REGION + s);
                 if (owner != 0) {
