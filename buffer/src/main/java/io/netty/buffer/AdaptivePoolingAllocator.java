@@ -243,7 +243,7 @@ final class AdaptivePoolingAllocator {
             IS_LOW_MEM ? sizeClassIndexOf(LOW_MEM_MAX_SIZE_CLASS) + 1 : SIZE_CLASSES_COUNT;
 
     private final MemorySource memory;
-    private final ChunkRegistry chunkRegistry;
+    private final LongAdder usedMemory = new LongAdder();
     private final StripedHeap[] stripedHeaps;
     private volatile int stripeScanLength;
 
@@ -269,7 +269,6 @@ final class AdaptivePoolingAllocator {
         pageStore = new PageStore(this, config, memory, mmap);
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         this.memory = ObjectUtil.checkNotNull(memory, "memory");
-        chunkRegistry = new ChunkRegistry();
         pageSlices = pageSlices(pageStore.config);
         stripedHeaps = new StripedHeap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
@@ -596,7 +595,7 @@ final class AdaptivePoolingAllocator {
      * their memory never leaves the allocator.
      */
     long usedMemory() {
-        return chunkRegistry.totalCapacity();
+        return usedMemory.sum();
     }
 
     /**
@@ -606,29 +605,14 @@ final class AdaptivePoolingAllocator {
      * @param threadLocal whether the chunk belongs to a thread-local heap
      */
     void chunkBufferAllocated(ChunkInfo chunk, boolean pooled, boolean threadLocal) {
-        chunkRegistry.add(chunk.capacity());
-        if (PlatformDependent.isJfrEnabled() && AllocateChunkEvent.isEventEnabled()) {
-            AllocateChunkEvent event = new AllocateChunkEvent();
-            if (event.shouldCommit()) {
-                event.fill(chunk, AdaptiveByteBufAllocator.class);
-                event.pooled = pooled;
-                event.threadLocal = threadLocal;
-                event.commit();
-            }
-        }
+        usedMemory.add(chunk.capacity());
+        MemoryEvents.allocated(chunk.memoryAddress(), chunk.capacity(), chunk.isDirect(), pooled, threadLocal);
     }
 
     /** The chunk buffer behind {@code chunk} is about to be released back to {@link #memory} by its chunk. */
     void chunkBufferFreed(ChunkInfo chunk, boolean pooled) {
-        chunkRegistry.remove(chunk.capacity());
-        if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
-            FreeChunkEvent event = new FreeChunkEvent();
-            if (event.shouldCommit()) {
-                event.fill(chunk, AdaptiveByteBufAllocator.class);
-                event.pooled = pooled;
-                event.commit();
-            }
-        }
+        usedMemory.add(-chunk.capacity());
+        MemoryEvents.freed(chunk.memoryAddress(), chunk.capacity(), chunk.isDirect(), pooled);
     }
 
     /**
@@ -636,35 +620,14 @@ final class AdaptivePoolingAllocator {
      * {@link PageStore} just committed: allocates nothing unless a JFR event is committed.
      */
     void storeBytesCommitted(long address, int bytes, boolean direct, boolean threadLocal) {
-        chunkRegistry.add(bytes);
-        if (PlatformDependent.isJfrEnabled() && AllocateChunkEvent.isEventEnabled()) {
-            AllocateChunkEvent event = new AllocateChunkEvent();
-            if (event.shouldCommit()) {
-                event.allocatorType = AdaptiveByteBufAllocator.class;
-                event.capacity = bytes;
-                event.direct = direct;
-                event.address = address;
-                event.pooled = true;
-                event.threadLocal = threadLocal;
-                event.commit();
-            }
-        }
+        usedMemory.add(bytes);
+        MemoryEvents.allocated(address, bytes, direct, true, threadLocal);
     }
 
     /** As {@link #chunkBufferFreed}, for {@code bytes} of shared slices whose memory the {@link PageStore} purged. */
     void storeBytesReleased(long address, int bytes, boolean direct) {
-        chunkRegistry.remove(bytes);
-        if (PlatformDependent.isJfrEnabled() && FreeChunkEvent.isEventEnabled()) {
-            FreeChunkEvent event = new FreeChunkEvent();
-            if (event.shouldCommit()) {
-                event.allocatorType = AdaptiveByteBufAllocator.class;
-                event.capacity = bytes;
-                event.direct = direct;
-                event.address = address;
-                event.pooled = true;
-                event.commit();
-            }
-        }
+        usedMemory.add(-bytes);
+        MemoryEvents.freed(address, bytes, direct, true);
     }
 
     // Ensure that we release all previous pooled resources when this object is finalized. This is needed as otherwise
@@ -992,9 +955,27 @@ final class AdaptivePoolingAllocator {
      * that touches it.
      */
     static final class ChunkQueue {
-        Chunk head;
-        Chunk tail;
-        int size;
+        private Chunk head;
+        private Chunk tail;
+        private int size;
+
+        /** The head, or {@code null}; does not remove it. */
+        Chunk peek() {
+            return head;
+        }
+
+        /** Remove and return the head, or {@code null} when empty. */
+        Chunk pollFront() {
+            Chunk chunk = head;
+            if (chunk != null) {
+                remove(chunk);
+            }
+            return chunk;
+        }
+
+        int size() {
+            return size;
+        }
 
         void pushFront(Chunk chunk) {
             Chunk head = this.head;
@@ -1279,7 +1260,7 @@ final class AdaptivePoolingAllocator {
          * MiMallocByteBufAllocator.java lines 1745-1768).
          */
         private boolean atOrBelowFloor() {
-            return exhausted.size + reusable.size <= FLOOR;
+            return exhausted.size() + reusable.size() <= FLOOR;
         }
 
         /**
@@ -1315,11 +1296,7 @@ final class AdaptivePoolingAllocator {
 
         /** A chunk object given up earlier, or {@code null}: see {@link #idle}. */
         SizeClassedChunk takeIdle() {
-            SizeClassedChunk chunk = (SizeClassedChunk) idle.head;
-            if (chunk != null) {
-                idle.remove(chunk);
-            }
-            return chunk;
+            return (SizeClassedChunk) idle.pollFront();
         }
 
         // --- Notification queue: cross-thread segment returns that could not take the lock ---
@@ -1463,9 +1440,8 @@ final class AdaptivePoolingAllocator {
         private SizeClassedChunk pollChunkInternal() {
             // The magazine gives up its active chunk before it asks for another one.
             assert active == null : "poll with an active chunk";
-            SizeClassedChunk chunk = (SizeClassedChunk) reusable.head;
+            SizeClassedChunk chunk = (SizeClassedChunk) reusable.pollFront();
             if (chunk != null) {
-                reusable.remove(chunk);
                 return chunk;
             }
             return probeExhausted();
@@ -1490,7 +1466,7 @@ final class AdaptivePoolingAllocator {
          * the only kind that holds when nothing matches.
          */
         private SizeClassedChunk probeExhausted() {
-            SizeClassedChunk cur = (SizeClassedChunk) exhausted.head;
+            SizeClassedChunk cur = (SizeClassedChunk) exhausted.peek();
             int visited = 0;
             while (cur != null && visited < MAX_EXHAUSTED_PROBE) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
@@ -1516,7 +1492,7 @@ final class AdaptivePoolingAllocator {
          * floor, it may keep some, and the next {@link #offerChunk} above the floor looks again.
          */
         void evictAboveFloor() {
-            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.peek();
             while (cur != null) {
                 if (atOrBelowFloor()) {
                     return;
@@ -1536,7 +1512,7 @@ final class AdaptivePoolingAllocator {
          */
         void evictWhollyFree() {
             drainPending();
-            SizeClassedChunk cur = (SizeClassedChunk) reusable.head;
+            SizeClassedChunk cur = (SizeClassedChunk) reusable.peek();
             while (cur != null) {
                 SizeClassedChunk next = (SizeClassedChunk) cur.nextInQueue;
                 if (cur.hasFullCapacity()) {
@@ -1629,15 +1605,14 @@ final class AdaptivePoolingAllocator {
 
         private static void freeAll(ChunkQueue queue) {
             Chunk cur;
-            while ((cur = queue.head) != null) {
-                queue.remove(cur);
+            while ((cur = queue.pollFront()) != null) {
                 ((SizeClassedChunk) cur).releaseOrAbandon();
             }
         }
 
         // Visible for testing: no chunk linked on either list.
         boolean isEmpty() {
-            return exhausted.size + reusable.size == 0;
+            return exhausted.size() + reusable.size() == 0;
         }
     }
 
@@ -2009,7 +1984,6 @@ final class AdaptivePoolingAllocator {
      * Made with its region; nothing is queued, nothing is owned.
      */
     static final class SharedSpanChunk extends Chunk {
-        private final PageStore store;
         final Segment block;
         private final int sliceShift;
         private final boolean threadLocal;
@@ -2017,7 +1991,6 @@ final class AdaptivePoolingAllocator {
         /** @param threadLocal whether the heaps whose spans this chunk holds are thread-local ones, for JFR */
         SharedSpanChunk(Segment block, PageStore store, boolean threadLocal) {
             super(block.buffer, store.allocator, true, store.config.segmentSize);
-            this.store = store;
             this.block = block;
             this.threadLocal = threadLocal;
             assert (block.sliceSize & block.sliceSize - 1) == 0 : "slices of a power of two";
@@ -2040,22 +2013,6 @@ final class AdaptivePoolingAllocator {
         @Override
         public String toString() {
             return "SharedSpanChunk[" + block + ']';
-        }
-    }
-
-    private static final class ChunkRegistry {
-        private final LongAdder totalCapacity = new LongAdder();
-
-        public long totalCapacity() {
-            return totalCapacity.sum();
-        }
-
-        void add(int bytes) {
-            totalCapacity.add(bytes);
-        }
-
-        void remove(int bytes) {
-            totalCapacity.add(-bytes);
         }
     }
 
@@ -2084,7 +2041,8 @@ final class AdaptivePoolingAllocator {
         // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
         final AdaptivePoolingAllocator allocator;
         final int capacity;
-        private final boolean pooled;
+        /** Whether this chunk serves many buffers, or is a one-shot chunk for a single one: for the JFR events. */
+        final boolean pooled;
 
         Chunk() {
             // Constructor only used by the PendingChunks end marker.
@@ -2592,15 +2550,7 @@ final class AdaptivePoolingAllocator {
             rootParent = unwrapped;
             tmpNioBuf = null;
 
-            if (PlatformDependent.isJfrEnabled() && AllocateBufferEvent.isEventEnabled()) {
-                AllocateBufferEvent event = new AllocateBufferEvent();
-                if (event.shouldCommit()) {
-                    event.fill(this, AdaptiveByteBufAllocator.class);
-                    event.chunkPooled = wrapped.pooled;
-                    event.chunkThreadLocal = wrapped.inThreadLocalMagazine();
-                    event.commit();
-                }
-            }
+            BufferEvents.allocated(this, wrapped);
         }
 
         private AbstractByteBuf rootParent() {
@@ -2634,14 +2584,7 @@ final class AdaptivePoolingAllocator {
                 return this;
             }
 
-            if (PlatformDependent.isJfrEnabled() && ReallocateBufferEvent.isEventEnabled()) {
-                ReallocateBufferEvent event = new ReallocateBufferEvent();
-                if (event.shouldCommit()) {
-                    event.fill(this, AdaptiveByteBufAllocator.class);
-                    event.newCapacity = newCapacity;
-                    event.commit();
-                }
-            }
+            BufferEvents.reallocated(this, newCapacity);
 
             // Reallocation required.
             Chunk chunk = this.chunk;
@@ -3073,13 +3016,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         protected void deallocate() {
-            if (PlatformDependent.isJfrEnabled() && FreeBufferEvent.isEventEnabled()) {
-                FreeBufferEvent event = new FreeBufferEvent();
-                if (event.shouldCommit()) {
-                    event.fill(this, AdaptiveByteBufAllocator.class);
-                    event.commit();
-                }
-            }
+            BufferEvents.freed(this);
 
             if (chunk != null) {
                 chunk.releaseSegment(startIndex, maxFastCapacity);

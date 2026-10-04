@@ -88,7 +88,7 @@ public class ChunkReuseTest {
         held.add(allocator.allocate(SIZE, SIZE));
         final SizeClassedChunk chunk = chunkOf(held.get(0));
         final SizeClassedChunkCache cache = chunk.owningCache;
-        assertEquals(SizeClassedChunkCache.FLOOR + 1, cache.exhausted.size);
+        assertEquals(SizeClassedChunkCache.FLOOR + 1, cache.exhausted.size());
         for (int i = 1; i < segments; i++) {
             held.add(allocator.allocate(SIZE, SIZE));
         }
@@ -227,7 +227,7 @@ public class ChunkReuseTest {
                 for (ByteBuf buf : burst) {
                     buf.release();
                 }
-                assertTrue(cache.idle.size > 0, "round " + round + ": chunks given up to the idle list");
+                assertTrue(cache.idle.size() > 0, "round " + round + ": chunks given up to the idle list");
             }
             assertTrue(cache.chunksMade <= peak, cache.chunksMade + " chunk objects made, peak " + peak);
         });

@@ -31,8 +31,8 @@ final class PageStoreUnmapEvent extends AbstractPageStoreEvent {
         return INSTANCE.isEnabled();
     }
 
-    /** A begun event, as an {@link Object} so that callers need not name this class outside a guarded branch. */
-    static Object start() {
+    /** A begun event; see {@link PageStoreEvents}. */
+    static AbstractPageStoreEvent start() {
         PageStoreUnmapEvent event = new PageStoreUnmapEvent();
         event.begin();
         return event;

@@ -744,8 +744,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         /** The two emptied chunks left the cache, which keeps the ones still in use. */
         void assertNotesApplied(String when) {
             assertEquals(0, cache.pendingCount(), when + ": the notes must be applied");
-            assertEquals(0, cache.reusable.size, when);
-            assertEquals(NOTE_KEPT_CHUNKS, cache.exhausted.size, when + ": only the chunks still in use stay");
+            assertEquals(0, cache.reusable.size(), when);
+            assertEquals(NOTE_KEPT_CHUNKS, cache.exhausted.size(), when + ": only the chunks still in use stay");
         }
 
         void releaseRest() {
@@ -774,7 +774,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             (i < 2 * perChunk ? released : stillHeld).add(buf);
         }
         SizeClassedChunkCache cache = chunkOf(stillHeld.get(0)).owningCache;
-        assertEquals(chunks, cache.exhausted.size, "full chunks only");
+        assertEquals(chunks, cache.exhausted.size(), "full chunks only");
         underStripeLocks(allocator, sharedStripe, () -> {
             try {
                 Thread t = new Thread(() -> {
@@ -789,7 +789,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             }
         });
         assertEquals(2, cache.pendingCount(), "one note per emptied chunk");
-        assertEquals(chunks, cache.exhausted.size, "nothing applied the notes yet");
+        assertEquals(chunks, cache.exhausted.size(), "nothing applied the notes yet");
         return new IdleSizeClass(cache, stillHeld, chunkSize);
     }
 
@@ -1467,7 +1467,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // Every worker has been joined, so the lists are quiescent and safe to walk from here.
         for (SizeClassedChunkCache cache : sizeClassChunkCaches(allocator)) {
             int stranded = 0;
-            for (AdaptivePoolingAllocator.Chunk c = cache.exhausted.head; c != null; c = c.nextInQueue) {
+            for (AdaptivePoolingAllocator.Chunk c = cache.exhausted.peek(); c != null; c = c.nextInQueue) {
                 if (((SizeClassedChunk) c).hasRemainingCapacity()) {
                     stranded++;
                 }
@@ -1568,13 +1568,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 }
                 for (SizeClassedChunkCache cache : caches) {
                     assertEquals(0, cache.pendingCount(), "a note was left after the last drain");
-                    assertEquals(0, cache.exhausted.size, "every buffer is back: no chunk may stay exhausted");
-                    for (AdaptivePoolingAllocator.Chunk c = cache.reusable.head; c != null; c = c.nextInQueue) {
+                    assertEquals(0, cache.exhausted.size(), "every buffer is back: no chunk may stay exhausted");
+                    for (AdaptivePoolingAllocator.Chunk c = cache.reusable.peek(); c != null; c = c.nextInQueue) {
                         assertTrue(((SizeClassedChunk) c).hasFullCapacity(), "every buffer is back");
                     }
                     cache.tickPurge();
-                    assertTrue(cache.reusable.size <= SizeClassedChunkCache.FLOOR,
-                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size);
+                    assertTrue(cache.reusable.size() <= SizeClassedChunkCache.FLOOR,
+                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size());
                 }
             });
         });

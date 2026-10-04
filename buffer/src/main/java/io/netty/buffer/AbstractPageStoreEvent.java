@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.internal.NativeCallException;
 import jdk.jfr.Category;
 import jdk.jfr.DataAmount;
 import jdk.jfr.Description;
@@ -25,7 +24,7 @@ import jdk.jfr.MemoryAddress;
 
 /**
  * A system call of the adaptive allocator's {@link PageStore}: the event's duration is the call's. Begun before the
- * call, committed after.
+ * call, committed after; see {@link PageStoreEvents}.
  */
 @Enabled(false)
 @Category("Netty")
@@ -41,33 +40,4 @@ abstract class AbstractPageStoreEvent extends Event {
     public int region;
     @Description("errno of the failed call, 0 when it succeeded, -1 when it failed with no errno")
     public int errno;
-
-    /** {@code event} is one of this class, begun: fill and commit it. */
-    static void end(Object event, long address, long length, int region, Throwable failure) {
-        AbstractPageStoreEvent e = (AbstractPageStoreEvent) event;
-        e.end();
-        if (e.shouldCommit()) {
-            e.address = address;
-            e.length = length;
-            e.region = region;
-            e.errno = failure == null ? 0 : errnoOf(failure);
-            e.commit();
-        }
-    }
-
-    /** The errno of the {@link NativeCallException} behind {@code failure}, or one it caused or suppressed; else -1. */
-    private static int errnoOf(Throwable failure) {
-        for (Throwable t = failure; t != null; t = t.getCause()) {
-            if (t instanceof NativeCallException) {
-                return ((NativeCallException) t).errno();
-            }
-            for (Throwable suppressed : t.getSuppressed()) {
-                int errno = errnoOf(suppressed);
-                if (errno != -1) {
-                    return errno;
-                }
-            }
-        }
-        return -1;
-    }
 }

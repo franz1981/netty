@@ -206,14 +206,11 @@ final class PageStore {
         int slots = regionBlocks;
         int size = slots * config.segmentSize;
         AbstractByteBuf buffer;
-        Object event = PlatformDependent.isJfrEnabled() && PageStoreMapEvent.isEventEnabled() ?
-                PageStoreMapEvent.start() : null;
+        AbstractPageStoreEvent event = PageStoreEvents.beginMap();
         try {
             buffer = mmap != null ? mmap.allocateRegion(size, regionAlignment) : memory.allocate(size, size);
         } catch (OutOfMemoryError | RuntimeException e) {
-            if (event != null) {
-                AbstractPageStoreEvent.end(event, 0, size, seen.length, e);
-            }
+            PageStoreEvents.end(event, 0, size, seen.length, e);
             if (mmap == null || config.mallocRegionSize <= 0 || config.regionSize == config.mallocRegionSize) {
                 // A block (malloc, byte[]) that cannot be had, or the direct memory limit it is charged to: this
                 // allocation fails, the next region may well fit.
@@ -226,9 +223,7 @@ final class PageStore {
             return -1;
         }
         assert buffer.capacity() == size;
-        if (event != null) {
-            AbstractPageStoreEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
-        }
+        PageStoreEvents.end(event, buffer._memoryAddress(), size, seen.length, null);
         int index = 0;
         while (index < seen.length && !seen[index].released) {
             index++;
@@ -643,8 +638,7 @@ final class PageStore {
      */
     private void releaseRegion(Region region) {
         long address = region.buffer._memoryAddress();
-        Object event = PlatformDependent.isJfrEnabled() && PageStoreUnmapEvent.isEventEnabled() ?
-                PageStoreUnmapEvent.start() : null;
+        AbstractPageStoreEvent event = PageStoreEvents.beginUnmap();
         Throwable failure = null;
         try {
             if (region.source != null) {
@@ -656,9 +650,7 @@ final class PageStore {
             failure = e;
             throw e;
         } finally {
-            if (event != null) {
-                AbstractPageStoreEvent.end(event, address, region.length, region.index, failure);
-            }
+            PageStoreEvents.end(event, address, region.length, region.index, failure);
         }
     }
 
@@ -954,8 +946,7 @@ final class PageStore {
         int length = n * sliceSize;
         boolean purged = false;
         try {
-            Object event = PlatformDependent.isJfrEnabled() && PageStorePurgeEvent.isEventEnabled() ?
-                    PageStorePurgeEvent.start() : null;
+            AbstractPageStoreEvent event = PageStoreEvents.beginPurge();
             Throwable failure = null;
             try {
                 region.source.purge(region.buffer, offset, length);
@@ -963,10 +954,7 @@ final class PageStore {
             } catch (Throwable t) {
                 failure = t;
             }
-            if (event != null) {
-                AbstractPageStoreEvent.end(event, block.address() + start * sliceSize, length, region.index,
-                        failure);
-            }
+            PageStoreEvents.end(event, block.address() + start * sliceSize, length, region.index, failure);
             if (failure != null) {
                 purgeFailed(failure);
                 // Still purgeable: the next pass tries again.

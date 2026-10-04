@@ -78,8 +78,8 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(chunkWithoutCapacity());
         cache.offerChunk(chunkWithCapacity());
 
-        assertEquals(2, cache.reusable.size);
-        assertEquals(1, cache.exhausted.size);
+        assertEquals(2, cache.reusable.size());
+        assertEquals(1, cache.exhausted.size());
     }
 
     @Test
@@ -90,7 +90,7 @@ public class SizeClassedChunkCacheTest {
         for (int i = 0; i < 200; i++) {
             cache.offerChunk(chunkWithCapacity());
         }
-        assertEquals(200, cache.reusable.size);
+        assertEquals(200, cache.reusable.size());
     }
 
     // --- pollChunk: O(1) from reusable list ---
@@ -105,8 +105,8 @@ public class SizeClassedChunkCacheTest {
 
         SizeClassedChunk polled = cache.pollChunk();
         assertSame(cap, polled);
-        assertEquals(1, cache.exhausted.size);
-        assertEquals(0, cache.reusable.size);
+        assertEquals(1, cache.exhausted.size());
+        assertEquals(0, cache.reusable.size());
     }
 
     @Test
@@ -137,7 +137,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithoutCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        assertEquals(1, cache.exhausted.size);
+        assertEquals(1, cache.exhausted.size());
 
         // Simulate a cross-thread segment return that could not take the lock: the segment lands in
         // the external free list, and the releaser leaves a note.
@@ -145,7 +145,7 @@ public class SizeClassedChunkCacheTest {
         cache.notifyHasCapacity(chunk);
 
         assertSame(chunk, cache.pollChunk());
-        assertEquals(0, cache.exhausted.size);
+        assertEquals(0, cache.exhausted.size());
     }
 
     // A note pushed concurrently with the drain, or by a releaser that has claimed its link but not
@@ -161,7 +161,7 @@ public class SizeClassedChunkCacheTest {
         when(chunk.hasRemainingCapacity()).thenReturn(true);
 
         assertSame(chunk, cache.pollChunk(), "the probe must find a chunk with no pending note");
-        assertEquals(0, cache.exhausted.size);
+        assertEquals(0, cache.exhausted.size());
     }
 
     @Test
@@ -171,7 +171,7 @@ public class SizeClassedChunkCacheTest {
             cache.offerChunk(chunkWithoutCapacity());
         }
         assertNull(cache.pollChunk());
-        assertEquals(50, cache.exhausted.size);
+        assertEquals(50, cache.exhausted.size());
     }
 
     // --- forcePurge: drains notifications + returns reusable chunk ---
@@ -183,8 +183,8 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithoutCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        assertEquals(1, cache.exhausted.size);
-        assertEquals(0, cache.reusable.size);
+        assertEquals(1, cache.exhausted.size());
+        assertEquals(0, cache.reusable.size());
 
         // Simulate external return giving capacity
         when(chunk.hasRemainingCapacity()).thenReturn(true);
@@ -295,7 +295,7 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk active = chunkWithCapacity();
         cache.activate(active);
         assertSame(active, cache.active);
-        assertSame(older, cache.reusable.head);
+        assertSame(older, cache.reusable.peek());
         assertNull(active.queue);
         assertNull(active.nextInQueue);
         assertNull(active.prevInQueue);
@@ -307,14 +307,13 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(unfull);
         cache.moveToReusable(unfull);
 
-        assertSame(offered, cache.reusable.head);
+        assertSame(offered, cache.reusable.peek());
         assertNull(offered.prevInQueue);
         assertSame(older, offered.nextInQueue);
         assertSame(unfull, older.nextInQueue);
         assertNull(unfull.nextInQueue);
-        assertSame(unfull, cache.reusable.tail);
         assertNull(active.nextInQueue);
-        assertEquals(3, cache.reusable.size);
+        assertEquals(3, cache.reusable.size());
     }
 
     @Test
@@ -333,15 +332,12 @@ public class SizeClassedChunkCacheTest {
         cache.notifyHasCapacity(regained);
         cache.drainPending();
         assertSame(cache.reusable, regained.queue);
-        assertSame(regained, cache.reusable.tail);
 
-        // The polls take the chunks filed before it first.
+        // The polls take the chunks filed before it first: regained joined at the back.
         assertSame(first, cache.pollChunk());
         assertSame(second, cache.pollChunk());
         assertSame(regained, cache.pollChunk());
         assertNull(cache.pollChunk());
-        assertNull(cache.reusable.head);
-        assertNull(cache.reusable.tail);
     }
 
     @Test
@@ -350,24 +346,26 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk a = chunkWithCapacity();
         SizeClassedChunk b = chunkWithCapacity();
         SizeClassedChunk c = chunkWithCapacity();
+        SizeClassedChunk d = chunkWithCapacity();
         queue.pushBack(b);
         queue.pushFront(a);
         queue.pushBack(c);
-        assertSame(a, queue.head);
-        assertSame(c, queue.tail);
         queue.remove(c);
-        assertSame(b, queue.tail);
-        assertNull(b.nextInQueue);
-        queue.remove(a);
-        assertSame(b, queue.head);
-        assertSame(b, queue.tail);
-        queue.remove(b);
-        assertNull(queue.head);
-        assertNull(queue.tail);
-        assertEquals(0, queue.size);
+        // The tail followed the removal of c: a pushBack now lands right after b, not lost.
+        queue.pushBack(d);
+        assertSame(a, queue.pollFront());
+        assertSame(b, queue.pollFront());
+        assertSame(d, queue.pollFront());
+        assertNull(queue.pollFront());
+        assertEquals(0, queue.size());
+
+        // Removing the only chunk clears both ends too: the next push starts a fresh queue.
         queue.pushBack(a);
-        assertSame(a, queue.head);
-        assertSame(a, queue.tail);
+        queue.remove(a);
+        assertEquals(0, queue.size());
+        queue.pushBack(b);
+        assertSame(b, queue.pollFront());
+        assertNull(queue.pollFront());
     }
 
     @Test
@@ -434,11 +432,11 @@ public class SizeClassedChunkCacheTest {
 
         assertNull(cache.active);
         assertSame(cache.exhausted, active.queue);
-        assertSame(active, cache.exhausted.head);
-        assertSame(other, cache.reusable.head);
+        assertSame(active, cache.exhausted.peek());
+        assertSame(other, cache.reusable.peek());
         assertNull(other.prevInQueue);
-        assertEquals(1, cache.reusable.size);
-        assertEquals(1, cache.exhausted.size);
+        assertEquals(1, cache.reusable.size());
+        assertEquals(1, cache.exhausted.size());
         // The next reusable head becomes the next active chunk.
         assertSame(other, cache.pollChunk());
     }
@@ -496,8 +494,8 @@ public class SizeClassedChunkCacheTest {
         cache.drainPending();
         assertSame(cache.reusable, active.queue,
                 "the drain must move the chunk back to reusable");
-        assertSame(active, cache.reusable.head);
-        assertEquals(0, cache.exhausted.size);
+        assertSame(active, cache.reusable.peek());
+        assertEquals(0, cache.exhausted.size());
     }
 
     // --- Signal A: exhausted → reusable via releaseSegment ---
@@ -508,15 +506,15 @@ public class SizeClassedChunkCacheTest {
 
         SizeClassedChunk chunk = chunkWithoutCapacity();
         cache.offerChunk(chunk);
-        assertEquals(1, cache.exhausted.size);
-        assertEquals(0, cache.reusable.size);
+        assertEquals(1, cache.exhausted.size());
+        assertEquals(0, cache.reusable.size());
         assertSame(cache.exhausted, chunk.queue);
 
         // Simulate Signal A: inline call from releaseSegment
         cache.moveToReusable(chunk);
 
-        assertEquals(0, cache.exhausted.size);
-        assertEquals(1, cache.reusable.size);
+        assertEquals(0, cache.exhausted.size());
+        assertEquals(1, cache.reusable.size());
         assertSame(cache.reusable, chunk.queue);
     }
 
@@ -533,13 +531,13 @@ public class SizeClassedChunkCacheTest {
 
         SizeClassedChunk chunk = chunkWithCapacity();
         cache.offerChunk(chunk);
-        int countBefore = cache.reusable.size;
+        int countBefore = cache.reusable.size();
 
         // Simulate Signal B: its last segment came back, it is fully free, above floor → evict
         when(chunk.hasFullCapacity()).thenReturn(true);
         cache.evictIfAboveFloor(chunk);
 
-        assertEquals(countBefore - 1, cache.reusable.size);
+        assertEquals(countBefore - 1, cache.reusable.size());
         verify(chunk).releaseSpan();
     }
 
@@ -554,7 +552,7 @@ public class SizeClassedChunkCacheTest {
         cache.evictIfAboveFloor(chunk);
 
         // Chunk stays in reusable list
-        assertEquals(1, cache.reusable.size);
+        assertEquals(1, cache.reusable.size());
         verify(chunk, never()).releaseSpan();
     }
 
@@ -578,7 +576,7 @@ public class SizeClassedChunkCacheTest {
         }
 
         assertEquals(2, drained);
-        assertEquals(2, cache.exhausted.size);
+        assertEquals(2, cache.exhausted.size());
     }
 
     // --- Bounded probing: a poll may glance at the exhausted list, but never walk it ---
@@ -660,8 +658,8 @@ public class SizeClassedChunkCacheTest {
 
         cache.drainPending();
         assertEquals(0, cache.pendingCount());
-        assertEquals(0, cache.exhausted.size);
-        assertEquals(1, cache.reusable.size);
+        assertEquals(0, cache.exhausted.size());
+        assertEquals(1, cache.reusable.size());
     }
 
     @Test
@@ -699,14 +697,14 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithoutCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        assertEquals(1, cache.exhausted.size);
+        assertEquals(1, cache.exhausted.size());
 
         when(chunk.hasRemainingCapacity()).thenReturn(true);
         cache.notifyHasCapacity(chunk);
         cache.drainPending();
 
-        assertEquals(0, cache.exhausted.size);
-        assertEquals(1, cache.reusable.size);
+        assertEquals(0, cache.exhausted.size());
+        assertEquals(1, cache.reusable.size());
         assertSame(cache.reusable, chunk.queue);
         assertNull(chunk.pendingNext);
     }
@@ -722,14 +720,14 @@ public class SizeClassedChunkCacheTest {
         SizeClassedChunk chunk = chunkWithCapacity();
         when(chunk.owningCache()).thenReturn(cache);
         cache.offerChunk(chunk);
-        int countBefore = cache.reusable.size;
+        int countBefore = cache.reusable.size();
 
         // Last outstanding segment comes back on a foreign thread.
         when(chunk.hasFullCapacity()).thenReturn(true);
         cache.notifyHasCapacity(chunk);
         cache.drainPending();
 
-        assertEquals(countBefore - 1, cache.reusable.size);
+        assertEquals(countBefore - 1, cache.reusable.size());
         assertSame(cache.idle, chunk.queue, "given up: its object waits idle for the next chunk");
         verify(chunk).releaseSpan();
     }
@@ -791,8 +789,8 @@ public class SizeClassedChunkCacheTest {
         assertSame(chunk, cache.pollChunk());
         assertNull(chunk.queue);
         assertEquals(0, cache.pendingCount());
-        assertEquals(0, cache.exhausted.size);
-        assertEquals(0, cache.reusable.size);
+        assertEquals(0, cache.exhausted.size());
+        assertEquals(0, cache.reusable.size());
     }
 
     @Test
@@ -833,7 +831,7 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(chunkWithoutCapacity());
         verify(kept).releaseSpan();
         assertSame(cache.idle, kept.queue);
-        assertEquals(RETENTION_FLOOR, cache.exhausted.size + cache.reusable.size);
+        assertEquals(RETENTION_FLOOR, cache.exhausted.size() + cache.reusable.size());
     }
 
     @Test
@@ -895,7 +893,7 @@ public class SizeClassedChunkCacheTest {
                     .filter(inv -> "releaseSpan".equals(inv.getMethod().getName())).count();
         }
         assertEquals(1, released);
-        assertEquals(RETENTION_FLOOR, cache.exhausted.size + cache.reusable.size);
+        assertEquals(RETENTION_FLOOR, cache.exhausted.size() + cache.reusable.size());
 
         // Every further offer above the floor gives up one more of them.
         for (int i = 1; i < RETENTION_FLOOR; i++) {
@@ -904,8 +902,8 @@ public class SizeClassedChunkCacheTest {
         for (SizeClassedChunk c : kept) {
             verify(c).releaseSpan();
         }
-        assertEquals(0, cache.reusable.size);
-        assertEquals(RETENTION_FLOOR, cache.exhausted.size);
+        assertEquals(0, cache.reusable.size());
+        assertEquals(RETENTION_FLOOR, cache.exhausted.size());
     }
 
     @Test
@@ -915,6 +913,6 @@ public class SizeClassedChunkCacheTest {
         cache.offerChunk(kept);
         cache.evictWhollyFree();
         verify(kept).releaseSpan();
-        assertEquals(0, cache.reusable.size);
+        assertEquals(0, cache.reusable.size());
     }
 }
