@@ -34,7 +34,7 @@ final class Segment {
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
     private static final AtomicLongFieldUpdater<Segment> COMMITTED =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "committed");
-    /** Set in what {@link #claimRun} returns when the block was wholly free: the claim labelled it. */
+    /** Set in what {@link #claimRun} returns when the block was empty: the claim labelled it. */
     static final int FIRST = 1 << 8;
     /** The first slice of a run, in what {@link #claimRun} returns. */
     static final int START = Long.SIZE - 1;
@@ -60,8 +60,8 @@ final class Segment {
     /** Per slice, slice owner only: whether it ever had memory behind it, so that free with none now was purged. */
     final boolean[] everCommitted;
     /**
-     * The bin of the first claim since the block was last wholly free (see {@link PageStore#binOf}), written by that
-     * claim alone: its run is held until after the write, so the block cannot be wholly free again before it. A hint:
+     * The bin of the first claim since the block was last empty (see {@link PageStore#binOf}), written by that
+     * claim alone: its run is held until after the write, so the block cannot be empty again before it. A hint:
      * the claims that go by it check the bitmap.
      */
     volatile byte bin;
@@ -128,7 +128,7 @@ final class Segment {
 
     /**
      * Any thread: claims the lowest run of {@code n} free slices, for a claim of {@code bin}. Returns its first slice,
-     * with {@link #FIRST} set if the block was wholly free, which labels it {@code bin}; or -1.
+     * with {@link #FIRST} set if the block was empty, which labels it {@code bin}; or -1.
      */
     int claimRun(int n, int bin) {
         if (n == slices) {
@@ -156,7 +156,7 @@ final class Segment {
 
     /**
      * Any thread: claims the first {@code n} slices if every slice is free, and labels the block {@code bin}, as the
-     * first claim since it was wholly free.
+     * first claim since it was empty.
      */
     boolean claimFirst(int n, int bin) {
         if (!FREE.compareAndSet(this, allFree, allFree & ~bits(0, n))) {
@@ -192,22 +192,22 @@ final class Segment {
         for (int i = start; i < start + n; i++) {
             freedAt[i] = now;
         }
-        giveBack(bits(start, n));
+        unclaim(bits(start, n));
         region.store.armPurge(now);
     }
 
     /**
      * The slices of {@code bits}, which the caller claimed, are free again, unstamped, and the store's maps show it
-     * (see {@link PageStore#freed}).
+     * (see {@link PageStore#slicesReleased}).
      */
-    void giveBack(long bits) {
+    void unclaim(long bits) {
         for (;;) {
             long current = free;
             if ((current & bits) != 0) {
                 throw new IllegalStateException("slices " + Long.toHexString(current & bits) + " are already free");
             }
             if (FREE.compareAndSet(this, current, current | bits)) {
-                region.store.freed(this, current | bits);
+                region.store.slicesReleased(this, current | bits);
                 return;
             }
         }

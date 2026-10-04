@@ -110,7 +110,7 @@ class MmapRegionSource {
         PlatformDependent.madviseDontNeed(mappingOf(region).address + offset, length);
     }
 
-    /** A wholly free region, out of use for good, goes back. */
+    /** An empty region, out of use for good, goes back. */
     void releaseRegion(AbstractByteBuf region) {
         region.release();
     }

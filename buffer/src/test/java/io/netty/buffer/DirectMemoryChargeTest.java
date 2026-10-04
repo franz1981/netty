@@ -150,7 +150,7 @@ final class DirectMemoryChargeTest {
         long run = store.claimSlices(9, false);
         assertEquals(SEGMENT_SIZE, allocator.usedMemory(), "the region, whole");
         assertChargedAtMost(base, SEGMENT_SIZE, "the region, whole");
-        store.takeRun(1); // a second region, whole: one block each
+        store.claimBlocks(1); // a second region, whole: one block each
         assertEquals(2L * SEGMENT_SIZE, allocator.usedMemory());
         store.regions[0].blocks[0].releaseRun(0, 9, System.nanoTime());
         assertEquals((int) run, (int) store.claimSlices(9, false));

@@ -184,7 +184,7 @@ final class PageStoreTest {
         assertEquals(2, calls[0], "never tried again");
         assertEquals(3, store.regionCount());
         assertEquals(2, segments.segmentsAllocated(), "the two one-block regions, from memory.allocate");
-        assertEquals(-1, store.takeRun(2), "new regions hold one block");
+        assertEquals(-1, store.claimBlocks(2), "new regions hold one block");
         assertSharedAccounted(segments, allocator);
         for (Segment block : new Segment[] {first, second}) {
             block.releaseRun(0, SPAN, System.nanoTime());

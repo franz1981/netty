@@ -61,9 +61,9 @@ final class SharedSlicePurgeRaceTest {
         final PageStore store = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL)).pageStore;
         int blocks = REGION_SIZE / SEGMENT_SIZE;
         int purgedBlock = (blocks - 1) * PER_BLOCK;
-        assertEquals(0, (int) store.takeRun(blocks), "the whole region");
+        assertEquals(0, (int) store.claimBlocks(blocks), "the whole region");
         Region region = store.regions[0];
-        store.freeRun(region, blocks - 1, 1); // the last block is the only free memory
+        store.releaseBlocks(region, blocks - 1, 1); // the last block is the only free memory
         final CountDownLatch purging = new CountDownLatch(1);
         final AtomicBoolean claimed = new AtomicBoolean();
         final AtomicReference<String> failure = new AtomicReference<String>();

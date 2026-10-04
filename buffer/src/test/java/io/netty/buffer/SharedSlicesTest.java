@@ -260,17 +260,17 @@ final class SharedSlicesTest {
     @Test
     void wholeBlocksSkipBlocksInUse() {
         PageStore store = store(INTERVAL);
-        long first = store.takeRun(2);
+        long first = store.claimBlocks(2);
         assertEquals(0, store.firstBlock(first));
         assertEquals(2 * PER_BLOCK, slice(store.claimSlices(1, false)), "blocks 0 and 1 are taken");
-        long second = store.takeRun(2);
+        long second = store.claimBlocks(2);
         assertEquals(3, store.firstBlock(second), "block 2 has a slice claimed");
-        assertEquals(5, store.firstBlock(store.takeRun(1)));
+        assertEquals(5, store.firstBlock(store.claimBlocks(1)));
         Region region = store.regions[0];
-        store.freeRun(region, 0, 2);
-        assertEquals(0, store.firstBlock(store.takeRun(2)), "free again");
-        store.freeRun(region, 5, 1);
-        assertEquals(5, store.firstBlock(store.takeRun(1)));
+        store.releaseBlocks(region, 0, 2);
+        assertEquals(0, store.firstBlock(store.claimBlocks(2)), "free again");
+        store.releaseBlocks(region, 5, 1);
+        assertEquals(5, store.firstBlock(store.claimBlocks(1)));
         // Blocks 0, 1, 3, 4 and 5, and a slice of block 2.
         assertArrayEquals(new int[] {5 * PER_BLOCK + 1, 0, PER_REGION - 5 * PER_BLOCK - 1}, store.sliceCounts());
     }
@@ -491,7 +491,7 @@ final class SharedSlicesTest {
             int[] run;
             if (random.nextInt(16) == 0) {
                 int blocks = 1 + random.nextInt(Math.min(2, store.config.segmentsPerRegion()));
-                long taken = store.takeRun(blocks);
+                long taken = store.claimBlocks(blocks);
                 assertTrue(taken >= 0);
                 run = new int[] {(int) (taken >>> 32), (int) taken, blocks * perBlock, 1};
             } else {
@@ -532,7 +532,7 @@ final class SharedSlicesTest {
             }
             Region region = store.regions[run[0]];
             if (run[3] == 1) {
-                store.freeRun(region, run[1] / perBlock, run[2] / perBlock);
+                store.releaseBlocks(region, run[1] / perBlock, run[2] / perBlock);
             } else {
                 region.blocks[run[1] / perBlock].releaseRun(run[1] % perBlock, run[2], System.nanoTime());
             }

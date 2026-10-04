@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * mimalloc v3 claims a page's slices straight from its arena's bitmap
  * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
  * Claims of one run length share blocks ({@link #binOf}), found through bitmaps over the blocks ({@link #maps}).
- * A buffer above a block takes a run of whole blocks ({@link #takeRun}). A new region is added under
+ * A buffer above a block takes a run of whole blocks ({@link #claimBlocks}). A new region is added under
  * this store's monitor, the only lock, when no block has a fit, and the claim that added it takes its run there
  * before any other thread sees the region.
  * <p>
@@ -89,17 +89,17 @@ final class PageStore {
      * {@link #otherBin}, whose claims have many lengths.
      */
     final int[] binSlices;
-    /** The map of the wholly free blocks in {@link #maps}, after one per bin. */
+    /** The map of the empty blocks in {@link #maps}, after one per bin. */
     final int emptyMap;
     /** A block's id is its region's index shifted by this, or its slot: a region's blocks have consecutive ids. */
     private final int idShift;
     /**
      * Bitmaps over the block ids, {@code emptyMap + 1} of them, each {@code maps.length() / (emptyMap + 1)} words,
      * one after the other: per bin, a bit set when a block of that bin has a free run of the bin's length; and the
-     * wholly free blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
-     * its block now earns ({@link #freed}); a claim that finds a block without the fit its bit stood for clears it,
-     * then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}). As mimalloc v3's
-     * {@code chunkmap} and {@code chunkmap_bins} over its bitmap chunks
+     * empty blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
+     * its block now earns ({@link #slicesReleased}); a claim that finds a block without the fit its bit stood for
+     * clears it, then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}). As
+     * mimalloc v3's {@code chunkmap} and {@code chunkmap_bins} over its bitmap chunks
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L261-L270). Replaced by a larger copy under
      * this store's monitor ({@link #growMaps}).
      */
@@ -189,11 +189,11 @@ final class PageStore {
     /**
      * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
      * allocation for a region of one block. Claims the caller's run in it before publishing it: {@code blocks} whole
-     * blocks, or if 0, {@code slices} slices of its first block. Published wholly free, a region could be given back
+     * blocks, or if 0, {@code slices} slices of its first block. Published empty, a region could be given back
      * by the purger, idle, before the claim that mapped it scanned it, and the claim map another: with a short purge
-     * delay, without end. Returns the run as {@link #claimSlices} and {@link #takeRun} encode theirs, not committed,
-     * or -1 for the caller to scan again: a region was added meanwhile, the run does not fit a new region, or a region
-     * cannot be had and this gave up {@link #mmap} for good.
+     * delay, without end. Returns the run as {@link #claimSlices} and {@link #claimBlocks} encode theirs, not
+     * committed, or -1 for the caller to scan again: a region was added meanwhile, the run does not fit a new
+     * region, or a region cannot be had and this gave up {@link #mmap} for good.
      */
     private synchronized long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
         if (closed) {
@@ -250,7 +250,7 @@ final class PageStore {
         grown[index] = region;
         regions = grown;
         for (Segment block : region.blocks) {
-            freed(block, block.free);
+            slicesReleased(block, block.free);
         }
         if (!region.purgesSlices) {
             // Its free slices have memory behind them, all of them if the claim failed.
@@ -263,7 +263,7 @@ final class PageStore {
      * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: the lowest
      * fit (first fit, as {@code mi_bchunk_try_find_and_clearNX},
      * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849) in the lowest block of its bin that
-     * has one, else the lowest wholly free block, which takes its bin, else a new region (see {@link #addRegion}).
+     * has one, else the lowest empty block, which takes its bin, else a new region (see {@link #addRegion}).
      * Lowest first, so that the highest blocks drain and go back. As mimalloc v3's
      * {@code mi_bbitmap_try_find_and_clear_generic}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884), minus its other bins and its
@@ -319,7 +319,7 @@ final class PageStore {
         return -1;
     }
 
-    /** The first {@code n} slices of the lowest wholly free block {@link #maps} shows, for {@code bin}, or -1. */
+    /** The first {@code n} slices of the lowest empty block {@link #maps} shows, for {@code bin}, or -1. */
     private long claimEmpty(Region[] regions, int bin, int n) {
         AtomicLongArray maps = this.maps;
         int words = wordsPerMap(maps);
@@ -342,12 +342,12 @@ final class PageStore {
 
     /**
      * After a claim of {@code bin} in {@code block} that returned {@code claimed} (see {@link Segment#claimRun}): the
-     * maps show the block as it now is to the claims of its bin, and as not wholly free if it was. Returns the run as
+     * maps show the block as it now is to the claims of its bin, and as not empty if it was. Returns the run as
      * {@link #claimSlices} does.
      */
     private long claimed(Segment block, int id, int bin, int claimed) {
         if ((claimed & Segment.FIRST) != 0) {
-            // This claim holds its run: the block cannot be wholly free again before the bit is clear.
+            // This claim holds its run: the block cannot be empty again before the bit is clear.
             clear(emptyMap, id);
         }
         if (block.hasFit(binSlices[bin])) {
@@ -360,9 +360,9 @@ final class PageStore {
 
     /**
      * Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit the block now earns, if
-     * not set, wholly free or a fit for its bin.
+     * not set, empty or a fit for its bin.
      */
-    void freed(Segment block, long free) {
+    void slicesReleased(Segment block, long free) {
         int id = id(block);
         if (free == block.allFree) {
             mark(emptyMap, id);
@@ -499,12 +499,12 @@ final class PageStore {
     }
 
     /**
-     * Any thread: claims {@code blocks} contiguous wholly free blocks of one region, for a buffer larger than a block
+     * Any thread: claims {@code blocks} contiguous empty blocks of one region, for a buffer larger than a block
      * (see {@link Region#claimBlocks}), else in a new region (see {@link #addRegion}). Returns the region's index in
      * {@link #regions} in the high half and the first block in the low half, or -1 when new regions hold fewer blocks.
-     * Every slice is committed; give them back with {@link #freeRun}.
+     * Every slice is committed; give them back with {@link #releaseBlocks}.
      */
-    long takeRun(int blocks) {
+    long claimBlocks(int blocks) {
         for (;;) {
             if (blocks > regionBlocks) {
                 // Since regions are one block each.
@@ -544,7 +544,7 @@ final class PageStore {
                 }
                 for (int slot = committed + 1; slot < blocks; slot++) {
                     Segment block = region.blocks[first + slot];
-                    block.giveBack(block.allFree);
+                    block.unclaim(block.allFree);
                 }
                 armPurge(now);
             }
@@ -577,12 +577,12 @@ final class PageStore {
         }
     }
 
-    /** {@code region << 32 | slice}: the run {@link #claimSlices} and {@link #takeRun} return, built only here. */
+    /** {@code region << 32 | slice}: the run {@link #claimSlices} and {@link #claimBlocks} return, built only here. */
     private static long run(int region, int slice) {
         return (long) region << 32 | slice;
     }
 
-    /** The region of a run {@link #claimSlices} or {@link #takeRun} returned. */
+    /** The region of a run {@link #claimSlices} or {@link #claimBlocks} returned. */
     Region region(long run) {
         return regions[(int) (run >>> 32)];
     }
@@ -597,13 +597,13 @@ final class PageStore {
         return (int) run % config.slicesPerSegment();
     }
 
-    /** The first block of a run {@link #claimSlices} or {@link #takeRun} returned. */
+    /** The first block of a run {@link #claimSlices} or {@link #claimBlocks} returned. */
     int firstBlock(long run) {
         return (int) run / config.slicesPerSegment();
     }
 
-    /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */
-    void freeRun(Region region, int start, int slots) {
+    /** Any thread: the blocks {@link #claimBlocks} returned go back to the shared slices. */
+    void releaseBlocks(Region region, int start, int slots) {
         long now = System.nanoTime();
         for (int slot = start; slot < start + slots; slot++) {
             Segment block = region.blocks[slot];
@@ -846,11 +846,11 @@ final class PageStore {
             long claimed = block.claimFree(run);
             long exact = block.idleOf(claimed, now, delay);
             if (exact != claimed) {
-                block.giveBack(claimed & ~exact);
+                block.unclaim(claimed & ~exact);
             }
             while (exact != 0) {
                 if (bytes >= budget) {
-                    block.giveBack(exact);
+                    block.unclaim(exact);
                     break;
                 }
                 long bits = lowestRun(exact);
@@ -865,13 +865,13 @@ final class PageStore {
     /**
      * Gives back {@code region}, of a source that cannot purge part of a region, if all its slices stayed free for the
      * purge delay, and returns the bytes given back: its length if it did. Its blocks are claimed whole by CAS first,
-     * as a purge claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer wholly
-     * free and idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that
+     * as a purge claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer empty
+     * and idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that
      * still sees it finds nothing there, and its place in {@link #regions} is taken by the next region mapped.
      */
     private long releaseIfIdle(Region region, long now) {
         long delay = config.purgeDelayNanos;
-        if (!whollyFree(region)) {
+        if (!regionIsEmpty(region)) {
             return 0;
         }
         long waited = shortestWait(region, now);
@@ -888,13 +888,13 @@ final class PageStore {
         }
         for (int slot = 0; slot < claimed; slot++) {
             Segment block = region.blocks[slot];
-            block.giveBack(block.allFree);
+            block.unclaim(block.allFree);
         }
         return 0;
     }
 
     /** Racy: whether every slice of {@code region} is free. */
-    private static boolean whollyFree(Region region) {
+    private static boolean regionIsEmpty(Region region) {
         for (Segment block : region.blocks) {
             if (!block.isEmpty()) {
                 return false;
@@ -967,7 +967,7 @@ final class PageStore {
                     allocator.storeBytesReleased(address, length, block.buffer.isDirect());
                 }
             } finally {
-                block.giveBack(bits);
+                block.unclaim(bits);
             }
         }
     }

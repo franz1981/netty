@@ -115,9 +115,9 @@ final class AdaptivePoolingAllocator {
     /**
      * {@code io.netty.allocator.chunkPurgeInterval}: how often a size-class magazine applies the notes left by other
      * threads on its heap, and counts its allocations for the heap's decay clock, counted in chunks' worth of
-     * allocations. A note that makes a chunk wholly free gives it up at once, unless its size class is down to the
+     * allocations. A note that makes a chunk empty gives it up at once, unless its size class is down to the
      * chunks it keeps. Default: 4. Read from {@code io.netty.allocator.chunkPurgePollsThreadLocal} when only that, its
-     * former name, is set. The wholly free chunks a size class kept at its floor are given up as soon as a chunk
+     * former name, is set. The empty chunks a size class kept at its floor are given up as soon as a chunk
      * filed takes it above it (see {@link SizeClassMagazine#retireCurrent}).
      */
     static final long CHUNK_PURGE_INTERVAL = Math.max(1, SystemPropertyUtil.getLong(
@@ -553,7 +553,7 @@ final class AdaptivePoolingAllocator {
         store.purgeIfDue(System.nanoTime());
         int segmentSize = store.config.segmentSize;
         int slots = (int) ((size + (long) segmentSize - 1) / segmentSize);
-        long run = store.takeRun(slots);
+        long run = store.claimBlocks(slots);
         if (run < 0) {
             return null;
         }
@@ -566,7 +566,7 @@ final class AdaptivePoolingAllocator {
             return chunk;
         } finally {
             if (!made) {
-                store.freeRun(region, start, slots);
+                store.releaseBlocks(region, start, slots);
             }
         }
     }
@@ -894,7 +894,7 @@ final class AdaptivePoolingAllocator {
             store.purgeIfDue(now);
         }
 
-        /** Act as the owner for one release, if the lock is free; 0 when there is no lock or it is busy (lock 6). */
+        /** Act as the owner for one release, if the lock is free; 0 when there is no lock or it is busy. */
         long tryOwn() {
             return lock == null ? 0 : lock.tryWriteLock();
         }
@@ -1008,8 +1008,8 @@ final class AdaptivePoolingAllocator {
 
     /**
      * Chunks that a releasing thread asked their owner to look at, because it freed memory in a chunk whose queues
-     * it may not touch (see Invariant N in {@link SizeClassMagazine}). One per heap, shared by the magazines of all
-     * its size classes, so that applying every note of the heap reads one head, not one per size class. A lock-free
+     * it may not touch. One per heap, shared by the magazines of all its size classes, so that applying every note
+     * of the heap reads one head, not one per size class. A lock-free
      * (Treiber) stack that any thread pushes to and the heap's owner takes whole. A chunk's {@code pendingNext} is both
      * its link and the claim that it is queued: a chunk is queued at most once, and a push on a queued chunk costs one
      * volatile read.
@@ -1130,8 +1130,8 @@ final class AdaptivePoolingAllocator {
      * {@link #spare} (no span, see {@link SizeClassedChunk}'s state diagram). {@link #reusable} is trustworthy
      * without a scan: nothing but {@link #current} ever hands out a slot, so a chunk filed with one keeps it.
      * {@link #full} is an ownership registry only, never walked except by the bounded probe in
-     * {@link #allocateSlow}: a cross-thread return that cannot synchronise leaves a note (see {@link PendingChunks}
-     * Invariant N) instead of moving the chunk there and then.
+     * {@link #allocateSlow}: a cross-thread return that cannot synchronise leaves a note (see {@link PendingChunks})
+     * instead of moving the chunk there and then.
      */
     static final class SizeClassMagazine {
         /** Bound on the last-resort probe of {@link #full}; see {@link #allocateSlow}. */
@@ -1154,7 +1154,7 @@ final class AdaptivePoolingAllocator {
         final ChunkQueue reusable = new ChunkQueue();
         final ChunkQueue full = new ChunkQueue();
         final ChunkQueue spare = new ChunkQueue();
-        /** Whether a wholly free chunk may sit on {@link #reusable}, kept because the class is at or below floor. */
+        /** Whether an empty chunk may sit on {@link #reusable}, kept because the class is at or below floor. */
         private boolean freeChunkKept;
 
         private final int tickThreshold;
@@ -1193,7 +1193,7 @@ final class AdaptivePoolingAllocator {
 
         /**
          * Called by {@link Heap#releaseIdle}: a size class that made no allocation since the previous decay gives
-         * up its current chunk and every wholly free chunk it keeps, the one it keeps as its floor included. Its floor
+         * up its current chunk and every empty chunk it keeps, the one it keeps as its floor included. Its floor
          * is for a class in use; one unused through a whole interval keeps nothing. Chunks with buffers out stay.
          * Reads only counters the allocations already keep.
          */
@@ -1298,7 +1298,7 @@ final class AdaptivePoolingAllocator {
         /**
          * The current chunk is out of slots, or the magazine is stopping (see {@link #close}, {@link #dropIfIdle}):
          * file it by capacity, exactly as a release files any chunk ({@link #slotReturned}). Above the floor no
-         * wholly free chunk stays: the chunk itself if it is one, and those kept while at or below the floor (see
+         * empty chunk stays: the chunk itself if it is one, and those kept while at or below the floor (see
          * {@link #freeChunkKept}), which this is the one to take above it.
          */
         private void retireCurrent() {
@@ -1347,7 +1347,7 @@ final class AdaptivePoolingAllocator {
             }
         }
 
-        /** {@code chunk}, wholly free and on {@link #reusable}, gives its span back to the store and waits spare. */
+        /** {@code chunk}, empty and on {@link #reusable}, gives its span back to the store and waits spare. */
         private void returnSpan(SizeClassedChunk chunk) {
             reusable.remove(chunk);
             chunk.releaseSpan();
@@ -1355,7 +1355,7 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Every wholly free chunk on {@link #reusable} gives its span back: {@code keepFloor} stops once at or below
+         * Every empty chunk on {@link #reusable} gives its span back: {@code keepFloor} stops once at or below
          * the floor, kept included gives up everything (a class idle through a whole decay interval, see
          * {@link #dropIfIdle}).
          */
@@ -1549,7 +1549,7 @@ final class AdaptivePoolingAllocator {
      *       chunk fills nothing, and {@link #next} is never cleared;</li>
      *   <li>{@link #localFree}: how many slots those two account for;</li>
      *   <li>{@link #remoteFree}: the slots released by any other thread, as one {@code long} holding their count
-     *       above the index of the first (3.1). A releaser writes its link and then publishes the new first and the
+     *       above the index of the first. A releaser writes its link and then publishes the new first and the
      *       count with one CAS; the owner takes the whole list, and its count, with one {@code getAndSet} when
      *       {@link #localHead} and {@link #bump} have run out. Only pushes race with each other and the list is only
      *       ever taken whole, so there is no ABA.</li>
@@ -1611,7 +1611,7 @@ final class AdaptivePoolingAllocator {
         private int bump;
         /** The slots reachable from {@link #localHead} plus those never handed out. */
         private int localFree;
-        /** Slots released by other threads: their count in the high half, the first one's index in the low (3.1). */
+        /** Slots released by other threads: their count in the high half, the first one's index in the low. */
         private volatile long remoteFree;
         /** {@code null} on a stripe, and once abandoned: see {@link #releaseOrAbandon}. */
         private Thread ownerThread;
@@ -1785,7 +1785,7 @@ final class AdaptivePoolingAllocator {
             return localFree > 0 || remoteFree != REMOTE_EMPTY;
         }
 
-        /** Every slot is back: see 3.2. */
+        /** Every slot is back. */
         boolean allFree() {
             return localFree + remoteCount(remoteFree) == slots;
         }
@@ -1927,7 +1927,7 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSlot(int startIndex, int size) {
             if (region != null) {
-                allocator.pageStore.freeRun(region, runStart, runSlots);
+                allocator.pageStore.releaseBlocks(region, runStart, runSlots);
             } else {
                 allocator.chunkBufferFreed(this, false);
                 delegate.release();

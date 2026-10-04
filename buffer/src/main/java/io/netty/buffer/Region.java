@@ -28,7 +28,7 @@ final class Region {
     final MmapRegionSource source;
     /**
      * Whether {@link #source} purges idle free slices in place; else the region is charged and counted whole, and
-     * goes back whole once wholly idle.
+     * goes back whole once idle.
      */
     final boolean purgesSlices;
     final int slots;
@@ -59,7 +59,7 @@ final class Region {
     }
 
     /**
-     * Any thread: claims {@code n} contiguous wholly free blocks and returns the first, or -1. As
+     * Any thread: claims {@code n} contiguous empty blocks and returns the first, or -1. As
      * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1950-L1997): from the
      * start, whole blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
@@ -85,7 +85,7 @@ final class Region {
             }
             for (int i = 0; i < claimed; i++) {
                 Segment block = blocks[first + i];
-                block.giveBack(block.allFree);
+                block.unclaim(block.allFree);
             }
             store.armPurge(System.nanoTime());
             first += claimed + 1;

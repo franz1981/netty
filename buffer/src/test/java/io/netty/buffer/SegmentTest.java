@@ -196,9 +196,9 @@ final class SegmentTest {
         assertEquals(5, segment.bin, "relabelled");
         segment.releaseRun(0, 8, 0);
         assertTrue(segment.claimWhole());
-        segment.giveBack(segment.allFree);
+        segment.unclaim(segment.allFree);
         assertEquals(segment.allFree, segment.claimFree(segment.allFree));
-        segment.giveBack(segment.allFree);
+        segment.unclaim(segment.allFree);
         assertEquals(5, segment.bin, "the purger's claims label nothing");
         assertEquals(Segment.FIRST, segment.claimRun(64, 2), "a whole block");
         assertEquals(2, segment.bin);
