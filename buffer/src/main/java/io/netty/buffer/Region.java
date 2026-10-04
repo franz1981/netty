@@ -57,10 +57,8 @@ final class Region {
     }
 
     /**
-     * Any thread: claims {@code n} contiguous empty blocks and returns the first, or -1. As
-     * mimalloc v3's {@code mi_bbitmap_try_find_and_clearN_} for objects above a chunk
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1950-L1997): from the
-     * start, whole blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
+     * Any thread: claims {@code n} contiguous empty blocks and returns the first, or -1: from the start, whole
+     * blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
      */
     int claimBlocks(int n) {
         Segment[] blocks = this.blocks;

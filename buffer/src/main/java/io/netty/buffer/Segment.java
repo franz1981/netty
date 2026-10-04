@@ -60,9 +60,8 @@ final class Segment {
     /** Per slice, slice owner only: whether it ever had memory behind it, so that free with none now was purged. */
     final boolean[] everCommitted;
     /**
-     * The bin of the first claim since the block was last empty (see {@link PageStore#binOf}), written by that
-     * claim alone: its run is held until after the write, so the block cannot be empty again before it. A hint:
-     * the claims that go by it check the bitmap.
+     * The bin of the first claim since the block was last empty (see {@link PageStore#binOf}): a hint, checked
+     * against the bitmap by the claims that go by it.
      */
     volatile byte bin;
     /** The chunk of every large-buffer span a stripe claimed in it. */

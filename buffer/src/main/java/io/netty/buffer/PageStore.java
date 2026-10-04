@@ -37,22 +37,13 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *    span     a run of slices holding one buffer above the sizes  Heap#allocateLarge, SharedSpanChunk
  * heap        a thread-local heap or a stripe                     AdaptivePoolingAllocator.Heap
  * </pre>
- * Heaps own chunks, never blocks: any heap claims a run of slices from the regions' shared bitmaps by CAS, and
- * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link Segment#releaseRun}), as
- * mimalloc v3 claims a page's slices straight from its arena's bitmap
- * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L240-L246). A hole one heap leaves is reused by any.
- * Claims of one run length share blocks ({@link #binOf}), found through bitmaps over the blocks ({@link #maps}).
- * A buffer above a block takes a run of whole blocks ({@link #claimBlocks}). A new region is added under
- * this store's monitor, the only lock, when no block has a fit, and the claim that added it takes its run there
- * before any other thread sees the region.
- * <p>
- * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link #mmap}) purge
- * the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
- * memory behind it to its purge; regions of one block ({@link #memory}: a {@code malloc}'d 4 MiB, or a {@code byte[]}
- * of 4032 KiB for heap memory) are charged and counted whole by their allocation, and go back whole once all of them
- * stayed free for the delay. Once an {@code mmap} region cannot be mapped, new regions are one {@code malloc}'d
- * block each, next to the regions mapped so far. One purger at a time, driven by the heaps' ticks: see
- * {@link #purgeIfDue}.
+ * Heaps own chunks, never blocks: any heap claims and releases a run of slices from the regions' shared bitmaps by
+ * CAS ({@link #claimSlices}, {@link Segment#releaseRun}), found through bins and chunkmaps as mimalloc v3's
+ * bitmap.h (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h) ({@link #binOf}, {@link #maps}); a new
+ * region is added under this store's monitor, the only lock, when no block has a fit. {@code mmap} regions
+ * ({@link #mmap}) purge idle free slices in place, charging and counting per slice; one-block regions
+ * ({@link #memory}: {@code malloc} or, for heap memory, {@code byte[]}) are charged, counted and purged whole. One
+ * purger at a time, driven by the heaps' ticks: see {@link #purgeIfDue}.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -67,20 +58,16 @@ final class PageStore {
     private static final Region[] NO_REGIONS = new Region[0];
     /**
      * The bytes a purge pass gives back, {@code madvise}d or released whole, past which it makes no more calls (see
-     * {@link #purge}): bytes, not calls, as a call costs about as much as the memory it gives back. Measured with
-     * {@code mmap}, 1 GiB freed at once: passes of 8.6 ms (p50) and 10 ms (p90), 1 GiB back in 15.5 s; 32 MiB: 4.5
-     * and 5.5 ms, 31 s; 128 MiB: 17 and 19.5 ms, 7 to 8 s.
+     * {@link #purge}): bytes, not calls, as a call costs about as much as the memory it gives back.
      */
     static final long PURGE_BYTES = 64L << 20;
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
     /**
-     * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the short
-     * runs do not cut the holes the long ones leave. A page kind's bin is its index in
-     * {@link SizeClassTable#pageKinds}; every other length is in {@link #otherBin}. As mimalloc v3's
-     * size bins of its bitmap chunks ({@code mi_chunkbin_of},
-     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L249-L257), by exact length.
+     * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the
+     * short runs do not cut the holes the long ones leave. A page kind's bin is its index in
+     * {@link SizeClassTable#pageKinds}; every other length is in {@link #otherBin}.
      */
     final byte[] binOf;
     final int otherBin;
@@ -98,10 +85,8 @@ final class PageStore {
      * one after the other: per bin, a bit set when a block of that bin has a free run of the bin's length; and the
      * empty blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
      * its block now has ({@link #slicesReleased}); a claim that finds a block without the fit its bit stood for
-     * clears it, then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}). As
-     * mimalloc v3's {@code chunkmap} and {@code chunkmap_bins} over its bitmap chunks
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L261-L270). Replaced by a larger copy under
-     * this store's monitor ({@link #growMaps}).
+     * clears it, then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}).
+     * Replaced by a larger copy under this store's monitor ({@link #growMaps}).
      */
     private volatile AtomicLongArray maps;
     final MemorySource memory;
@@ -117,8 +102,7 @@ final class PageStore {
     private volatile int purging;
     /** When the last pass ran, or started: see {@link #isDue}. */
     volatile long lastPurgeNanos = System.nanoTime();
-    // Read by every run release, written once per arming by a release and by the purger. HotSpot packs this object's
-    // fields into about 150 bytes, so these share lines with regions, slicesCommitted and the purger's counters.
+    // Read by every run release, written once per arming by a release and by the purger.
     /** 1 once a run was released since the purger last disarmed: see {@link #armPurge}. */
     private volatile int armed;
     /** When {@link #armed} was set, as {@link System#nanoTime()}: a pass waits the purge delay from then. */
@@ -259,16 +243,11 @@ final class PageStore {
     }
 
     /**
-     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: the lowest
-     * fit (first fit, as {@code mi_bchunk_try_find_and_clearNX},
-     * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L793-L849) in the lowest block of its bin that
-     * has one, else the lowest empty block, which takes its bin, else a new region (see {@link #addRegion}).
-     * Lowest first, so that the highest blocks drain and go back. As mimalloc v3's
-     * {@code mi_bbitmap_try_find_and_clear_generic}
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1801-L1884), minus its other bins and its
-     * start at the thread's sequence. Returns the region's index in the high half and the
-     * run's first slice in the region in the low half. The run's slices are committed (see {@link #commitSlices});
-     * give it back with {@link Segment#releaseRun}, from any thread.
+     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: the
+     * lowest fit in the lowest block of its bin that has one, else the lowest empty block, which takes its bin, else
+     * a new region (see {@link #addRegion}). Lowest first, so that the highest blocks drain and go back. Returns the
+     * region's index in the high half and the run's first slice in the region in the low half. The run's slices are
+     * committed (see {@link #commitSlices}); give it back with {@link Segment#releaseRun}, from any thread.
      */
     long claimSlices(int slices, boolean threadLocal) {
         int bin = binOf[slices];
@@ -430,11 +409,8 @@ final class PageStore {
     }
 
     /**
-     * Clears bit {@code id} of {@code map}, which a claim found the block does not have, then reads the block again and
-     * sets it again if it does: a release meanwhile may have found the bit still set. As mimalloc v3's
-     * {@code mi_bbitmap_chunkmap_try_clear}
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1679-L1693): "a concurrent set may have
-     * happened in between ... We check again".
+     * Clears bit {@code id} of {@code map}, which a claim found the block does not have, then reads the block again
+     * and sets it again if it does: a release meanwhile may have found the bit still set.
      */
     private void unmark(int map, int id) {
         if (clear(map, id)) {
@@ -661,10 +637,8 @@ final class PageStore {
 
     /**
      * Any thread, after it released a run at {@code now}: arms the purge, unless armed. The common case reads one
-     * shared field; only the release that finds it disarmed writes, unlike mimalloc v3, which sets its arena's purge
-     * expiry by CAS on every free (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2325). A purger
-     * that sees {@link #armed} before {@link #armedAt} is written may run a pass early: it finds the run not idle yet
-     * and arms again for it.
+     * shared field; only the release that finds it disarmed writes. A purger that sees {@link #armed} before
+     * {@link #armedAt} is written may run a pass early: it finds the run not idle yet and arms again for it.
      */
     void armPurge(long now) {
         if (armed == 0 && ARMED.compareAndSet(this, 0, 1)) {
@@ -720,13 +694,10 @@ final class PageStore {
     }
 
     /**
-     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, until its calls
-     * ({@code madvise} or region releases) gave back {@link #PURGE_BYTES}; the call that reaches it is made whole, so
-     * a pass makes one call at least. One that stops short arms the purge again, due at once, and the next pass, after
-     * the cadence floor, goes on from where this one stopped. mimalloc v3 bounds a pass by arenas purged instead, a
-     * quarter of them plus one, from an arena chosen by the thread's sequence
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2433-L2450); one region of ours can need
-     * thousands of calls.
+     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, until its
+     * calls ({@code madvise} or region releases) gave back {@link #PURGE_BYTES}; the call that reaches it is made
+     * whole, so a pass makes one call at least. One that stops short arms the purge again, due at once, and the
+     * next pass, after the cadence floor, goes on from where this one stopped.
      */
     private void purge(long now) {
         purges++;
@@ -818,16 +789,10 @@ final class PageStore {
     /**
      * Shared slices: purges the free slices of {@code block} with memory behind them freed
      * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, until the calls
-     * reached {@code budget} bytes, and returns their bytes. As mimalloc v3's {@code mi_arena_try_purge_range}
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L2345-L2359): a run's
-     * slices are claimed by CAS first, so that no claim can take them while their memory goes, and given back after;
-     * and as its {@code _mi_bitmap_forall_setc_ranges}
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1466-L1509), a run never
-     * spans more than one bitmap word (a block): the purger holds at most one block's run at a time, and a claim
-     * meanwhile finds every other free slice. A claim never waits for the purger: one that finds no fit maps a region,
-     * as mimalloc v3's claim fails on slices its purge holds
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L246) and reserves a new arena
-     * (https://github.com/microsoft/mimalloc/blob/31d034d/src/arena.c#L548-L564).
+     * reached {@code budget} bytes, and returns their bytes. A run's slices are claimed by CAS first, so that no
+     * claim can take them while their memory goes, and given back after; a run never spans more than one block, so
+     * the purger holds at most one block's run at a time, and a claim meanwhile finds every other free slice. A
+     * claim never waits for the purger: one that finds no fit maps a region instead.
      */
     private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;

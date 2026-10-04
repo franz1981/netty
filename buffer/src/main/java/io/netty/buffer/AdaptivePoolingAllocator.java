@@ -43,7 +43,7 @@ import java.util.concurrent.locks.StampedLock;
  * request depends on its size:
  * <ul>
  *   <li><b>Up to the largest size class</b> ({@link SizeClassTable#SIZES}): a {@link SizeClassedChunk}, cut into equal
- *       segments of one size class. Its {@link SizeClassMagazine} allocates from one chunk at a time and keeps the
+ *       slots of one size class. Its {@link SizeClassMagazine} allocates from one chunk at a time and keeps the
  *       others queued by whether they have a free slot (see {@link SizeClassedChunk}'s state diagram).</li>
  *   <li><b>Above it, up to a block</b>: a span of whole slices holding that buffer alone, see
  *       {@link Heap#allocateLarge}.</li>
@@ -57,11 +57,11 @@ import java.util.concurrent.locks.StampedLock;
  * stripes serve the other threads.
  * <p>
  * A buffer released by the thread that owns its chunk is returned to it directly. A buffer released by any other
- * thread puts its segment on the chunk's lock-free free list and leaves a note for the owner, which applies it on its
+ * thread puts its slot on the chunk's lock-free free list and leaves a note for the owner, which applies it on its
  * next slow path: the chunk's own structures are only ever touched by one thread at a time.
  * <p>
  * A size class keeps a few empty chunks; any other chunk it gives up frees its slices at once, for any heap. A chunk
- * lists its free segments in their own memory, so making one allocates no list.
+ * lists its free slots in their own memory, so making one allocates no list.
  */
 @UnstableApi
 final class AdaptivePoolingAllocator {
@@ -441,21 +441,11 @@ final class AdaptivePoolingAllocator {
 
     /**
      * When a heap gives back what it keeps idle: the chunks of a size class that made no allocation through a whole
-     * interval (see {@link SizeClassMagazine#dropIfIdle}). On a thread-local heap they age with all of the thread's
-     * allocations, whatever their size.
-     * <p>
-     * The only signal is the heap's own allocations, by whichever thread makes them: each purge tick of a size class
-     * adds the allocations it counted, and each span of the large-buffer magazine, already under the stripe lock or
-     * on the owner thread, adds its size in units of the smallest size class, so that large buffers read the clock
-     * about as often per byte as small ones. The count only paces the clock reads, not the aging. Nothing is added to
-     * the size classes' allocation fast paths. Every {@link #DECAY_MIN_ALLOCATIONS} of them the clock is read once,
-     * and when {@link #DECAY_INTERVAL_NANOS} passed since the last decay, the idle size classes give up their chunks;
-     * otherwise nothing happens until the next count.
-     * <p>
-     * A chunk given up frees its slices at once, and the heap's ticks drive the store's purge of what stayed free for
-     * its own delay, shorter than a decay interval (see {@link PageStore#purgeIfDue}).
-     * <p>
-     * Guarded like the heap: by the stripe lock, or by the owner thread of a thread-local heap.
+     * interval (see {@link SizeClassMagazine#dropIfIdle}), aged by the heap's own allocations of any size. Every
+     * {@link #DECAY_MIN_ALLOCATIONS} of them the clock is read once; once {@link #DECAY_INTERVAL_NANOS} passed since
+     * the last decay, the idle size classes give up their chunks, which frees their slices at once (the store's own
+     * purge, shorter delay, picks that up: see {@link PageStore#purgeIfDue}). Guarded like the heap: by the stripe
+     * lock, or by the owner thread of a thread-local heap.
      */
     /**
      * One thread's heap, or one stripe shared by the threads without one: {@code lock} is {@code null} for a
@@ -472,7 +462,7 @@ final class AdaptivePoolingAllocator {
         private static final long DECAY_MIN_ALLOCATIONS = 10000;
         /** An allocation counts toward the decay clock as its size in units of the smallest size class. */
         private static final int COUNT_SHIFT = 5;
-        /** 4032 bytes at most, as mimalloc's large colours: https://github.com/microsoft/mimalloc/pull/1339 */
+        /** 4032 bytes at most. */
         private static final int MAX_SPAN_COLOURS = 64;
 
         final StampedLock lock;
@@ -605,10 +595,9 @@ final class AdaptivePoolingAllocator {
             long run = store.claimSlices(slices, owner != null);
             Segment segment = store.block(run);
             int start = store.start(run);
-            // Colour, as the size classes' chunks (see colourOffset) and as mimalloc does for its large allocations
-            // (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to 4032 bytes into
-            // its span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer,
-            // so it costs no memory. A release rounds its capacity up to whole slices again.
+            // Colour, as the size classes' chunks (see colourOffset): the buffer starts up to 4032 bytes into its
+            // span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer, so
+            // it costs no memory. A release rounds its capacity up to whole slices again.
             int room = (int) (((long) slices << shift) - size);
             int colour = SizeClassTable.colourOffset(nextSpanColour++, room, MAX_SPAN_COLOURS);
             // A block has one chunk for the spans of every thread-local heap, and one for every stripe's.
@@ -832,9 +821,8 @@ final class AdaptivePoolingAllocator {
          * later, unrelated one.
          * <p>
          * The store is a full volatile store on purpose, not a lazySet: it is the store half of a Dekker pair with
-         * the releaser, which pushes the segment (the push ends in a CAS on the chunk's external list, a StoreLoad)
-         * and only then reads {@code pendingNext}. The processing reads the free counts right after this store;
-         * without the StoreLoad here both sides could miss each other and the chunk would be stranded.
+         * the releaser, which pushes the slot (a CAS on {@link SizeClassedChunk#remoteFree}, a StoreLoad) and only
+         * then reads {@code pendingNext}; without the StoreLoad here both sides could miss each other.
          */
         static Chunk rearm(Chunk chunk) {
             Chunk next = chunk.pendingNext;
@@ -991,11 +979,8 @@ final class AdaptivePoolingAllocator {
             if (curr != null) {
                 boolean success = curr.takeSlot(buf, size, startingCapacity, maxCapacity);
                 if (!success || curr.freeBytes() == 0) {
-                    // Out of slots: retire the chunk. If a slot comes back from another thread after the count
-                    // above, retireCurrent files it as reusable by its capacity, so a later probe can hand it back.
-                    // The !success case is defensive: the previous call left freeBytes() > 0, which counts
-                    // only free slots, and this magazine is the only consumer of its chunk's free lists, so the
-                    // read above always finds a slot.
+                    // Out of slots (or, defensively, takeSlot failed): a slot that comes back from another thread
+                    // after this files it as reusable by its capacity, so a later probe can hand it back.
                     retireCurrent();
                 }
                 if (success) {
@@ -1217,21 +1202,21 @@ final class AdaptivePoolingAllocator {
      */
     abstract static class Chunk {
         /**
-         * The {@link ChunkQueue} of its magazine's cache this chunk is filed on, or {@code null}: the magazine's
-         * active chunk, a chunk just polled, or one that left the cache. The release paths take a cache decision only
-         * when it is on a queue, with one null check.
+         * The {@link ChunkQueue} this chunk is filed on, or {@code null}: the magazine's current chunk, a chunk just
+         * polled, or one that left every queue. The release paths take a queue decision only when it is on one, with
+         * one null check.
          */
         ChunkQueue queue;
         // Links of the ChunkQueue this chunk is on, if any.
         Chunk prevInQueue;
         Chunk nextInQueue;
         /**
-         * Link in its cache's {@link PendingChunks}: {@code null} = not queued for attention, non-null = queued (or in
-         * the middle of being queued). This field <em>is</em> the dedup claim: whoever moves it off {@code null} owns
-         * the push, so no separate flag is needed.
+         * Link in its magazine's {@link PendingChunks}: {@code null} = not queued for attention, non-null = queued
+         * (or in the middle of being queued). This field <em>is</em> the dedup claim: whoever moves it off
+         * {@code null} owns the push, so no separate flag is needed.
          */
         volatile Chunk pendingNext;
-        /** Final but for a size-class chunk, which has one per incarnation (see {@code SizeClassedChunk#reinit}). */
+        /** Final but for a size-class chunk, which has one per incarnation (see {@code SizeClassedChunk#takeSpan}). */
         protected AbstractByteBuf delegate;
         // We need the top-level allocator so ByteBuf.capacity(int) can call reallocate()
         final AdaptivePoolingAllocator allocator;
@@ -1285,19 +1270,13 @@ final class AdaptivePoolingAllocator {
      * </ul>
      * Every question about capacity is arithmetic on the counts: nothing walks a list.
      * <p>
-     * <b>Incarnations.</b> A chunk object outlives its span: given up, it waits on its magazine's spare list and
-     * serves the magazine's next chunk on whatever span the store has ({@link #takeSpan}); its colour stays, so its
-     * capacity too.
+     * <b>Incarnations.</b> A chunk object outlives its span, served again on another ({@link #takeSpan}) with the
+     * same colour and capacity.
      * <p>
-     * <b>One owner.</b> Every field but {@link #remoteFree} and {@code pendingNext} belongs to the chunk's owner: the
-     * owner thread, or the holder of the stripe lock, or, once the heap died with buffers out, the store's purger
-     * (see {@link #releaseOrAbandon}). Any other releaser writes its slot's link, pushes it with one CAS on
-     * {@link #remoteFree}, and leaves a note for the owner; it reads nothing else of the chunk. Only the owner
-     * decides that every slot is back ({@link #allFree}: one volatile read) and gives the span up, so a span goes
-     * back once and a late release cannot find it gone: before its CAS a slot is out, so the chunk is not all free.
-     * After its CAS a releaser touches only the final {@link #magazine} and {@code pendingNext}, which mean the same
-     * for every incarnation: its note may reach a later one, and is harmless, since a note only says "look at this
-     * chunk" and the owner files it by what it is now.
+     * <b>One owner.</b> The owner thread, the stripe lock holder, or, once abandoned, the purger ({@link
+     * #releaseOrAbandon}) touches every field but {@link #remoteFree} and {@code pendingNext}, which any other
+     * releaser only pushes a slot onto or leaves a note on, so a span is given back exactly once and a note from an
+     * earlier incarnation is harmless.
      * <p>
      * <b>States.</b> The queue this chunk is on is the only truth; {@code queue == null} is CURRENT (or, with
      * {@code ownerThread == null} and no span, ABANDONED). NOTED ({@code pendingNext != null}) is orthogonal, owned
