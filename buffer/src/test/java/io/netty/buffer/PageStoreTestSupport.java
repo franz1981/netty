@@ -15,7 +15,7 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
+import io.netty.buffer.AdaptivePoolingAllocator.Heap;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.internal.PlatformDependent;
@@ -44,7 +44,7 @@ final class PageStoreTestSupport {
     static final int SEGMENT_SIZE = 4 * MIB;
     static final int REGION_SIZE = 36 * MIB;
     static final int REGION_ALIGNMENT = 2 * MIB;
-    static final long INTERVAL = IdleDecay.DECAY_INTERVAL_NANOS;
+    static final long INTERVAL = Heap.DECAY_INTERVAL_NANOS;
 
     private PageStoreTestSupport() {
     }

@@ -28,7 +28,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
+import io.netty.buffer.AdaptivePoolingAllocator.Heap;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassMagazine;
 
@@ -689,7 +689,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             underStripeLocks(allocator, sharedStripe, cache::drainPending);
             assertEquals(used, claimedHeapBytes(allocator),
                     "a fully free active chunk must not be evicted on release");
-            underStripeLocks(allocator, sharedStripe, cache::tickPurge);
+            underStripeLocks(allocator, sharedStripe, () -> {
+                cache.drainPending();
+                cache.returnFreeSpans(true);
+            });
             assertEquals(used, claimedHeapBytes(allocator),
                     "a fully free active chunk must not be evicted by the purge");
             // The one representation check: it is still the magazine's current chunk.
@@ -879,19 +882,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         });
     }
 
-    /** The {@link IdleDecay} of the calling thread's thread-local heap. */
-    private static IdleDecay threadLocalIdleDecay(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
-        tlField.setAccessible(true);
-        Object heap = ((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(pooling)).get();
-        Field decayField = heap.getClass().getDeclaredField("idleDecay");
-        decayField.setAccessible(true);
-        return (IdleDecay) decayField.get(heap);
-    }
-
     private static final int BUDDY_NOTE_SIZE = 512 * 1024;
 
     /** Runs {@code body} on a new thread whose heap is thread-local, freed when the body returns. */
@@ -911,40 +901,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** How many stripes created a magazine for buffers above the size classes. */
-    private static int stripesWithASpanMagazine(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        int stripes = 0;
-        for (Object stripe : (Object[]) stripesField.get(pooling)) {
-            Field magField = stripe.getClass().getDeclaredField("spanMagazine");
-            magField.setAccessible(true);
-            if (magField.get(stripe) != null) {
-                stripes++;
-            }
-        }
-        return stripes;
-    }
-
     /** The calling thread's thread-local heap. */
     private static Object threadLocalHeap(AdaptiveByteBufAllocator allocator) throws Exception {
         Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
         heapField.setAccessible(true);
         Object pooling = heapField.get(allocator);
-        Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
+        Field tlField = pooling.getClass().getDeclaredField("threadLocalHeap");
         tlField.setAccessible(true);
         return ((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(pooling)).get();
-    }
-
-    /** The calling thread's thread-local heap's magazine for buffers above the size classes, or null. */
-    private static Object spanMagazine(AdaptiveByteBufAllocator allocator) throws Exception {
-        Object heap = threadLocalHeap(allocator);
-        Field magField = heap.getClass().getDeclaredField("spanMagazine");
-        magField.setAccessible(true);
-        return magField.get(heap);
     }
 
     /** The current chunk of the calling thread's size-class magazine for {@code size}, or null. */
@@ -972,17 +936,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             allocator.heapBuffer(idleSize, idleSize).release();
             long idleChunk = claimedHeapBytes(allocator);
             allocator.heapBuffer(busySize).release();
-            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+            Heap heap = (Heap) threadLocalHeap(allocator);
             long used = claimedHeapBytes(allocator);
             assertNotNull(currentChunk(allocator, idleSize));
 
             // The first decay only records where each class stands.
-            idleDecay.decay(System.nanoTime());
+            heap.releaseIdle(System.nanoTime());
             assertNotNull(currentChunk(allocator, idleSize), "allocated since the heap was created: not idle");
             allocator.heapBuffer(busySize).release();
 
             // Idle through a whole interval: its chunk's slices go back.
-            idleDecay.decay(System.nanoTime());
+            heap.releaseIdle(System.nanoTime());
             assertNull(currentChunk(allocator, idleSize), "the idle class gave its chunk up");
             assertNotNull(currentChunk(allocator, busySize), "the class in use keeps its chunk");
             assertEquals(used - idleChunk, claimedHeapBytes(allocator));
@@ -997,8 +961,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         onThreadLocalHeap(() -> {
             final int size = 64 * 1024;
             allocator.heapBuffer(size, size).release();
-            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
-            idleDecay.decay(System.nanoTime());
+            Heap heap = (Heap) threadLocalHeap(allocator);
+            heap.releaseIdle(System.nanoTime());
             int threshold = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
                     * (heapChunkSizeOf(size) / size);
             for (int i = 0; i < threshold; i++) {
@@ -1006,7 +970,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             }
             Object current = currentChunk(allocator, size);
             assertNotNull(current);
-            idleDecay.decay(System.nanoTime());
+            heap.releaseIdle(System.nanoTime());
             assertSame(current, currentChunk(allocator, size), "its allocation count came back to where it was");
         });
     }
@@ -1022,16 +986,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             allocator.heapBuffer(256).release();
             long used = claimedHeapBytes(allocator);
             Object stripe = stripeHeapWithMagazines(allocator);
-            Field decayField = stripe.getClass().getDeclaredField("idleDecay");
-            decayField.setAccessible(true);
-            IdleDecay idleDecay = (IdleDecay) decayField.get(stripe);
+            Heap heap = (Heap) stripe;
             Field lockField = stripe.getClass().getDeclaredField("lock");
             lockField.setAccessible(true);
             StampedLock lock = (StampedLock) lockField.get(stripe);
             for (int round = 0; round < 2; round++) {
                 long stamp = lock.writeLock();
                 try {
-                    idleDecay.decay(System.nanoTime());
+                    heap.releaseIdle(System.nanoTime());
                 } finally {
                     lock.unlockWrite(stamp);
                 }
@@ -1057,10 +1019,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assertNotNull(chunk.pendingNext, "the other thread's release left a note");
             allocator.heapBuffer(256).release();
             long used = claimedHeapBytes(allocator);
-            IdleDecay idleDecay = threadLocalIdleDecay(allocator);
-            idleDecay.decay(System.nanoTime());
+            Heap heap = (Heap) threadLocalHeap(allocator);
+            heap.releaseIdle(System.nanoTime());
             allocator.heapBuffer(256).release();
-            idleDecay.decay(System.nanoTime());
+            heap.releaseIdle(System.nanoTime());
             assertNull(currentChunk(allocator, idleSize));
             assertEquals(used - idleChunk, claimedHeapBytes(allocator));
             assertNull(chunk.pendingNext);
@@ -1106,11 +1068,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             final int size = 64 * 1024;
             ByteBuf out = allocator.heapBuffer(size, size);
             try {
-                IdleDecay idleDecay = threadLocalIdleDecay(allocator);
+                Heap heap = (Heap) threadLocalHeap(allocator);
                 long used = allocator.usedHeapMemory();
                 Object chunk = currentChunk(allocator, size);
                 for (int i = 0; i < 4; i++) {
-                    idleDecay.decay(System.nanoTime());
+                    heap.releaseIdle(System.nanoTime());
                 }
                 assertSame(chunk, currentChunk(allocator, size));
                 assertEquals(used, allocator.usedHeapMemory());
@@ -1130,8 +1092,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         onThreadLocalHeap(() -> {
             ByteBuf buf = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
             try {
-                assertNotNull(spanMagazine(allocator), "the heap's own magazine");
-                assertEquals(0, stripesWithASpanMagazine(allocator), "no stripe involved");
+                assertTrue(chunkOfAny(buf).inThreadLocalMagazine(),
+                        "the thread-local heap served it, not a stripe");
             } finally {
                 buf.release();
             }
@@ -1157,8 +1119,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 for (int i = 0; i < 64 * 1024; i++) {
                     assertEquals((byte) i, buf.getByte(i));
                 }
-                assertNotNull(spanMagazine(allocator), "the heap's own magazine");
-                assertEquals(0, stripesWithASpanMagazine(allocator), "no stripe involved");
+                assertTrue(chunkOfAny(buf).inThreadLocalMagazine(),
+                        "the thread-local heap served it, not a stripe");
             } finally {
                 buf.release();
             }
@@ -1202,11 +1164,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     private static SizeClassedChunk chunkOf(ByteBuf buf) {
+        return (SizeClassedChunk) chunkOfAny(buf);
+    }
+
+    private static AdaptivePoolingAllocator.Chunk chunkOfAny(ByteBuf buf) {
         // Unwrap the leak-aware wrapper, if any.
         while (!(buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf)) {
             buf = buf.unwrap();
         }
-        return (SizeClassedChunk) ((AdaptivePoolingAllocator.AdaptiveByteBuf) buf).chunk;
+        return ((AdaptivePoolingAllocator.AdaptiveByteBuf) buf).chunk;
     }
 
     private static void release(ByteBuf buf, boolean foreignThread) throws InterruptedException {
@@ -1360,7 +1326,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** The allocator's {@code FastThreadLocal} of thread-local heaps. */
     private static FastThreadLocal<?> threadLocalHeapVariable(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field tlField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalSizeClassHeap");
+        Field tlField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalHeap");
         tlField.setAccessible(true);
         return (FastThreadLocal<?>) tlField.get(heap(allocator));
     }
@@ -1498,7 +1464,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                     for (AdaptivePoolingAllocator.Chunk c = cache.reusable.peek(); c != null; c = c.nextInQueue) {
                         assertTrue(((SizeClassedChunk) c).allFree(), "every buffer is back");
                     }
-                    cache.tickPurge();
+                    cache.drainPending();
+                    cache.returnFreeSpans(true);
                     assertTrue(cache.reusable.size() <= SizeClassMagazine.FLOOR,
                             "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size());
                 }
@@ -1951,7 +1918,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         Field stripesField = inner.getClass().getDeclaredField("stripedHeaps");
         stripesField.setAccessible(true);
         for (Object stripe : (Object[]) stripesField.get(inner)) {
-            Method free = stripe.getClass().getDeclaredMethod("freeStripe");
+            Method free = stripe.getClass().getDeclaredMethod("close");
             free.setAccessible(true);
             free.invoke(stripe);
         }

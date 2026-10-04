@@ -33,9 +33,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  *  block      4 MiB, one 64-bit free bitmap                       {@link Segment}
  *   slice     64 KiB, one bit of its block's bitmap
  *    chunk    a run of slices serving one size class              SizeClassedChunk
- *     slot    one buffer's place in a chunk                       SizeClassedChunk's "segment", segmentSize
- *    span     a run of slices holding one buffer above the sizes  SpanMagazine, SharedSpanChunk
- * heap        a thread-local heap or a stripe                     StripedHeap, ThreadLocalSizeClassHeap
+ *     slot    one buffer's place in a chunk                       SizeClassedChunk's slotSize
+ *    span     a run of slices holding one buffer above the sizes  Heap#allocateLarge, SharedSpanChunk
+ * heap        a thread-local heap or a stripe                     AdaptivePoolingAllocator.Heap
  * </pre>
  * Heaps own chunks, never blocks: any heap claims a run of slices from the regions' shared bitmaps by CAS, and
  * whichever thread frees the run gives it back by CAS ({@link #claimSlices}, {@link Segment#releaseRun}), as
@@ -680,7 +680,7 @@ final class PageStore {
     }
 
     /**
-     * Any thread, from a heap's purge tick (see {@code IdleDecay#count}) or a one-shot buffer. At most once per
+     * Any thread, from a heap's purge tick (see {@code Heap#countAllocations}) or a one-shot buffer. At most once per
      * {@link PageStoreConfig#purgeCheckNanos}, only once the purge was armed {@link PageStoreConfig#purgeDelayNanos}
      * ago (see {@link #armPurge}), and by one thread at a time (a try-guard: a caller that finds a purge running
      * returns at once), gives back to the OS the memory of the free slices, or of the regions of one block, that

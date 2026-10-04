@@ -16,7 +16,7 @@
 package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
-import io.netty.buffer.AdaptivePoolingAllocator.IdleDecay;
+import io.netty.buffer.AdaptivePoolingAllocator.Heap;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.concurrent.FastThreadLocal;
@@ -115,12 +115,8 @@ public class AdaptiveSegmentsTest {
 
     /** The calling thread's thread-local heap. */
     private static Object threadLocalHeap(AdaptivePoolingAllocator allocator) throws Exception {
-        FastThreadLocal<?> ftl = (FastThreadLocal<?>) field(allocator, "threadLocalSizeClassHeap");
+        FastThreadLocal<?> ftl = (FastThreadLocal<?>) field(allocator, "threadLocalHeap");
         return ftl.get();
-    }
-
-    private static IdleDecay idleDecay(Object heap) throws Exception {
-        return (IdleDecay) field(heap, "idleDecay");
     }
 
     /** The slices claimed in the block of region {@code index}, a region of one block. */
@@ -145,7 +141,7 @@ public class AdaptiveSegmentsTest {
         StampedLock lock = (StampedLock) field(stripe, "lock");
         long stamp = lock.writeLock();
         try {
-            idleDecay(stripe).decay(now);
+            ((AdaptivePoolingAllocator.Heap) stripe).releaseIdle(now);
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -313,7 +309,7 @@ public class AdaptiveSegmentsTest {
             Object heap = threadLocalHeap(allocator);
             long now = System.nanoTime();
             for (int decay = 1; decay <= 8; decay++) {
-                idleDecay(heap).decay(now += INTERVAL);
+                ((Heap) heap).releaseIdle(now += INTERVAL);
             }
             assertEquals(0, usedSlices(allocator), "every span went back whole");
             return null;
@@ -486,9 +482,9 @@ public class AdaptiveSegmentsTest {
             // Nothing applied yet: the block still holds the three spans.
             assertEquals(24, usedSlices(allocator));
             long now = System.nanoTime();
-            idleDecay(heap).decay(now + INTERVAL); // the class allocated since the last decay: not idle yet
+            ((Heap) heap).releaseIdle(now + INTERVAL); // the class allocated since the last decay: not idle yet
             assertEquals(24, usedSlices(allocator));
-            idleDecay(heap).decay(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
+            ((Heap) heap).releaseIdle(now + 2 * INTERVAL); // idle: its chunks, applied from the notes, are given up
             assertEquals(0, usedSlices(allocator));
             assertAccounted(source, allocator);
             return null;

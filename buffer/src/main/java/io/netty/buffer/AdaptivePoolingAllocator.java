@@ -62,15 +62,15 @@ import java.util.concurrent.locks.StampedLock;
  *       segments of one size class. Its {@link SizeClassMagazine} allocates from one chunk at a time and keeps the
  *       others queued by whether they have a free slot (see {@link SizeClassedChunk}'s state diagram).</li>
  *   <li><b>Above it, up to a block</b>: a span of whole slices holding that buffer alone, see
- *       {@link SpanMagazine}.</li>
+ *       {@link Heap#allocateLarge}.</li>
  *   <li><b>Larger still</b>, or when no span can be had: a one-shot {@link OneShotChunk}, holding that buffer alone and
  *       freed with it.</li>
  * </ul>
  * <p>
- * The magazines are grouped into {@link StripedHeap}s, each guarded by one lock, and a thread picks a stripe by its
+ * The magazines are grouped into stripe {@link Heap}s, each guarded by one lock, and a thread picks a stripe by its
  * id; more stripes are used when threads collide on the lock. A {@link FastThreadLocalThread} instead gets a
- * {@link ThreadLocalSizeClassHeap} of its own, which needs no lock at all, for the size classes and for the buffers
- * above them; the stripes serve the other threads.
+ * {@link Heap} of its own, which needs no lock at all, for the size classes and for the buffers above them; the
+ * stripes serve the other threads.
  * <p>
  * A buffer released by the thread that owns its chunk is returned to it directly. A buffer released by any other
  * thread puts its segment on the chunk's lock-free free list and leaves a note for the owner, which applies it on its
@@ -114,7 +114,7 @@ final class AdaptivePoolingAllocator {
 
     /**
      * {@code io.netty.allocator.chunkPurgeInterval}: how often a size-class magazine applies the notes left by other
-     * threads on its heap, and counts its allocations for the heap's {@link IdleDecay}, counted in chunks' worth of
+     * threads on its heap, and counts its allocations for the heap's decay clock, counted in chunks' worth of
      * allocations. A note that makes a chunk wholly free gives it up at once, unless its size class is down to the
      * chunks it keeps. Default: 4. Read from {@code io.netty.allocator.chunkPurgePollsThreadLocal} when only that, its
      * former name, is set. The wholly free chunks a size class kept at its floor are given up as soon as a chunk
@@ -244,11 +244,11 @@ final class AdaptivePoolingAllocator {
 
     private final MemorySource memory;
     private final LongAdder usedMemory = new LongAdder();
-    private final StripedHeap[] stripedHeaps;
+    private final Heap[] stripedHeaps;
     private volatile int stripeScanLength;
 
     private final AdaptiveRecycler fallbackRecycler;
-    private final FastThreadLocal<ThreadLocalSizeClassHeap> threadLocalSizeClassHeap;
+    private final FastThreadLocal<Heap> threadLocalHeap;
 
     /** Per size class, the slices of its chunks: a page kind of the store's blocks (see {@link #pageKinds}). */
     final int[] pageSlices;
@@ -270,27 +270,27 @@ final class AdaptivePoolingAllocator {
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         this.memory = ObjectUtil.checkNotNull(memory, "memory");
         pageSlices = pageSlices(pageStore.config);
-        stripedHeaps = new StripedHeap[MAX_STRIPES];
+        stripedHeaps = new Heap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
-            stripedHeaps[i] = new StripedHeap(pageStore);
+            stripedHeaps[i] = new Heap(this, new StampedLock(), null);
         }
         stripeScanLength = INITIAL_MAGAZINES;
         fallbackRecycler = AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
 
         boolean disableThreadLocalGroups = IS_LOW_MEM && DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM;
-        threadLocalSizeClassHeap = disableThreadLocalGroups ? null : new FastThreadLocal<ThreadLocalSizeClassHeap>() {
+        threadLocalHeap = disableThreadLocalGroups ? null : new FastThreadLocal<Heap>() {
             @Override
-            protected ThreadLocalSizeClassHeap initialValue() {
+            protected Heap initialValue() {
                 if (useCacheForNonEventLoopThreads || ThreadExecutorMap.currentExecutor() != null) {
-                    return new ThreadLocalSizeClassHeap(AdaptivePoolingAllocator.this);
+                    return new Heap(AdaptivePoolingAllocator.this, null, Thread.currentThread());
                 }
                 return null;
             }
 
             @Override
-            protected void onRemoval(final ThreadLocalSizeClassHeap heap) throws Exception {
+            protected void onRemoval(final Heap heap) throws Exception {
                 if (heap != null) {
-                    heap.free();
+                    heap.close();
                 }
             }
         };
@@ -325,23 +325,14 @@ final class AdaptivePoolingAllocator {
         AdaptiveByteBuf allocated = null;
         if (size <= MAX_POOLED_BUF_SIZE) {
             final int index = sizeClassIndexOf(size);
-            ThreadLocalSizeClassHeap heap = null;
-            if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
-                heap = threadLocalSizeClassHeap.get();
-            }
-            if (index < POOLED_SIZE_CLASSES_COUNT) {
-                if (heap != null) {
-                    allocated = heap.allocate(index, size, maxCapacity, buf);
-                } else {
-                    allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
+            // Above the size classes: a thread with its own heap never takes a stripe lock for these either.
+            if (index < POOLED_SIZE_CLASSES_COUNT || !IS_LOW_MEM) {
+                Heap heap = null;
+                if (!IS_LOW_MEM && FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
+                    heap = threadLocalHeap.get();
                 }
-            } else if (!IS_LOW_MEM) {
-                // Above the size classes: a thread with its own heap never takes a stripe lock for these either.
-                if (heap != null) {
-                    allocated = heap.allocateLarge(size, maxCapacity, buf);
-                } else {
-                    allocated = allocateShared(index, size, maxCapacity, currentThread, buf);
-                }
+                allocated = heap != null ? heap.allocate(index, size, maxCapacity, buf)
+                        : allocateShared(index, size, maxCapacity, currentThread, buf);
             }
         }
         if (allocated == null) {
@@ -361,9 +352,8 @@ final class AdaptivePoolingAllocator {
             int mask = currentScanLen - 1;
             int start = threadIdx & mask;
             for (int i = 0, m = currentScanLen << 1; i < m; i++) {
-                StripedHeap stripe = stripedHeaps[(start + i) & mask];
-                AdaptiveByteBuf result = stripe.tryAllocate(
-                        sizeClassIndex, size, maxCapacity, buf, reallocate, this);
+                Heap stripe = stripedHeaps[(start + i) & mask];
+                AdaptiveByteBuf result = stripe.tryAllocate(sizeClassIndex, size, maxCapacity, buf, reallocate);
                 if (result != null) {
                     return result;
                 }
@@ -545,9 +535,9 @@ final class AdaptivePoolingAllocator {
     private AdaptiveByteBuf allocateLargeSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
         Thread current = Thread.currentThread();
         if (FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals()) {
-            ThreadLocalSizeClassHeap heap = threadLocalSizeClassHeap.get();
+            Heap heap = threadLocalHeap.get();
             if (heap != null) {
-                return heap.allocateLarge(size, maxCapacity, buf);
+                return heap.allocate(SIZE_CLASSES_COUNT, size, maxCapacity, buf);
             }
         }
         return allocateShared(SIZE_CLASSES_COUNT, size, maxCapacity, current, buf);
@@ -659,15 +649,15 @@ final class AdaptivePoolingAllocator {
      * this allocator, including one still ending: the regions under them are unmapped or freed.
      */
     void close() {
-        if (threadLocalSizeClassHeap != null) {
-            threadLocalSizeClassHeap.remove();
+        if (threadLocalHeap != null) {
+            threadLocalHeap.remove();
         }
         free();
     }
 
     private void free() {
-        for (StripedHeap stripe : stripedHeaps) {
-            stripe.freeStripe();
+        for (Heap stripe : stripedHeaps) {
+            stripe.close();
         }
         pageStore.close();
     }
@@ -690,31 +680,188 @@ final class AdaptivePoolingAllocator {
      * <p>
      * Guarded like the heap: by the stripe lock, or by the owner thread of a thread-local heap.
      */
-    static final class IdleDecay {
+    /**
+     * One thread's heap, or one stripe shared by the threads without one: {@code lock} is {@code null} for a
+     * thread-local heap (the owner thread needs none) and a real {@link StampedLock} for a stripe ({@code owner} is
+     * then {@code null} too). Two entry points: {@link #allocate} on the owner thread, without a lock; and
+     * {@link #tryAllocate}, under the stripe's {@code tryWriteLock}. Every release path takes the same lock, if any,
+     * through {@link #tryOwn()}/{@link #unown}.
+     */
+    static final class Heap {
+        private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
         /** At most one decay per this interval: 10 s. */
         static final long DECAY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
         /** How many allocations of the heap between two looks at the clock. */
-        static final long DECAY_MIN_ALLOCATIONS = 10000;
+        private static final long DECAY_MIN_ALLOCATIONS = 10000;
+        /** An allocation counts toward the decay clock as its size in units of the smallest size class. */
+        private static final int COUNT_SHIFT = 5;
+        /** 4032 bytes at most, as mimalloc's large colours: https://github.com/microsoft/mimalloc/pull/1339 */
+        private static final int MAX_SPAN_COLOURS = 64;
 
-        /** The allocator's page store, whose purge the heap's ticks drive; see {@link #count}. */
-        private final PageStore store;
-        /** The heap's size-class magazines, set once the heap has them; see {@link SizeClassMagazine#dropIfIdle}. */
+        final StampedLock lock;
+        final Thread owner;
+        final AdaptivePoolingAllocator allocator;
+        final PageStore store;
+        private final int sliceShift;
+        private final int segmentSlices;
+
         SizeClassMagazine[] magazines;
-        // Visible for testing.
-        long allocationsSinceCheck;
-        // Visible for testing.
-        long lastDecayNanos = System.nanoTime();
+        /** The notes left for this heap's size classes: see {@link PendingChunks}. */
+        final PendingChunks notes = new PendingChunks();
+        private AdaptiveRecycler recycler;
+        /** Round robin over the colours of the spans; single writer, as the heap's owner or lock holder. */
+        private int spans;
+        private long allocationsSinceCheck;
+        private long lastDecayNanos = System.nanoTime();
 
-        IdleDecay(PageStore store) {
-            this.store = store;
+        Heap(AdaptivePoolingAllocator allocator, StampedLock lock, Thread owner) {
+            this.allocator = allocator;
+            this.store = allocator.pageStore;
+            this.lock = lock;
+            this.owner = owner;
+            int sliceSize = store.config.sliceSize;
+            assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
+            sliceShift = Integer.numberOfTrailingZeros(sliceSize);
+            segmentSlices = store.config.slicesPerSegment();
+        }
+
+        /** The magazine of {@code sizeClassIndex}, made on first use. */
+        SizeClassMagazine magazine(int sizeClassIndex) {
+            SizeClassMagazine[] mags = magazines;
+            if (mags == null) {
+                mags = new SizeClassMagazine[SIZE_CLASSES_COUNT];
+                magazines = mags;
+            }
+            SizeClassMagazine mag = mags[sizeClassIndex];
+            if (mag == null) {
+                mag = new SizeClassMagazine(this, sizeClassIndex);
+                mags[sizeClassIndex] = mag;
+            }
+            return mag;
+        }
+
+        /** The buffer-object recycler shared by every magazine of a stripe, made on first use. */
+        private AdaptiveRecycler buffers() {
+            AdaptiveRecycler r = recycler;
+            if (r == null) {
+                r = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+                recycler = r;
+            }
+            return r;
+        }
+
+        AdaptiveByteBuf newBuffer() {
+            AdaptiveByteBuf buf = owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL.get() : buffers().get();
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
+        }
+
+        /** Owner entry point: no lock. */
+        AdaptiveByteBuf allocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
+            if (sizeClassIndex < SIZE_CLASSES_COUNT) {
+                SizeClassMagazine mag = magazine(sizeClassIndex);
+                boolean reallocate = buf != null;
+                if (!reallocate) {
+                    buf = newBuffer();
+                }
+                boolean success = mag.allocate(size, maxCapacity, buf);
+                assert success : "owner allocation must always succeed";
+                mag.countAllocation();
+                return buf;
+            }
+            return allocateLarge(size, maxCapacity, buf, buf != null);
+        }
+
+        /** Stripe entry point: under {@code tryWriteLock}; {@code null} when busy. */
+        AdaptiveByteBuf tryAllocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf,
+                                    boolean reallocate) {
+            long stamp = lock.tryWriteLock();
+            if (stamp == 0) {
+                return null;
+            }
+            try {
+                if (sizeClassIndex < SIZE_CLASSES_COUNT) {
+                    SizeClassMagazine mag = magazine(sizeClassIndex);
+                    if (buf == null) {
+                        buf = newBuffer();
+                    }
+                    if (mag.allocate(size, maxCapacity, buf)) {
+                        mag.countAllocation();
+                        return buf;
+                    }
+                    if (!reallocate) {
+                        buf.release();
+                    }
+                    return null;
+                }
+                // No purge tick here: allocateLarge counts its own allocations.
+                return allocateLarge(size, maxCapacity, buf, reallocate);
+            } finally {
+                lock.unlockWrite(stamp);
+            }
+        }
+
+        /**
+         * Above the size classes, up to a block: a span of whole slices of the store's shared slices (see
+         * {@link PageStore#claimSlices}), sized to the buffer rounded up to slices, as mimalloc's large pages. No
+         * chunk, nothing kept for reuse: a release, from any thread, gives the span back to the store at once (see
+         * {@link SharedSpanChunk}).
+         */
+        private AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
+            if (buf == null) {
+                buf = newBuffer();
+            }
+            boolean allocated = false;
+            try {
+                allocateSpan(size, maxCapacity, buf);
+                allocated = true;
+                return buf;
+            } finally {
+                if (!allocated && !reallocate) {
+                    buf.release();
+                }
+            }
+        }
+
+        private void allocateSpan(int size, int maxCapacity, AdaptiveByteBuf buf) {
+            int shift = sliceShift;
+            int slices = (int) ((size + (1L << shift) - 1) >>> shift);
+            if (slices > segmentSlices) {
+                // Slices smaller than the buffer (a small configured segment size): a buffer of its own.
+                allocator.allocateOneShot(size, maxCapacity, buf);
+                return;
+            }
+            long run = store.claimSlices(slices, owner != null);
+            Segment segment = store.block(run);
+            int start = store.start(run);
+            // Colour, as the size classes' chunks (see colourOffset) and as mimalloc does for its large allocations
+            // (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to 4032 bytes into
+            // its span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer,
+            // so it costs no memory. A release rounds its capacity up to whole slices again.
+            int room = (int) (((long) slices << shift) - size);
+            int colour = colourOffset(spans++, room, MAX_SPAN_COLOURS);
+            // A block has one chunk for the spans of every thread-local heap, and one for every stripe's.
+            Chunk chunk = owner != null ? segment.threadLocalSpans : segment.sharedSpans;
+            boolean initialized = false;
+            try {
+                buf.init(segment.buffer, chunk, 0, 0, segment.base + (start << shift) + colour, size,
+                        (slices << shift) - colour, maxCapacity);
+                initialized = true;
+            } finally {
+                if (!initialized) {
+                    segment.releaseRun(start, slices, System.nanoTime());
+                }
+            }
+            countAllocations(size >>> COUNT_SHIFT);
         }
 
         /**
          * The heap made {@code allocations} more allocations: a size class's purge tick, or a span. Every tick also
-         * reads the clock for the store's purge (see {@link PageStore#purgeIfDue}), whose delay is shorter than a decay
-         * interval: a tick comes once per four chunks' worth of a class's allocations, at least 128.
+         * reads the clock for the store's purge (see {@link PageStore#purgeIfDue}), whose delay is shorter than a
+         * decay interval: a tick comes once per four chunks' worth of a class's allocations, at least 128.
          */
-        void count(long allocations) {
+        void countAllocations(long allocations) {
             allocationsSinceCheck += allocations;
             if (allocationsSinceCheck < DECAY_MIN_ALLOCATIONS) {
                 store.purgeIfDue(System.nanoTime());
@@ -726,14 +873,14 @@ final class AdaptivePoolingAllocator {
             allocationsSinceCheck = 0;
             long now = System.nanoTime();
             if (now - lastDecayNanos >= DECAY_INTERVAL_NANOS) {
-                decay(now);
+                releaseIdle(now);
             } else {
                 store.purgeIfDue(now);
             }
         }
 
-        // Visible for testing.
-        void decay(long now) {
+        /** The idle size classes give up their chunks: see {@link SizeClassMagazine#dropIfIdle}. */
+        void releaseIdle(long now) {
             lastDecayNanos = now;
             allocationsSinceCheck = 0;
             SizeClassMagazine[] mags = magazines;
@@ -746,85 +893,22 @@ final class AdaptivePoolingAllocator {
             }
             store.purgeIfDue(now);
         }
-    }
 
-    // A stripe: the heap of the threads without a thread-local one that pick it. One StampedLock covers all its
-    // size-class magazines and its magazine for buffers above the size classes.
-    private static final class StripedHeap {
-        final StampedLock lock = new StampedLock();
-        /** The notes left for the stripe's size classes: see {@link PendingChunks}. */
-        final PendingChunks notes = new PendingChunks();
-        final IdleDecay idleDecay;
-        SizeClassMagazine[] magazines;
-        SpanMagazine spanMagazine;
-        AdaptiveRecycler recycler;
-
-        StripedHeap(PageStore store) {
-            idleDecay = new IdleDecay(store);
+        /** Act as the owner for one release, if the lock is free; 0 when there is no lock or it is busy (lock 6). */
+        long tryOwn() {
+            return lock == null ? 0 : lock.tryWriteLock();
         }
 
-        SizeClassMagazine getOrCreateMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
-            SizeClassMagazine[] mags = magazines;
-            if (mags == null) {
-                return createFirstMagazine(sizeClassIndex, allocator);
-            }
-            SizeClassMagazine mag = mags[sizeClassIndex];
-            if (mag == null) {
-                mag = createMagazine(sizeClassIndex, allocator);
-            }
-            return mag;
+        /** Release the ownership taken by {@link #tryOwn()}; {@code stamp} must be non-zero. */
+        void unown(long stamp) {
+            assert stamp != 0 : "unown(0): tryOwn did not grant the lock";
+            lock.unlockWrite(stamp);
         }
 
-        private SizeClassMagazine createFirstMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
-            magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
-            idleDecay.magazines = magazines;
-            return createMagazine(sizeClassIndex, allocator);
-        }
-
-        private SizeClassMagazine createMagazine(int sizeClassIndex, AdaptivePoolingAllocator allocator) {
-            if (recycler == null) {
-                recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-            }
-            SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                    sizeClassIndex, null, recycler, lock, notes);
-            magazines[sizeClassIndex] = mag;
-            return mag;
-        }
-
-        /** Above the size classes, under the stripe lock: a span. */
-        private AdaptiveByteBuf allocateLargeLocked(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate,
-                                                    AdaptivePoolingAllocator allocator) {
-            SpanMagazine mag = getOrCreateSpanMagazine(allocator);
-            if (buf == null) {
-                buf = mag.newBuffer();
-            }
-            boolean allocated = false;
-            try {
-                mag.allocate(size, maxCapacity, buf);
-                allocated = true;
-                return buf;
-            } finally {
-                if (!allocated && !reallocate) {
-                    buf.release();
-                }
-            }
-        }
-
-        SpanMagazine getOrCreateSpanMagazine(AdaptivePoolingAllocator allocator) {
-            SpanMagazine mag = spanMagazine;
-            if (mag == null) {
-                if (recycler == null) {
-                    recycler = AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
-                }
-                mag = new SpanMagazine(allocator, recycler, null, idleDecay);
-                spanMagazine = mag;
-            }
-            return mag;
-        }
-
-        void freeStripe() {
+        /** The heap is gone: every magazine's chunks give their spans back, or are abandoned. */
+        void close() {
             final StampedLock l = lock;
-            long stamp = l.writeLock();
+            long stamp = l != null ? l.writeLock() : 0;
             try {
                 if (magazines != null) {
                     for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
@@ -835,126 +919,13 @@ final class AdaptivePoolingAllocator {
                         }
                     }
                 }
-                // Nobody drains the stripe's notes any more: see SizeClassMagazine#close.
+                // Nobody drains the notes any more: see SizeClassMagazine#close.
                 notes.clear();
-                spanMagazine = null;
             } finally {
-                l.unlockWrite(stamp);
-            }
-        }
-
-        AdaptiveByteBuf tryAllocate(int sizeClassIndex, int size, int maxCapacity,
-                                     AdaptiveByteBuf buf, boolean reallocate,
-                                     AdaptivePoolingAllocator allocator) {
-            final StampedLock l = lock;
-            long stamp = l.tryWriteLock();
-            if (stamp == 0) {
-                return null;
-            }
-            try {
-                if (sizeClassIndex < SIZE_CLASSES_COUNT) {
-                    SizeClassMagazine mag = getOrCreateMagazine(sizeClassIndex, allocator);
-                    if (buf == null) {
-                        buf = mag.newBuffer();
-                    }
-                    if (mag.allocate(size, maxCapacity, buf)) {
-                        mag.countAllocation();
-                        return buf;
-                    }
-                } else {
-                    // No purge tick here: the large-buffer magazines count their allocations themselves.
-                    return allocateLargeLocked(size, maxCapacity, buf, reallocate, allocator);
-                }
-                if (!reallocate) {
-                    buf.release();
-                }
-                return null;
-            } finally {
-                l.unlockWrite(stamp);
-            }
-        }
-    }
-
-    private static final class ThreadLocalSizeClassHeap {
-        private final SizeClassMagazine[] magazines = new SizeClassMagazine[SIZE_CLASSES_COUNT];
-        /** The notes left for the heap's size classes: see {@link PendingChunks}. */
-        private final PendingChunks notes = new PendingChunks();
-        /** Buffers above the size classes; {@code null} until the first one. */
-        private SpanMagazine spanMagazine;
-        // Visible for testing.
-        final IdleDecay idleDecay;
-        private final AdaptivePoolingAllocator allocator;
-
-        ThreadLocalSizeClassHeap(AdaptivePoolingAllocator allocator) {
-            this.allocator = allocator;
-            idleDecay = new IdleDecay(allocator.pageStore);
-            idleDecay.magazines = magazines;
-        }
-
-        AdaptiveByteBuf allocate(int sizeClassIndex, int size, int maxCapacity, AdaptiveByteBuf buf) {
-            SizeClassMagazine mag = getOrCreateMagazine(sizeClassIndex);
-            boolean reallocate = buf != null;
-            if (!reallocate) {
-                buf = mag.newBuffer();
-            }
-            boolean success = mag.allocate(size, maxCapacity, buf);
-            assert success : "Thread-local allocation must always succeed";
-            mag.countAllocation();
-            return buf;
-        }
-
-        /**
-         * A buffer above the size classes: a span of shared slices from this heap's own {@link SpanMagazine}, created
-         * on first use; the owner thread needs no lock.
-         */
-        AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            SpanMagazine mag = spanMagazine;
-            if (mag == null) {
-                mag = new SpanMagazine(allocator, null, Thread.currentThread(), idleDecay);
-                spanMagazine = mag;
-            }
-            boolean reallocate = buf != null;
-            if (!reallocate) {
-                buf = mag.newBuffer();
-            }
-            boolean allocated = false;
-            try {
-                mag.allocate(size, maxCapacity, buf);
-                allocated = true;
-                return buf;
-            } finally {
-                if (!allocated && !reallocate) {
-                    buf.release();
+                if (l != null) {
+                    l.unlockWrite(stamp);
                 }
             }
-        }
-
-        SizeClassMagazine getOrCreateMagazine(int sizeClassIndex) {
-            SizeClassMagazine mag = magazines[sizeClassIndex];
-            if (mag == null) {
-                mag = createMagazine(sizeClassIndex);
-            }
-            return mag;
-        }
-
-        private SizeClassMagazine createMagazine(int sizeClassIndex) {
-            SizeClassMagazine mag = new SizeClassMagazine(allocator, idleDecay,
-                                       sizeClassIndex, Thread.currentThread(), null, null, notes);
-            magazines[sizeClassIndex] = mag;
-            return mag;
-        }
-
-        void free() {
-            for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-                SizeClassMagazine mag = magazines[i];
-                if (mag != null) {
-                    mag.close();
-                    magazines[i] = null;
-                }
-            }
-            // Nobody drains the heap's notes any more: see SizeClassMagazine#close.
-            notes.clear();
-            spanMagazine = null;
         }
     }
 
@@ -1163,19 +1134,13 @@ final class AdaptivePoolingAllocator {
      * Invariant N) instead of moving the chunk there and then.
      */
     static final class SizeClassMagazine {
-        private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
         /** Bound on the last-resort probe of {@link #full}; see {@link #allocateSlow}. */
         private static final int MAX_FULL_PROBE = 8;
         /** The chunks a size class keeps queued before it gives one up that empties: see {@link #atFloor}. */
         static final int FLOOR = 4;
 
-        final AdaptivePoolingAllocator allocator;
-        final Thread ownerThread;
+        final Heap heap;
         final int sizeClassIndex;
-        private final IdleDecay idleDecay;
-        final AdaptiveRecycler bufRecycler; // for ByteBuf wrapper pooling; null → EVENT_LOOP_LOCAL_BUFFER_POOL
-        final StampedLock stripeLock;
-        final PendingChunks notes;
 
         private final int slotSize;
         final int chunkSize;
@@ -1199,18 +1164,11 @@ final class AdaptivePoolingAllocator {
         private int ticksAtDecay;
         private int allocCountAtDecay;
 
-        SizeClassMagazine(AdaptivePoolingAllocator allocator, IdleDecay idleDecay, int sizeClassIndex,
-                          Thread ownerThread, AdaptiveRecycler bufRecycler, StampedLock stripeLock,
-                          PendingChunks heapNotes) {
-            this.idleDecay = idleDecay;
-            this.allocator = allocator;
-            this.ownerThread = ownerThread;
+        SizeClassMagazine(Heap heap, int sizeClassIndex) {
+            this.heap = heap;
             this.sizeClassIndex = sizeClassIndex;
-            this.bufRecycler = bufRecycler;
-            this.stripeLock = stripeLock;
-            this.notes = heapNotes;
             slotSize = SIZE_CLASSES[sizeClassIndex];
-            chunkSize = allocator.pageSlices[sizeClassIndex] * allocator.pageStore.config.sliceSize;
+            chunkSize = heap.allocator.pageSlices[sizeClassIndex] * heap.store.config.sliceSize;
             slots = chunkBuffersOf(slotSize, chunkSize);
             room = chunkSize - slots * slotSize;
             tickThreshold = (int) Math.min(Integer.MAX_VALUE, CHUNK_PURGE_INTERVAL * (chunkSize / slotSize));
@@ -1218,9 +1176,9 @@ final class AdaptivePoolingAllocator {
 
         /**
          * Count one successful allocation and, when the budget is spent, apply the heap's notes, then count the
-         * allocations for the heap's {@link IdleDecay}. A size class that keeps allocating from its current chunk
-         * takes no slow path, so this is what applies the notes of the other size classes of its heap then, and what
-         * reads the clock for the decays and the store's purge.
+         * allocation for the heap's decay clock. A size class that keeps allocating from its current chunk takes no
+         * slow path, so this is what applies the notes of the other size classes of its heap then, and what reads
+         * the clock for the decays and the store's purge.
          *
          * <p>Call exactly once per successful {@link #allocate}.
          */
@@ -1229,12 +1187,12 @@ final class AdaptivePoolingAllocator {
                 allocCount = 0;
                 ticks++;
                 drainPending();
-                idleDecay.count(tickThreshold);
+                heap.countAllocations(tickThreshold);
             }
         }
 
         /**
-         * Called by the heap's {@link IdleDecay}: a size class that made no allocation since the previous decay gives
+         * Called by {@link Heap#releaseIdle}: a size class that made no allocation since the previous decay gives
          * up its current chunk and every wholly free chunk it keeps, the one it keeps as its floor included. Its floor
          * is for a class in use; one unused through a whole interval keeps nothing. Chunks with buffers out stay.
          * Reads only counters the allocations already keep.
@@ -1299,9 +1257,9 @@ final class AdaptivePoolingAllocator {
                 // claimChunk: a run of the store's shared slices, served by a chunk object the magazine gave up
                 // earlier or a new one, coloured round robin so that slot k of consecutive chunks does not share
                 // its offset in a 4 KiB page (Bonwick, "The Slab Allocator", USENIX Summer 1994, section 4.3).
-                PageStore store = allocator.pageStore;
+                PageStore store = heap.store;
                 int slices = chunkSize / store.config.sliceSize;
-                long run = store.claimSlices(slices, ownerThread != null);
+                long run = store.claimSlices(slices, heap.owner != null);
                 Segment segment = store.block(run);
                 int start = store.start(run);
                 try {
@@ -1432,7 +1390,7 @@ final class AdaptivePoolingAllocator {
          * is the owner thread.
          */
         void drainPending() {
-            Chunk cur = notes.takeAll();
+            Chunk cur = heap.notes.takeAll();
             while (cur != null) {
                 // Re-arm BEFORE processing: see PendingChunks#rearm.
                 Chunk next = PendingChunks.rearm(cur);
@@ -1440,27 +1398,6 @@ final class AdaptivePoolingAllocator {
                 chunk.magazine.slotReturned(chunk);
                 cur = next;
             }
-        }
-
-        /** Apply the heap's notes, then give up this magazine's wholly free chunks above the floor. */
-        void tickPurge() {
-            drainPending();
-            returnFreeSpans(true);
-        }
-
-        /**
-         * Try to take exclusive access to this magazine's lists so a releasing thread can place a slot and apply any
-         * resulting list transition. Returns 0 when unavailable: a thread-local magazine has no exclusive mode to
-         * take, and a contended stripe lock is not waited on.
-         */
-        long tryLockForRelease() {
-            return stripeLock == null ? 0 : stripeLock.tryWriteLock();
-        }
-
-        /** Release the exclusive access taken by {@link #tryLockForRelease()}; {@code stamp} must be non-zero. */
-        void unlockAfterRelease(long stamp) {
-            assert stamp != 0 : "unlockAfterRelease(0): tryLockForRelease did not grant the lock";
-            stripeLock.unlockWrite(stamp);
         }
 
         /**
@@ -1481,90 +1418,6 @@ final class AdaptivePoolingAllocator {
             while ((cur = queue.pollFront()) != null) {
                 ((SizeClassedChunk) cur).releaseOrAbandon();
             }
-        }
-
-        AdaptiveByteBuf newBuffer() {
-            AdaptiveByteBuf buf = bufRecycler != null ? bufRecycler.get() : EVENT_LOOP_LOCAL_BUFFER_POOL.get();
-            buf.resetRefCnt();
-            buf.discardMarks();
-            return buf;
-        }
-    }
-
-    /**
-     * Buffers above the size classes, up to a block, when the allocator has a {@link PageStore}: each one is a span of
-     * whole slices of the store's shared slices (see {@link PageStore#claimSlices}), sized to the buffer rounded up to
-     * slices, as mimalloc's large pages. No block of a chunk, nothing kept for reuse: a release, from any thread,
-     * gives the span back to the store at once (see {@link SharedSpanChunk}).
-     * <p>
-     * The heap's owner (the stripe lock holder, or the thread of a thread-local heap) claims the spans.
-     */
-    private static final class SpanMagazine {
-        /** An allocation counts toward the heap's {@link IdleDecay} as its size in units of the smallest size class. */
-        private static final int COUNT_SHIFT = 5;
-        /** 4032 bytes at most, as mimalloc's large colours: https://github.com/microsoft/mimalloc/pull/1339 */
-        private static final int MAX_COLOURS = 64;
-
-        final AdaptivePoolingAllocator allocator;
-        private final AdaptiveRecycler bufRecycler;
-        private final Thread ownerThread;
-        private final IdleDecay idleDecay;
-        final int sliceShift;
-        private final int segmentSlices;
-        /** Round robin over the colours of the spans; single writer, as the magazine. */
-        private int nextColour;
-
-        SpanMagazine(AdaptivePoolingAllocator allocator, AdaptiveRecycler bufRecycler, Thread ownerThread,
-                     IdleDecay idleDecay) {
-            this.allocator = allocator;
-            this.bufRecycler = bufRecycler;
-            this.ownerThread = ownerThread;
-            this.idleDecay = idleDecay;
-            int sliceSize = allocator.pageStore.config.sliceSize;
-            assert (sliceSize & sliceSize - 1) == 0 : "slices of a power of two";
-            sliceShift = Integer.numberOfTrailingZeros(sliceSize);
-            segmentSlices = allocator.pageStore.config.slicesPerSegment();
-        }
-
-        void allocate(int size, int maxCapacity, AdaptiveByteBuf buf) {
-            int sliceShift = this.sliceShift;
-            int slices = (int) ((size + (1L << sliceShift) - 1) >>> sliceShift);
-            if (slices > segmentSlices) {
-                // Segments smaller than the buffer (a small configured segment size): a buffer of its own.
-                allocator.allocateOneShot(size, maxCapacity, buf);
-                return;
-            }
-            PageStore store = allocator.pageStore;
-            long run = store.claimSlices(slices, ownerThread != null);
-            Segment segment = store.block(run);
-            int start = store.start(run);
-            // Colour, as the size classes' spans (see colourOffset) and as mimalloc does for its large allocations
-            // (https://github.com/microsoft/mimalloc/pull/1339, issue #1121): the buffer starts up to 4032 bytes into
-            // its span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer,
-            // so it costs no memory. A release rounds its capacity up to whole slices again.
-            int room = (int) (((long) slices << sliceShift) - size);
-            int colour = colourOffset(nextColour++, room, MAX_COLOURS);
-            // A block has one chunk for the spans of every thread-local heap, and one for every stripe's.
-            Chunk chunk = ownerThread != null ? segment.threadLocalSpans : segment.sharedSpans;
-            boolean initialized = false;
-            try {
-                buf.init(segment.buffer, chunk, 0, 0, segment.base + (start << sliceShift) + colour, size,
-                        (slices << sliceShift) - colour, maxCapacity);
-                initialized = true;
-            } finally {
-                if (!initialized) {
-                    segment.releaseRun(start, slices, System.nanoTime());
-                }
-            }
-            idleDecay.count(size >>> COUNT_SHIFT);
-        }
-
-        AdaptiveByteBuf newBuffer() {
-            AdaptiveByteBuf buf = bufRecycler != null ? bufRecycler.get()
-                    : SizeClassMagazine.EVENT_LOOP_LOCAL_BUFFER_POOL.get();
-            buf.resetRefCnt();
-            buf.discardMarks();
-            return buf;
         }
     }
 
@@ -1792,14 +1645,14 @@ final class AdaptivePoolingAllocator {
 
         /** A chunk object of {@code magazine}, with no span until {@link #takeSpan}. */
         SizeClassedChunk(SizeClassMagazine magazine, int colour) {
-            super(null, magazine.allocator, true, magazine.chunkSize - colour);
+            super(null, magazine.heap.allocator, true, magazine.chunkSize - colour);
             slotSize = magazine.slotSize;
             slots = magazine.slots;
             assert slots <= MAX_SEGMENTS : slots;
             this.colour = colour;
             next = new short[slots];
             indexRecip = indexReciprocal(slotSize);
-            ownerThread = magazine.ownerThread;
+            ownerThread = magazine.heap.owner;
             this.magazine = magazine;
         }
 
@@ -1977,7 +1830,8 @@ final class AdaptivePoolingAllocator {
                 return;
             }
             final SizeClassMagazine mag = magazine;
-            final long stamp = mag.tryLockForRelease();
+            final Heap heap = mag.heap;
+            final long stamp = heap.tryOwn();
             if (stamp != 0) {
                 try {
                     pushLocalFree(startIndex);
@@ -1985,14 +1839,14 @@ final class AdaptivePoolingAllocator {
                         mag.slotReturned(this);
                     }
                 } finally {
-                    mag.unlockAfterRelease(stamp);
+                    heap.unown(stamp);
                 }
                 return;
             }
             pushRemoteFree(startIndex);
             // The chunk just gained capacity but we could not take the lock to apply the resulting list
             // transition. Leave a note instead; the next drain applies it.
-            mag.notes.push(this);
+            heap.notes.push(this);
         }
 
         /** The slices of the span this chunk is; its colour is less than one. */
@@ -2027,9 +1881,9 @@ final class AdaptivePoolingAllocator {
          * its next pass when the lock is taken.
          */
         boolean returnSpanIfAllFree() {
-            SizeClassMagazine mag = magazine;
-            long stamp = mag.tryLockForRelease();
-            if (stamp == 0 && mag.stripeLock != null) {
+            Heap heap = magazine.heap;
+            long stamp = heap.tryOwn();
+            if (stamp == 0 && heap.lock != null) {
                 return false;
             }
             try {
@@ -2040,7 +1894,7 @@ final class AdaptivePoolingAllocator {
                 return true;
             } finally {
                 if (stamp != 0) {
-                    mag.unlockAfterRelease(stamp);
+                    heap.unown(stamp);
                 }
             }
         }

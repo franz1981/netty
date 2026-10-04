@@ -177,14 +177,12 @@ public class JfrEventsTest {
             Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField(which);
             heapField.setAccessible(true);
             Object pooling = heapField.get(alloc);
-            Field tlField = pooling.getClass().getDeclaredField("threadLocalSizeClassHeap");
+            Field tlField = pooling.getClass().getDeclaredField("threadLocalHeap");
             tlField.setAccessible(true);
-            Object heap = ((FastThreadLocal<?>) tlField.get(pooling)).get();
-            Field decayField = heap.getClass().getDeclaredField("idleDecay");
-            decayField.setAccessible(true);
-            AdaptivePoolingAllocator.IdleDecay idleDecay = (AdaptivePoolingAllocator.IdleDecay) decayField.get(heap);
+            AdaptivePoolingAllocator.Heap heap =
+                    (AdaptivePoolingAllocator.Heap) ((FastThreadLocal<?>) tlField.get(pooling)).get();
             for (int i = 0; i < decays; i++) {
-                idleDecay.decay(System.nanoTime());
+                heap.releaseIdle(System.nanoTime());
             }
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
