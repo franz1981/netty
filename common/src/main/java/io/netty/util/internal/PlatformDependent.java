@@ -686,6 +686,42 @@ public final class PlatformDependent {
                 "sun.misc.Unsafe or java.nio.DirectByteBuffer.<init>(long, int) not available");
     }
 
+    /**
+     * Whether {@link #mmapAnonymous(long)}, {@link #munmap(long, long)} and {@link #madviseDontNeed(long, long)}
+     * are linked: Java 22+, 64-bit Linux x86_64 or aarch64, with native access enabled for this module.
+     */
+    public static boolean hasMmap() {
+        return LinuxMmapLinker.isAvailable();
+    }
+
+    /**
+     * {@code mmap(2)} of {@code length} anonymous, private, zero-filled bytes; returns the mapping's address.
+     *
+     * @throws NativeCallException if {@code mmap(2)} failed.
+     */
+    public static long mmapAnonymous(long length) {
+        return LinuxMmapLinker.mmap(length);
+    }
+
+    /**
+     * {@code munmap(2)} of {@code length} bytes starting at {@code address}.
+     *
+     * @throws NativeCallException if {@code munmap(2)} failed.
+     */
+    public static void munmap(long address, long length) {
+        LinuxMmapLinker.munmap(address, length);
+    }
+
+    /**
+     * {@code madvise(2)} with {@code MADV_DONTNEED} of {@code length} bytes starting at {@code address}: the kernel
+     * drops the range's pages at once, which read zero if touched again.
+     *
+     * @throws NativeCallException if {@code madvise(2)} failed.
+     */
+    public static void madviseDontNeed(long address, long length) {
+        LinuxMmapLinker.madviseDontNeed(address, length);
+    }
+
     public static boolean hasVarHandle() {
         return VAR_HANDLE;
     }
