@@ -90,17 +90,16 @@ final class PageStorePurgePassTest {
     void noPassUntilARunIsReleasedAndIdleForTheDelay(long base) {
         PageStore store = store(base, 1);
         store.purgeIfDue(base + CHECK);
-        assertEquals(0, store.purges(), "nothing released: no pass");
+        assertEquals(0, regions.purgeCalls(), "nothing released: no pass");
         long released = base + DELAY / 4;
         block(store, 0).releaseRun(3, 2, released);
         store.purgeIfDue(released + CHECK / 2);
         store.purgeIfDue(released + DELAY - 1);
-        assertEquals(0, store.purges(), "armed, not due");
+        assertEquals(0, regions.purgeCalls(), "armed, not due");
         store.purgeIfDue(released + DELAY);
-        assertEquals(1, store.purges());
         assertEquals(1, regions.purgeCalls());
         store.purgeIfDue(released + 20 * DELAY);
-        assertEquals(1, store.purges(), "nothing released since: no pass");
+        assertEquals(1, regions.purgeCalls(), "nothing released since: no pass");
     }
 
     /** The run released in a block the pass has passed is found only because its release arms the purge again. */
@@ -119,9 +118,8 @@ final class PageStorePurgePassTest {
         store.purgeIfDue(pass);
         assertEquals(1, regions.purgeCalls());
         store.purgeIfDue(pass + DELAY - 1);
-        assertEquals(1, store.purges(), "armed by the release during the pass, not due");
+        assertEquals(1, regions.purgeCalls(), "armed by the release during the pass, not due");
         store.purgeIfDue(pass + DELAY);
-        assertEquals(2, store.purges());
         assertEquals(2, regions.purgeCalls());
         assertEquals(5 * SLICE, regions.purges.get(1)[0]);
     }
@@ -137,17 +135,15 @@ final class PageStorePurgePassTest {
         store.purgeIfDue(base + DELAY);
         assertEquals(1, regions.purgeCalls(), "block 1 not idle for the delay yet");
         store.purgeIfDue(base + 3 * DELAY / 2 - 1);
-        assertEquals(1, store.purges(), "armed for the first slice skipped, not due");
+        assertEquals(1, regions.purgeCalls(), "armed for the first slice skipped, not due");
         store.purgeIfDue(base + 3 * DELAY / 2);
-        assertEquals(2, store.purges());
         assertEquals(2, regions.purgeCalls(), "the slice freed at base + DELAY / 2");
         assertEquals(SEGMENT_SIZE, regions.purges.get(1)[0]);
         store.purgeIfDue(base + 7 * DELAY / 4);
-        assertEquals(3, store.purges());
         assertEquals(3, regions.purgeCalls(), "the slice freed at base + 3 * DELAY / 4");
         assertEquals(SEGMENT_SIZE + 2 * SLICE, regions.purges.get(2)[0]);
         store.purgeIfDue(base + 10 * DELAY);
-        assertEquals(3, store.purges(), "nothing left");
+        assertEquals(3, regions.purgeCalls(), "nothing left");
     }
 
     /**
@@ -193,8 +189,9 @@ final class PageStorePurgePassTest {
         }
         assertEquals((PER_BLOCK / 2 - 1) * SLICE, regions.purges.get(calls + 5)[0], "then around to block 0");
         assertEquals((PER_BLOCK - 1) * SLICE, regions.purges.get(calls + 6)[0]);
+        int totalCalls = calls + 7;
         store.purgeIfDue(now + 10 * DELAY);
-        assertEquals(2, store.purges(), "the last pass finished: disarmed");
+        assertEquals(totalCalls, regions.purgeCalls(), "the last pass finished: disarmed");
     }
 
     /** A pass whose calls reach {@link PageStore#PURGE_BYTES} exactly stops there, and the next one goes on. */
@@ -235,7 +232,7 @@ final class PageStorePurgePassTest {
         assertEquals(used, allocator.usedMemory(), "not charged again");
         block(store, 0).releaseRun(0, 6, released);
         store.purgeIfDue(released + DELAY - 1);
-        assertEquals(0, store.purges(), "not due");
+        assertEquals(0, regions.purgeCalls(), "not due");
         store.purgeIfDue(released + DELAY);
         assertEquals(1, regions.purgeCalls());
         assertEquals(6 * SLICE, regions.purges.get(0)[1]);
