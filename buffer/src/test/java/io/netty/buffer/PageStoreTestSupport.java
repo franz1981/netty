@@ -50,32 +50,18 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Direct or heap blocks counted as they are allocated and freed, as the regions of one block of
-     * {@link #mallocRegionSource()} unless {@link #fallback} is set; also the chunk allocator of the allocator under
-     * test, for the chunks that are not carved from blocks. The heap one does what the heap allocator's does: a
-     * {@code byte[]} per block or chunk.
+     * Direct or heap blocks counted as they are allocated and freed: the one-block regions a page store falls back
+     * to where it has no {@link MmapRegionSource}, counted as {@link #segments} when their size is exactly
+     * {@link #regionSize} (never a chunk's: a one-shot chunk is always larger than a block); also the chunk allocator
+     * of the allocator under test, for the chunks that are not carved from blocks. The heap one does what the heap
+     * allocator's does: a {@code byte[]} per block or chunk.
      */
     static final class CountingMemorySource implements MemorySource {
         final boolean heap;
         final List<AbstractByteBuf> segments = new ArrayList<AbstractByteBuf>();
         final List<AbstractByteBuf> chunks = new ArrayList<AbstractByteBuf>();
-        /** What {@link #mallocRegionSource()} returns: by default, this source's blocks, one per region. */
-        RegionSource fallback = new RegionSource() {
-            @Override
-            public AbstractByteBuf allocateRegion(int size, int alignment) {
-                return allocateSegment(size);
-            }
-
-            @Override
-            public boolean canPurgeSlices() {
-                return false;
-            }
-
-            @Override
-            public void purge(AbstractByteBuf region, int offset, int length) {
-                throw new UnsupportedOperationException();
-            }
-        };
+        /** The exact size of a one-block region, or 0: every {@link #allocate} lands in {@link #chunks}. */
+        int regionSize;
 
         CountingMemorySource() {
             this(false);
@@ -83,6 +69,7 @@ final class PageStoreTestSupport {
 
         CountingMemorySource(boolean heap) {
             this.heap = heap;
+            regionSize = SEGMENT_SIZE;
         }
 
         private AbstractByteBuf newBuffer(int initialCapacity, int maxCapacity) {
@@ -101,14 +88,13 @@ final class PageStoreTestSupport {
         }
 
         @Override
-        public RegionSource mallocRegionSource() {
-            return fallback;
-        }
-
-        @Override
         public synchronized AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
             AbstractByteBuf buf = newBuffer(initialCapacity, maxCapacity);
-            chunks.add(buf);
+            if (regionSize != 0 && initialCapacity == regionSize && maxCapacity == regionSize) {
+                segments.add(buf);
+            } else {
+                chunks.add(buf);
+            }
             return buf;
         }
 
@@ -149,64 +135,36 @@ final class PageStoreTestSupport {
     }
 
     /**
-     * Regions counted as they are mapped, and purges as they are called: {@code mmap} and {@code madvise} where
-     * {@link MmapRegionSource} is available, else plain direct buffers (untouched {@code malloc} memory, unaligned)
-     * whose purged ranges are zeroed.
+     * A real {@link MmapRegionSource}, counted and hookable for tests: multi-block regions, mapped and purged for
+     * real. Needs {@link MmapRegionSource#isAvailable()}; a page store with no real {@code mmap} falls back to
+     * one-block regions from a {@link CountingMemorySource} instead, with no region source involved at all.
      */
-    static final class CountingRegionSource implements RegionSource {
-        final MmapRegionSource mmap;
-        /** Whether this stands for {@link MallocRegionSource}: whole regions only, charged by their allocation. */
-        final boolean malloc;
-        final boolean heap;
+    static final class CountingRegionSource extends MmapRegionSource {
         final List<AbstractByteBuf> regions = new ArrayList<AbstractByteBuf>();
         /** Regions given back, in call order. */
         final List<AbstractByteBuf> released = new ArrayList<AbstractByteBuf>();
         /** Runs inside each release, before it releases, when set. */
         volatile Consumer<AbstractByteBuf> onRelease;
-
-        CountingRegionSource() {
-            this(false);
-        }
-
-        CountingRegionSource(boolean malloc) {
-            this(malloc, false);
-        }
-
-        /** {@code heap}: whole regions only, each a {@code byte[]}, as the heap allocator's. */
-        CountingRegionSource(boolean malloc, boolean heap) {
-            assert malloc || !heap;
-            this.malloc = malloc;
-            this.heap = heap;
-            mmap = !malloc && MmapRegionSource.isAvailable() ? new MmapRegionSource(UnpooledByteBufAllocator.DEFAULT) :
-                    null;
-        }
-
-        @Override
-        public boolean canPurgeSlices() {
-            return !malloc;
-        }
-
-        @Override
-        public void releaseRegion(AbstractByteBuf region) {
-            Consumer<AbstractByteBuf> hook = onRelease;
-            if (hook != null) {
-                hook.accept(region);
-            }
-            synchronized (this) {
-                released.add(region);
-            }
-            region.release();
-        }
         /** {offset, length} of each purge call, in call order. */
         final List<int[]> purges = new ArrayList<int[]>();
         /** Runs inside each purge call, before it purges, when set. */
         volatile Runnable onPurge;
 
+        CountingRegionSource() {
+            super(UnpooledByteBufAllocator.DEFAULT);
+        }
+
         @Override
-        public void purge(AbstractByteBuf region, int offset, int length) {
-            if (malloc) {
-                throw new UnsupportedOperationException("malloc: no purge");
+        AbstractByteBuf allocateRegion(int size, int alignment) {
+            AbstractByteBuf region = super.allocateRegion(size, alignment);
+            synchronized (this) {
+                regions.add(region);
             }
+            return region;
+        }
+
+        @Override
+        void purge(AbstractByteBuf region, int offset, int length) {
             Runnable hook = onPurge;
             if (hook != null) {
                 hook.run();
@@ -214,24 +172,23 @@ final class PageStoreTestSupport {
             synchronized (this) {
                 purges.add(new int[] {offset, length});
             }
-            if (mmap != null) {
-                mmap.purge(region, offset, length);
-            } else {
-                region.setZero(offset, length);
+            super.purge(region, offset, length);
+        }
+
+        @Override
+        void releaseRegion(AbstractByteBuf region) {
+            Consumer<AbstractByteBuf> hook = onRelease;
+            if (hook != null) {
+                hook.accept(region);
             }
+            synchronized (this) {
+                released.add(region);
+            }
+            super.releaseRegion(region);
         }
 
         synchronized int purgeCalls() {
             return purges.size();
-        }
-
-        @Override
-        public synchronized AbstractByteBuf allocateRegion(int size, int alignment) {
-            AbstractByteBuf region = mmap != null ? mmap.allocateRegion(size, alignment) :
-                    heap ? new UnpooledHeapByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size) :
-                    UnsafeByteBufUtil.newDirectByteBuf(UnpooledByteBufAllocator.DEFAULT, size, size);
-            regions.add(region);
-            return region;
         }
 
         synchronized int live() {
@@ -279,6 +236,7 @@ final class PageStoreTestSupport {
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
     static AdaptivePoolingAllocator newAllocator(CountingMemorySource source, int segmentSize) {
+        source.regionSize = segmentSize;
         return new AdaptivePoolingAllocator(source, true, null,
                 new PageStoreConfig(segmentSize, SLICE_SIZE_BYTES, INTERVAL, 0, 0, segmentSize));
     }
@@ -289,15 +247,15 @@ final class PageStoreTestSupport {
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, INTERVAL, regionSize, alignment));
     }
 
-    /** With regions of {@code regionSize} from {@code regions}: every chunk is a run of their shared slices. */
-    static AdaptivePoolingAllocator newSharedAllocator(CountingMemorySource segments, RegionSource regions,
+    /** With regions of {@code regionSize} from {@code mmap}: every chunk is a run of their shared slices. */
+    static AdaptivePoolingAllocator newSharedAllocator(CountingMemorySource segments, MmapRegionSource mmap,
                                                        int regionSize, long purgeDelayNanos) {
         // A region of one block is a malloc'd one's size.
         PageStoreConfig config = regionSize == SEGMENT_SIZE ?
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, 0, 0, SEGMENT_SIZE)
                         .withMallocRegions() :
                 new PageStoreConfig(SEGMENT_SIZE, SLICE_SIZE_BYTES, purgeDelayNanos, regionSize, REGION_ALIGNMENT);
-        return new AdaptivePoolingAllocator(segments, true, regions, config);
+        return new AdaptivePoolingAllocator(segments, true, regionSize == SEGMENT_SIZE ? null : mmap, config);
     }
 
     /**

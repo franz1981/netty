@@ -39,7 +39,7 @@ import static java.lang.invoke.MethodType.methodType;
  * Neither the mapping nor a purge is charged to or credited from {@code PlatformDependent}'s direct memory counter:
  * {@link PageStore} charges the slots it commits.
  */
-final class MmapRegionSource implements RegionSource {
+class MmapRegionSource {
     /** {@code (long address, long size) -> ByteBuffer}, via {@code MemorySegment}; {@code null} if never linked. */
     private static final MethodHandle WRAP;
 
@@ -68,9 +68,6 @@ final class MmapRegionSource implements RegionSource {
     private final ByteBufAllocator allocator;
 
     MmapRegionSource(ByteBufAllocator allocator) {
-        if (!isAvailable()) {
-            throw new UnsupportedOperationException("mmap(2) regions are not available");
-        }
         this.allocator = allocator;
     }
 
@@ -79,8 +76,10 @@ final class MmapRegionSource implements RegionSource {
      * {@code alignment}: three system calls, no memory touched. Of the class {@link UnsafeByteBufUtil#newDirectByteBuf}
      * picks, so that the spans of a region are of the class of a segment allocated on its own; its release unmaps it.
      */
-    @Override
-    public AbstractByteBuf allocateRegion(int size, int alignment) {
+    AbstractByteBuf allocateRegion(int size, int alignment) {
+        if (!isAvailable()) {
+            throw new UnsupportedOperationException("mmap(2) regions are not available");
+        }
         if (size <= 0 || alignment < 0 || (alignment & alignment - 1) != 0) {
             throw new IllegalArgumentException("size: " + size + ", alignment: " + alignment);
         }
@@ -128,13 +127,17 @@ final class MmapRegionSource implements RegionSource {
      * kernel rejects an unaligned start but rounds a partial last page up, discarding the next page's data. One
      * system call, and one TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
      */
-    @Override
-    public void purge(AbstractByteBuf region, int offset, int length) {
+    void purge(AbstractByteBuf region, int offset, int length) {
         if (offset < 0 || length <= 0 || offset > region.capacity() - length) {
             throw new IllegalArgumentException("offset: " + offset + ", length: " + length + " of "
                     + region.capacity() + " bytes");
         }
         PlatformDependent.madviseDontNeed(mappingOf(region).address + offset, length);
+    }
+
+    /** A wholly free region, out of use for good, goes back. */
+    void releaseRegion(AbstractByteBuf region) {
+        region.release();
     }
 
     /** The start of {@code region}'s mapping. */

@@ -18,15 +18,16 @@ package io.netty.buffer;
 import java.util.Arrays;
 
 /**
- * One piece of memory from a {@link RegionSource}, cut into {@link #slots} blocks at fixed offsets, all made with the
- * region. Each block's {@link Segment#free} is the free bitmap of its slices, claimed in runs and released by CAS from
- * any thread. A region lives as long as its {@link PageStore}, or until it goes back whole ({@link #released}).
+ * One piece of memory, cut into {@link #slots} blocks at fixed offsets, all made with the region: {@code mmap}d by
+ * {@link #source}, or, where it is {@code null}, one plain block from the store's {@link MemorySource}. Each block's
+ * {@link Segment#free} is the free bitmap of its slices, claimed in runs and released by CAS from any thread. A
+ * region lives as long as its {@link PageStore}, or until it goes back whole ({@link #released}).
  */
 final class Region {
     final PageStore store;
     final AbstractByteBuf buffer;
-    /** Where {@link #buffer} comes from, and goes back to. */
-    final RegionSource source;
+    /** Where {@link #buffer} comes from, and goes back to; {@code null}: one plain block, goes back whole. */
+    final MmapRegionSource source;
     /**
      * Whether {@link #source} purges idle free slices in place; else the region is charged and counted whole, and
      * goes back whole once wholly idle.
@@ -47,13 +48,13 @@ final class Region {
     volatile boolean released;
 
     /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
-    Region(PageStore store, AbstractByteBuf buffer, RegionSource source, int slots,
+    Region(PageStore store, AbstractByteBuf buffer, MmapRegionSource source, int slots,
            PageStoreConfig config, boolean committed, long committedAt) {
         assert slots > 0 && slots <= Long.SIZE;
         this.store = store;
         this.buffer = buffer;
         this.source = source;
-        purgesSlices = source.canPurgeSlices();
+        purgesSlices = source != null;
         this.slots = slots;
         int size = config.segmentSize;
         length = slots * size;

@@ -46,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The page store's shared slices (see {@link PageStore#claimSlices}): first fit within a block, never across one,
@@ -64,6 +65,7 @@ final class SharedSlicesTest {
     private final CountingRegionSource regions = new CountingRegionSource();
 
     private PageStore store(long purgeDelayNanos) {
+        assumeTrue(MmapRegionSource.isAvailable(), "shared slice tests need mmap");
         return closer.add(newSharedAllocator(segments, regions, REGION_SIZE, purgeDelayNanos)).pageStore;
     }
 
@@ -326,22 +328,30 @@ final class SharedSlicesTest {
         final int threads = 8;
         final int maxRegions = 256;
         final boolean mmap = "mmap".equals(kind);
+        final boolean heap = "heap".equals(kind);
+        if (mmap) {
+            assumeTrue(MmapRegionSource.isAvailable(), "mmap regions need mmap");
+        }
         final AtomicIntegerArray owners = new AtomicIntegerArray(maxRegions * PER_REGION);
         final AtomicReference<String> failure = new AtomicReference<String>();
-        final CheckingRegionSource source = new CheckingRegionSource(mmap ? regions :
-                new CountingRegionSource(true, "heap".equals(kind)), owners, failure);
-        // malloc'd and byte[] regions are one block each, as the direct and heap allocators'.
-        final boolean heap = "heap".equals(kind);
+        final Set<Region> claimedIn = ConcurrentHashMap.newKeySet();
+        // malloc'd and byte[] regions are one block each, as the direct and heap allocators', with no region source
+        // at all: the store falls back to one-block regions from the memory source directly.
         final CountingMemorySource segments = heap ? new CountingMemorySource(true) : this.segments;
+        final CheckingRegionSource source = mmap ? new CheckingRegionSource(regions, claimedIn, owners, failure) :
+                null;
         final PageStore store;
         if (heap) {
             int block = PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES;
-            store = closer.add(new AdaptivePoolingAllocator(segments, true, source,
+            segments.regionSize = block;
+            store = closer.add(new AdaptivePoolingAllocator(segments, true, null,
                     new PageStoreConfig(block, SLICE, 1, 0, 0, block).withMallocRegions())).pageStore;
         } else {
             store = closer.add(newSharedAllocator(segments, source, mmap ? REGION_SIZE : SEGMENT_SIZE, 1)).pageStore;
         }
-        source.store = store;
+        if (source != null) {
+            source.store = store;
+        }
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
         final CountDownLatch start = new CountDownLatch(1);
         final AtomicLong operations = new AtomicLong();
@@ -351,7 +361,7 @@ final class SharedSlicesTest {
             workers.add(new Thread(() -> {
                 try {
                     start.await();
-                    new Worker(store, owners, source.claimedIn, failure, id).run(deadline, operations);
+                    new Worker(store, owners, claimedIn, failure, id).run(deadline, operations);
                 } catch (Throwable e) {
                     failure.compareAndSet(null, "worker " + id + ": " + e);
                 }
@@ -381,16 +391,17 @@ final class SharedSlicesTest {
         assertTrue(operations.get() > 1000, "too few claims to mean anything: " + operations.get());
         assertEquals(0, store.sliceCounts()[0], "a slice is still claimed");
         assertMapsShowEveryFit(store);
-        assertEquals(0, segments.segmentsAllocated());
-        assertEquals(heap, source.delegate.regions.get(0).hasArray(), "byte[] regions for heap memory only");
+        assertEquals(heap, store.regions[0].buffer.hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);
         if (!mmap) {
+            assertEquals(0, segments.chunks.size(), "no chunk, every region a segment");
             // All free and idle now: every region goes back, in passes of a budget each.
             purgeUntilDone(store, System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             assertEquals(0, countLive(store), "a wholly free region stayed");
-            assertEquals(source.mapped(), store.regionsReleased, "every region mapped went back");
+            assertEquals(segments.segmentsAllocated(), store.regionsReleased, "every region mapped went back");
             assertEquals(0, store.allocator.usedMemory());
         } else {
+            assertEquals(0, segments.segmentsAllocated());
             assertTrue(store.slicesPurged > 0, "the purger purged nothing");
         }
         store.close();
@@ -411,10 +422,9 @@ final class SharedSlicesTest {
      */
     @Test
     void aWhollyIdleMallocRegionGoesBackAndItsPlaceIsTaken() {
-        CountingRegionSource malloc = new CountingRegionSource(true);
-        PageStore store = closer.add(newSharedAllocator(segments, malloc, REGION_SIZE, INTERVAL)).pageStore;
+        PageStore store = closer.add(newSharedAllocator(segments, regions, SEGMENT_SIZE, INTERVAL)).pageStore;
         long first = store.claimSlices(9, false);
-        assertEquals(REGION_SIZE, store.allocator.usedMemory(), "counted whole");
+        assertEquals(SEGMENT_SIZE, store.allocator.usedMemory(), "counted whole");
         release(store, first, 9);
         store.purgeIfDue(System.nanoTime() + INTERVAL / 2);
         assertEquals(0, store.regionsReleased, "freed less than a delay ago");
@@ -424,19 +434,19 @@ final class SharedSlicesTest {
         release(store, first, 9);
         store.purgeIfDue(System.nanoTime() + 4 * INTERVAL);
         assertEquals(1, store.regionsReleased);
-        assertEquals(1, malloc.released.size());
-        assertEquals(0, malloc.released.get(0).refCnt(), "freed");
+        AbstractByteBuf releasedBuffer = segments.segments.get(0);
+        assertEquals(0, releasedBuffer.refCnt(), "freed");
         assertEquals(0, store.allocator.usedMemory());
         assertEquals(0, store.purgeCalls, "no part of a malloc'd region is purged");
         long again = store.claimSlices(9, false);
         assertEquals(0, (int) (again >>> 32), "the released region's place");
         assertEquals(1, store.regionCount());
-        assertEquals(2, malloc.regions.size());
-        assertTrue(store.regions[0].buffer != malloc.released.get(0));
+        assertEquals(2, segments.segmentsAllocated());
+        assertTrue(store.regions[0].buffer != releasedBuffer);
         release(store, again, 9);
         store.close();
         assertEquals(0, store.allocator.usedMemory());
-        assertEquals(0, malloc.live());
+        assertEquals(0, segments.segmentsLive());
     }
 
     private static final class Worker {
@@ -529,34 +539,30 @@ final class SharedSlicesTest {
         }
     }
 
-    /** Checks that no purged slice has an owner, then purges. */
-    private static final class CheckingRegionSource implements RegionSource {
+    /** Checks that no purged slice has an owner, then purges: {@code mmap} regions only. */
+    private static final class CheckingRegionSource extends MmapRegionSource {
         private final CountingRegionSource delegate;
+        private final Set<Region> claimedIn;
         private final AtomicIntegerArray owners;
         private final AtomicReference<String> failure;
-        /** The regions a worker claimed a run in. */
-        final Set<Region> claimedIn = ConcurrentHashMap.newKeySet();
         volatile PageStore store;
 
-        CheckingRegionSource(CountingRegionSource delegate, AtomicIntegerArray owners,
+        CheckingRegionSource(CountingRegionSource delegate, Set<Region> claimedIn, AtomicIntegerArray owners,
                              AtomicReference<String> failure) {
+            super(UnpooledByteBufAllocator.DEFAULT);
             this.delegate = delegate;
+            this.claimedIn = claimedIn;
             this.owners = owners;
             this.failure = failure;
         }
 
         @Override
-        public AbstractByteBuf allocateRegion(int size, int alignment) {
+        AbstractByteBuf allocateRegion(int size, int alignment) {
             return delegate.allocateRegion(size, alignment);
         }
 
         @Override
-        public boolean canPurgeSlices() {
-            return delegate.canPurgeSlices();
-        }
-
-        @Override
-        public void releaseRegion(AbstractByteBuf region) {
+        void releaseRegion(AbstractByteBuf region) {
             Region r = check(region, 0, REGION_SIZE, "given back");
             if (r != null && !claimedIn.contains(r)) {
                 // Mapped for a claim, and given back before that claim had its run.
@@ -566,13 +572,9 @@ final class SharedSlicesTest {
         }
 
         @Override
-        public void purge(AbstractByteBuf region, int offset, int length) {
+        void purge(AbstractByteBuf region, int offset, int length) {
             check(region, offset, length, "purged");
             delegate.purge(region, offset, length);
-        }
-
-        int mapped() {
-            return delegate.regions.size();
         }
 
         /** The region of {@code region}, or {@code null} at the close. */

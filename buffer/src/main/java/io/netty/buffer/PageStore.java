@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 /**
  * The units, largest first, and their names in the code:
  * <pre>
- * region      one piece of memory from a {@link RegionSource}       {@link Region}
+ * region      one piece of memory, mapped or allocated whole        {@link Region}
  *  block      4 MiB, one 64-bit free bitmap                       {@link Segment}
  *   slice     64 KiB, one bit of its block's bitmap
  *    chunk    a run of slices serving one size class              SizeClassedChunk
@@ -47,12 +47,12 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * this store's monitor, the only lock, when no block has a fit, and the claim that added it takes its run there
  * before any other thread sees the region.
  * <p>
- * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link MmapRegionSource})
- * purge the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
- * memory behind it to its purge; regions of one block ({@link MallocRegionSource}: a {@code malloc}'d 4 MiB, or a
- * {@code byte[]} of 4032 KiB for heap memory) are charged and counted whole by their allocation, and go back whole once
- * all of them stayed free for the delay. Once an {@code mmap} region cannot be mapped, new regions are one
- * {@code malloc}'d block each, next to the regions mapped so far. One purger at a time, driven by the heaps' ticks: see
+ * The source is a detail of the memory, not of the ownership: {@code mmap} regions (256 MiB, {@link #mmap}) purge
+ * the free slices idle for the purge delay in place, and charge and count a slice from the claim that finds no
+ * memory behind it to its purge; regions of one block ({@link #memory}: a {@code malloc}'d 4 MiB, or a {@code byte[]}
+ * of 4032 KiB for heap memory) are charged and counted whole by their allocation, and go back whole once all of them
+ * stayed free for the delay. Once an {@code mmap} region cannot be mapped, new regions are one {@code malloc}'d
+ * block each, next to the regions mapped so far. One purger at a time, driven by the heaps' ticks: see
  * {@link #purgeIfDue}.
  */
 final class PageStore {
@@ -106,16 +106,11 @@ final class PageStore {
      */
     private volatile AtomicLongArray maps;
     final MemorySource memory;
-    /** Where new regions come from. Replaced once, under this store's monitor, by {@link #fallbackSource}. */
-    volatile RegionSource regionSource;
-    /** The blocks of a new region, and where it starts: replaced with {@link #regionSource}. */
+    /** Where new regions are mapped, or {@code null}: one block from {@link #memory} instead. */
+    volatile MmapRegionSource mmap;
+    /** The blocks of a new region, and where it starts: 1 and 0 once {@link #mmap} fails and is given up. */
     private volatile int regionBlocks;
     private int regionAlignment;
-    /**
-     * Regions of one block to make from when a region of {@link #regionSource} cannot be had, or {@code null}. Under
-     * this store's monitor.
-     */
-    private RegionSource fallbackSource;
     /** Replaced under this store's monitor, one longer or with a released region's place taken; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
@@ -153,22 +148,19 @@ final class PageStore {
     private int nextBlock;
 
     /**
-     * @param regionSource where the regions come from, or {@code null} for {@code memory}'s: {@code mmap} where
-     *                     the config has regions and the source can map them, else {@code malloc}'d regions of one
-     *                     block where the config has them
+     * @param mmap where {@code mmap} regions come from, or {@code null}: {@code memory}'s regions of one block
+     *             instead, or where the config has no regions at all
      */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, MemorySource memory,
-              RegionSource regionSource) {
-        if (regionSource == null) {
-            regionSource = config.regionSize > 0 ? memory.regionSource() : null;
-            if (regionSource == null && config.mallocRegionSize > 0) {
-                regionSource = memory.mallocRegionSource();
-                config = config.withMallocRegions();
-            }
+              MmapRegionSource mmap) {
+        if (config.regionSize == 0) {
+            mmap = null;
         }
-        if (config.regionSize == 0 || regionSource == null) {
-            throw new IllegalArgumentException("a page store needs regions: " + config.regionSize + ", "
-                    + regionSource);
+        if (mmap == null) {
+            if (config.mallocRegionSize <= 0) {
+                throw new IllegalArgumentException("a page store needs regions: " + config.regionSize + ", " + mmap);
+            }
+            config = config.withMallocRegions();
         }
         this.allocator = allocator;
         this.config = config;
@@ -187,11 +179,9 @@ final class PageStore {
         emptyMap = otherBin + 1;
         idShift = Integer.SIZE - Integer.numberOfLeadingZeros(config.segmentsPerRegion() - 1);
         maps = new AtomicLongArray(emptyMap + 1);
-        this.regionSource = regionSource;
+        this.mmap = mmap;
         regionBlocks = config.segmentsPerRegion();
         regionAlignment = config.regionAlignment;
-        fallbackSource = config.mallocRegionSize > 0 && config.regionSize != config.mallocRegionSize ?
-                memory.mallocRegionSource() : null;
         if (PlatformDependent.isJfrEnabled()) {
             PageStoreStateEvent.register(this);
         }
@@ -204,7 +194,7 @@ final class PageStore {
      * by the purger, idle, before the claim that mapped it scanned it, and the claim map another: with a short purge
      * delay, without end. Returns the run as {@link #claimSlices} and {@link #takeRun} encode theirs, not committed,
      * or -1 for the caller to scan again: a region was added meanwhile, the run does not fit a new region, or a region
-     * cannot be had and this switched to {@link #fallbackSource}.
+     * cannot be had and this gave up {@link #mmap} for good.
      */
     private synchronized long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
         if (closed) {
@@ -213,28 +203,26 @@ final class PageStore {
         if (regions != seen) {
             return -1;
         }
-        RegionSource source = regionSource;
+        MmapRegionSource mmap = this.mmap;
         int slots = regionBlocks;
         int size = slots * config.segmentSize;
         AbstractByteBuf buffer;
         Object event = PlatformDependent.isJfrEnabled() && PageStoreMapEvent.isEventEnabled() ?
                 PageStoreMapEvent.start() : null;
         try {
-            buffer = source.allocateRegion(size, regionAlignment);
+            buffer = mmap != null ? mmap.allocateRegion(size, regionAlignment) : memory.allocate(size, size);
         } catch (OutOfMemoryError | RuntimeException e) {
             if (event != null) {
                 AbstractPageStoreEvent.end(event, 0, size, seen.length, e);
             }
-            RegionSource fallback = fallbackSource;
-            if (fallback == null) {
+            if (mmap == null || config.mallocRegionSize <= 0 || config.regionSize == config.mallocRegionSize) {
                 // A block (malloc, byte[]) that cannot be had, or the direct memory limit it is charged to: this
                 // allocation fails, the next region may well fit.
                 throw e;
             }
-            fallbackSource = null;
+            this.mmap = null;
             regionBlocks = 1;
             regionAlignment = 0;
-            regionSource = fallback;
             logger.warn("Cannot map a region of {} bytes: regions are one block each from now on.", size, e);
             return -1;
         }
@@ -242,7 +230,7 @@ final class PageStore {
         if (event != null) {
             AbstractPageStoreEvent.end(event, buffer._memoryAddress(), size, seen.length, null);
         }
-        Region region = sharedRegion(buffer, source, slots);
+        Region region = sharedRegion(buffer, mmap, slots);
         if (!region.purgesSlices) {
             // Charged by its allocation, counted whole from now on.
             allocator.storeBytesCommitted(buffer._memoryAddress(), size, buffer.isDirect(), threadLocal);
@@ -275,9 +263,8 @@ final class PageStore {
     }
 
     /** A region charged whole has memory behind all of it, free since now. */
-    private Region sharedRegion(AbstractByteBuf buffer, RegionSource source, int blocks) {
-        Region region = new Region(this, buffer, source, blocks, config, !source.canPurgeSlices(),
-                System.nanoTime());
+    private Region sharedRegion(AbstractByteBuf buffer, MmapRegionSource mmap, int blocks) {
+        Region region = new Region(this, buffer, mmap, blocks, config, mmap == null, System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];
             block.sharedSpans = new AdaptivePoolingAllocator.SharedSpanChunk(block, this, false);
@@ -642,7 +629,11 @@ final class PageStore {
                     PageStoreUnmapEvent.start() : null;
             Throwable failure = null;
             try {
-                region.source.releaseRegion(region.buffer);
+                if (region.source != null) {
+                    region.source.releaseRegion(region.buffer);
+                } else {
+                    region.buffer.release();
+                }
             } catch (RuntimeException | Error e) {
                 failure = e;
                 throw e;
@@ -932,7 +923,7 @@ final class PageStore {
                 PageStoreUnmapEvent.start() : null;
         Throwable failure = null;
         try {
-            region.source.releaseRegion(region.buffer);
+            region.buffer.release();
             regionsReleased++;
         } catch (RuntimeException | Error e) {
             failure = e;

@@ -35,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Shared slices: a claim racing a purge that holds the only free run.
@@ -56,6 +57,7 @@ final class SharedSlicePurgeRaceTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void aClaimRacingAPurgeNeverWaitsAndMapsOneRegionAtMost() throws Exception {
+        assumeTrue(MmapRegionSource.isAvailable(), "the purge race needs real mmap purging");
         final PageStore store = closer.add(newSharedAllocator(segments, regions, REGION_SIZE, INTERVAL)).pageStore;
         int blocks = REGION_SIZE / SEGMENT_SIZE;
         int purgedBlock = (blocks - 1) * PER_BLOCK;

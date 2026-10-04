@@ -54,7 +54,9 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
         DirectChunkAllocator directChunks = new DirectChunkAllocator(this);
-        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, null,
+        // mmap regions where libc can be bound (Java 22+ on Linux with native access), else one-block regions.
+        MmapRegionSource mmap = MmapRegionSource.isAvailable() ? new MmapRegionSource(this) : null;
+        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, mmap,
                 PageStoreConfig.directDefaults());
         HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
         heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, null,
@@ -114,12 +116,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
                     new UnpooledUnsafeHeapByteBuf(allocator, initialCapacity, maxCapacity) :
                     new UnpooledHeapByteBuf(allocator, initialCapacity, maxCapacity);
         }
-
-        /** Regions of one block each, one {@code byte[]} per block. */
-        @Override
-        public RegionSource mallocRegionSource() {
-            return new MallocRegionSource(this);
-        }
     }
 
     /**
@@ -137,18 +133,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         @Override
         public AbstractByteBuf allocate(int initialCapacity, int maxCapacity) {
             return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity);
-        }
-
-        /** {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none. */
-        @Override
-        public RegionSource regionSource() {
-            return MmapRegionSource.isAvailable() ? new MmapRegionSource(allocator) : null;
-        }
-
-        /** Elsewhere, {@code malloc}'d regions. */
-        @Override
-        public RegionSource mallocRegionSource() {
-            return new MallocRegionSource(this);
         }
     }
 }

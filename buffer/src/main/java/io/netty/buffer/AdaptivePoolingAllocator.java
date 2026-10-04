@@ -260,13 +260,13 @@ final class AdaptivePoolingAllocator {
     private final int largeSpanLimit;
 
     /**
-     * @param regionSource where the regions come from, or {@code null} for {@code memory}'s (see
-     *                     {@link PageStore#PageStore})
+     * @param mmap where {@code mmap} regions come from, or {@code null} for {@code memory}'s one-block ones (see
+     *             {@link PageStore#PageStore})
      */
     AdaptivePoolingAllocator(MemorySource memory, boolean useCacheForNonEventLoopThreads,
-                             RegionSource regionSource, PageStoreConfig config) {
+                             MmapRegionSource mmap, PageStoreConfig config) {
         checkSizeClassSpansFit(config);
-        pageStore = new PageStore(this, config, memory, regionSource);
+        pageStore = new PageStore(this, config, memory, mmap);
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         this.memory = ObjectUtil.checkNotNull(memory, "memory");
         chunkRegistry = new ChunkRegistry();

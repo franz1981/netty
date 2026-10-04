@@ -19,6 +19,7 @@ import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -40,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * An {@link AdaptivePoolingAllocator} on shared slices: size-class chunks, large-buffer spans and one-shot buffers
@@ -56,10 +58,12 @@ final class SharedSliceAllocatorTest {
     private final CountingRegionSource regions = new CountingRegionSource();
     private AdaptivePoolingAllocator allocator;
 
-    /** On {@code mmap} regions where they can be had, or on {@code malloc}'d ones. */
+    /** On {@code mmap} regions of many blocks, or on {@code malloc}'d ones of one. */
     private void use(boolean malloc) {
-        allocator = closer.add(newSharedAllocator(segments, malloc ? new CountingRegionSource(true) : regions,
-                REGION_SIZE, INTERVAL));
+        if (!malloc) {
+            assumeTrue(MmapRegionSource.isAvailable(), "mmap regions of many blocks need mmap");
+        }
+        allocator = closer.add(newSharedAllocator(segments, regions, malloc ? SEGMENT_SIZE : REGION_SIZE, INTERVAL));
     }
 
     @BeforeEach
@@ -83,7 +87,7 @@ final class SharedSliceAllocatorTest {
         ByteBuf buf = allocator.allocate(1024, 1024);
         Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk) adaptive(buf).chunk).segment;
         assertNotNull(block.sharedSpans, "a block of shared slices");
-        assertEquals(0, segments.segmentsAllocated());
+        assertEquals(malloc ? 1 : 0, segments.segmentsAllocated(), "a one-block region, only without mmap");
         assertTrue(regionOffset(buf) >= 0 && regionOffset(buf) < REGION_SIZE);
         assertSharedAccounted(segments, allocator);
         buf.release();
@@ -150,11 +154,13 @@ final class SharedSliceAllocatorTest {
         assertSharedAccounted(segments, allocator);
     }
 
-    /** Up to a block, a span of whole slices, which a block shares with others; above, contiguous whole blocks. */
-    @ParameterizedTest(name = "malloc: {0}")
-    @ValueSource(booleans = {false, true})
-    void spansUpToABlockAndWholeBlocksAbove(boolean malloc) {
-        use(malloc);
+    /**
+     * Up to a block, a span of whole slices, which a block shares with others; above, contiguous whole blocks: needs
+     * a region of more than one block, so {@code mmap} only (a {@code malloc}'d region is always one block).
+     */
+    @Test
+    void spansUpToABlockAndWholeBlocksAbove() {
+        use(false);
         ByteBuf span = allocator.allocate(3 * MIB, 3 * MIB);
         ByteBuf small = allocator.allocate(MIB, MIB);
         ByteBuf blocks = allocator.allocate(SEGMENT_SIZE + 1, SEGMENT_SIZE + 1);

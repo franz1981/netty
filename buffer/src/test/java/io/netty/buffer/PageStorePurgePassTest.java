@@ -29,6 +29,7 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * When a purge pass runs and how far it goes: every time is a {@code now} the test passes, from a base where the raw
@@ -52,6 +53,7 @@ final class PageStorePurgePassTest {
     }
 
     private PageStore store(long base, int blocks, int regionSize) {
+        assumeTrue(MmapRegionSource.isAvailable(), "shared slice purging needs mmap");
         PageStore store = closer.add(newSharedAllocator(segments, regions, regionSize, DELAY)).pageStore;
         assertEquals(DELAY / 4, store.config.purgeCheckNanos);
         store.lastPurgeNanos = base;
@@ -206,31 +208,6 @@ final class PageStorePurgePassTest {
     private static int callsToBudget(int run) {
         long runBytes = (long) run * SLICE;
         return (int) ((PageStore.PURGE_BYTES + runBytes - 1) / runBytes);
-    }
-
-    /**
-     * A pass makes one call at least, however large: a {@code malloc}'d region larger than
-     * {@link PageStore#PURGE_BYTES} goes back whole, one per pass.
-     */
-    @Test
-    void aPassMakesOneCallEvenPastItsBudget() {
-        int blocks = (int) (PageStore.PURGE_BYTES / SEGMENT_SIZE) + 1;
-        CountingRegionSource malloc = new CountingRegionSource(true);
-        PageStore store = closer.add(newSharedAllocator(segments, malloc, blocks * SEGMENT_SIZE, DELAY)).pageStore;
-        assertEquals(0, (int) store.takeRun(blocks));
-        assertEquals(1L << 32, store.takeRun(blocks));
-        long base = System.nanoTime();
-        for (Region region : store.regions) {
-            for (Segment block : region.blocks) {
-                block.releaseRun(0, PER_BLOCK, base);
-            }
-        }
-        store.purgeIfDue(base + DELAY);
-        assertEquals(1, store.regionsReleased);
-        assertEquals(1, malloc.released.size());
-        store.purgeIfDue(base + DELAY + CHECK);
-        assertEquals(2, store.regionsReleased, "the other one, in the next pass");
-        assertEquals(2, store.purges);
     }
 
     /**

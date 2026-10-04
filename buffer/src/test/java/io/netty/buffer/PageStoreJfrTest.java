@@ -39,6 +39,7 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The page store's JFR events: the system calls (map, purge, unmap), segments taken and given back with where they
@@ -87,6 +88,7 @@ public class PageStoreJfrTest {
     @Test
     public void sharedSliceEventsFollowTheirRuns() throws Exception {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
+        assumeTrue(MmapRegionSource.isAvailable(), "shared slice purge events need mmap");
         final CountDownLatch stateSeen = new CountDownLatch(1);
         final CountDownLatch unmapped = new CountDownLatch(1);
         final String thread = Thread.currentThread().getName();

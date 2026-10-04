@@ -44,8 +44,8 @@ final class PageStoreConfig {
      * its {@link Segment}s out of (see {@link PageStore}), rounded to the nearest multiple of the segment size from 2
      * up to {@link Long#SIZE} segments; 0: none, {@code malloc}'d regions of one segment instead. Default:
      * {@link Long#SIZE} segments (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a
-     * segment's pages are committed as they are touched. Regions need a {@link RegionSource},
-     * {@link MmapRegionSource} for the direct allocator.
+     * segment's pages are committed as they are touched. Regions need an {@link MmapRegionSource}, for the direct
+     * allocator; without one, {@link PageStore} falls back to regions of one block.
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
@@ -166,7 +166,7 @@ final class PageStoreConfig {
         return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, mallocRegionSize, 0, mallocRegionSize);
     }
 
-    /** Regions of one block, one {@code byte[]} each (see {@link MallocRegionSource}): nothing to map nor purge. */
+    /** Regions of one block, one {@code byte[]} each, from {@link MemorySource#allocate}: nothing to map nor purge. */
     static PageStoreConfig heapDefaults() {
         return new PageStoreConfig(HEAP_SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
                 TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), 0, 0, HEAP_SEGMENT_SIZE_BYTES);

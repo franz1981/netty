@@ -582,7 +582,7 @@ public class AdaptiveSegmentsTest {
         PageStore heapStore = ((AdaptivePoolingAllocator) field(allocator, "heap")).pageStore;
         int heapSegmentSize = PageStoreConfig.heapDefaults().segmentSize;
         assertEquals(heapSegmentSize, heapStore.config.segmentSize);
-        assertTrue(heapStore.regionSource instanceof MallocRegionSource);
+        assertNull(heapStore.mmap, "the heap store falls back to one-block regions");
         assertEquals(heapSegmentSize, heapStore.config.regionSize);
         ByteBuf heap = allocator.heapBuffer(1024, 1024);
         assertNotNull(chunkOf(heap).segment);

@@ -43,6 +43,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Buffers above the size classes in an allocator with a page store: up to a whole block each is a span of the shared
@@ -75,6 +76,7 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     private AdaptivePoolingAllocator withRegions() {
+        assumeTrue(MmapRegionSource.isAvailable(), "regions of many blocks need mmap");
         return closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
     }
 

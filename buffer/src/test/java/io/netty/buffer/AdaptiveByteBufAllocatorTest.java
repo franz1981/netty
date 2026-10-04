@@ -165,7 +165,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** Whether the direct allocator's regions are mmap'd: their slices count from their first claim. */
     static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
-        return direct(allocator).pageStore.regionSource.canPurgeSlices();
+        return direct(allocator).pageStore.mmap != null;
     }
 
     static AdaptivePoolingAllocator heap(AdaptiveByteBufAllocator allocator) {
@@ -269,7 +269,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         int slice = store.config.sliceSize;
         int size = block / 4 * 3; // above half a block
         long span = (size + slice - 1) / slice * (long) slice;
-        boolean perSlice = store.regionSource.canPurgeSlices();
+        boolean perSlice = store.mmap != null;
         ByteBufAllocatorMetric metric = allocator.metric();
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
