@@ -1071,11 +1071,9 @@ final class AdaptivePoolingAllocator {
             try {
                 int remainingCapacity = curr.remainingCapacity();
                 assert remainingCapacity >= size : "the chunk handed out has no free slot";
+                success = curr.takeSlot(buf, size, startingCapacity, maxCapacity);
                 if (remainingCapacity > startingCapacity) {
-                    success = curr.takeSlot(buf, size, startingCapacity, maxCapacity);
                     curr = null;
-                } else {
-                    success = curr.takeSlot(buf, size, remainingCapacity, maxCapacity);
                 }
             } finally {
                 if (curr != null) {

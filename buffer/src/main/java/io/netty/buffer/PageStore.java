@@ -152,8 +152,8 @@ final class PageStore {
      */
     PageStore(AdaptivePoolingAllocator allocator, PageStoreConfig config, MemorySource memory,
               MmapRegionSource mmap) {
-        if (config.regionSize == 0) {
-            mmap = null;
+        if (mmap != null && config.regionSize == 0) {
+            throw new IllegalArgumentException("a page store needs regions: " + config.regionSize + ", " + mmap);
         }
         if (mmap == null) {
             if (config.mallocRegionSize <= 0) {

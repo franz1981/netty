@@ -58,8 +58,32 @@ final class PageStoreConfig {
     static final long PURGE_DELAY_MILLIS = purgeDelayMillisOf(
             SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
 
+    /** The fewest slices of a heap segment: one buffer of the largest size class, 132 KiB, takes 3. */
+    static final int MIN_HEAP_SEGMENT_SLICES = 3;
+
+    /**
+     * {@code io.netty.allocator.heapSegmentSize}: the size of a heap allocator's segments, rounded down to whole
+     * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them, which set the page kinds of the
+     * size-class chunks (see {@link SizeClassTable#pageKinds}). Default: one slice less than
+     * {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose regions are powers of two, its {@code byte[]} with the
+     * header fits in whole regions with a slice to spare, and in half a region from 8 MiB regions up (a humongous
+     * object takes regions of its own: a 4 MiB array would take two 4 MiB regions, or a whole 8 MiB one).
+     */
+    static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
+            "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));
+
+    /** {@code value}, no lower than {@code min} nor higher than {@code max}. */
+    private static long clamp(long value, long min, long max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    /** {@code value} rounded to the nearest multiple of {@code unit}. */
+    private static long round(long value, long unit) {
+        return Math.round((double) value / unit) * unit;
+    }
+
     static long purgeDelayMillisOf(long millis) {
-        return Math.max(10, Math.min(600000, millis));
+        return clamp(millis, 10, 600000);
     }
 
     /** The largest: one bit per segment in one {@code long}. */
@@ -76,10 +100,7 @@ final class PageStoreConfig {
         if (size == 0) {
             return 0;
         }
-        long min = 2L * segmentSize;
-        long max = (long) Long.SIZE * segmentSize;
-        long rounded = Math.round((double) size / segmentSize) * (long) segmentSize;
-        return (int) Math.max(min, Math.min(max, rounded));
+        return (int) clamp(round(size, segmentSize), 2L * segmentSize, (long) Long.SIZE * segmentSize);
     }
 
     /**
@@ -88,11 +109,15 @@ final class PageStoreConfig {
      * multiple of {@link #SLICE_SIZE_BYTES}, so the result is always a valid slice count too.
      */
     static int segmentSizeOf(int size) {
-        long rounded = Math.round((double) size / REGION_ALIGNMENT_BYTES) * (long) REGION_ALIGNMENT_BYTES;
         long min = (MIN_SEGMENT_SIZE_BYTES + REGION_ALIGNMENT_BYTES - 1) / REGION_ALIGNMENT_BYTES
                 * (long) REGION_ALIGNMENT_BYTES;
         long max = MAX_SEGMENT_SIZE_BYTES / REGION_ALIGNMENT_BYTES * (long) REGION_ALIGNMENT_BYTES;
-        return (int) Math.max(min, Math.min(max, rounded));
+        return (int) clamp(round(size, REGION_ALIGNMENT_BYTES), min, max);
+    }
+
+    /** {@code size} rounded down to whole slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE}. */
+    static int heapSegmentSizeOf(int size) {
+        return (int) clamp(size / SLICE_SIZE_BYTES, MIN_HEAP_SEGMENT_SLICES, Long.SIZE) * SLICE_SIZE_BYTES;
     }
 
     /** 1 to {@link Long#SIZE} whole slices. */
@@ -174,26 +199,6 @@ final class PageStoreConfig {
     static PageStoreConfig heapDefaults() {
         return new PageStoreConfig(HEAP_SEGMENT_SIZE_BYTES, SLICE_SIZE_BYTES,
                 TimeUnit.MILLISECONDS.toNanos(PURGE_DELAY_MILLIS), 0, 0, HEAP_SEGMENT_SIZE_BYTES);
-    }
-
-    /** The fewest slices of a heap segment: one buffer of the largest size class, 132 KiB, takes 3. */
-    static final int MIN_HEAP_SEGMENT_SLICES = 3;
-
-    /**
-     * {@code io.netty.allocator.heapSegmentSize}: the size of a heap allocator's segments, rounded down to whole
-     * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them, which set the page kinds of the
-     * size-class chunks (see {@link SizeClassTable#pageKinds}). Default: one slice less than
-     * {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose regions are powers of two, its {@code byte[]} with the
-     * header fits in whole regions with a slice to spare, and in half a region from 8 MiB regions up (a humongous
-     * object takes regions of its own: a 4 MiB array would take two 4 MiB regions, or a whole 8 MiB one).
-     */
-    static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
-            "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));
-
-    /** {@code size} rounded down to whole slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE}. */
-    static int heapSegmentSizeOf(int size) {
-        int slices = Math.max(MIN_HEAP_SEGMENT_SLICES, Math.min(Long.SIZE, size / SLICE_SIZE_BYTES));
-        return slices * SLICE_SIZE_BYTES;
     }
 
     static PageStoreConfig directDefaults() {

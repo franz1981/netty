@@ -263,9 +263,9 @@ final class LinuxMmapLinker {
 
     // A failed mmap/munmap changed no mapping and madvise(DONTNEED) is idempotent, so the retry is safe.
     private static long mmapCapturing(long length) {
-        Object arena = openArena();
+        Object[] capture = beginCapture();
+        Object state = capture[1];
         try {
-            Object state = newCallState(arena);
             long address;
             try {
                 address = (long) MMAP_CAPTURING.invokeExact(state, 0L, length, PROT_READ | PROT_WRITE,
@@ -278,14 +278,14 @@ final class LinuxMmapLinker {
             }
             return address;
         } finally {
-            closeArena(arena);
+            endCapture(capture);
         }
     }
 
     private static void munmapCapturing(long address, long length) {
-        Object arena = openArena();
+        Object[] capture = beginCapture();
+        Object state = capture[1];
         try {
-            Object state = newCallState(arena);
             int result;
             try {
                 result = (int) MUNMAP_CAPTURING.invokeExact(state, address, length);
@@ -296,14 +296,14 @@ final class LinuxMmapLinker {
                 throw fail("munmap(2) failed for " + length + " bytes at 0x" + Long.toHexString(address), state);
             }
         } finally {
-            closeArena(arena);
+            endCapture(capture);
         }
     }
 
     private static void madviseCapturing(long address, long length) {
-        Object arena = openArena();
+        Object[] capture = beginCapture();
+        Object state = capture[1];
         try {
-            Object state = newCallState(arena);
             int result;
             try {
                 result = (int) MADVISE_CAPTURING.invokeExact(state, address, length, MADV_DONTNEED);
@@ -315,7 +315,7 @@ final class LinuxMmapLinker {
                         + Long.toHexString(address), state);
             }
         } finally {
-            closeArena(arena);
+            endCapture(capture);
         }
     }
 
@@ -325,25 +325,24 @@ final class LinuxMmapLinker {
         return new NativeCallException(what + ": errno " + errno, errno);
     }
 
-    private static Object openArena() {
+    /** A confined arena, open for one retry, and its capture-state segment: {@code [arena, state]}. */
+    private static Object[] beginCapture() {
+        Object arena;
         try {
-            return (Object) OPEN_ARENA.invokeExact();
+            arena = (Object) OPEN_ARENA.invokeExact();
+        } catch (Throwable t) {
+            throw new Error(t);
+        }
+        try {
+            return new Object[] {arena, (Object) NEW_CALL_STATE.invokeExact(arena)};
         } catch (Throwable t) {
             throw new Error(t);
         }
     }
 
-    private static Object newCallState(Object arena) {
+    private static void endCapture(Object[] capture) {
         try {
-            return (Object) NEW_CALL_STATE.invokeExact(arena);
-        } catch (Throwable t) {
-            throw new Error(t);
-        }
-    }
-
-    private static void closeArena(Object arena) {
-        try {
-            CLOSE_ARENA.invokeExact(arena);
+            CLOSE_ARENA.invokeExact(capture[0]);
         } catch (Throwable t) {
             throw new Error(t);
         }
