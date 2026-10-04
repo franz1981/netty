@@ -143,15 +143,15 @@ final class PageStoreStateEvent extends Event {
                         long bytes = (slot - runStart) * sliceSize;
                         long start = event.base + runStart * sliceSize;
                         switch (runState) {
-                            case Segment.OUT:
+                            case Segment.SLICE_OUT:
                                 event.outBytes += bytes;
                                 range(out, start, bytes);
                                 break;
-                            case Segment.COMMITTED_STATE:
+                            case Segment.SLICE_COMMITTED:
                                 event.freeCommittedBytes += bytes;
                                 range(committed, start, bytes);
                                 break;
-                            case Segment.PURGED:
+                            case Segment.SLICE_PURGED:
                                 event.purgedBytes += bytes;
                                 range(purged, start, bytes);
                                 break;

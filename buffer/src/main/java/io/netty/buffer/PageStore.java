@@ -97,7 +97,7 @@ final class PageStore {
      * Bitmaps over the block ids, {@code emptyMap + 1} of them, each {@code maps.length() / (emptyMap + 1)} words,
      * one after the other: per bin, a bit set when a block of that bin has a free run of the bin's length; and the
      * empty blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
-     * its block now earns ({@link #slicesReleased}); a claim that finds a block without the fit its bit stood for
+     * its block now has ({@link #slicesReleased}); a claim that finds a block without the fit its bit stood for
      * clears it, then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}). As
      * mimalloc v3's {@code chunkmap} and {@code chunkmap_bins} over its bitmap chunks
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L261-L270). Replaced by a larger copy under
@@ -359,7 +359,7 @@ final class PageStore {
     }
 
     /**
-     * Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit the block now earns, if
+     * Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit the block now has, if
      * not set, empty or a fit for its bin.
      */
     void slicesReleased(Segment block, long free) {
@@ -378,8 +378,8 @@ final class PageStore {
         return block.region.index << idShift | block.slot;
     }
 
-    /** Whether {@code block} earns its bit in {@code map}. Racy. */
-    private boolean earns(int map, Segment block) {
+    /** Whether {@code block} has its bit in {@code map}. Racy. */
+    private boolean hasBitIn(int map, Segment block) {
         return map == emptyMap ? block.isEmpty() : block.bin == map && block.hasFit(binSlices[map]);
     }
 
@@ -431,7 +431,7 @@ final class PageStore {
     }
 
     /**
-     * Clears bit {@code id} of {@code map}, which a claim found the block does not earn, then reads the block again and
+     * Clears bit {@code id} of {@code map}, which a claim found the block does not have, then reads the block again and
      * sets it again if it does: a release meanwhile may have found the bit still set. As mimalloc v3's
      * {@code mi_bbitmap_chunkmap_try_clear}
      * (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.c#L1679-L1693): "a concurrent set may have
@@ -440,7 +440,7 @@ final class PageStore {
     private void unmark(int map, int id) {
         if (clear(map, id)) {
             Segment block = blockOf(regions, id);
-            if (block != null && earns(map, block)) {
+            if (block != null && hasBitIn(map, block)) {
                 mark(map, id);
             }
         }

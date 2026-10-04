@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
 import io.netty.buffer.AdaptivePoolingAllocator.Chunk;
 import io.netty.util.internal.PlatformDependent;
 

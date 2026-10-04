@@ -52,7 +52,7 @@ public class AdaptiveByteBufAllocatorGrowthTest {
     @DisabledForSlowLeakDetection
     @RepeatedTest(400)
     void concurrentBufferAllocateAndGrowth(RepetitionInfo info) throws Exception {
-        // This test targets data races where Chunk.remainingCapacity() is called concurrently
+        // This test targets data races where Chunk.freeBytes() is called concurrently
         // with other operations on the chunk. It is important that calling this method does not
         // modify or corrupt the state of the chunks.
 

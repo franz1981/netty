@@ -99,12 +99,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     public void testUnsafeHeapBufferAndUnsafeDirectBuffer() {
         AdaptiveByteBufAllocator allocator = newUnpooledAllocator();
         ByteBuf directBuffer = allocator.directBuffer();
-        assertInstanceOf(directBuffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
+        assertInstanceOf(directBuffer, AdaptiveByteBuf.class);
         assertTrue(directBuffer.isDirect());
         directBuffer.release();
 
         ByteBuf heapBuffer = allocator.heapBuffer();
-        assertInstanceOf(heapBuffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
+        assertInstanceOf(heapBuffer, AdaptiveByteBuf.class);
         assertFalse(heapBuffer.isDirect());
         heapBuffer.release();
     }
@@ -359,7 +359,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     void sliceOrDuplicateUnwrapLetNotEscapeRootParent(boolean slice) {
         AdaptiveByteBufAllocator allocator = newAllocator(false);
         ByteBuf buffer = allocator.buffer(8);
-        assertInstanceOf(buffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
+        assertInstanceOf(buffer, AdaptiveByteBuf.class);
         // Unwrap if this is wrapped by a leak aware buffer.
         if (buffer instanceof SimpleLeakAwareByteBuf) {
             assertNull(buffer.unwrap().unwrap());
@@ -371,14 +371,14 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // When we unwrap the derived buffer we should get our original buffer of type AdaptiveByteBuf back.
         ByteBuf unwrapped = derived instanceof SimpleLeakAwareByteBuf ?
                 derived.unwrap().unwrap() : derived.unwrap();
-        assertInstanceOf(unwrapped, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
+        assertInstanceOf(unwrapped, AdaptiveByteBuf.class);
         assertSameBuffer(buffer instanceof SimpleLeakAwareByteBuf ? buffer.unwrap() : buffer, unwrapped);
 
         ByteBuf retainedDerived = slice ? buffer.retainedSlice(0, 4) : buffer.retainedDuplicate();
         // When we unwrap the derived buffer we should get our original buffer of type AdaptiveByteBuf back.
         ByteBuf unwrappedRetained = retainedDerived instanceof SimpleLeakAwareByteBuf ?
                 retainedDerived.unwrap().unwrap() :  retainedDerived.unwrap();
-        assertInstanceOf(unwrappedRetained, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
+        assertInstanceOf(unwrappedRetained, AdaptiveByteBuf.class);
         assertSameBuffer(buffer instanceof SimpleLeakAwareByteBuf ? buffer.unwrap() : buffer, unwrappedRetained);
         retainedDerived.release();
 
@@ -1169,10 +1169,10 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     private static AdaptivePoolingAllocator.Chunk chunkOfAny(ByteBuf buf) {
         // Unwrap the leak-aware wrapper, if any.
-        while (!(buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf)) {
+        while (!(buf instanceof AdaptiveByteBuf)) {
             buf = buf.unwrap();
         }
-        return ((AdaptivePoolingAllocator.AdaptiveByteBuf) buf).chunk;
+        return ((AdaptiveByteBuf) buf).chunk;
     }
 
     private static void release(ByteBuf buf, boolean foreignThread) throws InterruptedException {
@@ -1361,7 +1361,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         for (SizeClassMagazine cache : sizeClassChunkCaches(allocator)) {
             int stranded = 0;
             for (AdaptivePoolingAllocator.Chunk c = cache.full.head; c != null; c = c.nextInQueue) {
-                if (((SizeClassedChunk) c).hasRemainingCapacity()) {
+                if (((SizeClassedChunk) c).hasFreeSlot()) {
                     stranded++;
                 }
             }
@@ -1674,7 +1674,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // One buffer: chunk A is active and its other segments were never handed out.
         held.add(allocator.heapBuffer(BURST_BUF_SIZE));
         SizeClassedChunk chunkA = chunkOf(held.get(0));
-        assertTrue(chunkA.hasRemainingCapacity());
+        assertTrue(chunkA.hasFreeSlot());
         assertFalse(chunkA.allFree());
 
         // Chunk A: every segment handed out. Chunk B: the active chunk, one segment handed out.
@@ -1683,13 +1683,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
         assertSame(chunkA, chunkOf(held.get(BURST_SEGMENTS_PER_CHUNK - 1)));
         assertNotSame(chunkA, chunkOf(held.get(BURST_SEGMENTS_PER_CHUNK)));
-        assertFalse(chunkA.hasRemainingCapacity());
-        assertEquals(0, chunkA.remainingCapacity());
+        assertFalse(chunkA.hasFreeSlot());
+        assertEquals(0, chunkA.freeBytes());
 
         // Released by a thread that could take the stripe lock: straight into the chunk's local free list.
         release(held.get(0), false);
-        assertTrue(chunkA.hasRemainingCapacity());
-        assertEquals(BURST_BUF_SIZE, chunkA.remainingCapacity());
+        assertTrue(chunkA.hasFreeSlot());
+        assertEquals(BURST_BUF_SIZE, chunkA.freeBytes());
 
         // Released by a thread that cannot take the lock: counted as free before anyone takes them over. The last
         // buffer of A stays in use, so that A is never given up and the same chunk serves what follows.
@@ -1703,9 +1703,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK - 1; i++) {
                 release(held.get(i), true);
             }
-            assertTrue(chunkA.hasRemainingCapacity());
+            assertTrue(chunkA.hasFreeSlot());
             assertFalse(chunkA.allFree());
-            assertEquals((BURST_SEGMENTS_PER_CHUNK - 1) * BURST_BUF_SIZE, chunkA.remainingCapacity());
+            assertEquals((BURST_SEGMENTS_PER_CHUNK - 1) * BURST_BUF_SIZE, chunkA.freeBytes());
         } finally {
             for (int i = 0; i < locks.size(); i++) {
                 locks.get(i).unlockWrite(stamps.get(i));
@@ -1730,8 +1730,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assertSame(chunkA, chunkOf(buf));
             assertTrue(offsets.add(buf.arrayOffset()), "segment handed out twice");
         }
-        assertFalse(chunkA.hasRemainingCapacity());
-        assertEquals(0, chunkA.remainingCapacity());
+        assertFalse(chunkA.hasFreeSlot());
+        assertEquals(0, chunkA.freeBytes());
 
         // Every segment of A back, from another thread that cannot take the lock: all of them free, none polled yet.
         held.add(lastOfA);
@@ -1743,7 +1743,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 release(buf, true);
             }
             assertTrue(chunkA.allFree());
-            assertTrue(chunkA.hasRemainingCapacity());
+            assertTrue(chunkA.hasFreeSlot());
         } finally {
             for (int i = 0; i < locks.size(); i++) {
                 locks.get(i).unlockWrite(stamps.get(i));

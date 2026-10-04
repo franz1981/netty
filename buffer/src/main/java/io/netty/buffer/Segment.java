@@ -282,21 +282,21 @@ final class Segment {
         return buffer._memoryAddress() + base;
     }
 
-    static final int OUT = 0;
-    static final int COMMITTED_STATE = 1;
-    static final int PURGED = 2;
-    static final int UNTOUCHED = 3;
+    static final int SLICE_OUT = 0;
+    static final int SLICE_COMMITTED = 1;
+    static final int SLICE_PURGED = 2;
+    static final int SLICE_UNTOUCHED = 3;
 
     /** Of slice {@code i}: claimed, free with memory behind it, purged since used, or never used. */
     int sliceState(int i) {
         long bit = 1L << i;
         if ((free & bit) == 0) {
-            return OUT;
+            return SLICE_OUT;
         }
         if ((committed & bit) != 0) {
-            return COMMITTED_STATE;
+            return SLICE_COMMITTED;
         }
-        return everCommitted[i] ? PURGED : UNTOUCHED;
+        return everCommitted[i] ? SLICE_PURGED : SLICE_UNTOUCHED;
     }
 
     /** Adds this block's {claimed, free with memory behind, free without} slice counts to {@code counts}. Racy. */

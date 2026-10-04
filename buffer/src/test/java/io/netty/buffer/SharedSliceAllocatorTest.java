@@ -71,8 +71,8 @@ final class SharedSliceAllocatorTest {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
     }
 
-    private static AdaptivePoolingAllocator.AdaptiveByteBuf adaptive(ByteBuf buf) {
-        return (AdaptivePoolingAllocator.AdaptiveByteBuf) (buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ?
+    private static AdaptiveByteBuf adaptive(ByteBuf buf) {
+        return (AdaptiveByteBuf) (buf instanceof AdaptiveByteBuf ?
                 buf : buf.unwrap());
     }
 

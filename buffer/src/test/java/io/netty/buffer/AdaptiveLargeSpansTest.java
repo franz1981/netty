@@ -91,8 +91,8 @@ final class AdaptiveLargeSpansTest {
         return mode == Mode.HEAP ? heapAllocator() : allocator(mode == Mode.DIRECT_REGIONS);
     }
 
-    private static AdaptivePoolingAllocator.AdaptiveByteBuf adaptive(ByteBuf buf) {
-        return (AdaptivePoolingAllocator.AdaptiveByteBuf) (buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ?
+    private static AdaptiveByteBuf adaptive(ByteBuf buf) {
+        return (AdaptiveByteBuf) (buf instanceof AdaptiveByteBuf ?
                 buf : buf.unwrap());
     }
 

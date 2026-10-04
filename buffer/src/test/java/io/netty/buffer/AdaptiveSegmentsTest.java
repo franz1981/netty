@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
 import io.netty.buffer.AdaptivePoolingAllocator.Heap;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;

@@ -62,7 +62,7 @@ class AdaptivePoolingAllocatorTest {
             }
         }
         assertEquals(2048, mostSegments);
-        assertTrue(mostSegments <= SizeClassedChunk.MAX_SEGMENTS);
+        assertTrue(mostSegments <= SizeClassedChunk.MAX_SLOTS);
     }
 
     private static void assertSizeClassOf(int expectedSizeClass, int previousSizeIncluded, int maxSizeIncluded) {

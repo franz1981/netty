@@ -58,9 +58,9 @@ public class AdaptiveSegmentRegionsTest {
             bufs.add(buf);
             buf.setLong(size - 8, size);
             assertEquals(size, buf.getLong(size - 8));
-            ByteBuf adaptive = buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap();
+            ByteBuf adaptive = buf instanceof AdaptiveByteBuf ? buf : buf.unwrap();
             Segment segment = ((AdaptivePoolingAllocator.SizeClassedChunk)
-                    ((AdaptivePoolingAllocator.AdaptiveByteBuf) adaptive).chunk).segment;
+                    ((AdaptiveByteBuf) adaptive).chunk).segment;
             assertNotNull(segment.region);
             long base = segment.region.buffer.memoryAddress();
             assertTrue(buf.memoryAddress() >= base && buf.memoryAddress() + size <= base + REGION_SIZE);
@@ -103,9 +103,9 @@ public class AdaptiveSegmentRegionsTest {
         PageStore store = AdaptiveByteBufAllocatorTest.direct(allocator).pageStore;
         assertNull(store.mmap);
         ByteBuf buf = allocator.directBuffer(1024, 1024);
-        ByteBuf adaptive = buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap();
+        ByteBuf adaptive = buf instanceof AdaptiveByteBuf ? buf : buf.unwrap();
         Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk)
-                ((AdaptivePoolingAllocator.AdaptiveByteBuf) adaptive).chunk).segment;
+                ((AdaptiveByteBuf) adaptive).chunk).segment;
         assertNotNull(block.region);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
         buf.release();

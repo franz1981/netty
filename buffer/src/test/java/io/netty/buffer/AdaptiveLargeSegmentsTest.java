@@ -256,8 +256,8 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     private static Segment blockOf(ByteBuf buf) {
-        AdaptivePoolingAllocator.AdaptiveByteBuf adaptive = (AdaptivePoolingAllocator.AdaptiveByteBuf)
-                (buf instanceof AdaptivePoolingAllocator.AdaptiveByteBuf ? buf : buf.unwrap());
+        AdaptiveByteBuf adaptive = (AdaptiveByteBuf)
+                (buf instanceof AdaptiveByteBuf ? buf : buf.unwrap());
         return ((AdaptivePoolingAllocator.SharedSpanChunk) adaptive.chunk).block;
     }
 
