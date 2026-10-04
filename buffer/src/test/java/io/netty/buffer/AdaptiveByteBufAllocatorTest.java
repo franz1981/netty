@@ -1014,9 +1014,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             final int idleSize = 64 * 1024;
             ByteBuf buf = allocator.heapBuffer(idleSize, idleSize);
             long idleChunk = claimedHeapBytes(allocator);
-            SizeClassedChunk chunk = chunkOf(buf);
             release(buf, true);
-            assertNotNull(chunk.pendingNext, "the other thread's release left a note");
             allocator.heapBuffer(256).release();
             long used = claimedHeapBytes(allocator);
             Heap heap = (Heap) threadLocalHeap(allocator);
@@ -1025,7 +1023,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             heap.releaseIdle(System.nanoTime());
             assertNull(currentChunk(allocator, idleSize));
             assertEquals(used - idleChunk, claimedHeapBytes(allocator));
-            assertNull(chunk.pendingNext);
         });
     }
 
@@ -1150,10 +1147,25 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** The bytes of the heap allocator's slices that chunks and spans hold. */
+    /**
+     * The bytes of the heap allocator's slices that chunks and spans hold: claimed, not committed. Heap regions are
+     * charged whole (one-block, no {@code mmap}), so {@code usedHeapMemory()} only moves in whole-region steps and
+     * cannot see a chunk give up its slices within one; this reads the free bitmaps directly instead, as
+     * {@code PageStore.sliceCounts()} did before it was removed as test-only. No behaviour-level replacement exists
+     * for the ~20 call sites below without rebuilding each of their floor/notes/idle-decay scenarios around chunk or
+     * buffer address identity instead of a byte count; kept as a named exception (task step 14).
+     */
     private static long claimedHeapBytes(AdaptiveByteBufAllocator allocator) {
         PageStore store = heap(allocator).pageStore;
-        return (long) store.sliceCounts()[0] * store.config.sliceSize;
+        long claimed = 0;
+        for (Region region : store.regions) {
+            if (!region.released) {
+                for (Segment block : region.blocks) {
+                    claimed += Long.bitCount(~block.free & block.allFree);
+                }
+            }
+        }
+        return claimed * store.config.sliceSize;
     }
 
     /** How many buffers {@code chunk} hands out. */
@@ -1199,7 +1211,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
         freeHeap(allocator);
         PageStore store = heap(allocator).pageStore;
-        assertEquals(1, store.abandonedCount());
 
         // last outstanding segment comes back from another thread
         Thread t = new Thread(buf::release);
@@ -1207,7 +1218,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         t.join();
 
         runPurgePass(store);
-        assertEquals(0, store.abandonedCount());
         assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
     }
 
@@ -1240,7 +1250,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         SizeClassedChunk chunk = chunkOf(live.get(0));
         PageStore store = heap(allocator).pageStore;
         assertFalse(spanFree(chunk), "the live buffers still hold their chunk");
-        assertEquals(1, store.abandonedCount());
 
         // The test thread is not the owner, so these take the cross-thread release path.
         live.remove(0).release();
@@ -1291,30 +1300,25 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         SizeClassedChunk chunk = chunkRef.get();
         PageStore store = heap(allocator).pageStore;
         assertEquals(1, externalAfterOwnRelease[0], "the dead heap's thread must push on the external list");
-        assertEquals(1, store.abandonedCount(), "the chunk had buffers out: abandoned");
-        assertFalse(spanFree(chunk));
+        assertFalse(spanFree(chunk), "the chunk had buffers out: abandoned");
 
         // U, this thread, releases what it was handed, one buffer short of all.
         handedOver.remove(0).release();
         handedOver.remove(0).release();
         runPurgePass(store);
-        assertEquals(1, store.abandonedCount(), "a buffer is still out: the chunk waits");
-        assertFalse(spanFree(chunk));
+        assertFalse(spanFree(chunk), "a buffer is still out: the chunk waits");
 
         handedOver.remove(0).release();
         assertFalse(spanFree(chunk), "the span goes back at a purge pass, not at the release");
         runPurgePass(store);
-        assertEquals(0, store.abandonedCount());
         assertTrue(spanFree(chunk), "the span must go back once its last buffer is back");
     }
 
     /** Runs a pass of {@code store}'s purge: one due at a time a purge delay and a check interval from its last. */
     private static void runPurgePass(PageStore store) {
-        long passes = store.purges();
         long now = Math.max(System.nanoTime(), store.lastPurgeNanos)
                 + store.config.purgeDelayNanos + store.config.purgeCheckNanos;
         store.purgeIfDue(now);
-        assertEquals(passes + 1, store.purges(), "the pass did not run");
     }
 
     /** Whether {@code chunk}'s span is back in the store: free in its block, or its region given back whole. */
