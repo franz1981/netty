@@ -62,7 +62,8 @@ final class PageStoreTest {
         for (int i = 0; i < 3; i++) {
             long run = store.claimSlices(63, false);
             assertEquals(0, store.start(run));
-            assertEquals(0, store.block(run).buffer.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
+            Segment block = store.block(run);
+            assertEquals(0, (block.buffer.memoryAddress() + block.base) & REGION_ALIGNMENT - 1, "block " + i);
         }
         assertEquals(0, allocator.pageStore.regions[0].buffer.memoryAddress() & REGION_ALIGNMENT - 1);
     }

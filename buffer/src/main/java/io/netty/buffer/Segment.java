@@ -38,7 +38,10 @@ final class Segment {
     /** The first slice of a run, in what {@link #claimRun} returns. */
     static final int START = Long.SIZE - 1;
 
+    /** The region's buffer: every block of a region shares it. */
     final AbstractByteBuf buffer;
+    /** This block's start in {@link #buffer}. */
+    final int base;
     final int sliceSize;
     final int slices;
     final long allFree;
@@ -64,11 +67,12 @@ final class Segment {
     /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
     AdaptivePoolingAllocator.Chunk threadLocalSpans;
 
-    Segment(AbstractByteBuf buffer, int sliceSize, Region region, int slot) {
+    Segment(AbstractByteBuf buffer, int base, int size, int sliceSize, Region region, int slot) {
         this.region = region;
         this.slot = slot;
-        int slices = buffer.capacity() / sliceSize;
-        assert slices > 0 && slices <= Long.SIZE && buffer.capacity() == slices * sliceSize;
+        this.base = base;
+        int slices = size / sliceSize;
+        assert slices > 0 && slices <= Long.SIZE && size == slices * sliceSize;
         this.buffer = buffer;
         this.sliceSize = sliceSize;
         this.slices = slices;

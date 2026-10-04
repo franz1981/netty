@@ -276,7 +276,7 @@ final class PageStore {
 
     /** A region charged whole has memory behind all of it, free since now. */
     private Region sharedRegion(AbstractByteBuf buffer, RegionSource source, int blocks) {
-        Region region = new Region(this, buffer, source, blocks, memory, config, !source.canPurgeSlices(),
+        Region region = new Region(this, buffer, source, blocks, config, !source.canPurgeSlices(),
                 System.nanoTime());
         for (int slot = 0; slot < region.slots; slot++) {
             Segment block = region.blocks[slot];
@@ -580,7 +580,7 @@ final class PageStore {
         int sliceSize = block.sliceSize;
         long bits = block.bits(start, n) & ~block.committed;
         int fresh = Long.bitCount(bits);
-        long address = block.buffer._memoryAddress() + (long) start * sliceSize;
+        long address = block.buffer._memoryAddress() + block.base + (long) start * sliceSize;
         boolean committed = false;
         try {
             if (fresh != 0) {
@@ -663,7 +663,7 @@ final class PageStore {
             block.committed = 0;
             if (committed != 0) {
                 PlatformDependent.decrementMemoryCounter(committed * sliceSize);
-                allocator.storeBytesReleased(block.buffer._memoryAddress(), committed * sliceSize,
+                allocator.storeBytesReleased(block.buffer._memoryAddress() + block.base, committed * sliceSize,
                         block.buffer.isDirect());
             }
         }

@@ -522,7 +522,7 @@ final class AdaptivePoolingAllocator {
         }
         boolean initialized = false;
         try {
-            buf.init(chunk.delegate, chunk, 0, 0, 0, size, size, maxCapacity);
+            buf.init(chunk.delegate, chunk, 0, 0, chunk.base, size, size, maxCapacity);
             initialized = true;
         } finally {
             if (!initialized) {
@@ -562,8 +562,7 @@ final class AdaptivePoolingAllocator {
         int start = (int) run;
         boolean made = false;
         try {
-            AbstractByteBuf view = store.memory.view(region.buffer, start * segmentSize, slots * segmentSize);
-            OneShotChunk chunk = new OneShotChunk(view, this, region, start, slots);
+            OneShotChunk chunk = new OneShotChunk(region.buffer, this, region, start, slots);
             made = true;
             return chunk;
         } finally {
@@ -1984,7 +1983,7 @@ final class AdaptivePoolingAllocator {
             Chunk chunk = ownerThread != null ? segment.threadLocalSpans : segment.sharedSpans;
             boolean initialized = false;
             try {
-                buf.init(segment.buffer, chunk, 0, 0, (start << sliceShift) + colour, size,
+                buf.init(segment.buffer, chunk, 0, 0, segment.base + (start << sliceShift) + colour, size,
                         (slices << sliceShift) - colour, maxCapacity);
                 initialized = true;
             } finally {
@@ -2017,7 +2016,7 @@ final class AdaptivePoolingAllocator {
 
         /** @param threadLocal whether the heaps whose spans this chunk holds are thread-local ones, for JFR */
         SharedSpanChunk(Segment block, PageStore store, boolean threadLocal) {
-            super(block.buffer, store.allocator, true);
+            super(block.buffer, store.allocator, true, store.config.segmentSize);
             this.store = store;
             this.block = block;
             this.threadLocal = threadLocal;
@@ -2029,7 +2028,8 @@ final class AdaptivePoolingAllocator {
         @Override
         void releaseSegment(int offset, int length) {
             int shift = sliceShift;
-            block.releaseRun(offset >>> shift, length + (1 << shift) - 1 >>> shift, System.nanoTime());
+            int relative = offset - block.base;
+            block.releaseRun(relative >>> shift, length + (1 << shift) - 1 >>> shift, System.nanoTime());
         }
 
         @Override
@@ -2268,9 +2268,9 @@ final class AdaptivePoolingAllocator {
         void reinit(Segment segment, int spanStart) {
             this.segment = segment;
             this.spanStart = spanStart;
-            // The block's own buffer, as a large-buffer span reads it: no buffer object per chunk.
+            // The region's own buffer, as a large-buffer span reads it: no buffer object per chunk.
             delegate = segment.buffer;
-            base = spanStart * segment.sliceSize + colour;
+            base = segment.base + spanStart * segment.sliceSize + colour;
             bump = 0;
             head = FREE_LIST_EMPTY;
             localFree = segments;
@@ -2529,13 +2529,17 @@ final class AdaptivePoolingAllocator {
         private final Region region;
         private final int runStart;
         private final int runSlots;
+        /** This run's start in {@code delegate}, a region's buffer; 0 for an allocation of its own. */
+        final int base;
 
         OneShotChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, Region region, int runStart,
                      int runSlots) {
-            super(delegate, allocator, false);
+            super(delegate, allocator, false,
+                    region != null ? runSlots * region.store.config.segmentSize : delegate.capacity());
             this.region = region;
             this.runStart = runStart;
             this.runSlots = runSlots;
+            base = region != null ? runStart * region.store.config.segmentSize : 0;
         }
 
         /** Any thread, once: the run goes back to the store, or the allocation is freed. */
@@ -2551,7 +2555,7 @@ final class AdaptivePoolingAllocator {
 
         @Override
         public String toString() {
-            return "OneShotChunk[capacity: " + delegate.capacity() + ']';
+            return "OneShotChunk[capacity: " + capacity() + ']';
         }
     }
 

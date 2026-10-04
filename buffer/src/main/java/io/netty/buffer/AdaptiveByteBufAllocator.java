@@ -20,8 +20,6 @@ import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.nio.ByteBuffer;
-
 /**
  * An auto-tuning pooling {@link ByteBufAllocator}, that follows an anti-generational hypothesis.
  * <p>
@@ -117,11 +115,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
                     new UnpooledHeapByteBuf(allocator, initialCapacity, maxCapacity);
         }
 
-        @Override
-        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
-            return block;
-        }
-
         /** Regions of one block each, one {@code byte[]} per block. */
         @Override
         public RegionSource mallocRegionSource() {
@@ -146,11 +139,6 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
             return UnsafeByteBufUtil.newDirectByteBuf(allocator, initialCapacity, maxCapacity);
         }
 
-        @Override
-        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
-            return directSpan(allocator, block, offset, length);
-        }
-
         /** {@code mmap} regions where libc can be bound (Java 22+ on Linux with native access), else none. */
         @Override
         public RegionSource regionSource() {
@@ -162,21 +150,5 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         public RegionSource mallocRegionSource() {
             return new MallocRegionSource(this);
         }
-    }
-
-    /**
-     * A buffer over {@code length} bytes of {@code segment}, a buffer of {@link UnsafeByteBufUtil#newDirectByteBuf},
-     * from {@code offset}: of the class of {@code segment}, so that the buffers reading a chunk see one class whatever
-     * the chunk, and never freeing the memory.
-     */
-    static AbstractByteBuf directSpan(ByteBufAllocator allocator, AbstractByteBuf segment, int offset, int length) {
-        ByteBuffer span = segment.nioBuffer(offset, length);
-        if (segment instanceof UnpooledUnsafeNoCleanerDirectByteBuf) {
-            return new UnpooledUnsafeNoCleanerDirectByteBuf(allocator, span, length);
-        }
-        if (segment instanceof UnpooledUnsafeDirectByteBuf) {
-            return new UnpooledUnsafeDirectByteBuf(allocator, span, length, false);
-        }
-        return new UnpooledDirectByteBuf(allocator, span, length, false, false);
     }
 }

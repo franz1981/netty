@@ -53,7 +53,7 @@ final class PageStoreTestSupport {
      * Direct or heap blocks counted as they are allocated and freed, as the regions of one block of
      * {@link #mallocRegionSource()} unless {@link #fallback} is set; also the chunk allocator of the allocator under
      * test, for the chunks that are not carved from blocks. The heap one does what the heap allocator's does: a
-     * {@code byte[]} per block or chunk, and a view is the block itself.
+     * {@code byte[]} per block or chunk.
      */
     static final class CountingMemorySource implements MemorySource {
         final boolean heap;
@@ -98,12 +98,6 @@ final class PageStoreTestSupport {
             AbstractByteBuf buf = newBuffer(size, size);
             segments.add(buf);
             return buf;
-        }
-
-        @Override
-        public AbstractByteBuf view(AbstractByteBuf block, int offset, int length) {
-            return heap ? block :
-                    AdaptiveByteBufAllocator.directSpan(UnpooledByteBufAllocator.DEFAULT, block, offset, length);
         }
 
         @Override
@@ -256,9 +250,9 @@ final class PageStoreTestSupport {
     static long offsetIn(ByteBuf buf, Segment segment) {
         if (segment.buffer.hasArray()) {
             assertSame(segment.buffer.array(), buf.array(), "not the segment's array");
-            return buf.arrayOffset() - segment.buffer.arrayOffset();
+            return buf.arrayOffset() - segment.buffer.arrayOffset() - segment.base;
         }
-        return buf.memoryAddress() - segment.buffer.memoryAddress();
+        return buf.memoryAddress() - segment.buffer.memoryAddress() - segment.base;
     }
 
     /**
