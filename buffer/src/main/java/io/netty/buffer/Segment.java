@@ -20,14 +20,9 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
  * A block: memory cut into equal slices (at most {@link Long#SIZE}), claimed and released as runs of contiguous
- * slices. The state is one bit per slice in {@link #free}, none in the memory: claims are first fit from the lowest
- * slice, and a released run merges with its free neighbours by construction. Chunk creation and deallocation only,
- * never per buffer.
- * <p>
- * A block of a {@link Region} has no owner: any thread claims and releases runs of its slices by CAS
- * ({@link #claimRun}, {@link #releaseRun}), and a cleared bit belongs to the thread that cleared it, which alone
- * touches that slice's bit of {@link #committed} and its {@link #freedAt}; the CAS that sets the bit again publishes
- * them.
+ * slices, one bit per slice in {@link #free}. A block has no owner: any thread claims and releases runs by CAS
+ * ({@link #claimRun}, {@link #releaseRun}); a cleared bit belongs to the thread that cleared it, which alone touches
+ * that slice's bit of {@link #committed} and its {@link #freedAt}, until the CAS that sets the bit again.
  */
 final class Segment {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -39,19 +34,14 @@ final class Segment {
     /** The first slice of a run, in what {@link #claimRun} returns. */
     static final int START = Long.SIZE - 1;
 
-    /** The region's buffer: every block of a region shares it. */
     final AbstractByteBuf buffer;
-    /** This block's start in {@link #buffer}. */
     final int base;
     final int sliceSize;
     final int slices;
     final long allFree;
     /** Bit {@code i} set when slice {@code i} is free. */
     volatile long free;
-    /**
-     * Bit {@code i} set when slice {@code i} has memory behind it. Each holder changes its own bits only, by CAS: the
-     * holders of other runs of the block change theirs meanwhile.
-     */
+    /** Bit {@code i} set when slice {@code i} has memory behind it; each holder changes its own bits only, by CAS. */
     volatile long committed;
     final Region region;
     final int slot;
@@ -59,17 +49,13 @@ final class Segment {
     final long[] freedAt;
     /** Per slice, slice owner only: whether it ever had memory behind it, so that free with none now was purged. */
     final boolean[] everCommitted;
-    /**
-     * The bin of the first claim since the block was last empty (see {@link PageStore#binOf}): a hint, checked
-     * against the bitmap by the claims that go by it.
-     */
+    /** The bin of the first claim since the block was last empty (see {@link PageStore#binOf}): a hint. */
     volatile byte bin;
     /** The chunk of every large-buffer span a stripe claimed in it. */
     final AdaptivePoolingAllocator.Chunk sharedSpans;
     /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
     final AdaptivePoolingAllocator.Chunk threadLocalSpans;
 
-    /** Every slice free; committed and freed at {@code committedAt} already if {@code committed} (charged whole). */
     Segment(AbstractByteBuf buffer, int base, int size, int sliceSize, Region region, int slot,
             boolean committed, long committedAt) {
         this.region = region;
@@ -94,7 +80,7 @@ final class Segment {
     }
 
     /**
-     * The first slice of the lowest run of {@code n} free slices in {@code free}, or -1. After {@code k} rounds of
+     * The first slice of the lowest run of {@code n} free slices in {@code free}, or -1: after {@code k} rounds of
      * {@code m &= m >>> 1}, bit {@code i} of {@code m} is set when slices {@code i} to {@code i + k} are all free.
      */
     static int firstFit(long free, int n) {
@@ -105,12 +91,10 @@ final class Segment {
         return m == 0 ? -1 : Long.numberOfTrailingZeros(m);
     }
 
-    /** Whether {@code free} has a run of {@code n} contiguous free slices. */
     static boolean hasFit(long free, int n) {
         return firstFit(free, n) >= 0;
     }
 
-    /** Whether this block, as it is now, has a run of {@code n} contiguous free slices. */
     boolean hasFit(int n) {
         return hasFit(free, n);
     }
@@ -120,15 +104,11 @@ final class Segment {
         return (1L << n) - 1 << start;
     }
 
-    /** The bits of the run of {@code n} slices from {@code start}. */
     long bits(int start, int n) {
         return n == slices ? allFree : mask(start, n);
     }
 
-    /**
-     * Any thread: claims the lowest run of {@code n} free slices, for a claim of {@code bin}. Returns its first slice,
-     * with {@link #FIRST} set if the block was empty, which labels it {@code bin}; or -1.
-     */
+    /** Any thread: claims the lowest run of {@code n} free slices, for a claim of {@code bin}, or -1. */
     int claimRun(int n, int bin) {
         if (n == slices) {
             if (!claimWhole()) {
@@ -153,10 +133,6 @@ final class Segment {
         }
     }
 
-    /**
-     * Any thread: claims the first {@code n} slices if every slice is free, and labels the block {@code bin}, as the
-     * first claim since it was empty.
-     */
     boolean claimFirst(int n, int bin) {
         if (!FREE.compareAndSet(this, allFree, allFree & ~bits(0, n))) {
             return false;
@@ -165,12 +141,10 @@ final class Segment {
         return true;
     }
 
-    /** Claims every slice if all are free. */
     boolean claimWhole() {
         return FREE.compareAndSet(this, allFree, 0);
     }
 
-    /** Claims the slices of {@code bits} that are still free, and returns them. */
     long claimFree(long bits) {
         for (;;) {
             long current = free;
@@ -181,11 +155,7 @@ final class Segment {
         }
     }
 
-    /**
-     * The run of {@code n} slices from {@code start}, which the caller claimed, is free again, its
-     * slices stamped with {@code now} first, and the store's purge armed after (see {@link PageStore#armPurge}).
-     * Throws if any of them is free already.
-     */
+    /** The run of {@code n} slices from {@code start}, claimed by the caller, is free again. Throws if free already. */
     void releaseRun(int start, int n, long now) {
         long[] freedAt = this.freedAt;
         for (int i = start; i < start + n; i++) {
@@ -195,10 +165,6 @@ final class Segment {
         region.store.armPurge(now);
     }
 
-    /**
-     * The slices of {@code bits}, which the caller claimed, are free again, unstamped, and the store's maps show it
-     * (see {@link PageStore#slicesReleased}).
-     */
     void unclaim(long bits) {
         for (;;) {
             long current = free;
@@ -212,15 +178,10 @@ final class Segment {
         }
     }
 
-    /** Of {@code bits}, those not committed yet. */
     long fresh(long bits) {
         return bits & ~committed;
     }
 
-    /**
-     * The caller's claimed slices of {@code bits} have memory behind them now, marked {@link #everCommitted} for
-     * good. No other caller can own the same bits meanwhile.
-     */
     void commit(long bits) {
         long current;
         do {
@@ -231,7 +192,6 @@ final class Segment {
         }
     }
 
-    /** The caller's claimed slices of {@code bits} have no memory behind them any more. */
     void uncommit(long bits) {
         for (;;) {
             long current = committed;
@@ -248,11 +208,7 @@ final class Segment {
         return n;
     }
 
-    /**
-     * Of {@code bits}, those committed, freed {@code delay} or more before {@code now}: {@code now - freedAt[i]} by
-     * subtraction, wraparound-safe as {@link System#nanoTime()} is. Each committed slice not yet idle reports its
-     * wait to the store's purge cadence (see {@link PageStore#skip}), in the same scan.
-     */
+    /** Of {@code bits}, those committed and freed {@code delay} or more before {@code now}; the rest skip the purge. */
     long idleOf(long bits, long now, long delay) {
         long idle = 0;
         for (long b = bits & committed; b != 0; b &= b - 1) {
@@ -267,7 +223,6 @@ final class Segment {
         return idle;
     }
 
-    /** The shortest, at {@code now}, any slice of this block has been free: {@code now - freedAt[i]}, minimized. */
     long shortestWait(long now) {
         long shortest = Long.MAX_VALUE;
         for (long freedAt : this.freedAt) {
@@ -276,7 +231,6 @@ final class Segment {
         return shortest;
     }
 
-    /** The start of this block in memory. */
     long address() {
         return buffer._memoryAddress() + base;
     }

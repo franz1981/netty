@@ -38,12 +38,9 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
  * heap        a thread-local heap or a stripe                     AdaptivePoolingAllocator.Heap
  * </pre>
  * Heaps own chunks, never blocks: any heap claims and releases a run of slices from the regions' shared bitmaps by
- * CAS ({@link #claimSlices}, {@link Segment#releaseRun}), found through bins and chunkmaps as mimalloc v3's
- * bitmap.h (https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h) ({@link #binOf}, {@link #maps}); a new
- * region is added under this store's monitor, the only lock, when no block has a fit. {@code mmap} regions
- * ({@link #mmap}) purge idle free slices in place, charging and counting per slice; one-block regions
- * ({@link #memory}: {@code malloc} or, for heap memory, {@code byte[]}) are charged, counted and purged whole. One
- * purger at a time, driven by the heaps' ticks: see {@link #purgeIfDue}.
+ * CAS ({@link #claimSlices}, {@link Segment#releaseRun}), found through bins and chunkmaps ({@link #binOf},
+ * {@link #maps}), as mimalloc v3's bitmap.h. {@code mmap} regions ({@link #mmap}) purge idle free slices in place;
+ * one-block regions ({@link #memory}) are purged whole. One purger at a time: see {@link #purgeIfDue}.
  */
 final class PageStore {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(PageStore.class);
@@ -54,37 +51,24 @@ final class PageStore {
     private static final AtomicReferenceFieldUpdater<PageStore, SizeClassedChunk> ABANDONED =
             AtomicReferenceFieldUpdater.newUpdater(PageStore.class, SizeClassedChunk.class, "abandoned");
     private static final Region[] NO_REGIONS = new Region[0];
-    /**
-     * The bytes a purge pass gives back, {@code madvise}d or released whole, past which it makes no more calls (see
-     * {@link #purge}): bytes, not calls, as a call costs about as much as the memory it gives back.
-     */
+    /** The bytes a purge pass gives back before it stops: bytes, not calls, as a call costs about what it gives. */
     static final long PURGE_BYTES = 64L << 20;
 
     final AdaptivePoolingAllocator allocator;
     final PageStoreConfig config;
-    /**
-     * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the
-     * short runs do not cut the holes the long ones leave. A page kind's bin is its index in
-     * {@link SizeClassTable#pageKinds}; every other length is in {@link #otherBin}.
-     */
+    /** Per run length in slices, its bin, so short runs do not cut the holes long ones leave. */
     final byte[] binOf;
     final int otherBin;
-    /**
-     * Per bin, the run length whose fit its bit in {@link #maps} stands for: the page kind; 1 for
-     * {@link #otherBin}, whose claims have many lengths.
-     */
+    /** Per bin, the run length whose fit its bit in {@link #maps} stands for: 1 for {@link #otherBin}. */
     final int[] binSlices;
     /** The map of the empty blocks in {@link #maps}, after one per bin. */
     final int emptyMap;
     /** A block's id is its region's index shifted by this, or its slot: a region's blocks have consecutive ids. */
     private final int idShift;
     /**
-     * Bitmaps over the block ids, {@code emptyMap + 1} of them, each {@code maps.length() / (emptyMap + 1)} words,
-     * one after the other: per bin, a bit set when a block of that bin has a free run of the bin's length; and the
-     * empty blocks, for any bin. Hints: the truth is each block's {@link Segment#free}. A release sets the bit
-     * its block now has ({@link #slicesReleased}); a claim that finds a block without the fit its bit stood for
-     * clears it, then reads the block again and sets it again if a fit came back meanwhile ({@link #unmark}).
-     * Replaced by a larger copy under this store's monitor ({@link #growMaps}).
+     * Bitmaps over the block ids: per bin, a bit set when a block of that bin has a free run of the bin's length;
+     * and the empty blocks, for any bin. Hints only: the truth is each block's {@link Segment#free}, so a stale bit
+     * is corrected on the claim that finds it wrong ({@link #unmark}).
      */
     private volatile AtomicLongArray maps;
     final MemorySource memory;
@@ -96,22 +80,16 @@ final class PageStore {
     /** Replaced under this store's monitor, one longer or with a released region's place taken; read without it. */
     volatile Region[] regions = NO_REGIONS;
     private boolean closed;
-    /** 1 while a thread purges: one purger at a time. */
     private volatile int purging;
-    /** When the last pass ran, or started: see {@link #isDue}. */
     volatile long lastPurgeNanos = System.nanoTime();
-    // Read by every run release, written once per arming by a release and by the purger.
-    /** 1 once a run was released since the purger last disarmed: see {@link #armPurge}. */
+    /** 1 once a run was released since the purger last disarmed: read by every release, written by one at a time. */
     private volatile int armed;
-    /** When {@link #armed} was set, as {@link System#nanoTime()}: a pass waits the purge delay from then. */
     private volatile long armedAt;
     /** Chunks abandoned since the last pass, a stack linked through {@code nextInQueue}: see {@link #abandon}. */
     private volatile SizeClassedChunk abandoned;
     /** Purger only: abandoned chunks with buffers still out, linked through {@code nextInQueue}. */
     private SizeClassedChunk waiting;
-    // Written by the purger only.
     long purgeFailures;
-    /** Whether the pass left free slices that were not idle for the delay yet, and the longest any of them waited. */
     private boolean skipped;
     private long longestWait;
     /** Where the next pass starts: a region's index in {@link #regions}, and a block in it. */
@@ -158,15 +136,8 @@ final class PageStore {
         }
     }
 
-    /**
-     * Maps a new region, unless one was added since {@code seen} was read: three system calls for {@code mmap}, one
-     * allocation for a region of one block. Claims the caller's run in it before publishing it: {@code blocks} whole
-     * blocks, or if 0, {@code slices} slices of its first block. Published empty, a region could be given back
-     * by the purger, idle, before the claim that mapped it scanned it, and the claim map another: with a short purge
-     * delay, without end. Returns the run as {@link #claimSlices} and {@link #claimBlocks} encode theirs, not
-     * committed, or -1 for the caller to scan again: a region was added meanwhile, the run does not fit a new
-     * region, or a region cannot be had and this gave up {@link #mmap} for good.
-     */
+    /** Maps a new region, unless one was added since {@code seen} was read, claiming the caller's run in it before
+     *  publishing it: published empty, the purger could give it back idle before this claim scanned it. */
     private synchronized long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
         if (closed) {
             throw new IllegalStateException("closed");
@@ -231,13 +202,8 @@ final class PageStore {
         return first < 0 ? -1 : run(index, first);
     }
 
-    /**
-     * Shared slices, any thread: claims a run of {@code slices} free slices of one block, at most a block: the
-     * lowest fit in the lowest block of its bin that has one, else the lowest empty block, which takes its bin, else
-     * a new region (see {@link #addRegion}). Lowest first, so that the highest blocks drain and go back. Returns the
-     * region's index in the high half and the run's first slice in the region in the low half. The run's slices are
-     * committed (see {@link #commitSlices}); give it back with {@link Segment#releaseRun}, from any thread.
-     */
+    /** Shared slices, any thread: claims a run of {@code slices} free slices of one block, lowest fit first, so
+     *  the highest blocks drain and go back. Give it back with {@link Segment#releaseRun}, from any thread. */
     long claimSlices(int slices, boolean threadLocal) {
         int bin = binOf[slices];
         for (;;) {
@@ -307,11 +273,7 @@ final class PageStore {
         return -1;
     }
 
-    /**
-     * After a claim of {@code bin} in {@code block} that returned {@code claimed} (see {@link Segment#claimRun}): the
-     * maps show the block as it now is to the claims of its bin, and as not empty if it was. Returns the run as
-     * {@link #claimSlices} does.
-     */
+    /** After a claim of {@code bin} in {@code block}: the maps show it as it now is, and as not empty if it was. */
     private long claimed(Segment block, int id, int bin, int claimed) {
         if ((claimed & Segment.FIRST) != 0) {
             // This claim holds its run: the block cannot be empty again before the bit is clear.
@@ -325,10 +287,7 @@ final class PageStore {
         return run(block.region.index, block.slot * block.slices + (claimed & Segment.START));
     }
 
-    /**
-     * Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit the block now has, if
-     * not set, empty or a fit for its bin.
-     */
+    /** Any thread, after slices of {@code block} were freed, leaving {@code free}: sets the bit it now has. */
     void slicesReleased(Segment block, long free) {
         int id = id(block);
         if (free == block.allFree) {
@@ -350,7 +309,6 @@ final class PageStore {
         return map == emptyMap ? block.isEmpty() : block.bin == map && block.hasFit(binSlices[map]);
     }
 
-    /** The block of {@code id} in {@code regions}, or {@code null} when it has none. */
     private Segment blockOf(Region[] regions, int id) {
         int index = id >>> idShift;
         if (index >= regions.length) {
@@ -361,10 +319,7 @@ final class PageStore {
         return slot < region.slots ? region.blocks[slot] : null;
     }
 
-    /**
-     * Sets bit {@code id} of {@code map}, unless set, in the maps of now: again in the copy that replaced them
-     * meanwhile, if any (see {@link #growMaps}).
-     */
+    /** Sets bit {@code id} of {@code map}, unless set: again in the copy that replaced it meanwhile, if any. */
     void mark(int map, int id) {
         AtomicLongArray maps = this.maps;
         long bit = 1L << id;
@@ -397,10 +352,7 @@ final class PageStore {
         }
     }
 
-    /**
-     * Clears bit {@code id} of {@code map}, which a claim found the block does not have, then reads the block again
-     * and sets it again if it does: a release meanwhile may have found the bit still set.
-     */
+    /** Clears bit {@code id} of {@code map}, found wrong, then sets it again if a release raced it back true. */
     private void unmark(int map, int id) {
         if (clear(map, id)) {
             Segment block = blockOf(regions, id);
@@ -410,11 +362,8 @@ final class PageStore {
         }
     }
 
-    /**
-     * Under this store's monitor, before region {@code index} is published: the maps hold its blocks' ids, doubled if
-     * they did not. A mark on the old maps after the copy read its word, by a thread that read {@link #maps} before
-     * the new ones were published, is copied by the second pass; a later one sees the new maps and marks them too.
-     */
+    /** Under this store's monitor: grows the maps to hold region {@code index}'s block ids before it is published;
+     *  a mark lost to a reader mid-copy is caught by copying twice. */
     private void growMaps(int index) {
         AtomicLongArray old = maps;
         int count = emptyMap + 1;
@@ -430,12 +379,10 @@ final class PageStore {
         copyMaps(old, words, grown, grownWords);
     }
 
-    /** Words per map of {@code maps}: its length split {@link #emptyMap} + 1 ways. */
     private int wordsPerMap(AtomicLongArray maps) {
         return maps.length() / (emptyMap + 1);
     }
 
-    /** The index into {@code maps} of {@code map}'s word holding bit {@code id}. */
     private int word(AtomicLongArray maps, int map, int id) {
         return map * wordsPerMap(maps) + (id >>> 6);
     }
@@ -462,12 +409,8 @@ final class PageStore {
         return (maps.get(word(maps, map, id)) & 1L << id) != 0;
     }
 
-    /**
-     * Any thread: claims {@code blocks} contiguous empty blocks of one region, for a buffer larger than a block
-     * (see {@link Region#claimBlocks}), else in a new region (see {@link #addRegion}). Returns the region's index in
-     * {@link #regions} in the high half and the first block in the low half, or -1 when new regions hold fewer blocks.
-     * Every slice is committed; give them back with {@link #releaseBlocks}.
-     */
+    /** Any thread: claims {@code blocks} contiguous empty blocks of one region, else in a new region. Every slice
+     *  is committed; give them back with {@link #releaseBlocks}. */
     long claimBlocks(int blocks) {
         for (;;) {
             if (blocks > regionBlocks) {
@@ -512,11 +455,8 @@ final class PageStore {
         }
     }
 
-    /**
-     * The claimer's run of {@code n} slices of {@code block} from {@code start}: its slices with no memory behind them
-     * are charged to the direct memory limit and counted in the used memory, all at once. On failure the run goes back,
-     * any slice charged meanwhile staying charged and free, until it is purged.
-     */
+    /** The claimer's run of {@code n} slices of {@code block} from {@code start}: slices with no memory behind
+     *  them are charged and counted, all at once; on failure the run goes back, charged slices staying charged. */
     private void commitSlices(Segment block, int start, int n, boolean threadLocal) {
         int sliceSize = block.sliceSize;
         long fresh = block.fresh(block.bits(start, n));
@@ -542,27 +482,22 @@ final class PageStore {
         return (long) region << 32 | slice;
     }
 
-    /** The region of a run {@link #claimSlices} or {@link #claimBlocks} returned. */
     Region region(long run) {
         return regions[(int) (run >>> 32)];
     }
 
-    /** The block of a run {@link #claimSlices} returned. */
     Segment block(long run) {
         return region(run).blocks[firstBlock(run)];
     }
 
-    /** The first slice in its block of a run {@link #claimSlices} returned. */
     int start(long run) {
         return (int) run % config.slicesPerSegment();
     }
 
-    /** The first block of a run {@link #claimSlices} or {@link #claimBlocks} returned. */
     int firstBlock(long run) {
         return (int) run / config.slicesPerSegment();
     }
 
-    /** Any thread: the blocks {@link #claimBlocks} returned go back to the shared slices. */
     void releaseBlocks(Region region, int start, int slots) {
         long now = System.nanoTime();
         for (int slot = start; slot < start + slots; slot++) {
@@ -571,10 +506,7 @@ final class PageStore {
         }
     }
 
-    /**
-     * Unmaps every region, with whatever segments are still in heaps: only when nothing can touch them any more
-     * (the allocator is unreachable). Takes nothing from then on.
-     */
+    /** Unmaps every region: only when nothing can touch them any more (the allocator is unreachable). */
     synchronized void close() {
         closed = true;
         Region[] regions = this.regions;
@@ -587,11 +519,7 @@ final class PageStore {
         }
     }
 
-    /**
-     * Credits {@code region}'s committed slices back, and its buffer goes to {@link Region#release()}; one JFR
-     * event. Shared by {@link #close()} and the purger's {@link #releaseIdleRegion}, both under this store's
-     * monitor.
-     */
+    /** Credits {@code region}'s committed slices back, and its buffer goes to {@link Region#release()}. */
     private void releaseRegion(Region region) {
         if (region.source != null) {
             closeSlices(region);
@@ -611,7 +539,6 @@ final class PageStore {
         }
     }
 
-    /** Credits every committed slice of {@code region}: the close only. */
     private void closeSlices(Region region) {
         int sliceSize = config.sliceSize;
         for (Segment block : region.blocks) {
@@ -623,11 +550,7 @@ final class PageStore {
         }
     }
 
-    /**
-     * Any thread, after it released a run at {@code now}: arms the purge, unless armed. The common case reads one
-     * shared field; only the release that finds it disarmed writes. A purger that sees {@link #armed} before
-     * {@link #armedAt} is written may run a pass early: it finds the run not idle yet and arms again for it.
-     */
+    /** Any thread, after it released a run at {@code now}: arms the purge, unless armed, so only one release writes. */
     void armPurge(long now) {
         if (armed == 0 && ARMED.compareAndSet(this, 0, 1)) {
             armedAt = now;
@@ -635,12 +558,9 @@ final class PageStore {
     }
 
     /**
-     * Any thread, from a heap's purge tick (see {@code Heap#countAllocations}) or a one-shot buffer. At most once per
-     * {@link PageStoreConfig#purgeCheckNanos}, only once the purge was armed {@link PageStoreConfig#purgeDelayNanos}
-     * ago (see {@link #armPurge}), and by one thread at a time (a try-guard: a caller that finds a purge running
-     * returns at once), gives back to the OS the memory of the free slices, or of the regions of one block, that
-     * stayed free for the delay at least. The pass disarms the purge before it scans, so that a release during the
-     * pass arms it again, and arms it again itself for the free slices it found not idle long enough yet.
+     * Any thread: at most once per {@link PageStoreConfig#purgeCheckNanos}, once armed {@link
+     * PageStoreConfig#purgeDelayNanos} ago, and by one thread at a time, purges. Disarms before it scans, so a
+     * release during the pass arms it again.
      */
     void purgeIfDue(long now) {
         if (!isDue(now) || !PURGING.compareAndSet(this, 0, 1)) {
@@ -662,10 +582,7 @@ final class PageStore {
                 && now - armedAt >= config.purgeDelayNanos;
     }
 
-    /**
-     * Purger: arms the purge as if armed {@code waited} before {@code now}, unless armed to be due sooner. Racy against
-     * a release that arms meanwhile: either arming stands, and a pass that finds slices not idle yet arms again.
-     */
+    /** Purger: arms the purge as if armed {@code waited} before {@code now}, unless armed to be due sooner. */
     private void rearm(long now, long waited) {
         if (armed == 0 || now - armedAt < waited) {
             armedAt = now - waited;
@@ -681,12 +598,8 @@ final class PageStore {
         }
     }
 
-    /**
-     * One pass: the blocks of every region in turn, from where the last pass stopped and around to it, until its
-     * calls ({@code madvise} or region releases) gave back {@link #PURGE_BYTES}; the call that reaches it is made
-     * whole, so a pass makes one call at least. One that stops short arms the purge again, due at once, and the
-     * next pass, after the cadence floor, goes on from where this one stopped.
-     */
+    /** One pass: every region in turn, from where the last pass stopped, until its calls gave back
+     *  {@link #PURGE_BYTES}, the call that reaches it made whole. */
     private void purge(long now) {
         skipped = false;
         releaseAbandoned(now);
@@ -719,10 +632,8 @@ final class PageStore {
         }
     }
 
-    /**
-     * Any thread, for a chunk whose heap died with buffers out: the purger owns it from now on, and gives its span back
-     * at the first pass that finds every buffer back (see {@link #releaseAbandoned}).
-     */
+    /** Any thread, for a chunk whose heap died with buffers out: the purger owns it from now on (see
+     *  {@link #releaseAbandoned}). */
     void abandon(SizeClassedChunk chunk) {
         SizeClassedChunk head;
         do {
@@ -732,10 +643,7 @@ final class PageStore {
         armPurge(System.nanoTime());
     }
 
-    /**
-     * Purger: the abandoned chunks whose buffers are all back give their spans back; the others wait for a later
-     * pass, which this arms, a delay from now.
-     */
+    /** Purger: chunks whose buffers are all back give their spans back; the rest wait for the pass this arms. */
     private void releaseAbandoned(long now) {
         SizeClassedChunk taken = abandoned == null ? null : ABANDONED.getAndSet(this, null);
         SizeClassedChunk kept = keepWaiting(waiting, null);
@@ -762,12 +670,10 @@ final class PageStore {
     }
 
     /**
-     * Shared slices: purges the free slices of {@code block} with memory behind them freed
-     * {@link PageStoreConfig#purgeDelayNanos} ago or earlier, one call per run of contiguous ones, until the calls
-     * reached {@code budget} bytes, and returns their bytes. A run's slices are claimed by CAS first, so that no
-     * claim can take them while their memory goes, and given back after; a run never spans more than one block, so
-     * the purger holds at most one block's run at a time, and a claim meanwhile finds every other free slice. A
-     * claim never waits for the purger: one that finds no fit maps a region instead.
+     * Shared slices: purges the free slices of {@code block} idle for {@link PageStoreConfig#purgeDelayNanos} or
+     * more, one call per contiguous run, until the calls reach {@code budget} bytes, and returns their bytes. A
+     * run's slices are claimed by CAS first and given back after, so a claim meanwhile finds every other free
+     * slice; a claim never waits for the purger, since one that finds no fit maps a region instead.
      */
     private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;
@@ -796,11 +702,8 @@ final class PageStore {
     }
 
     /**
-     * Gives back {@code region}, of a source that cannot purge part of a region, if all its slices stayed free for the
-     * purge delay, and returns the bytes given back: its length if it did. Its blocks are claimed whole by CAS first,
-     * as a purge claims its run, so that no claim can take a slice of it meanwhile; a region that is no longer empty
-     * and idle once claimed goes back to use. A released region keeps its blocks claimed, so that a claim that
-     * still sees it finds nothing there, and its place in {@link #regions} is taken by the next region mapped.
+     * Gives back {@code region}, of a source that cannot purge part of a region, if all its slices stayed free for
+     * the purge delay; its blocks are claimed whole by CAS first, so one no longer empty or idle goes back to use.
      */
     private long releaseIfIdle(Region region, long now) {
         long delay = config.purgeDelayNanos;
@@ -829,10 +732,7 @@ final class PageStore {
         return true;
     }
 
-    /**
-     * Purges the contiguous slices {@code bits} of {@code block}, which the purger claimed, with one call, then gives
-     * them back. A run whose call fails keeps its memory, and stays purgeable.
-     */
+    /** Purges the contiguous slices {@code bits} of {@code block}, claimed by the purger, with one call. */
     private void purgeSliceRun(Segment block, long bits) {
         Region region = block.region;
         int sliceSize = block.sliceSize;

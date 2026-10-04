@@ -36,22 +36,10 @@ final class SizeClassTable {
     static final int MAX_CHUNK_COLOURS = 16;
 
     /**
-     * The size classes are chosen based on the following observation:
-     * <p>
-     * Most allocations, particularly ones above 256 bytes, aim to be a power-of-2. However, many use cases, such
-     * as framing protocols, are themselves operating or moving power-of-2 sized payloads, to which they add a
-     * small amount of overhead, such as headers or checksums.
-     * This means we seem to get a lot of mileage out of having both power-of-2 sizes, and power-of-2-plus-a-bit.
-     * <p>
-     * On the conflicting requirements of both having as few chunks as possible, and having as little wasted
-     * memory within each chunk as possible, this seems to strike a surprisingly good balance for the use cases
-     * tested so far.
-     * <p>
-     * Between them, from 256 bytes up to 16 KiB, each doubling has four steps a quarter apart (256, 320, 384, 448):
-     * a buffer leaves at most a fifth of its class unused, where the power-of-2 steps alone leave up to half. Up to
-     * 16 KiB most classes take one-slice chunks, so a class in use costs a heap 64 KiB. Above 16896 the steps are
-     * half a doubling apart (24576, 49152, 98304): those classes take chunks of 8 slices or more, at least 512 KiB
-     * per class in use and heap, so a finer step there costs more than the rounding it saves.
+     * Steps are a quarter of a doubling apart up to 16 KiB (256, 320, 384, 448, ...): a buffer leaves at most a
+     * fifth of its class unused, where power-of-2 steps alone leave up to half, and most classes take one-slice
+     * chunks. Above 16896 the steps are half a doubling apart: those classes take 8 slices or more per chunk, so a
+     * finer step there would cost more in chunks than it saves in rounding.
      */
     static final int[] SIZES = {
             32,

@@ -16,30 +16,20 @@
 package io.netty.buffer;
 
 /**
- * One piece of memory, cut into {@link #slots} blocks at fixed offsets, all made with the region: {@code mmap}d by
- * {@link #source}, or, where it is {@code null}, one plain block from the store's {@link MemorySource}. Each block's
- * {@link Segment#free} is the free bitmap of its slices, claimed in runs and released by CAS from any thread. A
- * region lives as long as its {@link PageStore}, or until it goes back whole ({@link #released}).
+ * One piece of memory cut into {@link #slots} blocks: {@code mmap}d, or one plain block, charged and purged
+ * whole, if {@link #source} is {@code null}.
  */
 final class Region {
     final PageStore store;
     final AbstractByteBuf buffer;
-    /**
-     * Where {@link #buffer} comes from, and goes back to; {@code null}: one plain block, goes back whole. Whether it
-     * purges idle free slices in place is {@code source != null}; else the region is charged and counted whole, and
-     * goes back whole once idle.
-     */
     final MmapRegionSource source;
     final int slots;
-    /** {@link #slots} blocks, in bytes. */
     final int length;
     final Segment[] blocks;
-    /** Its index in {@link PageStore#regions}, published with the region. */
     final int index;
-    /** Given back to its source whole: every block stays claimed. Set by the purger under the store's monitor. */
+    /** Set by the purger under the store's monitor; every block stays claimed once set. */
     volatile boolean released;
 
-    /** Every block made now, all slices free; committed and freed at {@code committedAt} if {@code committed}. */
     Region(PageStore store, AbstractByteBuf buffer, MmapRegionSource source, int slots,
            PageStoreConfig config, boolean committed, long committedAt, int index) {
         assert slots > 0 && slots <= Long.SIZE;
@@ -56,10 +46,6 @@ final class Region {
         }
     }
 
-    /**
-     * Any thread: claims {@code n} contiguous empty blocks and returns the first, or -1: from the start, whole
-     * blocks only, one CAS per block, and the blocks claimed so far go back when one is taken meanwhile.
-     */
     int claimBlocks(int n) {
         Segment[] blocks = this.blocks;
         int first = 0;
@@ -86,7 +72,6 @@ final class Region {
         return -1;
     }
 
-    /** Gives {@code n} blocks from {@code first}, claimed whole and never committed, back unclaimed. */
     void unclaimBlocks(int first, int n) {
         for (int i = first; i < first + n; i++) {
             Segment block = blocks[i];
@@ -94,7 +79,6 @@ final class Region {
         }
     }
 
-    /** Claims every block whole, one CAS at a time; returns how many, stopping at the first already claimed. */
     int claimAll() {
         int claimed = 0;
         while (claimed < slots && blocks[claimed].claimWhole()) {
@@ -103,7 +87,6 @@ final class Region {
         return claimed;
     }
 
-    /** Racy: whether every slice is free. */
     boolean isEmpty() {
         for (Segment block : blocks) {
             if (!block.isEmpty()) {
@@ -113,10 +96,7 @@ final class Region {
         return true;
     }
 
-    /**
-     * How long, at {@code now}, the slice freed last has been free: the region is idle once this reaches the purge
-     * delay. Racy unless the caller claimed every block.
-     */
+    /** How long, at {@code now}, the slice freed last has been free. Racy unless the caller claimed every block. */
     long shortestWait(long now) {
         long shortest = Long.MAX_VALUE;
         for (Segment block : blocks) {
@@ -125,7 +105,6 @@ final class Region {
         return shortest;
     }
 
-    /** Marks the region released and gives its buffer back. */
     void release() {
         released = true;
         buffer.release();
