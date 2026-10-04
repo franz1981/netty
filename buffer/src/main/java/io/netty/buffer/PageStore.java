@@ -245,6 +245,9 @@ final class PageStore {
         int first;
         if (blocks != 0) {
             first = region.claimBlocks(blocks);
+            if (first >= 0) {
+                first *= config.slicesPerSegment();
+            }
         } else {
             Segment block = region.blocks[0];
             first = block.claimFirst(slices, binOf[slices]) ? 0 : -1;
@@ -258,7 +261,7 @@ final class PageStore {
             // Its free slices have memory behind them, all of them if the claim failed.
             armPurge(System.nanoTime());
         }
-        return first < 0 ? -1 : (long) index << 32 | first;
+        return first < 0 ? -1 : run(index, first);
     }
 
     /**
@@ -294,7 +297,7 @@ final class PageStore {
     /** The lowest fit of {@code n} slices in a block of {@code bin} that {@link #maps} shows, or -1. */
     private long claimFit(Region[] regions, int bin, int n) {
         AtomicLongArray maps = this.maps;
-        int words = maps.length() / (emptyMap + 1);
+        int words = wordsPerMap(maps);
         int base = bin * words;
         int length = binSlices[bin];
         for (int w = 0; w < words; w++) {
@@ -324,7 +327,7 @@ final class PageStore {
     /** The first {@code n} slices of the lowest wholly free block {@link #maps} shows, for {@code bin}, or -1. */
     private long claimEmpty(Region[] regions, int bin, int n) {
         AtomicLongArray maps = this.maps;
-        int words = maps.length() / (emptyMap + 1);
+        int words = wordsPerMap(maps);
         int base = emptyMap * words;
         for (int w = 0; w < words; w++) {
             for (long bits = maps.get(base + w); bits != 0; bits &= bits - 1) {
@@ -357,7 +360,7 @@ final class PageStore {
         } else {
             unmark(bin, id);
         }
-        return (long) block.region.index << 32 | block.slot * block.slices + (claimed & Segment.START);
+        return run(block.region.index, block.slot * block.slices + (claimed & Segment.START));
     }
 
     /**
@@ -404,7 +407,7 @@ final class PageStore {
         AtomicLongArray maps = this.maps;
         long bit = 1L << id;
         for (;;) {
-            int i = map * (maps.length() / (emptyMap + 1)) + (id >>> 6);
+            int i = word(maps, map, id);
             long word = maps.get(i);
             if ((word & bit) != 0 || maps.compareAndSet(i, word, word | bit)) {
                 AtomicLongArray now = this.maps;
@@ -419,7 +422,7 @@ final class PageStore {
     /** Clears bit {@code id} of {@code map}, and returns whether it was set. A clear lost to a copy is a stale bit. */
     private boolean clear(int map, int id) {
         AtomicLongArray maps = this.maps;
-        int i = map * (maps.length() / (emptyMap + 1)) + (id >>> 6);
+        int i = word(maps, map, id);
         long bit = 1L << id;
         for (;;) {
             long word = maps.get(i);
@@ -456,7 +459,7 @@ final class PageStore {
     private void growMaps(int index) {
         AtomicLongArray old = maps;
         int count = emptyMap + 1;
-        int words = old.length() / count;
+        int words = wordsPerMap(old);
         int needed = ((index + 1 << idShift) + Long.SIZE - 1) >>> 6;
         if (needed <= words) {
             return;
@@ -466,6 +469,16 @@ final class PageStore {
         copyMaps(old, words, grown, grownWords);
         maps = grown;
         copyMaps(old, words, grown, grownWords);
+    }
+
+    /** Words per map of {@code maps}: its length split {@link #emptyMap} + 1 ways. */
+    private int wordsPerMap(AtomicLongArray maps) {
+        return maps.length() / (emptyMap + 1);
+    }
+
+    /** The index into {@code maps} of {@code map}'s word holding bit {@code id}. */
+    private int word(AtomicLongArray maps, int map, int id) {
+        return map * wordsPerMap(maps) + (id >>> 6);
     }
 
     private static void copyMaps(AtomicLongArray from, int words, AtomicLongArray to, int toWords) {
@@ -487,7 +500,7 @@ final class PageStore {
     boolean marked(int map, Segment block) {
         AtomicLongArray maps = this.maps;
         int id = id(block);
-        return (maps.get(map * (maps.length() / (emptyMap + 1)) + (id >>> 6)) & 1L << id) != 0;
+        return (maps.get(word(maps, map, id)) & 1L << id) != 0;
     }
 
     /**
@@ -508,13 +521,13 @@ final class PageStore {
                 int first = region.claimBlocks(blocks);
                 if (first >= 0) {
                     commitBlocks(region, first, blocks);
-                    return (long) i << 32 | first;
+                    return run(i, first * config.slicesPerSegment());
                 }
             }
-            long run = addRegion(regions, false, 0, blocks);
-            if (run >= 0) {
-                commitBlocks(this.regions[(int) (run >>> 32)], (int) run, blocks);
-                return run;
+            long claimed = addRegion(regions, false, 0, blocks);
+            if (claimed >= 0) {
+                commitBlocks(region(claimed), firstBlock(claimed), blocks);
+                return claimed;
             }
         }
     }
@@ -569,14 +582,29 @@ final class PageStore {
         }
     }
 
+    /** {@code region << 32 | slice}: the run {@link #claimSlices} and {@link #takeRun} return, built only here. */
+    private static long run(int region, int slice) {
+        return (long) region << 32 | slice;
+    }
+
+    /** The region of a run {@link #claimSlices} or {@link #takeRun} returned. */
+    Region region(long run) {
+        return regions[(int) (run >>> 32)];
+    }
+
     /** The block of a run {@link #claimSlices} returned. */
     Segment block(long run) {
-        return regions[(int) (run >>> 32)].blocks[(int) run / config.slicesPerSegment()];
+        return region(run).blocks[firstBlock(run)];
     }
 
     /** The first slice in its block of a run {@link #claimSlices} returned. */
     int start(long run) {
         return (int) run % config.slicesPerSegment();
+    }
+
+    /** The first block of a run {@link #claimSlices} or {@link #takeRun} returned. */
+    int firstBlock(long run) {
+        return (int) run / config.slicesPerSegment();
     }
 
     /** Any thread: the blocks {@link #takeRun} returned go back to the shared slices. */
@@ -997,6 +1025,11 @@ final class PageStore {
 
     int regionCount() {
         return regions.length;
+    }
+
+    /** For the JFR periodic event only. */
+    Region[] regions() {
+        return regions;
     }
 
 }

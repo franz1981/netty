@@ -261,16 +261,16 @@ final class SharedSlicesTest {
     void wholeBlocksSkipBlocksInUse() {
         PageStore store = store(INTERVAL);
         long first = store.takeRun(2);
-        assertEquals(0, (int) first);
+        assertEquals(0, store.firstBlock(first));
         assertEquals(2 * PER_BLOCK, slice(store.claimSlices(1, false)), "blocks 0 and 1 are taken");
         long second = store.takeRun(2);
-        assertEquals(3, (int) second, "block 2 has a slice claimed");
-        assertEquals(5, (int) store.takeRun(1));
+        assertEquals(3, store.firstBlock(second), "block 2 has a slice claimed");
+        assertEquals(5, store.firstBlock(store.takeRun(1)));
         Region region = store.regions[0];
         store.freeRun(region, 0, 2);
-        assertEquals(0, (int) store.takeRun(2), "free again");
+        assertEquals(0, store.firstBlock(store.takeRun(2)), "free again");
         store.freeRun(region, 5, 1);
-        assertEquals(5, (int) store.takeRun(1));
+        assertEquals(5, store.firstBlock(store.takeRun(1)));
         // Blocks 0, 1, 3, 4 and 5, and a slice of block 2.
         assertArrayEquals(new int[] {5 * PER_BLOCK + 1, 0, PER_REGION - 5 * PER_BLOCK - 1}, store.sliceCounts());
     }
@@ -493,7 +493,7 @@ final class SharedSlicesTest {
                 int blocks = 1 + random.nextInt(Math.min(2, store.config.segmentsPerRegion()));
                 long taken = store.takeRun(blocks);
                 assertTrue(taken >= 0);
-                run = new int[] {(int) (taken >>> 32), (int) taken * perBlock, blocks * perBlock, 1};
+                run = new int[] {(int) (taken >>> 32), (int) taken, blocks * perBlock, 1};
             } else {
                 int n = SIZES[random.nextInt(SIZES.length)];
                 long claimed = store.claimSlices(n, false);

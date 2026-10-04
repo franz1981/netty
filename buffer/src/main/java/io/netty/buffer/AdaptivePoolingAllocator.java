@@ -558,8 +558,8 @@ final class AdaptivePoolingAllocator {
         if (run < 0) {
             return null;
         }
-        Region region = store.regions[(int) (run >>> 32)];
-        int start = (int) run;
+        Region region = store.region(run);
+        int start = store.firstBlock(run);
         boolean made = false;
         try {
             OneShotChunk chunk = new OneShotChunk(region.buffer, this, region, start, slots);
