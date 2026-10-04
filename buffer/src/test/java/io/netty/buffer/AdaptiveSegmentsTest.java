@@ -187,7 +187,7 @@ public class AdaptiveSegmentsTest {
                 assertNotNull(chunk.segment, "size " + size);
                 assertSame(chunk.segment.buffer, field(chunk, "delegate"), "reads the segment's own buffer: no view");
                 assertEquals(expectedSlices(size) * SLICE_SIZE_BYTES, chunk.capacity(), "chunk of size " + size);
-                assertEquals(expectedBuffers(size), field(chunk, "segments"), "segments of size " + size);
+                assertEquals(expectedBuffers(size), field(chunk, "slots"), "segments of size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES
                         && offset + size <= ((long) chunk.spanStart + expectedSlices(size)) * SLICE_SIZE_BYTES,
@@ -609,11 +609,11 @@ public class AdaptiveSegmentsTest {
         ByteBuf b = large.allocate(4352, 4352);
         try {
             assertEquals(32 * 1024, chunkOf(a).capacity());
-            assertEquals(7, field(chunkOf(a), "segments"));
+            assertEquals(7, field(chunkOf(a), "slots"));
             assertEquals(32 * 1024, chunkOf(a).segment.sliceSize);
             assertEquals(64, chunkOf(a).segment.slices);
             assertEquals(64 * 1024, chunkOf(b).capacity());
-            assertEquals(15, field(chunkOf(b), "segments"));
+            assertEquals(15, field(chunkOf(b), "slots"));
             assertEquals(SLICE_SIZE_BYTES, chunkOf(b).segment.sliceSize);
             assertEquals(2L * 1024 * 1024, small.usedMemory());
             assertEquals(SEGMENT_SIZE, large.usedMemory());

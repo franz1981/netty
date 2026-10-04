@@ -103,7 +103,7 @@
     "name": "io.netty.buffer.AdaptivePoolingAllocator$SizeClassedChunk",
     "fields": [
       {
-        "name": "state"
+        "name": "remoteFree"
       }
     ]
   },

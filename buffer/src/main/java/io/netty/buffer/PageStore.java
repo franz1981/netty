@@ -799,7 +799,7 @@ final class PageStore {
     private static SizeClassedChunk keepWaiting(SizeClassedChunk chunk, SizeClassedChunk kept) {
         while (chunk != null) {
             SizeClassedChunk next = chunk.nextAbandoned;
-            if (chunk.releaseIfAllFree()) {
+            if (chunk.returnSpanIfAllFree()) {
                 chunk.nextAbandoned = null;
             } else {
                 chunk.nextAbandoned = kept;

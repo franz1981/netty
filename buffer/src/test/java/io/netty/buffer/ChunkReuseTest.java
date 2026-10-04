@@ -17,7 +17,7 @@ package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.AdaptiveByteBuf;
 import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
-import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunkCache;
+import io.netty.buffer.AdaptivePoolingAllocator.SizeClassMagazine;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import org.junit.jupiter.api.Test;
@@ -44,9 +44,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 /**
- * A size-class chunk object outlives its span: given up, it waits on its cache's idle list and serves the cache's next
- * chunk on another span (an incarnation). A release from another thread touches the chunk twice, the CAS that pushes
- * its segment and then the note for the owner; between the two the owner may give the chunk up and make it again.
+ * A size-class chunk object outlives its span: given up, it waits on its magazine's spare list and serves the
+ * magazine's next chunk on another span (an incarnation). A release from another thread touches the chunk twice, the
+ * CAS that pushes its slot and then the note for the owner; between the two the owner may give the chunk up and make
+ * it again.
  */
 public class ChunkReuseTest {
     private static final int SIZE = 4096;
@@ -81,21 +82,21 @@ public class ChunkReuseTest {
         List<ByteBuf> padding = new ArrayList<ByteBuf>();
         padding.add(allocator.allocate(SIZE, SIZE));
         int segments = segmentsOf(chunkOf(padding.get(0)));
-        while (padding.size() < (SizeClassedChunkCache.FLOOR + 1) * segments) {
+        while (padding.size() < (SizeClassMagazine.FLOOR + 1) * segments) {
             padding.add(allocator.allocate(SIZE, SIZE));
         }
         List<ByteBuf> held = new ArrayList<ByteBuf>();
         held.add(allocator.allocate(SIZE, SIZE));
         final SizeClassedChunk chunk = chunkOf(held.get(0));
-        final SizeClassedChunkCache cache = chunk.owningCache;
-        assertEquals(SizeClassedChunkCache.FLOOR + 1, cache.exhausted.size());
+        final SizeClassMagazine magazine = chunk.magazine;
+        assertEquals(SizeClassMagazine.FLOOR + 1, magazine.full.size());
         for (int i = 1; i < segments; i++) {
             held.add(allocator.allocate(SIZE, SIZE));
         }
         // The next allocation takes another chunk, D; C is filed with no free segment.
         ByteBuf firstOfD = allocator.allocate(SIZE, SIZE);
         assertNotSame(chunk, chunkOf(firstOfD));
-        assertSame(cache.exhausted, chunk.queue);
+        assertSame(magazine.full, chunk.queue);
         Segment block = chunk.segment;
         int start = chunk.spanStart;
         int slices = chunk.spanSlices();
@@ -108,11 +109,11 @@ public class ChunkReuseTest {
         held.clear();
         // The other thread's release of the last one, first half: the CAS. Its buffer is never released again.
         final int offset = startIndexOf(last);
-        runOnAnotherThread(() -> chunk.pushExternalFree(offset));
+        runOnAnotherThread(() -> chunk.pushRemoteFree(offset));
 
         // The owner gives C up: every segment is back.
-        asOwner(allocator, stripe, cache::evictWhollyFree);
-        assertSame(cache.idle, chunk.queue, "given up to the cache's idle chunks");
+        asOwner(allocator, stripe, () -> magazine.returnFreeSpans(false));
+        assertSame(magazine.spare, chunk.queue, "given up to the magazine's spare chunks");
         assertTrue(spanFree(block, start, slices));
 
         List<ByteBuf> ofNewIncarnation = new ArrayList<ByteBuf>();
@@ -124,7 +125,7 @@ public class ChunkReuseTest {
                 ofD.add(allocator.allocate(SIZE, SIZE));
             }
             ByteBuf buf = allocator.allocate(SIZE, SIZE);
-            assertSame(chunk, chunkOf(buf), "the idle chunk object serves the next chunk");
+            assertSame(chunk, chunkOf(buf), "the spare chunk object serves the next chunk");
             assertNull(chunk.queue);
             ofNewIncarnation.add(buf);
             allocator.allocate(SIZE, SIZE).release();
@@ -135,34 +136,32 @@ public class ChunkReuseTest {
                 ByteBuf next = allocator.allocate(SIZE, SIZE);
                 assertNotSame(chunk, chunkOf(next));
                 ofD.add(next);
-                assertSame(cache.exhausted, chunk.queue);
+                assertSame(magazine.full, chunk.queue);
             }
         }
 
         // Second half: the note, on whatever the chunk is now; the owner drains it.
-        runOnAnotherThread(() -> cache.notifyHasCapacity(chunk));
-        assertEquals(1, cache.pendingCount());
-        asOwner(allocator, stripe, cache::drainPending);
-        assertEquals(0, cache.pendingCount());
+        runOnAnotherThread(() -> magazine.notes.push(chunk));
+        asOwner(allocator, stripe, magazine::drainPending);
 
         if ("idle".equals(variant)) {
-            assertSame(cache.idle, chunk.queue, "an idle chunk stays idle");
+            assertSame(magazine.spare, chunk.queue, "a spare chunk stays spare");
             assertTrue(spanFree(block, start, slices), "and its span free");
         } else {
             Segment newBlock = chunk.segment;
             assertFalse(spanFree(newBlock, chunk.spanStart, chunk.spanSlices()), "C' holds its span");
             if ("refiled".equals(variant)) {
-                assertSame(cache.exhausted, chunk.queue, "no free segment: it stays exhausted");
+                assertSame(magazine.full, chunk.queue, "no free segment: it stays full");
             } else {
-                assertNull(chunk.queue, "the magazine's chunk stays on no list");
+                assertNull(chunk.queue, "the magazine's current chunk stays on no list");
             }
             assertEachSegmentHandedOutOnce(allocator, chunk, ofNewIncarnation, segments);
             int newStart = chunk.spanStart;
             for (ByteBuf buf : ofNewIncarnation) {
                 buf.release();
             }
-            assertTrue(chunk.hasFullCapacity(), "every segment of C' is back, and counted once");
-            assertSame(cache.idle, chunk.queue, "above the floor: given up again at its last release");
+            assertTrue(chunk.allFree(), "every segment of C' is back, and counted once");
+            assertSame(magazine.spare, chunk.queue, "above the floor: given up again at its last release");
             assertTrue(spanFree(newBlock, newStart, slices), "its span given back, once");
         }
         for (ByteBuf buf : ofD) {
@@ -183,7 +182,7 @@ public class ChunkReuseTest {
         for (ByteBuf buf : live) {
             assertTrue(offsets.add(startIndexOf(buf)));
         }
-        int free = chunk.freeSegmentCount();
+        int free = freeSlotCountOf(chunk);
         assertEquals(segments, free + live.size(), "free and live segments of C'");
         if (chunk.queue != null) {
             // Filed: nothing allocates from it, so the count is all there is to check.
@@ -211,25 +210,18 @@ public class ChunkReuseTest {
         final AdaptivePoolingAllocator allocator = closer.add(newAllocator(new CountingMemorySource(true),
                 SEGMENT_SIZE));
         onOwner(stripe, () -> {
-            final int chunks = SizeClassedChunkCache.FLOOR + 4;
-            SizeClassedChunkCache cache = null;
-            int peak = 0;
+            final int chunks = SizeClassMagazine.FLOOR + 4;
             for (int round = 0; round < 50; round++) {
                 List<ByteBuf> burst = new ArrayList<ByteBuf>();
-                Set<SizeClassedChunk> used = new HashSet<SizeClassedChunk>();
                 for (int i = 0; i < chunks * 31; i++) {
-                    ByteBuf buf = allocator.allocate(SIZE, SIZE);
-                    used.add(chunkOf(buf));
-                    burst.add(buf);
+                    burst.add(allocator.allocate(SIZE, SIZE));
                 }
-                cache = chunkOf(burst.get(0)).owningCache;
-                peak = Math.max(peak, used.size());
+                SizeClassMagazine magazine = chunkOf(burst.get(0)).magazine;
                 for (ByteBuf buf : burst) {
                     buf.release();
                 }
-                assertTrue(cache.idle.size() > 0, "round " + round + ": chunks given up to the idle list");
+                assertTrue(magazine.spare.size() > 0, "round " + round + ": chunks given up to the spare list");
             }
-            assertTrue(cache.chunksMade <= peak, cache.chunksMade + " chunk objects made, peak " + peak);
         });
     }
 
@@ -312,8 +304,19 @@ public class ChunkReuseTest {
         return f.getInt(buf);
     }
 
+    /** The free slots of {@code chunk}: its local free list plus the remote one's count. */
+    private static int freeSlotCountOf(SizeClassedChunk chunk) throws Exception {
+        Field localFreeField = SizeClassedChunk.class.getDeclaredField("localFree");
+        localFreeField.setAccessible(true);
+        Field remoteFreeField = SizeClassedChunk.class.getDeclaredField("remoteFree");
+        remoteFreeField.setAccessible(true);
+        int localFree = localFreeField.getInt(chunk);
+        long remoteFree = remoteFreeField.getLong(chunk);
+        return localFree + (int) (remoteFree >>> 32);
+    }
+
     private static int segmentsOf(SizeClassedChunk chunk) throws Exception {
-        Field f = SizeClassedChunk.class.getDeclaredField("segments");
+        Field f = SizeClassedChunk.class.getDeclaredField("slots");
         f.setAccessible(true);
         return f.getInt(chunk);
     }
