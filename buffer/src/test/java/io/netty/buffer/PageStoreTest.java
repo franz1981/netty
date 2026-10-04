@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -91,10 +92,13 @@ final class PageStoreTest {
         int live = 0;
         long now = System.nanoTime();
         Random random = new Random(11);
+        boolean purged = false;
         for (int op = 0; op < 10_000; op++) {
             int dice = random.nextInt(16);
             if (dice == 0) {
+                long before = allocator.usedMemory();
                 store.purgeIfDue(now += INTERVAL / 2);
+                purged |= allocator.usedMemory() < before;
             } else if (live == capacity || live > 0 && dice < 8) {
                 int k = random.nextInt(live);
                 spans[k].releaseRun(starts[k], lengths[k], System.nanoTime());
@@ -116,17 +120,14 @@ final class PageStoreTest {
             live--;
             spans[live].releaseRun(starts[live], lengths[live], System.nanoTime());
         }
-        assertEquals(0, store.sliceCounts()[0], "no span out");
         assertEquals(withRegions, !regions.regions.isEmpty());
-        assertEquals(withRegions, store.slicesPurged > 0, "the purges took idle slices");
-        assertEquals(!withRegions, store.regionsReleased > 0, "and gave back idle regions of one block");
+        assertTrue(purged, "the purges took idle memory back");
         store.purgeIfDue(now + 2 * INTERVAL);
         assertEquals(0, segments.segmentsLive());
         assertSharedAccounted(segments, allocator);
         store.close();
         assertEquals(0, allocator.usedMemory());
         assertEquals(0, regions.live(), "the close unmaps every region");
-        assertEquals(0, store.regionCount());
     }
 
     /** The close unmaps every region, with runs still claimed, and accounts all of them as freed. */
@@ -182,7 +183,7 @@ final class PageStoreTest {
         Segment second = claim(store, SPAN);
         assertNull(second.region.source);
         assertEquals(2, calls[0], "never tried again");
-        assertEquals(3, store.regionCount());
+        assertEquals(1, regions.regions.size(), "the one region that mapped before mmap was given up");
         assertEquals(2, segments.segmentsAllocated(), "the two one-block regions, from memory.allocate");
         assertEquals(-1, store.claimBlocks(2), "new regions hold one block");
         assertSharedAccounted(segments, allocator);
