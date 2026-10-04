@@ -330,15 +330,15 @@ final class MmapRegionSource implements RegionSource {
     }
 
     /**
-     * {@code madvise(MADV_DONTNEED)} on {@code length} bytes of {@code region} from {@code offset}, whole pages: one
+     * {@code madvise(MADV_DONTNEED)} on {@code length} bytes of {@code region} from {@code offset}, whole pages: the
+     * kernel rejects an unaligned start but rounds a partial last page up, discarding the next page's data. One
      * system call, and one TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
      */
     @Override
     public void purge(AbstractByteBuf region, int offset, int length) {
-        if (offset < 0 || length <= 0 || offset > region.capacity() - length
-                || ((offset | length) & PageStoreConfig.PAGE_SIZE_BYTES - 1) != 0) {
+        if (offset < 0 || length <= 0 || offset > region.capacity() - length) {
             throw new IllegalArgumentException("offset: " + offset + ", length: " + length + " of "
-                    + region.capacity() + " bytes, pages of " + PageStoreConfig.PAGE_SIZE_BYTES);
+                    + region.capacity() + " bytes");
         }
         madviseDontNeed(mappingOf(region).address + offset, length);
     }

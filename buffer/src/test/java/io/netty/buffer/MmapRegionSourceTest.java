@@ -72,8 +72,8 @@ final class MmapRegionSourceTest {
     void purgeZeroesAndGivesTheMemoryBack() throws IOException {
         AbstractByteBuf region = source.allocateRegion(REGION_SIZE, ALIGNMENT);
         try {
-            int page = PageStoreConfig.PAGE_SIZE_BYTES;
-            for (int offset = 0; offset < REGION_SIZE; offset += page) {
+            int stride = 4096;
+            for (int offset = 0; offset < REGION_SIZE; offset += stride) {
                 region.setLong(offset, offset + 1L);
             }
             long touched = residentKiB();
@@ -82,7 +82,7 @@ final class MmapRegionSourceTest {
             long droppedKiB = touched - purged;
             assertTrue(droppedKiB >= REGION_SIZE / 1024 * 3 / 4,
                     "resident memory went from " + touched + " KiB to " + purged + " KiB");
-            for (int offset = 0; offset < REGION_SIZE; offset += page) {
+            for (int offset = 0; offset < REGION_SIZE; offset += stride) {
                 assertEquals(0, region.getLong(offset), "offset " + offset);
             }
         } finally {
@@ -90,7 +90,7 @@ final class MmapRegionSourceTest {
         }
     }
 
-    /** A purge of a part leaves the rest as it was, and takes whole pages only. */
+    /** A purge of a part leaves the rest as it was; an out-of-bounds range is rejected, a misaligned address fails. */
     @Test
     void purgeOfAPartLeavesTheRest() {
         AbstractByteBuf region = source.allocateRegion(8 * MIB, ALIGNMENT);
@@ -102,9 +102,7 @@ final class MmapRegionSourceTest {
             assertEquals(1, region.getLong(MIB - 8));
             assertEquals(0, region.getLong(MIB));
             assertEquals(3, region.getLong(3 * MIB));
-            int page = PageStoreConfig.PAGE_SIZE_BYTES;
-            assertThrows(IllegalArgumentException.class, () -> source.purge(region, page / 2, page));
-            assertThrows(IllegalArgumentException.class, () -> source.purge(region, 0, page / 2));
+            assertThrows(IllegalStateException.class, () -> source.purge(region, 1, MIB));
             assertThrows(IllegalArgumentException.class, () -> source.purge(region, 0, 16 * MIB));
         } finally {
             region.release();
@@ -120,10 +118,10 @@ final class MmapRegionSourceTest {
         OutOfMemoryError tooLarge = assertThrows(OutOfMemoryError.class, () -> MmapRegionSource.mmap(1L << 62));
         assertTrue(tooLarge.getMessage().endsWith(": errno 12"), tooLarge.getMessage());
         IllegalStateException unmap = assertThrows(IllegalStateException.class,
-                () -> MmapRegionSource.munmap(1, PageStoreConfig.PAGE_SIZE_BYTES));
+                () -> MmapRegionSource.munmap(1, 4096));
         assertTrue(unmap.getMessage().endsWith(": errno 22"), unmap.getMessage());
         IllegalStateException advise = assertThrows(IllegalStateException.class,
-                () -> MmapRegionSource.madviseDontNeed(1, PageStoreConfig.PAGE_SIZE_BYTES));
+                () -> MmapRegionSource.madviseDontNeed(1, 4096));
         assertTrue(advise.getMessage().endsWith(": errno 22"), advise.getMessage());
     }
 

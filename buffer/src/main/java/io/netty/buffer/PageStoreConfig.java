@@ -23,8 +23,6 @@ import java.util.concurrent.TimeUnit;
  * {@code io.netty.allocator.segment*} properties. Read on slow paths only.
  */
 final class PageStoreConfig {
-    /** With regions, a slice is whole pages, so that no span starts or ends inside a page. */
-    static final int PAGE_SIZE_BYTES = PageSize.PAGE_SIZE;
     /** The slice of an allocator's {@link Segment}s: 64 KiB. A chunk carved from a segment is whole slices. */
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in one {@code long}: 4 MiB. */
@@ -47,10 +45,9 @@ final class PageStoreConfig {
      * up to {@link Long#SIZE} segments; 0: none, {@code malloc}'d regions of one segment instead. Default:
      * {@link Long#SIZE} segments (256 MiB with 4 MiB segments, 128 MiB in low-memory mode). Address space only: a
      * segment's pages are committed as they are touched. Regions need a {@link RegionSource},
-     * {@link MmapRegionSource} for the direct allocator, and pages no larger than {@link #SLICE_SIZE_BYTES}: 0
-     * otherwise.
+     * {@link MmapRegionSource} for the direct allocator.
      */
-    static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(PAGE_SIZE_BYTES, SystemPropertyUtil.getInt(
+    static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
 
     /**
@@ -83,11 +80,6 @@ final class PageStoreConfig {
         long max = (long) Long.SIZE * segmentSize;
         long rounded = Math.round((double) size / segmentSize) * (long) segmentSize;
         return (int) Math.max(min, Math.min(max, rounded));
-    }
-
-    /** 0 where a page is larger than a slice, else {@link #regionSizeOf(int, int)}. */
-    static int regionSizeOf(int pageSize, int size, int segmentSize) {
-        return pageSize > SLICE_SIZE_BYTES ? 0 : regionSizeOf(size, segmentSize);
     }
 
     /**
@@ -152,10 +144,6 @@ final class PageStoreConfig {
                 || regionSize / segmentSize < minBlocks || regionSize / segmentSize > Long.SIZE)) {
             throw new IllegalArgumentException("regionSize " + regionSize + " is not 0 nor " + minBlocks + " to "
                     + Long.SIZE + " segments of " + segmentSize);
-        }
-        if (regionSize != 0 && sliceSize % PAGE_SIZE_BYTES != 0) {
-            throw new IllegalArgumentException("sliceSize " + sliceSize + " is not whole pages of " + PAGE_SIZE_BYTES
-                    + ", as regions need");
         }
         if (regionAlignment < 0 || (regionAlignment & regionAlignment - 1) != 0) {
             throw new IllegalArgumentException("regionAlignment: " + regionAlignment);
