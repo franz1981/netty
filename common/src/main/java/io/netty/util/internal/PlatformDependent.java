@@ -722,6 +722,15 @@ public final class PlatformDependent {
         LinuxMmapLinker.madviseDontNeed(address, length);
     }
 
+    /**
+     * Wraps {@code size} bytes already mapped at {@code address} as a direct {@link ByteBuffer}, through
+     * {@code java.lang.foreign.MemorySegment}: unlike {@link #directBuffer(long, int)}, it does not need
+     * {@code sun.misc.Unsafe}.
+     */
+    public static ByteBuffer mappedBuffer(long address, int size) {
+        return LinuxMmapLinker.wrap(address, size);
+    }
+
     public static boolean hasVarHandle() {
         return VAR_HANDLE;
     }

@@ -21,6 +21,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Array;
+import java.nio.ByteBuffer;
 import java.util.Optional;
 
 import static java.lang.invoke.MethodType.methodType;
@@ -55,6 +56,8 @@ final class LinuxMmapLinker {
     private static final MethodHandle NEW_CALL_STATE;
     private static final MethodHandle CLOSE_ARENA;
     private static final MethodHandle ERRNO;
+    /** {@code (long address, long size) -> ByteBuffer}, via {@code MemorySegment.ofAddress(...).reinterpret(...)}. */
+    private static final MethodHandle WRAP;
 
     static {
         MethodHandle mmap = null;
@@ -67,6 +70,7 @@ final class LinuxMmapLinker {
         MethodHandle newCallState = null;
         MethodHandle closeArena = null;
         MethodHandle errno = null;
+        MethodHandle wrap = null;
         Throwable error = null;
         try {
             if (System.getProperty("org.graalvm.nativeimage.imagecode") != null) {
@@ -159,6 +163,13 @@ final class LinuxMmapLinker {
             errno = MethodHandles.insertArguments(lookup.findVirtual(memSegCls, "get",
                     methodType(int.class, ofIntCls, long.class)), 1, intLayout, errnoOffset)
                     .asType(methodType(int.class, Object.class));
+
+            MethodHandle ofAddress = lookup.findStatic(memSegCls, "ofAddress", methodType(memSegCls, long.class));
+            MethodHandle reinterpret = lookup.findVirtual(memSegCls, "reinterpret",
+                    methodType(memSegCls, long.class));
+            MethodHandle asByteBuffer = lookup.findVirtual(memSegCls, "asByteBuffer", methodType(ByteBuffer.class));
+            wrap = MethodHandles.filterReturnValue(
+                    MethodHandles.filterArguments(reinterpret, 0, ofAddress), asByteBuffer);
         } catch (Throwable t) {
             error = t;
         }
@@ -172,6 +183,7 @@ final class LinuxMmapLinker {
         NEW_CALL_STATE = newCallState;
         CLOSE_ARENA = closeArena;
         ERRNO = errno;
+        WRAP = wrap;
         if (error == null) {
             logger.debug("mmap(2): available");
         } else {
@@ -236,6 +248,16 @@ final class LinuxMmapLinker {
         }
         if (result != 0) {
             madviseCapturing(address, length);
+        }
+    }
+
+    /** {@code size} bytes at {@code address}, already mapped, as a direct {@link ByteBuffer}. */
+    static ByteBuffer wrap(long address, int size) {
+        try {
+            return (ByteBuffer) WRAP.invokeExact(address, (long) size);
+        } catch (Throwable t) {
+            PlatformDependent.throwException(t);
+            return null;
         }
     }
 

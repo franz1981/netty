@@ -19,11 +19,7 @@ import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.NativeCallException;
 import io.netty.util.internal.PlatformDependent;
 
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
 import java.nio.ByteBuffer;
-
-import static java.lang.invoke.MethodType.methodType;
 
 /**
  * Regions mapped with their own anonymous {@code mmap(2)}, trimmed to start at a multiple of the alignment, unmapped
@@ -32,35 +28,14 @@ import static java.lang.invoke.MethodType.methodType;
  * <p>
  * The three calls are {@link PlatformDependent#mmapAnonymous}, {@link PlatformDependent#munmap} and
  * {@link PlatformDependent#madviseDontNeed}, bound once for the whole JVM; {@link #isAvailable()} is
- * {@link PlatformDependent#hasMmap()}. Wrapping a mapped address as a {@link ByteBuffer} is its own small
- * {@code java.lang.foreign.MemorySegment} binding, independent of {@code sun.misc.Unsafe}: unlike
+ * {@link PlatformDependent#hasMmap()}. Wrapping a mapped address as a {@link ByteBuffer} is
+ * {@link PlatformDependent#mappedBuffer(long, int)}, independent of {@code sun.misc.Unsafe}: unlike
  * {@link PlatformDependent#directBuffer(long, int)}, it still works with {@code --sun-misc-unsafe-memory-access=deny}.
  * <p>
  * Neither the mapping nor a purge is charged to or credited from {@code PlatformDependent}'s direct memory counter:
  * {@link PageStore} charges the slots it commits.
  */
 class MmapRegionSource {
-    /** {@code (long address, long size) -> ByteBuffer}, via {@code MemorySegment}; {@code null} if never linked. */
-    private static final MethodHandle WRAP;
-
-    static {
-        MethodHandle wrap;
-        try {
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            Class<?> memSegCls = Class.forName("java.lang.foreign.MemorySegment");
-            MethodHandle ofAddress = lookup.findStatic(memSegCls, "ofAddress", methodType(memSegCls, long.class));
-            MethodHandle reinterpret = lookup.findVirtual(memSegCls, "reinterpret",
-                    methodType(memSegCls, long.class));
-            MethodHandle asByteBuffer = lookup.findVirtual(memSegCls, "asByteBuffer", methodType(ByteBuffer.class));
-            wrap = MethodHandles.filterReturnValue(
-                    MethodHandles.filterArguments(reinterpret, 0, ofAddress), asByteBuffer);
-        } catch (Throwable t) {
-            // Only reached where PlatformDependent.hasMmap() is also false: both need java.lang.foreign.
-            wrap = null;
-        }
-        WRAP = wrap;
-    }
-
     static boolean isAvailable() {
         return PlatformDependent.hasMmap();
     }
@@ -104,7 +79,7 @@ class MmapRegionSource {
         }
         ByteBuffer buffer;
         try {
-            buffer = (ByteBuffer) WRAP.invokeExact(start, (long) size);
+            buffer = PlatformDependent.mappedBuffer(start, size);
         } catch (Throwable t) {
             throw unmapAfter(new IllegalStateException("cannot wrap a mapping of " + size + " bytes", t), start, size);
         }
