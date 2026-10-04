@@ -58,7 +58,7 @@ import java.util.concurrent.locks.StampedLock;
  * ({@code mmap}'d regions, {@code malloc}'d blocks, or {@code byte[]} blocks for heap memory). Which run serves a
  * request depends on its size:
  * <ul>
- *   <li><b>Up to the largest size class</b> ({@link #SIZE_CLASSES}): a {@link SizeClassedChunk}, cut into equal
+ *   <li><b>Up to the largest size class</b> ({@link SizeClassTable#SIZES}): a {@link SizeClassedChunk}, cut into equal
  *       segments of one size class. Its {@link SizeClassMagazine} allocates from one chunk at a time and keeps the
  *       others queued by whether they have a free slot (see {@link SizeClassedChunk}'s state diagram).</li>
  *   <li><b>Above it, up to a block</b>: a span of whole slices holding that buffer alone, see
@@ -94,15 +94,6 @@ final class AdaptivePoolingAllocator {
     private static final boolean DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM = SystemPropertyUtil.getBoolean(
             "io.netty.allocator.disableThreadLocalMagazinesOnLowMemory", true);
 
-    /** A size class's page holds at least this many slots, unless only the largest page kind fits it. */
-    private static final int MIN_PAGE_SLOTS = 4;
-    /** At most this fraction of a page, as a right shift, stays unused at its end: an eighth. */
-    private static final int MAX_PAGE_WASTE_SHIFT = 3;
-    /** An exact fit with fewer slots takes the next page kind, for room to colour, unless that is the largest. */
-    private static final int MIN_EXACT_FIT_SLOTS = 16;
-    /** Colours are this many bytes apart, as a shift: one cache line. */
-    private static final int COLOUR_SHIFT = 6;
-    private static final int MAX_CHUNK_COLOURS = 16;
     private static final AtomicIntegerFieldUpdater<AdaptivePoolingAllocator> STRIPE_SCAN_LENGTH =
             AtomicIntegerFieldUpdater.newUpdater(AdaptivePoolingAllocator.class, "stripeScanLength");
     private static final int EXPANSION_ATTEMPTS = 3;
@@ -153,87 +144,15 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    /**
-     * The size classes are chosen based on the following observation:
-     * <p>
-     * Most allocations, particularly ones above 256 bytes, aim to be a power-of-2. However, many use cases, such
-     * as framing protocols, are themselves operating or moving power-of-2 sized payloads, to which they add a
-     * small amount of overhead, such as headers or checksums.
-     * This means we seem to get a lot of mileage out of having both power-of-2 sizes, and power-of-2-plus-a-bit.
-     * <p>
-     * On the conflicting requirements of both having as few chunks as possible, and having as little wasted
-     * memory within each chunk as possible, this seems to strike a surprisingly good balance for the use cases
-     * tested so far.
-     * <p>
-     * Between them, from 256 bytes up to 16 KiB, each doubling has four steps a quarter apart (256, 320, 384, 448):
-     * a buffer leaves at most a fifth of its class unused, where the power-of-2 steps alone leave up to half. Up to
-     * 16 KiB most classes take one-slice chunks, so a class in use costs a heap 64 KiB. Above 16896 the steps are
-     * half a doubling apart (24576, 49152, 98304): those classes take chunks of 8 slices or more, at least 512 KiB
-     * per class in use and heap, so a finer step there costs more than the rounding it saves.
-     */
-    private static final int[] SIZE_CLASSES = {
-            32,
-            64,
-            128,
-            256,
-            320,
-            384,
-            448,
-            512,
-            640, // 512 + 128
-            768,
-            896,
-            1024,
-            1152, // 1024 + 128
-            1280,
-            1536,
-            1792,
-            2048,
-            2304, // 2048 + 256
-            2560,
-            3072,
-            3584,
-            4096,
-            4352, // 4096 + 256
-            5120,
-            6144,
-            7168,
-            8192,
-            8704, // 8192 + 512
-            10240,
-            12288,
-            14336,
-            16384,
-            16896, // 16384 + 512
-            24576,
-            32768,
-            33792, // 32768 + 1024
-            49152,
-            65536,
-            67584, // 65536 + 2048
-            98304,
-            131072,
-            135168, // 131072 + 4096
-    };
-
-    private static final int SIZE_CLASSES_COUNT = SIZE_CLASSES.length;
-    private static final byte[] SIZE_INDEXES = new byte[SIZE_CLASSES[SIZE_CLASSES_COUNT - 1] / 32 + 1];
-
     static {
         if (MAGAZINE_BUFFER_QUEUE_CAPACITY < 2) {
             throw new IllegalArgumentException("MAGAZINE_BUFFER_QUEUE_CAPACITY: " + MAGAZINE_BUFFER_QUEUE_CAPACITY
                     + " (expected: >= " + 2 + ')');
         }
-        int lastIndex = 0;
-        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int sizeClass = SIZE_CLASSES[i];
-            //noinspection ConstantValue
-            assert (sizeClass & 31) == 0 : "Size class must be a multiple of 32";
-            int sizeIndex = sizeIndexOf(sizeClass);
-            Arrays.fill(SIZE_INDEXES, lastIndex + 1, sizeIndex + 1, (byte) i);
-            lastIndex = sizeIndex;
-        }
     }
+
+    /** The size classes this allocator serves, and the chunk geometry they take: see {@link SizeClassTable}. */
+    private static final int SIZE_CLASSES_COUNT = SizeClassTable.SIZES_COUNT;
 
     /** Largest size served by a size class in low-memory mode: the size classes above it are not pooled there. */
     private static final int LOW_MEM_MAX_SIZE_CLASS = 16896;
@@ -250,8 +169,8 @@ final class AdaptivePoolingAllocator {
     private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<Heap> threadLocalHeap;
 
-    /** Per size class, the slices of its chunks: a page kind of the store's blocks (see {@link #pageKinds}). */
-    final int[] chunkSlices;
+    /** The size classes and the chunk geometry they take under {@link #pageStore}'s config. */
+    final SizeClassTable table;
     final PageStore pageStore;
     /**
      * Outside low-memory mode: the largest buffer that is a span of the page store's shared slices, a whole block;
@@ -265,11 +184,11 @@ final class AdaptivePoolingAllocator {
      */
     AdaptivePoolingAllocator(MemorySource memory, boolean useCacheForNonEventLoopThreads,
                              MmapRegionSource mmap, PageStoreConfig config) {
-        checkSizeClassSpansFit(config);
+        table = new SizeClassTable(config);
+        checkSizeClassSpansFit(config, table);
         pageStore = new PageStore(this, config, memory, mmap);
         largeSpanLimit = IS_LOW_MEM ? 0 : config.segmentSize;
         this.memory = ObjectUtil.checkNotNull(memory, "memory");
-        chunkSlices = chunkSlices(pageStore.config);
         stripedHeaps = new Heap[MAX_STRIPES];
         for (int i = 0; i < MAX_STRIPES; i++) {
             stripedHeaps[i] = new Heap(this, new StampedLock(), null);
@@ -298,19 +217,18 @@ final class AdaptivePoolingAllocator {
 
     /**
      * The largest class must fit a block, and no chunk may hold more than {@link SizeClassedChunk#MAX_SEGMENTS}: the
-     * page kinds hold the largest class by construction once it fits the block (see {@link #pageKinds}).
+     * page kinds hold the largest class by construction once it fits the block (see {@link SizeClassTable#pageKinds}).
      */
-    private static void checkSizeClassSpansFit(PageStoreConfig config) {
-        int largest = SIZE_CLASSES[SIZE_CLASSES_COUNT - 1];
+    private static void checkSizeClassSpansFit(PageStoreConfig config, SizeClassTable table) {
+        int largest = SizeClassTable.SIZES[SIZE_CLASSES_COUNT - 1];
         if (largest > config.segmentSize) {
             throw new IllegalArgumentException("segmentSize " + config.segmentSize + " cannot hold a buffer of "
                     + largest + " (slices of " + config.sliceSize + ')');
         }
-        int[] slices = chunkSlices(config);
         for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            int segments = chunkBuffersOf(SIZE_CLASSES[i], slices[i] * config.sliceSize);
+            int segments = table.slots[i];
             if (segments > SizeClassedChunk.MAX_SEGMENTS) {
-                throw new IllegalArgumentException("chunks of " + SIZE_CLASSES[i] + "-byte buffers would hold "
+                throw new IllegalArgumentException("chunks of " + SizeClassTable.SIZES[i] + "-byte buffers would hold "
                         + segments + ", more than " + SizeClassedChunk.MAX_SEGMENTS + " (slices of "
                         + config.sliceSize + ')');
             }
@@ -376,125 +294,13 @@ final class AdaptivePoolingAllocator {
         return true;
     }
 
-    private static int sizeIndexOf(final int size) {
-        // this is aligning the size to the next multiple of 32 and dividing by 32 to get the size index.
-        return size + 31 >> 5;
-    }
-
-    /**
-     * The page kinds of a block of {@code blockSlices} slices of {@code sliceSize}, smallest first: the run lengths, in
-     * slices, a size class's chunk may be. One slice; the largest divisor of the block up to an eighth of it; the
-     * largest up to half of it; and the block itself if none of these holds the largest size class. Each divides the
-     * block, so chunks of one kind tile it with no tail. 64 slices: 1, 8, 32; 63: 1, 7, 21; 32: 1, 4, 16; 7: 1, 7.
-     */
-    static int[] pageKinds(int blockSlices, int sliceSize) {
-        int[] kinds = new int[4];
-        int count = 0;
-        kinds[count++] = 1;
-        count = addKind(kinds, count, largestDivisorUpTo(blockSlices, blockSlices / 8));
-        count = addKind(kinds, count, largestDivisorUpTo(blockSlices, blockSlices / 2));
-        if ((long) kinds[count - 1] * sliceSize < SIZE_CLASSES[SIZE_CLASSES_COUNT - 1]) {
-            count = addKind(kinds, count, blockSlices);
-        }
-        return Arrays.copyOf(kinds, count);
-    }
-
-    private static int largestDivisorUpTo(int n, int max) {
-        for (int d = max; d > 1; d--) {
-            if (n % d == 0) {
-                return d;
-            }
-        }
-        return 1;
-    }
-
-    private static int addKind(int[] kinds, int count, int kind) {
-        if (kind > kinds[count - 1]) {
-            kinds[count++] = kind;
-        }
-        return count;
-    }
-
-    /**
-     * The page kind, in slices, of a size class: the smallest of {@code kinds} with {@link #MIN_PAGE_SLOTS} slots or
-     * more that leaves at most an eighth of the page unused at its end, else the largest.
-     */
-    static int pageSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
-        for (int kind : kinds) {
-            int page = kind * sliceSize;
-            int slots = page / sizeClass;
-            if (slots >= MIN_PAGE_SLOTS && page - slots * sizeClass <= page >>> MAX_PAGE_WASTE_SHIFT) {
-                return kind;
-            }
-        }
-        return kinds[kinds.length - 1];
-    }
-
-    /**
-     * The slices of a size class's chunks: {@link #pageSlicesOf}, or for an exact fit of fewer than
-     * {@link #MIN_EXACT_FIT_SLOTS} slots the next kind, unless that is the largest, so that giving up one slot for the
-     * colours costs little (see {@link AdaptivePoolingAllocator#colourOffset}).
-     */
-    static int chunkSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
-        int kind = pageSlicesOf(sizeClass, kinds, sliceSize);
-        int k = Arrays.binarySearch(kinds, kind);
-        for (;;) {
-            int page = kinds[k] * sliceSize;
-            int slots = page / sizeClass;
-            if (page - slots * sizeClass >= 1 << COLOUR_SHIFT || slots <= 1 || slots >= MIN_EXACT_FIT_SLOTS
-                    || k + 2 >= kinds.length) {
-                return kinds[k];
-            }
-            k++;
-        }
-    }
-
-    /**
-     * The buffers a chunk of {@code chunkSize} bytes hands out: those that fit, less one an exact fit gives up for a
-     * second colour when that buffer makes room for it (not the 32-byte class).
-     */
-    static int chunkBuffersOf(int sizeClass, int chunkSize) {
-        int slots = chunkSize / sizeClass;
-        int room = chunkSize - slots * sizeClass;
-        return room < 1 << COLOUR_SHIFT && slots > 1 && room + sizeClass >= 1 << COLOUR_SHIFT ? slots - 1 : slots;
-    }
-
-    /** How many start offsets, 64 bytes apart, the chunks of a class rotate through: the room the buffers leave. */
-    static int chunkColoursOf(int sizeClass, int chunkSize) {
-        int room = chunkSize - chunkBuffersOf(sizeClass, chunkSize) * sizeClass;
-        return Math.min(MAX_CHUNK_COLOURS, (room >>> COLOUR_SHIFT) + 1);
-    }
-
-    /**
-     * Round robin over the colours {@code room} bytes leave, {@code maxColours} at most, 64 bytes apart: the start
-     * offset of the {@code sequence}'th chunk's or span's buffers, past the first one. Slab colouring, as the chunks'
-     * (see {@link #chunkColoursOf}) and mimalloc's large allocations (https://github.com/microsoft/mimalloc/pull/1339).
-     */
-    static int colourOffset(int sequence, int room, int maxColours) {
-        int colours = Math.min(maxColours, (room >>> COLOUR_SHIFT) + 1);
-        return colours == 1 ? 0 : (sequence & Integer.MAX_VALUE) % colours << COLOUR_SHIFT;
-    }
-
-    /** Per size class, {@link #chunkSlicesOf} under {@code config}'s page kinds. */
-    static int[] chunkSlices(PageStoreConfig config) {
-        int[] kinds = pageKinds(config.slicesPerSegment(), config.sliceSize);
-        int[] slices = new int[SIZE_CLASSES_COUNT];
-        for (int i = 0; i < SIZE_CLASSES_COUNT; i++) {
-            slices[i] = chunkSlicesOf(SIZE_CLASSES[i], kinds, config.sliceSize);
-        }
-        return slices;
-    }
-
+    /** The size class of {@code size}: see {@link SizeClassTable#indexOf}. */
     static int sizeClassIndexOf(int size) {
-        int sizeIndex = sizeIndexOf(size);
-        if (sizeIndex < SIZE_INDEXES.length) {
-            return SIZE_INDEXES[sizeIndex];
-        }
-        return SIZE_CLASSES_COUNT;
+        return SizeClassTable.indexOf(size);
     }
 
     static int[] getSizeClasses() {
-        return SIZE_CLASSES.clone();
+        return SizeClassTable.SIZES.clone();
     }
 
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
@@ -824,7 +630,7 @@ final class AdaptivePoolingAllocator {
             // its span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer,
             // so it costs no memory. A release rounds its capacity up to whole slices again.
             int room = (int) (((long) slices << shift) - size);
-            int colour = colourOffset(spans++, room, MAX_SPAN_COLOURS);
+            int colour = SizeClassTable.colourOffset(spans++, room, MAX_SPAN_COLOURS);
             // A block has one chunk for the spans of every thread-local heap, and one for every stripe's.
             Chunk chunk = owner != null ? segment.threadLocalSpans : segment.sharedSpans;
             boolean initialized = false;
@@ -1151,11 +957,12 @@ final class AdaptivePoolingAllocator {
 
         SizeClassMagazine(Heap heap, int sizeClassIndex) {
             this.heap = heap;
-            slotSize = SIZE_CLASSES[sizeClassIndex];
-            slices = heap.allocator.chunkSlices[sizeClassIndex];
+            SizeClassTable table = heap.allocator.table;
+            slotSize = SizeClassTable.SIZES[sizeClassIndex];
+            slices = table.chunkSlices[sizeClassIndex];
             chunkSize = slices * heap.store.config.sliceSize;
-            slots = chunkBuffersOf(slotSize, chunkSize);
-            room = chunkSize - slots * slotSize;
+            slots = table.slots[sizeClassIndex];
+            room = table.room[sizeClassIndex];
             tickThreshold = (int) Math.min(Integer.MAX_VALUE, CHUNK_PURGE_INTERVAL * (chunkSize / slotSize));
         }
 
@@ -1249,7 +1056,8 @@ final class AdaptivePoolingAllocator {
                 try {
                     curr = (SizeClassedChunk) spare.pollFront();
                     if (curr == null) {
-                        curr = new SizeClassedChunk(this, colourOffset(nextColour++, room, MAX_CHUNK_COLOURS));
+                        int colour = SizeClassTable.colourOffset(nextColour++, room, SizeClassTable.MAX_CHUNK_COLOURS);
+                        curr = new SizeClassedChunk(this, colour);
                     }
                     curr.takeSpan(segment, start);
                 } catch (Throwable t) {

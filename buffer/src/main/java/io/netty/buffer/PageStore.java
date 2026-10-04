@@ -78,7 +78,7 @@ final class PageStore {
     /**
      * Per run length in slices, its bin: claims of one length share blocks (see {@link Segment#bin}), so that the short
      * runs do not cut the holes the long ones leave. A page kind's bin is its index in
-     * {@link AdaptivePoolingAllocator#pageKinds}; every other length is in {@link #otherBin}. As mimalloc v3's
+     * {@link SizeClassTable#pageKinds}; every other length is in {@link #otherBin}. As mimalloc v3's
      * size bins of its bitmap chunks ({@code mi_chunkbin_of},
      * https://github.com/microsoft/mimalloc/blob/31d034d/src/bitmap.h#L249-L257), by exact length.
      */
@@ -165,7 +165,7 @@ final class PageStore {
         this.config = config;
         this.memory = memory;
         int perBlock = config.slicesPerSegment();
-        int[] kinds = AdaptivePoolingAllocator.pageKinds(perBlock, config.sliceSize);
+        int[] kinds = allocator.table.pageKinds;
         otherBin = kinds.length;
         binOf = new byte[perBlock + 1];
         Arrays.fill(binOf, (byte) otherBin);

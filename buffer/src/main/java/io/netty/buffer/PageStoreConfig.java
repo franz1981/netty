@@ -182,7 +182,7 @@ final class PageStoreConfig {
     /**
      * {@code io.netty.allocator.heapSegmentSize}: the size of a heap allocator's segments, rounded down to whole
      * slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE} of them, which set the page kinds of the
-     * size-class chunks (see {@link AdaptivePoolingAllocator#pageKinds}). Default: one slice less than
+     * size-class chunks (see {@link SizeClassTable#pageKinds}). Default: one slice less than
      * {@link #SEGMENT_SIZE_BYTES}, 4032 KiB: under G1, whose regions are powers of two, its {@code byte[]} with the
      * header fits in whole regions with a slice to spare, and in half a region from 8 MiB regions up (a humongous
      * object takes regions of its own: a 4 MiB array would take two 4 MiB regions, or a whole 8 MiB one).

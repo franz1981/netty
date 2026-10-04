@@ -79,11 +79,11 @@ public class AdaptivePageKindsTest {
 
     @Test
     void pageKindsPerBlock() {
-        assertArrayEquals(new int[] {1, 8, 32}, AdaptivePoolingAllocator.pageKinds(64, SLICE_SIZE_BYTES));
-        assertArrayEquals(new int[] {1, 7, 21}, AdaptivePoolingAllocator.pageKinds(63, SLICE_SIZE_BYTES));
-        assertArrayEquals(new int[] {1, 4, 16}, AdaptivePoolingAllocator.pageKinds(32, SLICE_SIZE_BYTES));
-        assertArrayEquals(new int[] {1, 7}, AdaptivePoolingAllocator.pageKinds(7, SLICE_SIZE_BYTES));
-        assertArrayEquals(new int[] {1, 3}, AdaptivePoolingAllocator.pageKinds(3, SLICE_SIZE_BYTES));
+        assertArrayEquals(new int[] {1, 8, 32}, SizeClassTable.pageKinds(64, SLICE_SIZE_BYTES));
+        assertArrayEquals(new int[] {1, 7, 21}, SizeClassTable.pageKinds(63, SLICE_SIZE_BYTES));
+        assertArrayEquals(new int[] {1, 4, 16}, SizeClassTable.pageKinds(32, SLICE_SIZE_BYTES));
+        assertArrayEquals(new int[] {1, 7}, SizeClassTable.pageKinds(7, SLICE_SIZE_BYTES));
+        assertArrayEquals(new int[] {1, 3}, SizeClassTable.pageKinds(3, SLICE_SIZE_BYTES));
     }
 
     @Test
@@ -108,7 +108,7 @@ public class AdaptivePageKindsTest {
     /** Low memory: 32-slice blocks; the exact fits under 16 buffers take the 4-slice kind. */
     @Test
     void lowMemoryBlockOf32Slices() {
-        int[] kinds = AdaptivePoolingAllocator.pageKinds(32, SLICE_SIZE_BYTES);
+        int[] kinds = SizeClassTable.pageKinds(32, SLICE_SIZE_BYTES);
         assertChunk(kinds, 8192, 4, 31, 16);
         assertChunk(kinds, 16384, 4, 15, 16);
         assertChunk(kinds, 16896, 4, 15, 16);
@@ -118,12 +118,12 @@ public class AdaptivePageKindsTest {
     @Test
     void endWasteIsAtMostAnEighthButADroppedBuffer() {
         for (int blockSlices : new int[] {64, 63, 32}) {
-            int[] kinds = AdaptivePoolingAllocator.pageKinds(blockSlices, SLICE_SIZE_BYTES);
+            int[] kinds = SizeClassTable.pageKinds(blockSlices, SLICE_SIZE_BYTES);
             for (int sizeClass : AdaptivePoolingAllocator.getSizeClasses()) {
-                int page = AdaptivePoolingAllocator.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES)
+                int page = SizeClassTable.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES)
                         * SLICE_SIZE_BYTES;
                 int fit = page / sizeClass;
-                int buffers = AdaptivePoolingAllocator.chunkBuffersOf(sizeClass, page);
+                int buffers = SizeClassTable.chunkBuffersOf(sizeClass, page);
                 assertTrue(page - fit * sizeClass <= page >>> 3, blockSlices + " slices, class " + sizeClass);
                 assertTrue(buffers == fit || buffers == fit - 1, "class " + sizeClass);
             }
@@ -131,19 +131,19 @@ public class AdaptivePageKindsTest {
     }
 
     private static void assertTable(int blockSlices, int column) {
-        int[] kinds = AdaptivePoolingAllocator.pageKinds(blockSlices, SLICE_SIZE_BYTES);
+        int[] kinds = SizeClassTable.pageKinds(blockSlices, SLICE_SIZE_BYTES);
         for (int[] row : TABLE) {
             assertChunk(kinds, row[0], row[column], row[column + 1], row[column + 2]);
         }
     }
 
     private static void assertChunk(int[] kinds, int sizeClass, int slices, int buffers, int colours) {
-        int chunkSlices = AdaptivePoolingAllocator.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES);
+        int chunkSlices = SizeClassTable.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES);
         assertEquals(slices, chunkSlices, "slices of class " + sizeClass);
         int chunkSize = chunkSlices * SLICE_SIZE_BYTES;
-        assertEquals(buffers, AdaptivePoolingAllocator.chunkBuffersOf(sizeClass, chunkSize),
+        assertEquals(buffers, SizeClassTable.chunkBuffersOf(sizeClass, chunkSize),
                 "buffers of class " + sizeClass);
-        assertEquals(colours, AdaptivePoolingAllocator.chunkColoursOf(sizeClass, chunkSize),
+        assertEquals(colours, SizeClassTable.chunkColoursOf(sizeClass, chunkSize),
                 "colours of class " + sizeClass);
     }
 }

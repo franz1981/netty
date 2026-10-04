@@ -62,17 +62,17 @@ public class AdaptiveSegmentsTest {
     final AllocatorCloser closer = new AllocatorCloser();
 
     /** The page kinds of this test's blocks: 64 slices of 64 KiB. */
-    private static final int[] KINDS = AdaptivePoolingAllocator.pageKinds(SEGMENT_SIZE / SLICE_SIZE_BYTES,
+    private static final int[] KINDS = SizeClassTable.pageKinds(SEGMENT_SIZE / SLICE_SIZE_BYTES,
             SLICE_SIZE_BYTES);
 
     /** Slices of the chunk of each size class in this test's blocks. */
     private static int expectedSlices(int sizeClass) {
-        return AdaptivePoolingAllocator.chunkSlicesOf(sizeClass, KINDS, SLICE_SIZE_BYTES);
+        return SizeClassTable.chunkSlicesOf(sizeClass, KINDS, SLICE_SIZE_BYTES);
     }
 
     /** The buffers a chunk hands out: an exact fit gives one up for its colours. */
     private static int expectedBuffers(int sizeClass) {
-        return AdaptivePoolingAllocator.chunkBuffersOf(sizeClass, expectedSlices(sizeClass) * SLICE_SIZE_BYTES);
+        return SizeClassTable.chunkBuffersOf(sizeClass, expectedSlices(sizeClass) * SLICE_SIZE_BYTES);
     }
 
     private static boolean isLowMemory() throws Exception {
@@ -637,7 +637,7 @@ public class AdaptiveSegmentsTest {
     void sevenSliceSegmentsHoldEverySizeClass(boolean heap) throws Exception {
         CountingMemorySource source = new CountingMemorySource(heap);
         int segmentSize = 7 * SLICE_SIZE_BYTES;
-        int[] kinds = AdaptivePoolingAllocator.pageKinds(7, SLICE_SIZE_BYTES);
+        int[] kinds = SizeClassTable.pageKinds(7, SLICE_SIZE_BYTES);
         assertArrayEquals(new int[] {1, 7}, kinds);
         AdaptivePoolingAllocator allocator = closer.add(newAllocator(source, segmentSize));
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
@@ -646,7 +646,7 @@ public class AdaptiveSegmentsTest {
             for (int j = 0; j < 2; j++) {
                 ByteBuf buf = allocator.allocate(size, size);
                 SizeClassedChunk chunk = chunkOf(buf);
-                int slices = AdaptivePoolingAllocator.chunkSlicesOf(size, kinds, SLICE_SIZE_BYTES);
+                int slices = SizeClassTable.chunkSlicesOf(size, kinds, SLICE_SIZE_BYTES);
                 assertEquals(slices * SLICE_SIZE_BYTES, chunk.capacity, "size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= 0 && offset + size <= segmentSize, "size " + size + " outside its segment");
