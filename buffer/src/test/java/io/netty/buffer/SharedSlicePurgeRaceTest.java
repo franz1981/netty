@@ -95,12 +95,12 @@ final class SharedSlicePurgeRaceTest {
         assertEquals(1, regions.purgeCalls());
         assertArrayEquals(new int[] {(blocks - 1) * SEGMENT_SIZE, SEGMENT_SIZE}, regions.purges.get(0));
         assertNotEquals((long) purgedBlock, run, "the run the purger held");
-        assertTrue(store.regionCount() <= 2, store.regionCount() + " regions");
-        int regionsMapped = store.regionCount();
+        assertTrue(regions.regions.size() <= 2, regions.regions.size() + " regions");
+        int regionsMapped = regions.regions.size();
         assertTrue(region.blocks[blocks - 1].isEmpty(), "the purged block, given back");
         // Not 8 slices: the new region's block has a fit of that bin.
         assertEquals(purgedBlock, (int) store.claimSlices(32, false), "the lowest wholly free block");
-        assertEquals(regionsMapped, store.regionCount());
+        assertEquals(regionsMapped, regions.regions.size());
         store.close();
     }
 }
