@@ -121,7 +121,7 @@ final class PageStoreStateEvent extends Event {
         int id = System.identityHashCode(store.allocator);
         long sliceSize = store.config.sliceSize;
         int perBlock = store.config.slicesPerSegment();
-        for (Region region : store.regions()) {
+        for (Region region : store.regions) {
             if (region.released) {
                 continue;
             }

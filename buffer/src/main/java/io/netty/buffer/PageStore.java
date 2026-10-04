@@ -719,7 +719,7 @@ final class PageStore {
     }
 
     /** Purger: free slices, or a region, free for {@code waited}, short of the delay, are left for a later pass. */
-    private void skip(long waited) {
+    void skip(long waited) {
         if (!skipped || waited > longestWait) {
             skipped = true;
             longestWait = waited;
@@ -839,20 +839,14 @@ final class PageStore {
     private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;
         long bytes = 0;
-        long candidates = block.purgeCandidates(now, delay);
-        long notYetIdle = block.notYetIdle(now, delay);
-        if (notYetIdle != 0) {
-            skip(block.longestWait(notYetIdle, now));
-        }
+        long candidates = block.idleOf(block.free, now, delay);
         while (candidates != 0 && bytes < budget) {
             long run = lowestRun(candidates);
             candidates &= ~run;
             long claimed = block.claimFree(run);
             long exact = block.idleOf(claimed, now, delay);
-            long stillNotIdle = block.notIdle(claimed, now, delay);
-            if (stillNotIdle != 0) {
-                block.giveBack(stillNotIdle);
-                skip(block.longestWait(stillNotIdle, now));
+            if (exact != claimed) {
+                block.giveBack(claimed & ~exact);
             }
             while (exact != 0) {
                 if (bytes >= budget) {
@@ -1013,11 +1007,6 @@ final class PageStore {
 
     int regionCount() {
         return regions.length;
-    }
-
-    /** For the JFR periodic event only. */
-    Region[] regions() {
-        return regions;
     }
 
 }

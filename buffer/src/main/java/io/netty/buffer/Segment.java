@@ -251,41 +251,21 @@ final class Segment {
 
     /**
      * Of {@code bits}, those committed, freed {@code delay} or more before {@code now}: {@code now - freedAt[i]} by
-     * subtraction, wraparound-safe as {@link System#nanoTime()} is.
+     * subtraction, wraparound-safe as {@link System#nanoTime()} is. Each committed slice not yet idle reports its
+     * wait to the store's purge cadence (see {@link PageStore#skip}), in the same scan.
      */
     long idleOf(long bits, long now, long delay) {
         long idle = 0;
         for (long b = bits & committed; b != 0; b &= b - 1) {
             int slice = Long.numberOfTrailingZeros(b);
-            if (now - freedAt[slice] >= delay) {
+            long waited = now - freedAt[slice];
+            if (waited >= delay) {
                 idle |= 1L << slice;
+            } else {
+                region.store.skip(waited);
             }
         }
         return idle;
-    }
-
-    /** This block's free, committed slices freed {@code delay} or more before {@code now}: ready to purge. */
-    long purgeCandidates(long now, long delay) {
-        return idleOf(free, now, delay);
-    }
-
-    /** Of {@code bits}, those committed but not idle long enough yet, {@code delay} at {@code now}. */
-    long notIdle(long bits, long now, long delay) {
-        return bits & committed & ~idleOf(bits, now, delay);
-    }
-
-    /** This block's own free, committed slices not idle long enough yet, {@code delay} at {@code now}. */
-    long notYetIdle(long now, long delay) {
-        return notIdle(free, now, delay);
-    }
-
-    /** The longest, at {@code now}, any of {@code bits} has been free: {@code now - freedAt[i]}, maxed over bits. */
-    long longestWait(long bits, long now) {
-        long longest = Long.MIN_VALUE;
-        for (long b = bits; b != 0; b &= b - 1) {
-            longest = Math.max(longest, now - freedAt[Long.numberOfTrailingZeros(b)]);
-        }
-        return longest;
     }
 
     /** The shortest, at {@code now}, any slice of this block has been free: {@code now - freedAt[i]}, minimized. */
