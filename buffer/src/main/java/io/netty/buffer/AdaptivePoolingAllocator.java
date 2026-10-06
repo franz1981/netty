@@ -16,17 +16,18 @@
 package io.netty.buffer;
 
 import io.netty.util.NettyRuntime;
-import io.netty.util.Recycler;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.MathUtil;
 import io.netty.util.internal.ObjectUtil;
+import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.SystemPropertyUtil;
 import io.netty.util.internal.ThreadExecutorMap;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
+import java.util.Queue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -130,7 +131,6 @@ final class AdaptivePoolingAllocator {
     private final Heap[] stripedHeaps;
     private volatile int stripeScanLength;
 
-    private final AdaptiveRecycler fallbackRecycler;
     private final FastThreadLocal<Heap> threadLocalHeap;
 
     /** The size classes and the chunk geometry they take under {@link #pageStore}'s config. */
@@ -158,7 +158,6 @@ final class AdaptivePoolingAllocator {
             stripedHeaps[i] = new Heap(this, new StampedLock(), null);
         }
         stripeScanLength = INITIAL_MAGAZINES;
-        fallbackRecycler = AdaptiveRecycler.sharedWith(MAGAZINE_BUFFER_QUEUE_CAPACITY);
 
         boolean disableThreadLocalGroups = IS_LOW_MEM && DISABLE_THREAD_LOCAL_MAGAZINES_ON_LOW_MEM;
         threadLocalHeap = disableThreadLocalGroups ? null : new FastThreadLocal<Heap>() {
@@ -359,16 +358,9 @@ final class AdaptivePoolingAllocator {
         }
     }
 
-    private AdaptiveByteBuf newFallbackBuffer() {
-        return newBuffer(fallbackRecycler);
-    }
-
-    /** {@code r.get()}, reset and ready: {@link #newFallbackBuffer} and {@link Heap#newBuffer} share this. */
-    private static AdaptiveByteBuf newBuffer(AdaptiveRecycler r) {
-        AdaptiveByteBuf buf = r.get();
-        buf.resetRefCnt();
-        buf.discardMarks();
-        return buf;
+    /** A buffer object of no heap: not kept for reuse. */
+    private static AdaptiveByteBuf newFallbackBuffer() {
+        return new AdaptiveByteBuf(null);
     }
 
     /**
@@ -436,7 +428,6 @@ final class AdaptivePoolingAllocator {
      * release path reads {@link #lock} and takes it the same way, if it is not {@code null}.
      */
     static final class Heap {
-        private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
         /** At most one decay per this interval: 10 s. */
         static final long DECAY_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10);
         /** How many allocations of the heap between two looks at the clock. */
@@ -455,8 +446,8 @@ final class AdaptivePoolingAllocator {
         SizeClassMagazine[] magazines;
         /** The notes left for this heap's size classes: see {@link PendingChunks}. */
         final PendingChunks notes = new PendingChunks();
-        /** The buffer-object recycler every magazine of this heap shares; fixed at construction. */
-        private final AdaptiveRecycler recycler;
+        /** The buffer objects this heap's buffers are made of, kept for reuse. */
+        final BufferPool pool;
         /** Round robin over the colours of the spans; single writer, as the heap's owner or lock holder. */
         private int nextSpanColour;
         private long allocationsSinceCheck;
@@ -468,8 +459,7 @@ final class AdaptivePoolingAllocator {
             this.lock = lock;
             this.owner = owner;
             segmentSlices = store.config.slicesPerSegment();
-            recycler = owner != null ? EVENT_LOOP_LOCAL_BUFFER_POOL
-                    : AdaptiveRecycler.sharedExclusiveGet(MAGAZINE_BUFFER_QUEUE_CAPACITY);
+            pool = new BufferPool(owner, MAGAZINE_BUFFER_QUEUE_CAPACITY);
         }
 
         /** The magazine of {@code sizeClassIndex}, made on first use. */
@@ -494,10 +484,6 @@ final class AdaptivePoolingAllocator {
             return mag;
         }
 
-        AdaptiveByteBuf newBuffer() {
-            return AdaptivePoolingAllocator.newBuffer(recycler);
-        }
-
         /**
          * The size-class slot in {@code sizeClassIndex}'s magazine. The owner thread always succeeds; the router,
          * under the stripe's lock, releases a fresh {@code buf} on failure (unless reallocating) and returns
@@ -507,10 +493,14 @@ final class AdaptivePoolingAllocator {
             SizeClassMagazine mag = magazine(sizeClassIndex);
             boolean reallocate = buf != null;
             if (!reallocate) {
-                buf = newBuffer();
+                buf = pool.take();
             }
             if (mag.allocate(size, maxCapacity, buf)) {
                 mag.tick();
+                if (reallocate) {
+                    // Its slot is this heap's now, so is the object: freed in the same owner decision as the slot.
+                    buf.pool = pool;
+                }
                 return buf;
             }
             if (!reallocate) {
@@ -526,7 +516,9 @@ final class AdaptivePoolingAllocator {
          */
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
             if (buf == null) {
-                buf = newBuffer();
+                buf = pool.take();
+            } else {
+                buf.pool = pool;
             }
             boolean allocated = false;
             try {
@@ -780,42 +772,68 @@ final class AdaptivePoolingAllocator {
         return id ^ (id >>> 16);
     }
 
-    static final class AdaptiveRecycler extends Recycler<AdaptiveByteBuf> {
+    /**
+     * The buffer objects one heap keeps for reuse: a stack its owner (the owner thread, or a stripe's lock holder)
+     * pushes and pops, and a queue any other thread returns into, which only the owner takes from.
+     */
+    static final class BufferPool {
+        /** The heap's owner thread; {@code null} for a stripe, whose owner is its lock holder. */
+        private final Thread owner;
+        private final AdaptiveByteBuf[] stack;
+        private int top;
+        private final Queue<AdaptiveByteBuf> returned;
 
-        private AdaptiveRecycler(boolean unguarded, int interval) {
-            // uses fast thread local
-            super(unguarded, interval);
+        BufferPool(Thread owner, int capacity) {
+            this.owner = owner;
+            stack = new AdaptiveByteBuf[capacity];
+            returned = PlatformDependent.newFixedMpscQueue(capacity);
         }
 
-        private AdaptiveRecycler(int maxCapacity, boolean unguarded) {
-            // doesn't use fast thread local, shared MPMC
-            super(maxCapacity, unguarded);
+        /** Owner: a buffer object, reset and ready. */
+        AdaptiveByteBuf take() {
+            AdaptiveByteBuf buf;
+            int t = top;
+            if (t != 0) {
+                top = --t;
+                buf = stack[t];
+                stack[t] = null;
+            } else {
+                buf = takeReturnedOrNew();
+            }
+            buf.resetRefCnt();
+            buf.discardMarks();
+            return buf;
         }
 
-        private AdaptiveRecycler(int maxCapacity, boolean unguarded, boolean exclusiveGet) {
-            // doesn't use fast thread local, exclusive-get mode
-            super(maxCapacity, unguarded, exclusiveGet);
+        // Out of line: once warm, the stack serves.
+        private AdaptiveByteBuf takeReturnedOrNew() {
+            AdaptiveByteBuf buf = returned.poll();
+            return buf != null ? buf : new AdaptiveByteBuf(this);
         }
 
-        @Override
-        protected AdaptiveByteBuf newObject(final Handle<AdaptiveByteBuf> handle) {
-            return new AdaptiveByteBuf((EnhancedHandle<AdaptiveByteBuf>) handle);
+        /** Owner: keeps {@code buf}, if any and if there is room. */
+        void keep(AdaptiveByteBuf buf) {
+            int t = top;
+            if (buf != null && t < stack.length) {
+                stack[t] = buf;
+                top = t + 1;
+            }
         }
 
-        static AdaptiveRecycler threadLocal() {
-            // Interval 0: pool every recycled buffer object, as the stripes' pools do, instead of the
-            // io.netty.recycler.ratio default, which admits one in eight at the cost of a counter and a
-            // data-dependent branch per allocation; retention is already bounded by the recycler's
-            // capacity.
-            return new AdaptiveRecycler(true, 0);
+        /** Any other thread: {@code buf}, if any, goes to the owner's queue, if there is room. */
+        void returnRemotely(AdaptiveByteBuf buf) {
+            if (buf != null) {
+                returned.offer(buf);
+            }
         }
 
-        static AdaptiveRecycler sharedWith(int maxCapacity) {
-            return new AdaptiveRecycler(maxCapacity, true);
-        }
-
-        static AdaptiveRecycler sharedExclusiveGet(int maxCapacity) {
-            return new AdaptiveRecycler(maxCapacity, true, true);
+        /** Any thread, with no slot decision to share: the owner thread keeps {@code buf}, any other queues it. */
+        void recycle(AdaptiveByteBuf buf) {
+            if (Thread.currentThread() == owner) {
+                keep(buf);
+            } else {
+                returnRemotely(buf);
+            }
         }
     }
 
@@ -1158,6 +1176,15 @@ final class AdaptivePoolingAllocator {
          */
         abstract void releaseSlot(int startIndex, int size);
 
+        /** {@link #releaseSlot}, and {@code buf} goes back to its pool. */
+        void release(int startIndex, int size, AdaptiveByteBuf buf) {
+            releaseSlot(startIndex, size);
+            BufferPool pool = buf.pool;
+            if (pool != null) {
+                pool.recycle(buf);
+            }
+        }
+
         /**
          * Whether this chunk is attached to a magazine of a thread-local heap right now, for the JFR events.
          */
@@ -1418,18 +1445,32 @@ final class AdaptivePoolingAllocator {
 
         @Override
         void releaseSlot(int offset, int size) {
+            release(offset, size, null);
+        }
+
+        /**
+         * The slot, and the buffer object back to the heap's pool in the same owner decision; {@code buf} is
+         * {@code null} when a reallocation gives the slot up and keeps the object.
+         */
+        @Override
+        void release(int offset, int size, AdaptiveByteBuf buf) {
+            Heap heap = magazine.heap;
+            assert buf == null || buf.pool == heap.pool;
             if (ownerThread != null && Thread.currentThread() == ownerThread) {
                 releasedByOwner(offset);
+                heap.pool.keep(buf);
                 return;
             }
-            StampedLock lock = magazine.heap.lock;
+            StampedLock lock = heap.lock;
             long stamp = lock == null ? 0 : lock.tryWriteLock();
             if (stamp == 0) {
                 releasedRemotely(offset);
+                heap.pool.returnRemotely(buf);
                 return;
             }
             try {
                 releasedByOwner(offset);
+                heap.pool.keep(buf);
             } finally {
                 lock.unlockWrite(stamp);
             }

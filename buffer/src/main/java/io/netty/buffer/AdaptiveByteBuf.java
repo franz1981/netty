@@ -19,8 +19,6 @@ import io.netty.buffer.AdaptivePoolingAllocator.Chunk;
 import io.netty.util.ByteProcessor;
 import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
-import io.netty.util.Recycler.EnhancedHandle;
-import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
@@ -36,7 +34,8 @@ import java.nio.charset.Charset;
 
 final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
 
-    private final EnhancedHandle<AdaptiveByteBuf> handle;
+    /** The pool this object goes back to: the heap's whose chunk holds it; {@code null} for a fallback buffer. */
+    AdaptivePoolingAllocator.BufferPool pool;
 
     // this both act as adjustment and the start index for a free list segment allocation
     private int startIndex;
@@ -48,9 +47,9 @@ final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
     private boolean hasArray;
     private boolean hasMemoryAddress;
 
-    AdaptiveByteBuf(EnhancedHandle<AdaptiveByteBuf> recyclerHandle) {
+    AdaptiveByteBuf(AdaptivePoolingAllocator.BufferPool pool) {
         super(0);
-        handle = ObjectUtil.checkNotNull(recyclerHandle, "recyclerHandle");
+        this.pool = pool;
     }
 
     void init(AbstractByteBuf unwrapped, Chunk wrapped, int readerIndex, int writerIndex,
@@ -534,12 +533,14 @@ final class AdaptiveByteBuf extends AbstractReferenceCountedByteBuf {
     protected void deallocate() {
         BufferEvents.freed(this);
 
-        if (chunk != null) {
-            chunk.releaseSlot(startIndex, maxFastCapacity);
-        }
+        Chunk chunk = this.chunk;
         tmpNioBuf = null;
-        chunk = null;
+        this.chunk = null;
         rootParent = null;
-        handle.unguardedRecycle(this);
+        if (chunk != null) {
+            chunk.release(startIndex, maxFastCapacity, this);
+        } else if (pool != null) {
+            pool.recycle(this);
+        }
     }
 }
