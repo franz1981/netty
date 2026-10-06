@@ -35,7 +35,8 @@ final class PageStoreConfig {
     /**
      * {@code io.netty.allocator.segmentRegionSize}: the {@code mmap} regions a direct allocator carves its
      * {@link Segment}s from; 0 falls back to one-segment {@code malloc}'d regions. Address space only: pages commit
-     * as they are touched.
+     * as they are touched. One-segment regions scatter the allocator's memory across the address space; some
+     * workloads run measurably faster on larger, contiguous regions.
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
