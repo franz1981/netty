@@ -101,6 +101,15 @@ class MmapRegionSource {
      * {@code madvise(MADV_DONTNEED)} on {@code length} bytes from {@code address}, whole pages: the kernel rejects an
      * unaligned start but rounds a partial last page up, discarding the next page's data. One system call, and one
      * TLB shootdown round on the CPUs that ran this process. The range reads zero afterwards.
+     * <p>
+     * Why this call: it only read-locks the memory map, so other threads keep faulting pages of the region while it
+     * runs; since Linux 6.17 it locks just this mapping
+     * (<a href="https://github.com/torvalds/linux/blob/v6.17/mm/madvise.c#L1699-L1722">v6.17</a>), before that the
+     * whole map (<a href="https://github.com/torvalds/linux/blob/v6.16/mm/madvise.c#L61-L80">v6.16</a>). Re-mapping the
+     * range {@code PROT_NONE} (how HotSpot uncommits its heap), {@code munmap} and {@code mprotect} write-lock the
+     * map (<a href="https://github.com/torvalds/linux/blob/v6.17/mm/util.c#L578">mmap</a>), stalling the region's
+     * faults, and split the region's mapping. {@code MADV_FREE} keeps the pages, and RSS, until the kernel needs
+     * memory.
      */
     void purge(long address, int length) {
         PlatformDependent.madviseDontNeed(address, length);
