@@ -31,7 +31,7 @@ final class SizeClassTable {
     /** An exact fit with fewer slots takes the next page kind, for room to colour, unless that is the largest. */
     private static final int MIN_EXACT_FIT_SLOTS = 16;
     /** Colours are this many bytes apart, as a shift: one cache line. */
-    static final int COLOUR_SHIFT = 6;
+    private static final int COLOUR_SHIFT = 6;
     static final int MAX_CHUNK_COLOURS = 16;
 
     /**
@@ -153,7 +153,7 @@ final class SizeClassTable {
      * The page kind, in slices, of a size class: the smallest of {@code kinds} with {@link #MIN_PAGE_SLOTS} slots or
      * more that leaves at most an eighth of the page unused at its end, else the largest.
      */
-    static int pageSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
+    private static int pageSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
         for (int kind : kinds) {
             int page = kind * sliceSize;
             int slots = page / sizeClass;
@@ -193,16 +193,11 @@ final class SizeClassTable {
         return room < 1 << COLOUR_SHIFT && slots > 1 && room + sizeClass >= 1 << COLOUR_SHIFT ? slots - 1 : slots;
     }
 
-    /** How many start offsets, 64 bytes apart, the chunks of a class rotate through: the room the buffers leave. */
-    static int chunkColoursOf(int sizeClass, int chunkSize) {
-        int room = chunkSize - chunkBuffersOf(sizeClass, chunkSize) * sizeClass;
-        return Math.min(MAX_CHUNK_COLOURS, (room >>> COLOUR_SHIFT) + 1);
-    }
-
     /**
      * Round robin over the colours {@code room} bytes leave, {@code maxColours} at most, 64 bytes apart: the start
-     * offset of the {@code sequence}'th chunk's or span's buffers, past the first one. Slab colouring, as the chunks'
-     * (see {@link #chunkColoursOf}) and mimalloc's large allocations (https://github.com/microsoft/mimalloc/pull/1339).
+     * offset of the {@code sequence}'th chunk's or span's buffers, past the first one. Slab colouring, for the size
+     * classes' chunks and for the spans of large buffers, as mimalloc's large allocations
+     * (https://github.com/microsoft/mimalloc/pull/1339).
      */
     static int colourOffset(int sequence, int room, int maxColours) {
         int colours = Math.min(maxColours, (room >>> COLOUR_SHIFT) + 1);

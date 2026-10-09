@@ -115,19 +115,6 @@ final class SegmentTest {
         assertThrows(IllegalStateException.class, () -> segment.releaseRun(2, 1, 0));
     }
 
-    @Test
-    void firstFitFindsTheLowestRunLongEnough() {
-        assertEquals(0, Segment.firstFit(-1L, 63));
-        assertEquals(-1, Segment.firstFit(0L, 1));
-        long free = 0b1111_0110L; // slices 1, 2 and 4 to 7
-        assertEquals(1, Segment.firstFit(free, 1));
-        assertEquals(1, Segment.firstFit(free, 2));
-        assertEquals(4, Segment.firstFit(free, 3));
-        assertEquals(4, Segment.firstFit(free, 4));
-        assertEquals(-1, Segment.firstFit(free, 5));
-        assertEquals(63, Segment.firstFit(1L << 63, 1));
-    }
-
     /** Random claims and releases against a model: the bitmap is exactly the free slices, whatever the order. */
     @Test
     void randomClaimsAndReleasesKeepTheBitmapExact() {

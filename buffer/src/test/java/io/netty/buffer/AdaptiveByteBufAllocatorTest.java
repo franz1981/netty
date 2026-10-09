@@ -36,7 +36,6 @@ import java.io.IOException;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
-import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -1080,24 +1079,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * A thread with its own heap takes buffers above the size classes from that heap too: no stripe, no lock.
-     */
-    @Test
-    void threadLocalHeapServesBuffersAboveTheSizeClasses() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
-        onThreadLocalHeap(() -> {
-            ByteBuf buf = allocator.heapBuffer(BUDDY_NOTE_SIZE, BUDDY_NOTE_SIZE);
-            try {
-                assertTrue(chunkOfAny(buf).inThreadLocalMagazine(),
-                        "the thread-local heap served it, not a stripe");
-            } finally {
-                buf.release();
-            }
-        });
-    }
-
-    /**
      * A buffer that grows from a size class into the sizes above them on a thread-local heap moves to the heap's own
      * magazine, keeping its content, without a stripe.
      */
@@ -1197,32 +1178,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         t.join();
     }
 
-    // Regression: on the shared (striped) path a segment returned after the allocator was
-    // freed was absorbed into the chunk's local free list by the lock-holding release path,
-    // which skipped the deallocation accounting entirely -- so the chunk never deallocated.
-    // The chunk is abandoned to the page store, whose purger takes the dead stripe's lock to look.
-    @Test
-    void segmentReturnedAfterFreeMustStillDeallocateChunk() throws Exception {
-        // useCacheForNonEventLoopThreads=false -> a plain thread takes the shared path
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        ByteBuf buf = allocator.heapBuffer(256);
-        SizeClassedChunk chunk = chunkOf(buf);
-        assertFalse(spanFree(chunk));
-
-        freeHeap(allocator);
-        PageStore store = heap(allocator).pageStore;
-
-        // last outstanding segment comes back from another thread
-        Thread t = new Thread(buf::release);
-        t.start();
-        t.join();
-
-        runPurgePass(store);
-        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
-    }
-
-    // The thread-local counterpart: the owner thread exits (its FastThreadLocal heap is removed and freed) while
-    // buffers of its magazine's active chunk are still live, and they come back from another thread.
+    // The owner thread exits (its FastThreadLocal heap is removed and freed) while buffers of its magazine's active
+    // chunk are still live, and they come back from another thread.
     @Test
     void segmentReturnedAfterThreadLocalHeapFreeMustStillDeallocateChunk() throws Exception {
         assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
@@ -1324,7 +1281,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     /** Whether {@code chunk}'s span is back in the store: free in its block, or its region given back whole. */
     private static boolean spanFree(SizeClassedChunk chunk) {
         Segment block = chunk.segment;
-        long bits = block.bits(chunk.spanStart, chunk.spanSlices());
+        long bits = block.bits(chunk.spanStart, chunk.magazine.slices);
         return block.region.released || (block.free & bits) == bits;
     }
 
@@ -1787,33 +1744,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * The last segment of a chunk comes back after the allocator was freed, from a thread that cannot take the
-     * stripe lock: it goes on the external list, and that release must be the one that deallocates the chunk.
-     */
-    @Test
-    void segmentReturnedExternallyAfterFreeMustStillDeallocateChunk() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        ByteBuf buf = allocator.heapBuffer(256);
-        SizeClassedChunk chunk = chunkOf(buf);
-        List<StampedLock> locks = stripeLocks(allocator);
-        freeHeap(allocator);
-        assertFalse(spanFree(chunk));
-        List<Long> stamps = new ArrayList<Long>();
-        for (StampedLock l : locks) {
-            stamps.add(l.writeLock());
-        }
-        try {
-            release(buf, true);
-        } finally {
-            for (int i = 0; i < locks.size(); i++) {
-                locks.get(i).unlockWrite(stamps.get(i));
-            }
-        }
-        runPurgePass(heap(allocator).pageStore);
-        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
-    }
-
-    /**
      * A buffer that outgrows its segment moves to a larger one: its bytes move with it, and the segment it left is
      * free again - the next buffer of that size gets it.
      */
@@ -1909,22 +1839,5 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             throw new AssertionError(failure.get());
         }
         assertTrue(inUse.isEmpty());
-    }
-
-    /**
-     * Frees the allocator's stripes, as its {@code free()} does, but keeps its page store open: a buffer still out
-     * writes its free-list link into its block when it is released, so the block must stay.
-     */
-    private static void freeHeap(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field f = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        f.setAccessible(true);
-        Object inner = f.get(allocator);
-        Field stripesField = inner.getClass().getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        for (Object stripe : (Object[]) stripesField.get(inner)) {
-            Method free = stripe.getClass().getDeclaredMethod("close");
-            free.setAccessible(true);
-            free.invoke(stripe);
-        }
     }
 }

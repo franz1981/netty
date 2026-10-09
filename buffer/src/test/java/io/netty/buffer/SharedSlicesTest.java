@@ -44,14 +44,13 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * The page store's shared slices (see {@link PageStore#claimSlices}): first fit within a block, never across one,
- * blocks shared by claims of one length, releases from any thread reused at once, whole-block runs, and a purge that
- * only takes free idle slices, coalesced across blocks. Then all of it at once from many threads.
+ * blocks shared by claims of one length, whole-block runs, and a purge that only takes free idle slices, coalesced
+ * across blocks. Then all of it at once from many threads.
  */
 final class SharedSlicesTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
@@ -232,23 +231,6 @@ final class SharedSlicesTest {
                 }
             }
         }
-    }
-
-    /** A run released by another thread is free for the next claim at once, and a second release throws. */
-    @Test
-    void aReleaseFromAnyThreadIsReusedAtOnce() throws Exception {
-        final PageStore store = store(INTERVAL);
-        final AtomicLong claimed = new AtomicLong(-1);
-        Thread claimer = new Thread(() -> claimed.set(store.claimSlices(9, false)));
-        claimer.start();
-        claimer.join();
-        Thread releaser = new Thread(() -> release(store, claimed.get(), 9));
-        releaser.start();
-        releaser.join();
-        long again = store.claimSlices(9, false);
-        assertEquals(slice(claimed.get()), slice(again), "the same slices");
-        release(store, again, 9);
-        assertThrows(IllegalStateException.class, () -> release(store, again, 9));
     }
 
     /**

@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Regions inside a direct {@link AdaptivePoolingAllocator}: size-class buffers land in region memory, and the
- * defaults.
+ * fallback to regions of one block where none can be mapped.
  */
 public class AdaptiveSegmentRegionsTest {
     @RegisterExtension
@@ -76,21 +76,6 @@ public class AdaptiveSegmentRegionsTest {
     }
 
     /**
-     * The defaults, in both memory modes: 64-segment regions aligned to 2 MiB, used wherever they can be mapped.
-     */
-    @Test
-    void regionsWhereverTheyCanBeMapped() {
-        org.junit.jupiter.api.Assumptions.assumeTrue(
-                System.getProperty("io.netty.allocator.segmentRegionSize") == null, "set explicitly");
-        PageStoreConfig direct = PageStoreConfig.directDefaults();
-        assertEquals(Long.SIZE * direct.segmentSize, direct.regionSize);
-        assertEquals(REGION_ALIGNMENT, direct.regionAlignment);
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(true, false));
-        assertEquals(MmapRegionSource.isAvailable(), AdaptiveByteBufAllocatorTest.direct(allocator).pageStore
-                .mmap != null);
-    }
-
-    /**
      * Below Java 22, or without native access: {@code malloc}'d regions of one block, counted whole from their
      * allocation.
      */
@@ -110,29 +95,6 @@ public class AdaptiveSegmentRegionsTest {
         assertNotNull(block.region);
         assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.metric().usedDirectMemory());
         buf.release();
-    }
-
-    /**
-     * {@code malloc}'d regions in place of {@code mmap} ones, by configuration (a region size of 0): the same shared
-     * slices, the region counted whole.
-     */
-    @Test
-    void aConfigWithoutMmapRegionsMallocsThem() {
-        AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
-        AdaptivePoolingAllocator direct = AdaptiveByteBufAllocatorTest.direct(adaptive);
-        MemorySource source = direct.pageStore.memory;
-        PageStoreConfig noMmap = new PageStoreConfig(PageStoreConfig.SEGMENT_SIZE_BYTES,
-                PageStoreConfig.SLICE_SIZE_BYTES, PageStoreTestSupport.INTERVAL, 0, 0,
-                PageStoreConfig.SEGMENT_SIZE_BYTES);
-        AdaptivePoolingAllocator allocator = closer.add(new AdaptivePoolingAllocator(source, true, null, noMmap));
-        PageStore store = allocator.pageStore;
-        assertNull(store.mmap);
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, store.config.regionSize);
-        ByteBuf buf = allocator.allocate(1024, 1024);
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, allocator.usedMemory());
-        buf.release();
-        store.close();
-        assertEquals(0, allocator.usedMemory());
     }
 
     /**

@@ -26,9 +26,9 @@ import java.util.concurrent.TimeUnit;
 final class PageStoreConfig {
     static final int SLICE_SIZE_BYTES = 64 * 1024;
     /** One bit per slice in a block's bitmap. */
-    static final int MAX_SEGMENT_SIZE_BYTES = Long.SIZE * SLICE_SIZE_BYTES;
+    private static final int MAX_SEGMENT_SIZE_BYTES = Long.SIZE * SLICE_SIZE_BYTES;
     /** Room for the largest size class (3 slices) with some to spare. */
-    static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
+    private static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
     /** {@code io.netty.allocator.segmentSize}: the block size, a multiple of {@link #REGION_ALIGNMENT_BYTES}. */
     static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
@@ -48,7 +48,7 @@ final class PageStoreConfig {
             SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
 
     /** The fewest slices of a heap allocator's block: one buffer of the largest size class takes 3. */
-    static final int MIN_HEAP_SEGMENT_SLICES = 3;
+    private static final int MIN_HEAP_SEGMENT_SLICES = 3;
 
     /**
      * {@code io.netty.allocator.heapSegmentSize}: the heap allocator's block size, which sets its page kinds (see

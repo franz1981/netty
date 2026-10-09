@@ -446,7 +446,7 @@ final class AdaptivePoolingAllocator {
         final PageStore store;
         private final int segmentSlices;
 
-        SizeClassMagazine[] magazines;
+        private SizeClassMagazine[] magazines;
         /** The notes left for this heap's size classes: see {@link PendingChunks}. */
         final PendingChunks notes = new PendingChunks();
         /** The buffer objects this heap's buffers are made of, kept for reuse. */
@@ -466,7 +466,7 @@ final class AdaptivePoolingAllocator {
         }
 
         /** The magazine of {@code sizeClassIndex}, made on first use. */
-        SizeClassMagazine magazine(int sizeClassIndex) {
+        private SizeClassMagazine magazine(int sizeClassIndex) {
             SizeClassMagazine[] mags = magazines;
             SizeClassMagazine mag;
             if (mags == null || (mag = mags[sizeClassIndex]) == null) {
@@ -765,7 +765,7 @@ final class AdaptivePoolingAllocator {
         }
 
         /** Drop every queued chunk, for a heap being freed. */
-        void clear() {
+        private void clear() {
             HEAD.lazySet(this, null);
         }
     }
@@ -909,7 +909,7 @@ final class AdaptivePoolingAllocator {
          * up its current chunk and every empty chunk it keeps, floor included; one unused through a whole interval
          * keeps nothing. Chunks with buffers out stay.
          */
-        void dropIfIdle() {
+        private void dropIfIdle() {
             int t = ticks;
             int allocs = allocCount;
             boolean idle = t == ticksAtDecay && allocs == allocCountAtDecay;
@@ -1090,7 +1090,7 @@ final class AdaptivePoolingAllocator {
          * The heap is gone: the current chunk and every queued one give their spans back, or are abandoned to the
          * store until their buffers are back (see {@link SizeClassedChunk#releaseOrAbandon}).
          */
-        void close() {
+        private void close() {
             if (current != null) {
                 retireCurrent();
             }
@@ -1241,7 +1241,7 @@ final class AdaptivePoolingAllocator {
      */
     static class SizeClassedChunk extends Chunk {
         /** Ends a list in {@link #next}; fits a {@code short} like every slot index. */
-        static final int FREE_LIST_EMPTY = -1;
+        private static final int FREE_LIST_EMPTY = -1;
         /** The cost of {@link #next}'s {@code short} entries: no chunk has more slots than a {@code short} indexes. */
         static final int MAX_SLOTS = Short.MAX_VALUE + 1;
         /** No slot and a count of zero: see {@link #remoteFree}. */
@@ -1511,11 +1511,6 @@ final class AdaptivePoolingAllocator {
             magazine.heap.notes.push(this);
         }
 
-        /** The slices of the span this chunk is: its magazine's, the same every time it takes a span. */
-        int spanSlices() {
-            return magazine.slices;
-        }
-
         /** Owner, with every slot back: the span goes back to its block, by CAS. */
         void releaseSpan() {
             assert allFree();
@@ -1526,7 +1521,7 @@ final class AdaptivePoolingAllocator {
          * Owner, as its heap dies: the span goes back now if every slot is back; else the chunk is abandoned to the
          * store, whose purger becomes its owner ({@link #returnSpanIfAllFree}) and every release takes the CAS path.
          */
-        void releaseOrAbandon() {
+        private void releaseOrAbandon() {
             if (allFree()) {
                 releaseSpan();
                 return;

@@ -137,7 +137,7 @@ final class PageStore {
     private volatile SizeClassedChunk abandoned;
     /** Purger only: abandoned chunks with buffers still out, linked through {@code nextAbandoned}. */
     private SizeClassedChunk waiting;
-    long purgeFailures;
+    private long purgeFailures;
     /**
      * Purger only: whether this pass found free slices, or a region, short of the purge delay, and the longest any
      * of them had waited, so the pass can arm the next one for when they are due ({@link #skip}).

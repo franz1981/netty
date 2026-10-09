@@ -98,7 +98,7 @@ public class ChunkReuseTest {
         assertSame(magazine.full, chunk.queue);
         Segment block = chunk.segment;
         int start = chunk.spanStart;
-        int slices = chunk.spanSlices();
+        int slices = magazine.slices;
 
         // All of C but one buffer comes back on the owner's side.
         ByteBuf last = held.remove(held.size() - 1);
@@ -148,7 +148,7 @@ public class ChunkReuseTest {
             assertTrue(spanFree(block, start, slices), "and its span free");
         } else {
             Segment newBlock = chunk.segment;
-            assertFalse(spanFree(newBlock, chunk.spanStart, chunk.spanSlices()), "C' holds its span");
+            assertFalse(spanFree(newBlock, chunk.spanStart, slices), "C' holds its span");
             if ("refiled".equals(variant)) {
                 assertSame(magazine.full, chunk.queue, "no free segment: it stays full");
             } else {

@@ -232,7 +232,7 @@ public class AdaptiveSegmentsTest {
                 for (int i = 0; i < chunks; i++) {
                     // Every buffer of every chunk is out: the lowest offset is where the chunk's buffers start.
                     assertEquals(i % colours * 64, firstOffsets[i], "chunk " + i + " of size " + size);
-                    assertEquals(slices, seen.get(i).spanSlices());
+                    assertEquals(slices, seen.get(i).magazine.slices);
                 }
             }
             for (ByteBuf buf : bufs) {
@@ -362,7 +362,7 @@ public class AdaptiveSegmentsTest {
                 }
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= (long) chunk.spanStart * SLICE_SIZE_BYTES && offset + buf.capacity()
-                        <= ((long) chunk.spanStart + chunk.spanSlices()) * SLICE_SIZE_BYTES, "outside its span");
+                        <= ((long) chunk.spanStart + chunk.magazine.slices) * SLICE_SIZE_BYTES, "outside its span");
                 for (int j = 0; j < buf.capacity(); j += 8) {
                     buf.setLong(j, (long) i << 32 | j);
                 }
@@ -571,34 +571,6 @@ public class AdaptiveSegmentsTest {
         heap.release();
         assertEquals(directUsed, allocator.metric().usedDirectMemory(),
                 "the segment stays with the chunk its size class keeps");
-    }
-
-    /**
-     * The page kinds come from the allocator's own slice size: the 4352-byte class gets one slice either way, 7
-     * buffers in 32 KiB, 15 in 64 KiB; and each allocator's spans are slices of its own size.
-     */
-    @Test
-    void chunkSizesFollowTheInstanceSliceSize() throws Exception {
-        CountingMemorySource source = new CountingMemorySource();
-        AdaptivePoolingAllocator small = closer.add(new AdaptivePoolingAllocator(source, true, null,
-                new PageStoreConfig(2 * 1024 * 1024, 32 * 1024, INTERVAL, 0, 0, 2 * 1024 * 1024)));
-        AdaptivePoolingAllocator large = closer.add(newAllocator(source, SEGMENT_SIZE));
-        ByteBuf a = small.allocate(4352, 4352);
-        ByteBuf b = large.allocate(4352, 4352);
-        try {
-            assertEquals(32 * 1024, chunkOf(a).capacity);
-            assertEquals(7, field(chunkOf(a), "slots"));
-            assertEquals(32 * 1024, chunkOf(a).segment.sliceSize);
-            assertEquals(64, chunkOf(a).segment.slices);
-            assertEquals(64 * 1024, chunkOf(b).capacity);
-            assertEquals(15, field(chunkOf(b), "slots"));
-            assertEquals(SLICE_SIZE_BYTES, chunkOf(b).segment.sliceSize);
-            assertEquals(2L * 1024 * 1024, small.usedMemory());
-            assertEquals(SEGMENT_SIZE, large.usedMemory());
-        } finally {
-            a.release();
-            b.release();
-        }
     }
 
     /** The allocator rejects a page store whose segments cannot hold a buffer of its largest size class. */

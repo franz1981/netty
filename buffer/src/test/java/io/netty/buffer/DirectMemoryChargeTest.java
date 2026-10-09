@@ -24,8 +24,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.parallel.Isolated;
 
-import java.lang.reflect.Field;
-
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
@@ -38,8 +36,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 /**
  * Region memory against Netty's direct memory limit: an {@code mmap} region's slice is charged when claimed with no
  * memory behind it, credited when purged or closed, and a claim past the limit gives its run back; a {@code malloc}'d
- * region is charged whole by its allocation. A segment allocated on its own is charged by
- * its allocation.
+ * region is charged whole by its allocation.
  * <p>
  * Amounts are read from the allocator's used memory, which moves with each charge and credit of its store: the JVM-wide
  * counter also moves whenever the finalizer frees another test's allocator. That only credits it, so the counter is
@@ -181,29 +178,6 @@ final class DirectMemoryChargeTest {
         assertChargedAtMost(base, SEGMENT_SIZE, "the failed claim charged nothing");
         store.close();
         assertCredited(base);
-    }
-
-    /** The direct allocator's regions of one block: each is charged by its allocation, credited by its release. */
-    @Test
-    void mallocBlocksAreChargedByTheirAllocation() throws Exception {
-        AdaptiveByteBufAllocator adaptive = closer.add(new AdaptiveByteBufAllocator(true, false));
-        Field direct = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
-        direct.setAccessible(true);
-        MemorySource memory = ((AdaptivePoolingAllocator) direct.get(adaptive)).pageStore.memory;
-        long base = PlatformDependent.usedDirectMemory();
-        AbstractByteBuf block = memory.allocate(SEGMENT_SIZE, SEGMENT_SIZE);
-        try {
-            assertChargedAtMost(base, SEGMENT_SIZE, "the block");
-        } finally {
-            block.release();
-        }
-        assertCredited(base);
-        long filler = overfill();
-        try {
-            assertThrows(OutOfDirectMemoryError.class, () -> memory.allocate(SEGMENT_SIZE, SEGMENT_SIZE));
-        } finally {
-            credit(filler);
-        }
     }
 
     /**

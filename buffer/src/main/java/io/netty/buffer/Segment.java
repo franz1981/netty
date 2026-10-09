@@ -53,12 +53,12 @@ final class Segment {
     final Region region;
     final int slot;
     /** Per slice, its holder only: when it was last freed, for the purge delay. */
-    final long[] freedAt;
+    private final long[] freedAt;
     /**
      * Per slice, its holder only: whether it ever had memory behind it, so a free slice with none now is known to
      * have been purged ({@link #sliceState}).
      */
-    final boolean[] everCommitted;
+    private final boolean[] everCommitted;
     /**
      * The bin of the first span claimed since the block was last empty: see {@link PageStore#binOf}. A hint, not
      * CASed: written by that claim after the CAS that found the block empty, so a claim racing it may still read
@@ -275,7 +275,7 @@ final class Segment {
     static final int SLICE_OUT = 0;
     static final int SLICE_COMMITTED = 1;
     static final int SLICE_PURGED = 2;
-    static final int SLICE_UNTOUCHED = 3;
+    private static final int SLICE_UNTOUCHED = 3;
 
     /** Of slice {@code i}, for the JFR state event: claimed, free with memory behind it, purged, or never used. */
     int sliceState(int i) {
