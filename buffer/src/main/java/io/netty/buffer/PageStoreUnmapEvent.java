@@ -22,7 +22,7 @@ import jdk.jfr.Name;
 @SuppressWarnings("Since15")
 @Name(PageStoreUnmapEvent.NAME)
 @Label("Page Store Unmap")
-@Description("A region of the page store was unmapped, when its allocator was closed")
+@Description("A region of the page store was given back: its allocator was closed, or all of it stayed free")
 final class PageStoreUnmapEvent extends AbstractPageStoreEvent {
     static final String NAME = "io.netty.PageStoreUnmap";
     private static final PageStoreUnmapEvent INSTANCE = new PageStoreUnmapEvent();

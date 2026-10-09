@@ -19,41 +19,58 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 
 /**
- * A block: memory cut into equal slices (at most {@link Long#SIZE}), claimed and released as runs of contiguous
- * slices, one bit per slice in {@link #free}. A block has no owner: any thread claims and releases runs by CAS
- * ({@link #claimRun}, {@link #releaseRun}); a cleared bit belongs to the thread that cleared it, which alone touches
- * that slice's bit of {@link #committed} and its {@link #freedAt}, until the CAS that sets the bit again.
+ * A block of a {@link Region}: memory cut into equal slices, at most {@link Long#SIZE}, with one bit per slice in
+ * {@link #free}. It has no owner. Any thread claims a span, consecutive free slices, with one CAS on {@link #free}
+ * ({@link #claimRun}) and frees it with one ({@link #releaseRun}); between the two, the claimer alone touches those
+ * slices' bits of {@link #committed} and their {@link #freedAt} and {@link #everCommitted}. The purger claims free
+ * slices the same way before it purges them. A block holds spans of one length, its {@link #bin}: see
+ * {@link PageStore#binOf}.
  */
 final class Segment {
     private static final AtomicLongFieldUpdater<Segment> FREE =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "free");
     private static final AtomicLongFieldUpdater<Segment> COMMITTED =
             AtomicLongFieldUpdater.newUpdater(Segment.class, "committed");
-    /** Set in what {@link #claimRun} returns when the block was empty: the claim labelled it. */
+    /** Set in what {@link #claimRun} returns when the block was empty: this claim set its {@link #bin}. */
     static final int FIRST = 1 << 8;
-    /** The first slice of a run, in what {@link #claimRun} returns. */
+    /** The mask of the span's first slice in what {@link #claimRun} returns. */
     static final int START = Long.SIZE - 1;
 
     final AbstractByteBuf buffer;
+    /** Where this block starts in {@link #buffer}, the region's. */
     final int base;
     final int sliceSize;
     final int slices;
+    /** {@link #free} with every slice free: the low {@link #slices} bits. */
     final long allFree;
-    /** Bit {@code i} set when slice {@code i} is free. */
+    /** Bit {@code i} set when slice {@code i} is free. Changed only by CAS; the one truth about the block. */
     volatile long free;
-    /** Bit {@code i} set when slice {@code i} has memory behind it; each holder changes its own bits only, by CAS. */
+    /**
+     * Bit {@code i} set when slice {@code i} has memory behind it: set on the first claim of the slice, cleared by
+     * the purger. Each holder changes its own slices' bits only, by CAS, since holders of other slices race it.
+     */
     volatile long committed;
     final Region region;
     final int slot;
-    /** Per slice, slice owner only: the {@link System#nanoTime()} of its last release. */
+    /** Per slice, its holder only: when it was last freed, for the purge delay. */
     final long[] freedAt;
-    /** Per slice, slice owner only: whether it ever had memory behind it, so that free with none now was purged. */
+    /**
+     * Per slice, its holder only: whether it ever had memory behind it, so a free slice with none now is known to
+     * have been purged ({@link #sliceState}).
+     */
     final boolean[] everCommitted;
-    /** The bin of the first claim since the block was last empty (see {@link PageStore#binOf}): a hint. */
+    /**
+     * The bin of the first span claimed since the block was last empty: see {@link PageStore#binOf}. A hint, not
+     * CASed: written by that claim after the CAS that found the block empty, so a claim racing it may still read
+     * the previous bin.
+     */
     volatile byte bin;
-    /** The chunk of every large-buffer span a stripe claimed in it. */
+    /**
+     * The chunk every span of a buffer above the size classes belongs to, when a stripe claimed it: one object per
+     * block, with no state of its own, so such a buffer costs no chunk object.
+     */
     final AdaptivePoolingAllocator.Chunk sharedSpans;
-    /** As {@link #sharedSpans}, for the spans of thread-local heaps. */
+    /** As {@link #sharedSpans}, for the spans of thread-local heaps: so the JFR events tell them apart. */
     final AdaptivePoolingAllocator.Chunk threadLocalSpans;
 
     Segment(AbstractByteBuf buffer, int base, int size, int sliceSize, Region region, int slot,
@@ -80,7 +97,7 @@ final class Segment {
     }
 
     /**
-     * The first slice of the lowest run of {@code n} free slices in {@code free}, or -1: after {@code k} rounds of
+     * The first of the lowest {@code n} consecutive free slices in {@code free}, or -1: after {@code k} rounds of
      * {@code m &= m >>> 1}, bit {@code i} of {@code m} is set when slices {@code i} to {@code i + k} are all free.
      */
     static int firstFit(long free, int n) {
@@ -104,11 +121,16 @@ final class Segment {
         return (1L << n) - 1 << start;
     }
 
+    /** The bits of slices {@code start} to {@code start + n - 1}. */
     long bits(int start, int n) {
         return n == slices ? allFree : mask(start, n);
     }
 
-    /** Any thread: claims the lowest run of {@code n} free slices, for a claim of {@code bin}, or -1. */
+    /**
+     * Any thread: claims the lowest {@code n} consecutive free slices (a "run", the span) with one CAS, for a span of
+     * {@code bin}. Returns the first slice, or'ed with {@link #FIRST} when the block was empty, or -1 when no
+     * {@code n} consecutive slices are free.
+     */
     int claimRun(int n, int bin) {
         if (n == slices) {
             if (!claimWhole()) {
@@ -133,6 +155,7 @@ final class Segment {
         }
     }
 
+    /** Any thread: claims the first {@code n} slices if the block is empty, making it {@code bin}'s. */
     boolean claimFirst(int n, int bin) {
         if (!FREE.compareAndSet(this, allFree, allFree & ~bits(0, n))) {
             return false;
@@ -141,10 +164,12 @@ final class Segment {
         return true;
     }
 
+    /** Any thread: claims every slice if the block is empty. */
     boolean claimWhole() {
         return FREE.compareAndSet(this, allFree, 0);
     }
 
+    /** Purger: claims those of {@code bits} that are free, and returns them; a claim that raced it keeps its own. */
     long claimFree(long bits) {
         for (;;) {
             long current = free;
@@ -155,7 +180,10 @@ final class Segment {
         }
     }
 
-    /** The run of {@code n} slices from {@code start}, claimed by the caller, is free again. Throws if free already. */
+    /**
+     * Any thread holding the span of {@code n} slices from {@code start}: stamps them freed at {@code now}, frees
+     * them with one CAS and arms the purge. Throws if one is free already.
+     */
     void releaseRun(int start, int n, long now) {
         long[] freedAt = this.freedAt;
         for (int i = start; i < start + n; i++) {
@@ -165,6 +193,7 @@ final class Segment {
         region.store.armPurge(now);
     }
 
+    /** The holder of {@code bits}: frees them with one CAS, then lets the store set the block's bit in its maps. */
     void unclaim(long bits) {
         for (;;) {
             long current = free;
@@ -178,10 +207,12 @@ final class Segment {
         }
     }
 
+    /** Of {@code bits}, those with no memory behind them. */
     long fresh(long bits) {
         return bits & ~committed;
     }
 
+    /** The holder of {@code bits}: memory is behind them now. */
     void commit(long bits) {
         long current;
         do {
@@ -192,6 +223,7 @@ final class Segment {
         }
     }
 
+    /** The purger, holding {@code bits}: their memory was given back. */
     void uncommit(long bits) {
         for (;;) {
             long current = committed;
@@ -201,14 +233,18 @@ final class Segment {
         }
     }
 
-    /** Every slice still committed, as a count, and uncommitted: only once nothing else touches this block. */
+    /** Counts and clears every committed slice, for the region's release: only once nothing else touches the block. */
     int takeCommitted() {
         int n = Long.bitCount(committed);
         committed = 0;
         return n;
     }
 
-    /** Of {@code bits}, those committed and freed {@code delay} or more before {@code now}; the rest skip the purge. */
+    /**
+     * Purger: of {@code bits}, those committed and freed {@code delay} or more before {@code now}. The rest are
+     * reported to {@link PageStore#skip}, so the next pass comes when they are due. Racy on slices the purger does
+     * not hold; it holds them before the call that decides.
+     */
     long idleOf(long bits, long now, long delay) {
         long idle = 0;
         for (long b = bits & committed; b != 0; b &= b - 1) {
@@ -223,6 +259,7 @@ final class Segment {
         return idle;
     }
 
+    /** How long ago the slice freed last was freed. Racy unless the caller holds every slice. */
     long shortestWait(long now) {
         long shortest = Long.MAX_VALUE;
         for (long freedAt : this.freedAt) {
@@ -240,7 +277,7 @@ final class Segment {
     static final int SLICE_PURGED = 2;
     static final int SLICE_UNTOUCHED = 3;
 
-    /** Of slice {@code i}: claimed, free with memory behind it, purged since used, or never used. */
+    /** Of slice {@code i}, for the JFR state event: claimed, free with memory behind it, purged, or never used. */
     int sliceState(int i) {
         long bit = 1L << i;
         if ((free & bit) == 0) {

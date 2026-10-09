@@ -22,7 +22,7 @@ import jdk.jfr.Name;
 @SuppressWarnings("Since15")
 @Name(PageStorePurgeEvent.NAME)
 @Label("Page Store Purge")
-@Description("One madvise(MADV_DONTNEED) call of the page store: a run of idle free slices of one block")
+@Description("One madvise(MADV_DONTNEED) call of the page store: consecutive idle free slices of one block")
 final class PageStorePurgeEvent extends AbstractPageStoreEvent {
     static final String NAME = "io.netty.PageStorePurge";
     private static final PageStorePurgeEvent INSTANCE = new PageStorePurgeEvent();

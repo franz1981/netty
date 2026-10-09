@@ -16,8 +16,11 @@
 package io.netty.buffer;
 
 /**
- * One piece of memory cut into {@link #slots} blocks: {@code mmap}d, or one plain block, charged and purged
- * whole, if {@link #source} is {@code null}.
+ * One piece of a {@link PageStore}'s memory, cut into {@link #slots} blocks ({@link Segment}). Either mapped by
+ * {@link #source}, many blocks whose free slices the purger gives back in place; or, with {@link #source}
+ * {@code null}, one block from the allocator's {@link MemorySource}, charged whole when added and given back whole
+ * once every slice is idle. Claims and releases touch only the blocks; this class is touched under the store's
+ * lock, or racily by the purger before it claims every block.
  */
 final class Region {
     final PageStore store;
@@ -26,8 +29,9 @@ final class Region {
     final int slots;
     final int length;
     final Segment[] blocks;
+    /** Its place in the store's regions, and the high half of its blocks' ids. */
     final int index;
-    /** Set under the store's lock; every block stays claimed once set. */
+    /** Set under the store's lock by whoever gives the region back, holding every block: nothing claims in it after. */
     volatile boolean released;
 
     Region(PageStore store, AbstractByteBuf buffer, MmapRegionSource source, int slots,
@@ -46,6 +50,10 @@ final class Region {
         }
     }
 
+    /**
+     * Any thread: claims {@code n} consecutive empty blocks whole, each by CAS; returns the first's slot, or -1.
+     * Blocks claimed before one that is no longer empty are freed again, and the search goes on past it.
+     */
     int claimBlocks(int n) {
         Segment[] blocks = this.blocks;
         int first = 0;
@@ -72,6 +80,7 @@ final class Region {
         return -1;
     }
 
+    /** The holder of blocks {@code first} to {@code first + n - 1}, claimed whole: frees them. */
     void unclaimBlocks(int first, int n) {
         for (int i = first; i < first + n; i++) {
             Segment block = blocks[i];
@@ -79,6 +88,7 @@ final class Region {
         }
     }
 
+    /** Purger: claims the blocks whole from the first, stopping at the first that is not empty; returns how many. */
     int claimAll() {
         int claimed = 0;
         while (claimed < slots && blocks[claimed].claimWhole()) {
@@ -87,6 +97,7 @@ final class Region {
         return claimed;
     }
 
+    /** Racy. */
     boolean isEmpty() {
         for (Segment block : blocks) {
             if (!block.isEmpty()) {
@@ -96,7 +107,7 @@ final class Region {
         return true;
     }
 
-    /** How long, at {@code now}, the slice freed last has been free. Racy unless the caller claimed every block. */
+    /** How long ago the slice freed last was freed. Racy unless the caller holds every block. */
     long shortestWait(long now) {
         long shortest = Long.MAX_VALUE;
         for (Segment block : blocks) {
@@ -105,6 +116,7 @@ final class Region {
         return shortest;
     }
 
+    /** Under the store's lock, holding every block: unmaps the mapping, or frees the one block. */
     void release() {
         released = true;
         buffer.release();

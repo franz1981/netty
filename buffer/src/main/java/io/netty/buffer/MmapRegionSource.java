@@ -22,9 +22,11 @@ import io.netty.util.internal.PlatformDependent;
 import java.nio.ByteBuffer;
 
 /**
- * Regions mapped with their own anonymous {@code mmap(2)}, trimmed to start at a multiple of the alignment, unmapped
- * when released, and purged page-wise with {@code madvise(MADV_DONTNEED)}: the memory of a purged range goes back to
- * the OS at once, and reads zero when touched again.
+ * Where a direct {@link PageStore}'s regions come from: each its own anonymous {@code mmap(2)}, trimmed to start at
+ * a multiple of the alignment, unmapped when given back, and purged in parts with {@code madvise(MADV_DONTNEED)}, so
+ * that the free slices of a region go back to the OS while its other slices stay in use; a purged range reads zero
+ * when touched again. Called by the store from any thread, with no lock of its own: the store serialises mapping and
+ * unmapping under its lock, and one purger purges.
  * <p>
  * The three calls are {@link PlatformDependent#mmapAnonymous}, {@link PlatformDependent#munmap} and
  * {@link PlatformDependent#madviseDontNeed}, bound once for the whole JVM; {@link #isAvailable()} is
@@ -33,7 +35,7 @@ import java.nio.ByteBuffer;
  * {@link PlatformDependent#directBuffer(long, int)}, it still works with {@code --sun-misc-unsafe-memory-access=deny}.
  * <p>
  * Neither the mapping nor a purge is charged to or credited from {@code PlatformDependent}'s direct memory counter:
- * {@link PageStore} charges the slots it commits.
+ * a mapping is address space only, and the store charges the slices it commits.
  */
 class MmapRegionSource {
     static boolean isAvailable() {
@@ -48,8 +50,9 @@ class MmapRegionSource {
 
     /**
      * Maps {@code size + alignment} bytes, then unmaps the head and the tail around the first multiple of
-     * {@code alignment}: three system calls, no memory touched. Of the class {@link UnsafeByteBufUtil#newDirectByteBuf}
-     * picks, so that the spans of a region are of the class of a segment allocated on its own; its release unmaps it.
+     * {@code alignment}: three system calls, no memory touched. The buffer is of the class
+     * {@link UnsafeByteBufUtil#newDirectByteBuf} picks, the same as a block allocated on its own, so the buffers
+     * carved from a region read their memory the same way; its release unmaps the region.
      */
     AbstractByteBuf allocateRegion(int size, int alignment) {
         if (!isAvailable()) {

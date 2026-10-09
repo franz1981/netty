@@ -19,24 +19,26 @@ import io.netty.util.internal.SystemPropertyUtil;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The immutable parameters of one allocator's page store, read once from the {@code io.netty.allocator.segment*}
- * properties.
+ * The immutable geometry of one allocator's {@link PageStore}: the slice, the block ("segment" in the property
+ * names), the region, and the purge delay. Read once from the {@code io.netty.allocator.segment*} properties, then
+ * shared by every thread.
  */
 final class PageStoreConfig {
     static final int SLICE_SIZE_BYTES = 64 * 1024;
+    /** One bit per slice in a block's bitmap. */
     static final int MAX_SEGMENT_SIZE_BYTES = Long.SIZE * SLICE_SIZE_BYTES;
     /** Room for the largest size class (3 slices) with some to spare. */
     static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
-    /** {@code io.netty.allocator.segmentSize}, rounded to a multiple of {@link #REGION_ALIGNMENT_BYTES}. */
+    /** {@code io.netty.allocator.segmentSize}: the block size, a multiple of {@link #REGION_ALIGNMENT_BYTES}. */
     static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
     /** A direct allocator's regions start at a multiple of 2 MiB, so a THP-enabled kernel can back them whole. */
     static final int REGION_ALIGNMENT_BYTES = 2 * 1024 * 1024;
     /**
-     * {@code io.netty.allocator.segmentRegionSize}: the {@code mmap} regions a direct allocator carves its
-     * {@link Segment}s from; 0 falls back to one-segment {@code malloc}'d regions. Address space only: pages commit
-     * as they are touched. One-segment regions scatter the allocator's memory across the address space; some
-     * workloads run measurably faster on larger, contiguous regions.
+     * {@code io.netty.allocator.segmentRegionSize}: the size of the {@code mmap} regions a direct allocator cuts
+     * its blocks from; 0 falls back to {@code malloc}'d regions of one block. A mapping is address space only:
+     * pages commit as they are touched. Regions of one block scatter the allocator's memory over as many mappings;
+     * a larger region keeps its blocks in one.
      */
     static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
@@ -45,10 +47,15 @@ final class PageStoreConfig {
     static final long PURGE_DELAY_MILLIS = purgeDelayMillisOf(
             SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
 
-    /** The fewest slices of a heap segment: one buffer of the largest size class takes 3. */
+    /** The fewest slices of a heap allocator's block: one buffer of the largest size class takes 3. */
     static final int MIN_HEAP_SEGMENT_SLICES = 3;
 
-    /** {@code io.netty.allocator.heapSegmentSize}, which sets the page kinds (see {@link SizeClassTable#pageKinds}). */
+    /**
+     * {@code io.netty.allocator.heapSegmentSize}: the heap allocator's block size, which sets its page kinds (see
+     * {@link SizeClassTable#pageKinds}). Such a block is one {@code byte[]}: born young, and copied to the old
+     * generation by the first collections. G1 collects young regions by count, so a size that fills its regions
+     * whole gets more copied, and more memory resident, than one that leaves part of each region untouched.
+     */
     static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
             "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));
 
@@ -87,19 +94,25 @@ final class PageStoreConfig {
         return (int) clamp(size / SLICE_SIZE_BYTES, MIN_HEAP_SEGMENT_SLICES, Long.SIZE) * SLICE_SIZE_BYTES;
     }
 
+    /** The block size. */
     final int segmentSize;
     final int sliceSize;
     /** {@code numberOfTrailingZeros(sliceSize)}: a byte offset to a slice index without a division. */
     final int sliceShift;
+    /** How long a slice stays free before the purger may give its memory back. */
     final long purgeDelayNanos;
+    /** The least time between two purge passes. */
     final long purgeCheckNanos;
-    /** 2 to {@link Long#SIZE} whole segments, or {@link #mallocRegionSize}; 0: regions of {@link #mallocRegionSize}. */
+    /**
+     * The size of a region: 2 to {@link Long#SIZE} blocks for an {@code mmap} one, or {@link #mallocRegionSize} once
+     * mapping was given up ({@link #withMallocRegions}); 0: no regions, the store cannot be built.
+     */
     final int regionSize;
     final int regionAlignment;
-    /** Where no {@code mmap} region source is had: the size of {@code malloc}'d regions (one block), or 0: none. */
+    /** The size of a {@code malloc}'d region of one block, taken where no {@code mmap} region can be; 0: none. */
     final int mallocRegionSize;
 
-    /** With regions of {@code regionSize} from the allocator's region source. */
+    /** With {@code mmap} regions of {@code regionSize} only: no fallback to {@code malloc}'d ones. */
     PageStoreConfig(int segmentSize, int sliceSize, long purgeDelayNanos, int regionSize, int regionAlignment) {
         this(segmentSize, sliceSize, purgeDelayNanos, regionSize, regionAlignment, 0);
     }
@@ -146,7 +159,7 @@ final class PageStoreConfig {
         this.mallocRegionSize = mallocRegionSize;
     }
 
-    /** This, with {@code malloc}'d regions of one block each, at libc's alignment. */
+    /** This, with {@code malloc}'d regions of one block each, at libc's alignment: after mapping failed. */
     PageStoreConfig withMallocRegions() {
         return new PageStoreConfig(segmentSize, sliceSize, purgeDelayNanos, mallocRegionSize, 0, mallocRegionSize);
     }

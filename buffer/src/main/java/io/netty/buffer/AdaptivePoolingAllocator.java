@@ -39,11 +39,12 @@ import java.util.concurrent.locks.StampedLock;
  * A pooling allocator that follows an anti-generational hypothesis: buffers are expected to die young, so the memory
  * behind them is kept close to the thread that allocated it and handed out again as soon as it comes back.
  * <p>
- * All memory comes from the allocator's {@link PageStore}, shared by all heaps, in runs of its 64 KiB slices. Up to
- * the largest size class ({@link SizeClassTable#SIZES}) a run is a {@link SizeClassedChunk}, cut into equal slots
- * of one size class, one {@link SizeClassMagazine} allocating from it at a time (see its state diagram). Above it,
- * up to a block, a run is a span holding one buffer alone ({@link Heap#allocateLarge}); larger still, or when no
- * span can be had, a one-shot {@link OneShotChunk} holds that buffer alone and is freed with it.
+ * All memory comes from the allocator's {@link PageStore}, shared by all heaps, as spans of its slices (its class
+ * javadoc defines the units). Up to the largest size class ({@link SizeClassTable#SIZES}) a span is a
+ * {@link SizeClassedChunk}, cut into equal slots of one size class, one {@link SizeClassMagazine} allocating from
+ * it at a time (see its state diagram). Above it, up to a block, a span holds one buffer alone
+ * ({@link Heap#allocateLarge}); larger still, or when no span can be had, a {@link OneShotChunk} holds that buffer
+ * alone and is freed with it.
  * <p>
  * The magazines are grouped into stripe {@link Heap}s, each guarded by one lock, and a thread picks a stripe by its
  * id; more stripes are used when threads collide on the lock. A {@link FastThreadLocalThread} instead gets a
@@ -137,8 +138,8 @@ final class AdaptivePoolingAllocator {
     final SizeClassTable table;
     final PageStore pageStore;
     /**
-     * Outside low-memory mode: the largest buffer that is a span of the page store's shared slices, a whole block;
-     * above it a buffer takes a run of whole blocks. 0 in low-memory mode.
+     * Outside low-memory mode: the largest buffer that is a span of the page store's slices, a whole block; above
+     * it a buffer takes consecutive whole blocks ({@link PageStore#claimBlocks}). 0 in low-memory mode.
      */
     private final int largeSpanLimit;
 
@@ -289,7 +290,7 @@ final class AdaptivePoolingAllocator {
 
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
         if (size > MAX_POOLED_BUF_SIZE && size <= largeSpanLimit) {
-            // Above the pooled sizes, up to a block: a span of shared slices, as smaller large buffers.
+            // Above the pooled sizes, up to a block: a span of the store's slices, as smaller large buffers.
             AdaptiveByteBuf spanned = allocateLargeSpan(size, maxCapacity, buf);
             if (spanned != null) {
                 return spanned;
@@ -303,7 +304,7 @@ final class AdaptivePoolingAllocator {
         if (buf == null) {
             buf = newFallbackBuffer();
         }
-        // Above a span, a run of the store's blocks if one fits; else an allocation of its own.
+        // Above a block: consecutive whole blocks of the store if a region holds them; else an allocation of its own.
         OneShotChunk chunk = largeSpanLimit != 0 && size > largeSpanLimit ? newStoreOneShot(size) : null;
         if (chunk == null) {
             chunk = new OneShotChunk(memory.allocate(size, maxCapacity), this, null, 0, 0);
@@ -333,10 +334,10 @@ final class AdaptivePoolingAllocator {
         return allocateShared(SIZE_CLASSES_COUNT, size, maxCapacity, current, buf);
     }
 
-    /** A one-shot chunk of whole blocks from the page store; {@code null} when no run fits a new region. */
+    /** A one-shot chunk of consecutive whole blocks of the page store; {@code null} when no region can hold them. */
     private OneShotChunk newStoreOneShot(int size) {
         PageStore store = pageStore;
-        // The heaps' decays drive the store's purge; these buffers count toward no heap's, so they drive it too.
+        // The purge runs from the heaps' allocation paths; these buffers pass through no heap, so they run it too.
         store.purgeIfDue(System.nanoTime());
         int segmentSize = store.config.segmentSize;
         int slots = (int) ((size + (long) segmentSize - 1) / segmentSize);
@@ -421,9 +422,11 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * One thread's heap, or one stripe shared by the threads without one: {@code lock} is {@code null} for a
-     * thread-local heap ({@code owner} is then non-null) and a real {@link StampedLock} for a stripe. The owner
-     * thread calls {@link #allocateSizeClass} and {@link #allocateLarge} directly; the router
+     * One thread's heap, or one stripe shared by the threads without one: a magazine per size class in use, its
+     * chunks, and the buffer objects. It owns chunks and spans, never the blocks they are in: those are the
+     * {@link PageStore}'s, shared by every heap. {@code lock} is {@code null} for a thread-local heap
+     * ({@code owner} is then non-null) and a {@link StampedLock} for a stripe. The owner thread calls
+     * {@link #allocateSizeClass} and {@link #allocateLarge} directly; the router
      * ({@link AdaptivePoolingAllocator#allocateShared}) takes the stripe's {@code tryWriteLock} itself. Every
      * release path reads {@link #lock} and takes it the same way, if it is not {@code null}.
      */
@@ -434,7 +437,7 @@ final class AdaptivePoolingAllocator {
         private static final long DECAY_MIN_ALLOCATIONS = 10000;
         /** An allocation counts toward the decay clock as its size in units of the smallest size class. */
         private static final int COUNT_SHIFT = 5;
-        /** 4032 bytes at most. */
+        /** Steps of one cache line a span's buffer may start into the span: see {@link #allocateSpan}. */
         private static final int MAX_SPAN_COLOURS = 64;
 
         final StampedLock lock;
@@ -510,8 +513,8 @@ final class AdaptivePoolingAllocator {
         }
 
         /**
-         * Above the size classes, up to a block: a span of whole shared slices (see {@link PageStore#claimSlices}),
-         * sized to the buffer rounded up to slices. No chunk, nothing kept for reuse: a release, from any thread,
+         * Above the size classes, up to a block: a span of the store's slices ({@link PageStore#claimSlices}), as
+         * many as the buffer rounds up to. No chunk object, nothing kept for reuse: a release, from any thread,
          * gives the span back to the store at once (see {@link SharedSpanChunk}).
          */
         AdaptiveByteBuf allocateLarge(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
@@ -543,12 +546,12 @@ final class AdaptivePoolingAllocator {
             long run = store.claimSlices(slices, owner != null);
             Segment segment = store.block(run);
             int start = store.start(run);
-            // Colour, as the size classes' chunks (see colourOffset): the buffer starts up to 4032 bytes into its
-            // span, in 64-byte steps taken round robin, out of the tail the span leaves unused past the buffer, so
-            // it costs no memory. A release rounds its capacity up to whole slices again.
+            // Colour, as the size classes' chunks (see colourOffset): the buffer starts a round-robin number of
+            // cache lines into its span, out of the tail the span leaves unused past the buffer, so it costs no
+            // memory. A release rounds its capacity up to whole slices again.
             int room = (int) (((long) slices << shift) - size);
             int colour = SizeClassTable.colourOffset(nextSpanColour++, room, MAX_SPAN_COLOURS);
-            // A block has one chunk for the spans of every thread-local heap, and one for every stripe's.
+            // A block has one chunk object for the spans of every thread-local heap, and one for every stripe's.
             Chunk chunk = owner != null ? segment.threadLocalSpans : segment.sharedSpans;
             boolean initialized = false;
             try {
@@ -854,7 +857,7 @@ final class AdaptivePoolingAllocator {
 
         private final int slotSize;
         final int chunkSize;
-        /** {@link #chunkSize} in slices: a span's length, for a fresh claim and {@code SizeClassedChunk}'s release. */
+        /** {@link #chunkSize} in slices: the span length this class claims and gives back, and its bin in the store. */
         final int slices;
         final int slots;
         /** The chunk size's tail its slots leave unused: the room {@code colourOffset} rotates a chunk's start in. */
@@ -960,9 +963,9 @@ final class AdaptivePoolingAllocator {
                 }
             }
             if (curr == null) {
-                // claimChunk: a run of the store's shared slices, served by a chunk object the magazine gave up
-                // earlier or a new one, coloured round robin so that slot k of consecutive chunks does not share
-                // its offset in a 4 KiB page (Bonwick, "The Slab Allocator", USENIX Summer 1994, section 4.3).
+                // A span of the store's slices, served by a chunk object the magazine gave up earlier (spare) or a
+                // new one, coloured round robin so that slot k of consecutive chunks does not share its offset in a
+                // page (Bonwick, "The Slab Allocator", USENIX Summer 1994, section 4.3).
                 PageStore store = heap.store;
                 long run = store.claimSlices(slices, heap.owner != null);
                 Segment segment = store.block(run);
@@ -1105,8 +1108,10 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * The chunk of every large-buffer span of one block, whichever heap claimed it: a release, from any thread,
-     * gives the span's slices back to the store at once. Nothing is queued, nothing is owned.
+     * The chunk every span of a buffer above the size classes in one block belongs to, whichever heap claimed it:
+     * one object per block (two: one for the thread-local heaps' spans, one for the stripes'), so such a buffer
+     * costs no object of its own. It has no state; a release, from any thread, gives the span back to the block by
+     * CAS at once. Nothing is queued, nothing is owned.
      */
     static final class SharedSpanChunk extends Chunk {
         final Segment block;
@@ -1119,7 +1124,7 @@ final class AdaptivePoolingAllocator {
             this.threadLocal = threadLocal;
         }
 
-        /** Any thread: the span of {@code length} bytes at {@code offset}, colour included, is free. */
+        /** Any thread: the span of {@code length} bytes at {@code offset}, colour included, goes back to the block. */
         @Override
         void releaseSlot(int offset, int length) {
             int shift = block.region.store.config.sliceShift;
@@ -1196,9 +1201,9 @@ final class AdaptivePoolingAllocator {
     /**
      * A chunk cut into fixed slots of one size class, a span of its block from slice {@link #spanStart}.
      * <p>
-     * <b>Free slots</b> are linked by index through {@link #next}, one entry per slot: the allocator never reads nor
-     * writes the memory it hands out, and a buffer written after its release cannot break a list. Slot {@code i} is
-     * at offset {@code base + i * slotSize} of the block. The chunk keeps
+     * <b>Free slots</b> are linked by index through {@link #next}, one entry per slot, never through the slots'
+     * own memory: see {@link #next}. Slot {@code i} is at offset {@code base + i * slotSize} of the block. The chunk
+     * keeps
      * <ul>
      *   <li>{@link #localHead}: the first slot released by the owner thread, or by a thread holding the stripe lock.
      *       The last slot released is the first handed out again;</li>
@@ -1235,8 +1240,9 @@ final class AdaptivePoolingAllocator {
      * </pre>
      */
     static class SizeClassedChunk extends Chunk {
+        /** Ends a list in {@link #next}; fits a {@code short} like every slot index. */
         static final int FREE_LIST_EMPTY = -1;
-        /** {@link #next} holds indexes as {@code short}s. */
+        /** The cost of {@link #next}'s {@code short} entries: no chunk has more slots than a {@code short} indexes. */
         static final int MAX_SLOTS = Short.MAX_VALUE + 1;
         /** No slot and a count of zero: see {@link #remoteFree}. */
         private static final long REMOTE_EMPTY = 0xFFFFFFFFL;
@@ -1246,7 +1252,15 @@ final class AdaptivePoolingAllocator {
         private final int slotSize;
         /** How far into each span the slots start: 64-byte steps, one per chunk object. */
         private final int colour;
-        /** For each free slot, the index of the next free one on its list, or {@link #FREE_LIST_EMPTY}. */
+        /**
+         * Per slot, the index of the next free slot on its list ({@link #localHead}'s or {@link #remoteFree}'s), or
+         * {@link #FREE_LIST_EMPTY}; meaningful for free slots only, never cleared. A side array rather than a link
+         * stored in each free slot's own memory (as mimalloc does): taking or freeing a slot then never reads or
+         * writes the slot's memory, so a buffer written after its release cannot break a list, a free slot's memory
+         * is not touched for the sake of the list, and the links survive the span being given back. One
+         * {@code short} per slot, owned by the chunk object, which {@link #takeSpan} reuses span after span: nothing
+         * is allocated per span. The cost is {@link #MAX_SLOTS}.
+         */
         private final short[] next;
         /** {@link #indexReciprocal} of {@link #slotSize}: an offset becomes an index without a division. */
         private final long indexRecip;
@@ -1312,12 +1326,15 @@ final class AdaptivePoolingAllocator {
             return base + index * slotSize;
         }
 
-        /** Owner: this object becomes a chunk on the span of {@code segment} from slice {@code spanStart}, every
-         *  slot free and none handed out; nothing is filled. */
+        /**
+         * Owner: this object becomes the chunk of the span of {@code segment} from slice {@code spanStart}, every
+         * slot free and none handed out. Nothing is filled: {@link #bump} hands out the slots in order, so the
+         * links in {@link #next} are written only as slots are freed.
+         */
         void takeSpan(Segment segment, int spanStart) {
             this.segment = segment;
             this.spanStart = spanStart;
-            // The region's own buffer, as a large-buffer span reads it: no buffer object per chunk.
+            // The region's own buffer, as a large buffer's span reads it: no buffer object per chunk.
             delegate = segment.buffer;
             base = segment.base + spanStart * segment.sliceSize + colour;
             bump = 0;
@@ -1494,12 +1511,12 @@ final class AdaptivePoolingAllocator {
             magazine.heap.notes.push(this);
         }
 
-        /** The slices of the span this chunk is: its magazine's, every incarnation the same. */
+        /** The slices of the span this chunk is: its magazine's, the same every time it takes a span. */
         int spanSlices() {
             return magazine.slices;
         }
 
-        /** Owner, with every slot back: the span goes back to the store's shared slices. */
+        /** Owner, with every slot back: the span goes back to its block, by CAS. */
         void releaseSpan() {
             assert allFree();
             segment.releaseRun(spanStart, magazine.slices, System.nanoTime());
@@ -1543,15 +1560,15 @@ final class AdaptivePoolingAllocator {
     }
 
     /**
-     * One buffer that owns its memory, freed with it: a run of whole blocks for a buffer above a block, else an
-     * allocation of its own.
+     * One buffer that owns its memory, freed with it: consecutive whole blocks of a region for a buffer above a
+     * block ({@link PageStore#claimBlocks}), else an allocation of its own from the {@link MemorySource}.
      */
     private static final class OneShotChunk extends Chunk {
-        /** The region whose blocks {@link #runStart} to {@link #runStart} + {@link #runSlots} this is, or null. */
+        /** The region of the {@link #runSlots} blocks from slot {@link #runStart} this buffer holds, or null. */
         private final Region region;
         private final int runStart;
         private final int runSlots;
-        /** This run's start in {@code delegate}, a region's buffer; 0 for an allocation of its own. */
+        /** Where those blocks start in {@code delegate}, the region's buffer; 0 for an allocation of its own. */
         final int base;
 
         OneShotChunk(AbstractByteBuf delegate, AdaptivePoolingAllocator allocator, Region region, int runStart,
@@ -1564,7 +1581,7 @@ final class AdaptivePoolingAllocator {
             base = region != null ? runStart * region.store.config.segmentSize : 0;
         }
 
-        /** Any thread, once: the run goes back to the store, or the allocation is freed. */
+        /** Any thread, once: the blocks go back to the store, or the allocation is freed. */
         @Override
         void releaseSlot(int startIndex, int size) {
             if (region != null) {

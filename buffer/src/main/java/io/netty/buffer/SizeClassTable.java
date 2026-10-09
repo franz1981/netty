@@ -18,11 +18,10 @@ package io.netty.buffer;
 import java.util.Arrays;
 
 /**
- * The size classes every {@link AdaptivePoolingAllocator} serves, which are the same for every allocator, and the
- * chunk geometry they take under one allocator's {@link PageStoreConfig}, built once from it: the page kinds a block
- * divides into, and, per size class, the chunk's slices, slots and leftover room. {@link AdaptivePoolingAllocator}'s
- * router keeps {@link AdaptivePoolingAllocator#sizeClassIndexOf}; a magazine's constructor and {@link PageStore}
- * read this table instead of recomputing the same geometry per heap or per store.
+ * The size classes every {@link AdaptivePoolingAllocator} serves, the same for every allocator, and the chunk
+ * geometry they take under one allocator's {@link PageStoreConfig}, built once from it: the page kinds (the span
+ * lengths, in slices, a chunk may have) and, per size class, its chunk's slices, slots and leftover room. Immutable,
+ * read by every heap and by the store's bins ({@link PageStore#binOf}).
  */
 final class SizeClassTable {
     /** A size class's page holds at least this many slots, unless only the largest page kind fits it. */
@@ -116,10 +115,11 @@ final class SizeClassTable {
     }
 
     /**
-     * The page kinds of a block of {@code blockSlices} slices of {@code sliceSize}, smallest first: the run lengths, in
-     * slices, a size class's chunk may be. One slice; the largest divisor of the block up to an eighth of it; the
-     * largest up to half of it; and the block itself if none of these holds the largest size class. Each divides the
-     * block, so chunks of one kind tile it with no tail. 64 slices: 1, 8, 32; 63: 1, 7, 21; 32: 1, 4, 16; 7: 1, 7.
+     * The page kinds of a block of {@code blockSlices} slices of {@code sliceSize}, smallest first: the span lengths,
+     * in slices, a size class's chunk may have. One slice; the largest divisor of the block up to an eighth of it;
+     * the largest up to half of it; and the block itself if none of these holds the largest size class. Each divides
+     * the block, so chunks of one kind tile it with no tail, and each kind is a bin of the store's blocks
+     * ({@link PageStore#binOf}). 64 slices: 1, 8, 32; 63: 1, 7, 21; 32: 1, 4, 16; 7: 1, 7.
      */
     static int[] pageKinds(int blockSlices, int sliceSize) {
         int[] kinds = new int[4];

@@ -16,11 +16,12 @@
 package io.netty.buffer;
 
 /**
- * Where an allocator's memory comes from: its one-shot chunks, and a page store's regions of one block where no
- * {@link MmapRegionSource} is had. libc {@code malloc} or {@code mmap} for the direct allocator, a {@code byte[]}
- * for the heap allocator. Implementations: the chunk allocators and test sources.
+ * Where an allocator's memory comes from when it is not carved out of an {@code mmap} region: the one-shot chunks
+ * of single buffers, and the {@link PageStore}'s regions of one block where no {@link MmapRegionSource} is
+ * available. libc {@code malloc} for the direct allocator, a {@code byte[]} for the heap allocator. Called from any
+ * thread; implementations are the chunk allocators and test sources.
  */
 interface MemorySource {
-    /** The buffer of a one-shot chunk, or a one-block region: of any class. */
+    /** The buffer of a one-shot chunk, or of a region of one block: of any class. */
     AbstractByteBuf allocate(int initialCapacity, int maxCapacity);
 }
