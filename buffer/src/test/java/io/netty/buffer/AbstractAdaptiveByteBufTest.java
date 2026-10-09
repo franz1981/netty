@@ -17,12 +17,20 @@ package io.netty.buffer;
 
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 public abstract class AbstractAdaptiveByteBufTest extends AbstractPooledByteBufTest {
-    private final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator();
+    @RegisterExtension
+    final AllocatorCloser closer = new AllocatorCloser();
+
+    /** Made by the first buffer: an instance whose test never runs makes none, and has none to close. */
+    private AdaptiveByteBufAllocator allocator;
 
     @Override
     protected final ByteBuf alloc(int length, int maxCapacity) {
+        if (allocator == null) {
+            allocator = closer.add(new AdaptiveByteBufAllocator());
+        }
         return alloc(allocator, length, maxCapacity);
     }
 
