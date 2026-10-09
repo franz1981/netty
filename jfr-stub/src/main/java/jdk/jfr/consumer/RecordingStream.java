@@ -47,6 +47,10 @@ public class RecordingStream implements AutoCloseable {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
 
+    public void setReuse(boolean reuse) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
     public void onEvent(String name, Consumer<RecordedEvent> consumer) {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }

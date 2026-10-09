@@ -103,7 +103,31 @@
     "name": "io.netty.buffer.AdaptivePoolingAllocator$SizeClassedChunk",
     "fields": [
       {
-        "name": "state"
+        "name": "remoteFree"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.PageStore",
+    "fields": [
+      {
+        "name": "purging"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.Region",
+    "fields": [
+      {
+        "name": "maxAccessed"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.buffer.Segment",
+    "fields": [
+      {
+        "name": "free"
       }
     ]
   },

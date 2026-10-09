@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 The Netty Project
+ * Copyright 2026 The Netty Project
  *
  * The Netty Project licenses this file to you under the Apache License,
  * version 2.0 (the "License"); you may not use this file except in compliance
@@ -13,14 +13,23 @@
  * License for the specific language governing permissions and limitations
  * under the License.
  */
-package jdk.jfr;
+package io.netty.util.internal;
 
-public class EventSettings {
-    public EventSettings() {
-        throw new UnsupportedOperationException("Stub should only be used at compile time");
+/**
+ * A linked native call ({@code mmap}, {@code munmap}, {@code madvise}) failed; {@link #errno()} is the C errno it
+ * reported.
+ */
+public final class NativeCallException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+
+    private final int errno;
+
+    NativeCallException(String message, int errno) {
+        super(message);
+        this.errno = errno;
     }
 
-    public final EventSettings withPeriod(java.time.Duration duration) {
-        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    public int errno() {
+        return errno;
     }
 }

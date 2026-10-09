@@ -30,6 +30,10 @@ public final class RecordedEvent {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
 
+    public long getLong(String fieldName) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
     public int getInt(String fieldName) {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }

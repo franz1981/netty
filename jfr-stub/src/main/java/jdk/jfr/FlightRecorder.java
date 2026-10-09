@@ -23,4 +23,12 @@ public final class FlightRecorder {
     public static boolean isAvailable() {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
+
+    public static void addPeriodicEvent(Class<? extends Event> eventClass, Runnable hook) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public static boolean removePeriodicEvent(Runnable hook) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
 }

@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.util.internal.CleanableDirectBuffer;
 import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
@@ -734,6 +735,20 @@ final class UnsafeByteBufUtil {
             return new UnpooledUnsafeDirectByteBuf(alloc, initialCapacity, maxCapacity, true);
         }
         return new UnpooledDirectByteBuf(alloc, initialCapacity, maxCapacity, true);
+    }
+
+    /**
+     * A buffer over {@code memory}, of the class {@link #newDirectByteBuf(ByteBufAllocator, int, int)} picks, that
+     * frees it by {@link CleanableDirectBuffer#clean()} when released.
+     */
+    static UnpooledDirectByteBuf newDirectByteBuf(ByteBufAllocator alloc, CleanableDirectBuffer memory) {
+        if (PlatformDependent.hasUnsafe()) {
+            if (PlatformDependent.useDirectBufferNoCleaner()) {
+                return new UnpooledUnsafeNoCleanerDirectByteBuf(alloc, memory);
+            }
+            return new UnpooledUnsafeDirectByteBuf(alloc, memory);
+        }
+        return new UnpooledDirectByteBuf(alloc, memory);
     }
 
     private UnsafeByteBufUtil() { }

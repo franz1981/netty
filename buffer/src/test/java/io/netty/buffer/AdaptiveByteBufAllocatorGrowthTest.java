@@ -32,6 +32,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 @Isolated("Uses a large amount of heap memory, so we don't want it to run concurrently with other allocator tests")
 public class AdaptiveByteBufAllocatorGrowthTest {
     private static final int THREAD_COUNT = Math.max(4, NettyRuntime.availableProcessors() * 2);
@@ -40,15 +42,17 @@ public class AdaptiveByteBufAllocatorGrowthTest {
     private static AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator(false);
 
     @AfterAll
-    static void cleanUp() {
-        allocator = null;
+    static void cleanUp() throws InterruptedException {
         THREAD_POOL.shutdown();
+        assertTrue(THREAD_POOL.awaitTermination(1, TimeUnit.MINUTES), "the pool's threads still run");
+        allocator.close();
+        allocator = null;
     }
 
     @DisabledForSlowLeakDetection
     @RepeatedTest(400)
     void concurrentBufferAllocateAndGrowth(RepetitionInfo info) throws Exception {
-        // This test targets data races where Chunk.remainingCapacity() is called concurrently
+        // This test targets data races where Chunk.freeBytes() is called concurrently
         // with other operations on the chunk. It is important that calling this method does not
         // modify or corrupt the state of the chunks.
 
@@ -56,7 +60,7 @@ public class AdaptiveByteBufAllocatorGrowthTest {
         final int bufSizeAdditional;
         final int bufSizeGrowth;
         if ((info.getCurrentRepetition() & 1) == 0) {
-            // Target large buffers: above the largest size class, so they take the buddy path.
+            // Target large buffers: above the largest size class, so they are spans or one-shots.
             bufSizeBase = 140000;
             bufSizeAdditional = 50000;
             bufSizeGrowth = 80000;
@@ -77,7 +81,6 @@ public class AdaptiveByteBufAllocatorGrowthTest {
                 SplittableRandom rng = new SplittableRandom();
                 for (int i = 0; i < 2000; i++) {
                     // Allocate buffers in various sizes.
-                    // For large buffers this exercises different buddy tree levels in the BuddyChunk.
                     int initialSize = bufSizeBase + rng.nextInt(bufSizeAdditional);
                     ByteBuf buf = allocator.heapBuffer(initialSize);
                     try {

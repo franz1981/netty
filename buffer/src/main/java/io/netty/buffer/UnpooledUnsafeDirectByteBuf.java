@@ -87,6 +87,11 @@ public class UnpooledUnsafeDirectByteBuf extends UnpooledDirectByteBuf {
         super(alloc, initialBuffer, maxCapacity, /* doFree = */ false, slice);
     }
 
+    /** Over {@code memory}, which it frees when released. */
+    UnpooledUnsafeDirectByteBuf(ByteBufAllocator alloc, CleanableDirectBuffer memory) {
+        super(alloc, memory);
+    }
+
     UnpooledUnsafeDirectByteBuf(ByteBufAllocator alloc, ByteBuffer initialBuffer, int maxCapacity, boolean doFree) {
         super(alloc, initialBuffer, maxCapacity, doFree, false);
     }

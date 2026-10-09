@@ -53,8 +53,16 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
 
     public AdaptiveByteBufAllocator(boolean preferDirect, boolean useCacheForNonEventLoopThreads) {
         super(preferDirect);
-        direct = new AdaptivePoolingAllocator(new DirectChunkAllocator(this), useCacheForNonEventLoopThreads);
-        heap = new AdaptivePoolingAllocator(new HeapChunkAllocator(this), useCacheForNonEventLoopThreads);
+        DirectChunkAllocator directChunks = new DirectChunkAllocator(this);
+        PageStoreConfig directConfig = PageStoreConfig.directDefaults();
+        // mmap regions where configured and libc can be bound (Java 22+ on Linux with native access), else one-block
+        // regions.
+        MmapRegionSource mmap = directConfig.regionSize > 0 && MmapRegionSource.isAvailable() ?
+                new MmapRegionSource(this) : null;
+        direct = new AdaptivePoolingAllocator(directChunks, useCacheForNonEventLoopThreads, mmap, directConfig);
+        HeapChunkAllocator heapChunks = new HeapChunkAllocator(this);
+        heap = new AdaptivePoolingAllocator(heapChunks, useCacheForNonEventLoopThreads, null,
+                PageStoreConfig.heapDefaults());
     }
 
     @Override
@@ -87,7 +95,17 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
-    private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    /** As {@link AdaptivePoolingAllocator#close()}, for both allocators: no live buffer of either. */
+    void close() {
+        try {
+            direct.close();
+        } finally {
+            heap.close();
+        }
+    }
+
+    /** Heap chunk buffers, and the blocks the size classes carve their chunks out of: one {@code byte[]} each. */
+    private static final class HeapChunkAllocator implements MemorySource {
         private final ByteBufAllocator allocator;
 
         private HeapChunkAllocator(ByteBufAllocator allocator) {
@@ -102,7 +120,12 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         }
     }
 
-    private static final class DirectChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
+    /**
+     * Direct chunk buffers, and the segments the size classes carve their chunks out of: both are libc {@code malloc}
+     * behind {@link UnsafeByteBufUtil#newDirectByteBuf} (or {@link java.nio.ByteBuffer#allocateDirect} without
+     * {@code Unsafe}, which touches every page at once).
+     */
+    private static final class DirectChunkAllocator implements MemorySource {
         private final ByteBufAllocator allocator;
 
         private DirectChunkAllocator(ByteBufAllocator allocator) {
