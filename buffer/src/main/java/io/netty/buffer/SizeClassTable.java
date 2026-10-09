@@ -21,7 +21,7 @@ import java.util.Arrays;
  * The size classes every {@link AdaptivePoolingAllocator} serves, the same for every allocator, and the chunk
  * geometry they take under one allocator's {@link PageStoreConfig}, built once from it: the page kinds (the span
  * lengths, in slices, a chunk may have) and, per size class, its chunk's slices, slots and leftover room. Immutable,
- * read by every heap and by the store's bins ({@link PageStore#binOf}).
+ * read by every heap and by the store's bins ({@link PageStore#binByLength}).
  */
 final class SizeClassTable {
     /** A size class's page holds at least this many slots, unless only the largest page kind fits it. */
@@ -89,27 +89,27 @@ final class SizeClassTable {
     private static final byte[] SIZE_INDEXES = new byte[SIZES[SIZES_COUNT - 1] / 32 + 1];
 
     static {
-        int lastIndex = 0;
+        int lastStep = 0;
         for (int i = 0; i < SIZES_COUNT; i++) {
             int sizeClass = SIZES[i];
             //noinspection ConstantValue
             assert (sizeClass & 31) == 0 : "Size class must be a multiple of 32";
-            int sizeIndex = sizeIndexOf(sizeClass);
-            Arrays.fill(SIZE_INDEXES, lastIndex + 1, sizeIndex + 1, (byte) i);
-            lastIndex = sizeIndex;
+            int step = sizeStep(sizeClass);
+            Arrays.fill(SIZE_INDEXES, lastStep + 1, step + 1, (byte) i);
+            lastStep = step;
         }
     }
 
-    private static int sizeIndexOf(final int size) {
-        // this is aligning the size to the next multiple of 32 and dividing by 32 to get the size index.
+    /** {@code size} in steps of 32 bytes, rounded up: its index in {@link #SIZE_INDEXES}. */
+    private static int sizeStep(final int size) {
         return size + 31 >> 5;
     }
 
     /** The size class of {@code size}, or {@link #SIZES_COUNT} above the largest size class. */
-    static int indexOf(int size) {
-        int sizeIndex = sizeIndexOf(size);
-        if (sizeIndex < SIZE_INDEXES.length) {
-            return SIZE_INDEXES[sizeIndex];
+    static int sizeClassIndex(int size) {
+        int step = sizeStep(size);
+        if (step < SIZE_INDEXES.length) {
+            return SIZE_INDEXES[step];
         }
         return SIZES_COUNT;
     }
@@ -119,7 +119,7 @@ final class SizeClassTable {
      * in slices, a size class's chunk may have. One slice; the largest divisor of the block up to an eighth of it;
      * the largest up to half of it; and the block itself if none of these holds the largest size class. Each divides
      * the block, so chunks of one kind tile it with no tail, and each kind is a bin of the store's blocks
-     * ({@link PageStore#binOf}). 64 slices: 1, 8, 32; 63: 1, 7, 21; 32: 1, 4, 16; 7: 1, 7.
+     * ({@link PageStore#binByLength}). 64 slices: 1, 8, 32; 63: 1, 7, 21; 32: 1, 4, 16; 7: 1, 7.
      */
     static int[] pageKinds(int blockSlices, int sliceSize) {
         int[] kinds = new int[4];
@@ -153,7 +153,7 @@ final class SizeClassTable {
      * The page kind, in slices, of a size class: the smallest of {@code kinds} with {@link #MIN_PAGE_SLOTS} slots or
      * more that leaves at most an eighth of the page unused at its end, else the largest.
      */
-    private static int pageSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
+    private static int pageSlices(int sizeClass, int[] kinds, int sliceSize) {
         for (int kind : kinds) {
             int page = kind * sliceSize;
             int slots = page / sizeClass;
@@ -165,12 +165,12 @@ final class SizeClassTable {
     }
 
     /**
-     * The slices of a size class's chunks: {@link #pageSlicesOf}, or for an exact fit of fewer than
+     * The slices of a size class's chunks: {@link #pageSlices}, or for an exact fit of fewer than
      * {@link #MIN_EXACT_FIT_SLOTS} slots the next kind, unless that is the largest, so that giving up one slot for the
      * colours costs little (see {@link #colourOffset}).
      */
-    static int chunkSlicesOf(int sizeClass, int[] kinds, int sliceSize) {
-        int kind = pageSlicesOf(sizeClass, kinds, sliceSize);
+    static int slicesPerChunk(int sizeClass, int[] kinds, int sliceSize) {
+        int kind = pageSlices(sizeClass, kinds, sliceSize);
         int k = Arrays.binarySearch(kinds, kind);
         for (;;) {
             int page = kinds[k] * sliceSize;
@@ -187,7 +187,7 @@ final class SizeClassTable {
      * The buffers a chunk of {@code chunkSize} bytes hands out: those that fit, less one an exact fit gives up for a
      * second colour when that buffer makes room for it (not the 32-byte class).
      */
-    static int chunkBuffersOf(int sizeClass, int chunkSize) {
+    static int slotsPerChunk(int sizeClass, int chunkSize) {
         int slots = chunkSize / sizeClass;
         int room = chunkSize - slots * sizeClass;
         return room < 1 << COLOUR_SHIFT && slots > 1 && room + sizeClass >= 1 << COLOUR_SHIFT ? slots - 1 : slots;
@@ -206,9 +206,9 @@ final class SizeClassTable {
 
     /** The page kinds of {@code config}'s blocks: see {@link #pageKinds}. */
     final int[] pageKinds;
-    /** Per size class, its chunk's slices: {@link #chunkSlicesOf} under {@link #pageKinds}. */
+    /** Per size class, its chunk's slices: {@link #slicesPerChunk} under {@link #pageKinds}. */
     final int[] chunkSlices;
-    /** Per size class, the buffers its chunk hands out: {@link #chunkBuffersOf}. */
+    /** Per size class, the buffers its chunk hands out: {@link #slotsPerChunk}. */
     final int[] slots;
     /** Per size class, its chunk size's tail its slots leave unused: the room {@link #colourOffset} rotates in. */
     final int[] room;
@@ -220,9 +220,9 @@ final class SizeClassTable {
         room = new int[SIZES_COUNT];
         for (int i = 0; i < SIZES_COUNT; i++) {
             int sizeClass = SIZES[i];
-            int slices = chunkSlicesOf(sizeClass, pageKinds, config.sliceSize);
+            int slices = slicesPerChunk(sizeClass, pageKinds, config.sliceSize);
             int chunkSize = slices * config.sliceSize;
-            int classSlots = chunkBuffersOf(sizeClass, chunkSize);
+            int classSlots = slotsPerChunk(sizeClass, chunkSize);
             chunkSlices[i] = slices;
             slots[i] = classSlots;
             room[i] = chunkSize - classSlots * sizeClass;

@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicLongFieldUpdater;
  * ({@link #claimRun}) and frees it with one ({@link #releaseRun}); between the two, the claimer alone touches those
  * slices' bits of {@link #committed} and their {@link #freedAt} and {@link #everCommitted}. The purger claims free
  * slices the same way before it purges them. A block holds spans of one length, its {@link #bin}: see
- * {@link PageStore#binOf}.
+ * {@link PageStore#binByLength}.
  */
 final class Segment {
     private static final AtomicLongFieldUpdater<Segment> FREE =
@@ -60,7 +60,7 @@ final class Segment {
      */
     private final boolean[] everCommitted;
     /**
-     * The bin of the first span claimed since the block was last empty: see {@link PageStore#binOf}. A hint, not
+     * The bin of the first span claimed since the block was last empty: see {@link PageStore#binByLength}. A hint, not
      * CASed: written by that claim after the CAS that found the block empty, so a claim racing it may still read
      * the previous bin.
      */
@@ -245,7 +245,7 @@ final class Segment {
      * reported to {@link PageStore#skip}, so the next pass comes when they are due. Racy on slices the purger does
      * not hold; it holds them before the call that decides.
      */
-    long idleOf(long bits, long now, long delay) {
+    long idleSlices(long bits, long now, long delay) {
         long idle = 0;
         for (long b = bits & committed; b != 0; b &= b - 1) {
             int slice = Long.numberOfTrailingZeros(b);

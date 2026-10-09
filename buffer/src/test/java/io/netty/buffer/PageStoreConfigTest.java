@@ -67,19 +67,19 @@ final class PageStoreConfigTest {
     /** The heap segment property is rounded down to whole slices, from 3 (one 132 KiB buffer) to 64. */
     @Test
     void heapSegmentSizeIsWholeSlices() {
-        assertEquals(3 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(100 * 1024));
-        assertEquals(7 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(8 * SLICE_SIZE_BYTES - 1));
-        assertEquals(64 * SLICE_SIZE_BYTES, PageStoreConfig.heapSegmentSizeOf(10 * 1024 * 1024));
+        assertEquals(3 * SLICE_SIZE_BYTES, PageStoreConfig.clampHeapSegmentSize(100 * 1024));
+        assertEquals(7 * SLICE_SIZE_BYTES, PageStoreConfig.clampHeapSegmentSize(8 * SLICE_SIZE_BYTES - 1));
+        assertEquals(64 * SLICE_SIZE_BYTES, PageStoreConfig.clampHeapSegmentSize(10 * 1024 * 1024));
         assertEquals(PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES, PageStoreConfig.heapDefaults().segmentSize);
     }
 
     /** The purge delay property is clamped to 10 ms .. 10 minutes. */
     @Test
     void purgeDelayIsClamped() {
-        assertEquals(10, PageStoreConfig.purgeDelayMillisOf(0));
-        assertEquals(10, PageStoreConfig.purgeDelayMillisOf(-5));
-        assertEquals(4000, PageStoreConfig.purgeDelayMillisOf(4000));
-        assertEquals(600000, PageStoreConfig.purgeDelayMillisOf(Long.MAX_VALUE));
+        assertEquals(10, PageStoreConfig.clampPurgeDelayMillis(0));
+        assertEquals(10, PageStoreConfig.clampPurgeDelayMillis(-5));
+        assertEquals(4000, PageStoreConfig.clampPurgeDelayMillis(4000));
+        assertEquals(600000, PageStoreConfig.clampPurgeDelayMillis(Long.MAX_VALUE));
     }
 
     /**
@@ -90,18 +90,18 @@ final class PageStoreConfigTest {
     void badRegionSizesAreClampedToTheNearestValid() {
         assertEquals(256 * MIB, PageStoreConfig.defaultRegionSize(SEGMENT_SIZE));
         assertEquals(128 * MIB, PageStoreConfig.defaultRegionSize(2 * MIB));
-        assertEquals(0, PageStoreConfig.regionSizeOf(0, SEGMENT_SIZE));
-        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(36 * MIB, SEGMENT_SIZE));
-        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(256 * MIB, SEGMENT_SIZE));
+        assertEquals(0, PageStoreConfig.clampRegionSize(0, SEGMENT_SIZE));
+        assertEquals(36 * MIB, PageStoreConfig.clampRegionSize(36 * MIB, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.clampRegionSize(256 * MIB, SEGMENT_SIZE));
         // Below the floor: clamped up to it.
-        assertEquals(8 * MIB, PageStoreConfig.regionSizeOf(-1, SEGMENT_SIZE));
-        assertEquals(8 * MIB, PageStoreConfig.regionSizeOf(4 * MIB, SEGMENT_SIZE));
+        assertEquals(8 * MIB, PageStoreConfig.clampRegionSize(-1, SEGMENT_SIZE));
+        assertEquals(8 * MIB, PageStoreConfig.clampRegionSize(4 * MIB, SEGMENT_SIZE));
         // Not a multiple of the segment size: rounded to the nearest one.
-        assertEquals(36 * MIB, PageStoreConfig.regionSizeOf(34 * MIB, SEGMENT_SIZE));
-        assertEquals(40 * MIB, PageStoreConfig.regionSizeOf(38 * MIB, SEGMENT_SIZE));
+        assertEquals(36 * MIB, PageStoreConfig.clampRegionSize(34 * MIB, SEGMENT_SIZE));
+        assertEquals(40 * MIB, PageStoreConfig.clampRegionSize(38 * MIB, SEGMENT_SIZE));
         // Above the ceiling: clamped down to it.
-        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(260 * MIB, SEGMENT_SIZE));
-        assertEquals(256 * MIB, PageStoreConfig.regionSizeOf(Integer.MAX_VALUE, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.clampRegionSize(260 * MIB, SEGMENT_SIZE));
+        assertEquals(256 * MIB, PageStoreConfig.clampRegionSize(Integer.MAX_VALUE, SEGMENT_SIZE));
         // The config itself: 2 to 64 whole segments, a power-of-two alignment.
         assertRejected(SEGMENT_SIZE, SEGMENT_SIZE, REGION_ALIGNMENT);
         assertRejected(SEGMENT_SIZE, 65 * SEGMENT_SIZE, REGION_ALIGNMENT);
@@ -121,17 +121,17 @@ final class PageStoreConfigTest {
      */
     @Test
     void badSegmentSizesAreClampedToTheNearestValid() {
-        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(0));
-        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(-1));
-        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(MIB));
-        assertEquals(2 * MIB, PageStoreConfig.segmentSizeOf(2 * MIB));
+        assertEquals(2 * MIB, PageStoreConfig.clampSegmentSize(0));
+        assertEquals(2 * MIB, PageStoreConfig.clampSegmentSize(-1));
+        assertEquals(2 * MIB, PageStoreConfig.clampSegmentSize(MIB));
+        assertEquals(2 * MIB, PageStoreConfig.clampSegmentSize(2 * MIB));
         // Exactly halfway between 2 and 4 MiB: rounds up.
-        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(3 * MIB));
-        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(4 * MIB));
-        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(5 * MIB));
-        assertEquals(4 * MIB, PageStoreConfig.segmentSizeOf(Integer.MAX_VALUE));
+        assertEquals(4 * MIB, PageStoreConfig.clampSegmentSize(3 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.clampSegmentSize(4 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.clampSegmentSize(5 * MIB));
+        assertEquals(4 * MIB, PageStoreConfig.clampSegmentSize(Integer.MAX_VALUE));
         for (int size = MIB; size <= 4 * MIB; size += 64 * 1024) {
-            int rounded = PageStoreConfig.segmentSizeOf(size);
+            int rounded = PageStoreConfig.clampSegmentSize(size);
             assertEquals(0, rounded % PageStoreConfig.REGION_ALIGNMENT_BYTES, "" + size);
             assertEquals(0, rounded % SLICE_SIZE_BYTES, "" + size);
         }

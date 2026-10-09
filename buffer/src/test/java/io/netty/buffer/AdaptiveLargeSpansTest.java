@@ -69,7 +69,7 @@ final class AdaptiveLargeSpansTest {
     }
 
     /** The heap allocator's block: one slice less than a direct one, 63 slices. */
-    private static final int HEAP_BLOCK = PageStoreConfig.heapSegmentSizeOf(SEGMENT_SIZE - SLICE);
+    private static final int HEAP_BLOCK = PageStoreConfig.clampHeapSegmentSize(SEGMENT_SIZE - SLICE);
 
     /** On regions of one heap block: one {@code byte[]} each. */
     private AdaptivePoolingAllocator heapAllocator() {

@@ -30,7 +30,7 @@ final class PageStoreConfig {
     /** Room for the largest size class (3 slices) with some to spare. */
     private static final int MIN_SEGMENT_SIZE_BYTES = 1024 * 1024;
     /** {@code io.netty.allocator.segmentSize}: the block size, a multiple of {@link #REGION_ALIGNMENT_BYTES}. */
-    static final int SEGMENT_SIZE_BYTES = segmentSizeOf(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
+    static final int SEGMENT_SIZE_BYTES = clampSegmentSize(SystemPropertyUtil.getInt("io.netty.allocator.segmentSize",
             AdaptivePoolingAllocator.IS_LOW_MEM ? 2 * 1024 * 1024 : MAX_SEGMENT_SIZE_BYTES));
     /** A direct allocator's regions start at a multiple of 2 MiB, so a THP-enabled kernel can back them whole. */
     static final int REGION_ALIGNMENT_BYTES = 2 * 1024 * 1024;
@@ -40,11 +40,11 @@ final class PageStoreConfig {
      * pages commit as they are touched. Regions of one block scatter the allocator's memory over as many mappings;
      * a larger region keeps its blocks in one.
      */
-    static final int SEGMENT_REGION_SIZE_BYTES = regionSizeOf(SystemPropertyUtil.getInt(
+    static final int SEGMENT_REGION_SIZE_BYTES = clampRegionSize(SystemPropertyUtil.getInt(
             "io.netty.allocator.segmentRegionSize", defaultRegionSize(SEGMENT_SIZE_BYTES)), SEGMENT_SIZE_BYTES);
 
     /** {@code io.netty.allocator.segmentPurgeDelay}: milliseconds a free slice stays free before it is purged. */
-    static final long PURGE_DELAY_MILLIS = purgeDelayMillisOf(
+    static final long PURGE_DELAY_MILLIS = clampPurgeDelayMillis(
             SystemPropertyUtil.getLong("io.netty.allocator.segmentPurgeDelay", 4000));
 
     /** The fewest slices of a heap allocator's block: one buffer of the largest size class takes 3. */
@@ -56,7 +56,7 @@ final class PageStoreConfig {
      * generation by the first collections. G1 collects young regions by count, so a size that fills its regions
      * whole gets more copied, and more memory resident, than one that leaves part of each region untouched.
      */
-    static final int HEAP_SEGMENT_SIZE_BYTES = heapSegmentSizeOf(SystemPropertyUtil.getInt(
+    static final int HEAP_SEGMENT_SIZE_BYTES = clampHeapSegmentSize(SystemPropertyUtil.getInt(
             "io.netty.allocator.heapSegmentSize", SEGMENT_SIZE_BYTES - SLICE_SIZE_BYTES));
 
     private static long clamp(long value, long min, long max) {
@@ -67,7 +67,7 @@ final class PageStoreConfig {
         return Math.round((double) value / unit) * unit;
     }
 
-    static long purgeDelayMillisOf(long millis) {
+    static long clampPurgeDelayMillis(long millis) {
         return clamp(millis, 10, 600000);
     }
 
@@ -75,14 +75,14 @@ final class PageStoreConfig {
         return Long.SIZE * segmentSize;
     }
 
-    static int regionSizeOf(int size, int segmentSize) {
+    static int clampRegionSize(int size, int segmentSize) {
         if (size == 0) {
             return 0;
         }
         return (int) clamp(round(size, segmentSize), 2L * segmentSize, (long) Long.SIZE * segmentSize);
     }
 
-    static int segmentSizeOf(int size) {
+    static int clampSegmentSize(int size) {
         long min = (MIN_SEGMENT_SIZE_BYTES + REGION_ALIGNMENT_BYTES - 1) / REGION_ALIGNMENT_BYTES
                 * (long) REGION_ALIGNMENT_BYTES;
         long max = MAX_SEGMENT_SIZE_BYTES / REGION_ALIGNMENT_BYTES * (long) REGION_ALIGNMENT_BYTES;
@@ -90,7 +90,7 @@ final class PageStoreConfig {
     }
 
     /** {@code size} rounded down to whole slices, from {@link #MIN_HEAP_SEGMENT_SLICES} to {@link Long#SIZE}. */
-    static int heapSegmentSizeOf(int size) {
+    static int clampHeapSegmentSize(int size) {
         return (int) clamp(size / SLICE_SIZE_BYTES, MIN_HEAP_SEGMENT_SLICES, Long.SIZE) * SLICE_SIZE_BYTES;
     }
 

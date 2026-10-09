@@ -125,7 +125,7 @@ final class SharedSlicesTest {
         Segment eights = block(store, store.claimSlices(8, false));
         Segment ones = block(store, store.claimSlices(1, false));
         assertEquals(1, store.id(ones), "block 1 of region 0");
-        int bin1 = store.binOf[1];
+        int bin1 = store.binByLength[1];
         store.mark(bin1, store.id(eights));
         assertEquals(PER_BLOCK + 1, slice(store.claimSlices(1, false)), "not in the 8-slice bin's block");
         assertFalse(store.marked(bin1, eights));
@@ -208,7 +208,7 @@ final class SharedSlicesTest {
 
     private static void assertBins(PageStore store, int... lengths) {
         for (int n : lengths) {
-            assertTrue(store.binOf[n] != store.otherBin, n + " slices: not a page kind");
+            assertTrue(store.binByLength[n] != store.otherBin, n + " slices: not a page kind");
         }
     }
 

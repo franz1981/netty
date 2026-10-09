@@ -45,7 +45,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * No heap owns a block. A heap takes a span with one CAS on the block's bitmap ({@link #claimSlices}) and gives it
  * back with one ({@link Segment#releaseRun}), from any thread: the slices of a chunk one heap gave back are a
  * chunk of any heap's at once, so a heap that stops using a size class keeps no memory from the others. A block
- * holds spans of one length only, its bin, found through {@link #maps}: see {@link #binOf}.
+ * holds spans of one length only, its bin, found through {@link #maps}: see {@link #binByLength}.
  * <p>
  * Idle memory goes back to the OS from the allocation paths, with no thread of its own: a freed span arms the
  * purge ({@link #armPurge}); once {@link PageStoreConfig#purgeDelayNanos} passed, the next allocation that looks
@@ -81,7 +81,7 @@ final class PageStore {
      * ({@link SizeClassTable#pageKinds}), the chunks' lengths; every other length, a large buffer's, shares
      * {@link #otherBin}.
      */
-    final byte[] binOf;
+    final byte[] binByLength;
     final int otherBin;
     /**
      * Per bin, the span length its bit in {@link #maps} promises room for: 1 for {@link #otherBin}, whose spans
@@ -169,12 +169,12 @@ final class PageStore {
         int perBlock = config.slicesPerSegment();
         int[] kinds = allocator.table.pageKinds;
         otherBin = kinds.length;
-        binOf = new byte[perBlock + 1];
-        Arrays.fill(binOf, (byte) otherBin);
+        binByLength = new byte[perBlock + 1];
+        Arrays.fill(binByLength, (byte) otherBin);
         binSlices = new int[otherBin + 1];
         binSlices[otherBin] = 1;
         for (int bin = 0; bin < kinds.length; bin++) {
-            binOf[kinds[bin]] = (byte) bin;
+            binByLength[kinds[bin]] = (byte) bin;
             binSlices[bin] = kinds[bin];
         }
         emptyMap = otherBin + 1;
@@ -259,7 +259,7 @@ final class PageStore {
                 }
             } else {
                 Segment block = region.blocks[0];
-                first = block.claimFirst(slices, binOf[slices]) ? 0 : -1;
+                first = block.claimFirst(slices, binByLength[slices]) ? 0 : -1;
             }
             grown[index] = region;
             regions = grown;
@@ -291,7 +291,7 @@ final class PageStore {
      * thread.
      */
     long claimSlices(int slices, boolean threadLocal) {
-        int bin = binOf[slices];
+        int bin = binByLength[slices];
         for (;;) {
             Region[] regions = this.regions;
             long run = claimFit(regions, bin, slices);
@@ -317,7 +317,7 @@ final class PageStore {
         for (int w = 0; w < words; w++) {
             for (long bits = maps.get(base + w); bits != 0; bits &= bits - 1) {
                 int id = w << 6 | Long.numberOfTrailingZeros(bits);
-                Segment block = blockOf(regions, id);
+                Segment block = blockWithId(regions, id);
                 if (block == null) {
                     // A region published in the maps but not yet in the regions this claim read.
                     continue;
@@ -346,7 +346,7 @@ final class PageStore {
         for (int w = 0; w < words; w++) {
             for (long bits = maps.get(base + w); bits != 0; bits &= bits - 1) {
                 int id = w << 6 | Long.numberOfTrailingZeros(bits);
-                Segment block = blockOf(regions, id);
+                Segment block = blockWithId(regions, id);
                 if (block == null) {
                     continue;
                 }
@@ -398,7 +398,7 @@ final class PageStore {
         return map == emptyMap ? block.isEmpty() : block.bin == map && block.hasFit(binSlices[map]);
     }
 
-    private Segment blockOf(Region[] regions, int id) {
+    private Segment blockWithId(Region[] regions, int id) {
         int index = id >>> idShift;
         if (index >= regions.length) {
             return null;
@@ -447,7 +447,7 @@ final class PageStore {
     /** Clears bit {@code id} of {@code map}, found wrong by a claim; sets it again if a release meanwhile earned it. */
     private void unmark(int map, int id) {
         if (clear(map, id)) {
-            Segment block = blockOf(regions, id);
+            Segment block = blockWithId(regions, id);
             if (block != null && hasBitIn(map, block)) {
                 mark(map, id);
             }
@@ -809,12 +809,12 @@ final class PageStore {
     private long purgeBlock(Segment block, long now, long budget) {
         long delay = config.purgeDelayNanos;
         long bytes = 0;
-        long candidates = block.idleOf(block.free, now, delay);
+        long candidates = block.idleSlices(block.free, now, delay);
         while (candidates != 0 && bytes < budget) {
             long run = lowestRun(candidates);
             candidates &= ~run;
             long claimed = block.claimFree(run);
-            long exact = block.idleOf(claimed, now, delay);
+            long exact = block.idleSlices(claimed, now, delay);
             if (exact != claimed) {
                 block.unclaim(claimed & ~exact);
             }

@@ -66,12 +66,12 @@ public class AdaptiveSegmentsTest {
 
     /** Slices of the chunk of each size class in this test's blocks. */
     private static int expectedSlices(int sizeClass) {
-        return SizeClassTable.chunkSlicesOf(sizeClass, KINDS, SLICE_SIZE_BYTES);
+        return SizeClassTable.slicesPerChunk(sizeClass, KINDS, SLICE_SIZE_BYTES);
     }
 
     /** The buffers a chunk hands out: an exact fit gives one up for its colours. */
     private static int expectedBuffers(int sizeClass) {
-        return SizeClassTable.chunkBuffersOf(sizeClass, expectedSlices(sizeClass) * SLICE_SIZE_BYTES);
+        return SizeClassTable.slotsPerChunk(sizeClass, expectedSlices(sizeClass) * SLICE_SIZE_BYTES);
     }
 
     private static boolean isLowMemory() throws Exception {
@@ -539,7 +539,7 @@ public class AdaptiveSegmentsTest {
      * The defaults: 4 MiB segments in 64-segment regions; 2 MiB segments in low-memory mode, where the single stripe
      * carves its chunks out of segments too. {@code mmap} regions wherever they can be mapped, for direct memory only;
      * else regions of one block, as heap memory always has. The memory accounted is a segment, direct or heap. Heap
-     * segments are cut under G1 (see {@link PageStoreConfig#heapSegmentSizeOf}).
+     * segments are cut under G1 (see {@link PageStoreConfig#clampHeapSegmentSize}).
      */
     @Test
     void segmentDefaultsFollowTheMemoryMode() throws Exception {
@@ -600,7 +600,7 @@ public class AdaptiveSegmentsTest {
             for (int j = 0; j < 2; j++) {
                 ByteBuf buf = allocator.allocate(size, size);
                 SizeClassedChunk chunk = chunkOf(buf);
-                int slices = SizeClassTable.chunkSlicesOf(size, kinds, SLICE_SIZE_BYTES);
+                int slices = SizeClassTable.slicesPerChunk(size, kinds, SLICE_SIZE_BYTES);
                 assertEquals(slices * SLICE_SIZE_BYTES, chunk.capacity, "size " + size);
                 long offset = offsetIn(buf, chunk.segment);
                 assertTrue(offset >= 0 && offset + size <= segmentSize, "size " + size + " outside its segment");

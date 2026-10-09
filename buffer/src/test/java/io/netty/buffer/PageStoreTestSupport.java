@@ -220,7 +220,7 @@ final class PageStoreTestSupport {
 
     /** The bytes of a chunk of {@code size}'s class under {@code config}: its page kind's slices. */
     static int chunkSizeOf(int size, PageStoreConfig config) {
-        int index = AdaptivePoolingAllocator.sizeClassIndexOf(size);
+        int index = SizeClassTable.sizeClassIndex(size);
         return new SizeClassTable(config).chunkSlices[index] * config.sliceSize;
     }
 

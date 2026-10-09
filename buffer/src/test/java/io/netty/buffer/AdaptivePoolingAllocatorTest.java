@@ -68,7 +68,7 @@ class AdaptivePoolingAllocatorTest {
     private static void assertSizeClassOf(int expectedSizeClass, int previousSizeIncluded, int maxSizeIncluded) {
         for (int size = previousSizeIncluded; size <= maxSizeIncluded; size++) {
             int sizeToTest = size;
-            assertEquals(expectedSizeClass, AdaptivePoolingAllocator.sizeClassIndexOf(size),
+            assertEquals(expectedSizeClass, SizeClassTable.sizeClassIndex(size),
                          () -> "size = " + sizeToTest);
         }
     }

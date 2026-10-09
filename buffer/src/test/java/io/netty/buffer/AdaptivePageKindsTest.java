@@ -41,10 +41,10 @@ public class AdaptivePageKindsTest {
         for (int blockSlices : new int[] {64, 63, 32}) {
             int[] kinds = SizeClassTable.pageKinds(blockSlices, SLICE_SIZE_BYTES);
             for (int sizeClass : SizeClassTable.SIZES) {
-                int page = SizeClassTable.chunkSlicesOf(sizeClass, kinds, SLICE_SIZE_BYTES)
+                int page = SizeClassTable.slicesPerChunk(sizeClass, kinds, SLICE_SIZE_BYTES)
                         * SLICE_SIZE_BYTES;
                 int fit = page / sizeClass;
-                int buffers = SizeClassTable.chunkBuffersOf(sizeClass, page);
+                int buffers = SizeClassTable.slotsPerChunk(sizeClass, page);
                 assertTrue(page - fit * sizeClass <= page >>> 3, blockSlices + " slices, class " + sizeClass);
                 assertTrue(buffers == fit || buffers == fit - 1, "class " + sizeClass);
             }

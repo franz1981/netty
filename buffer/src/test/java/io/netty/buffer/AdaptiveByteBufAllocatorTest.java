@@ -184,7 +184,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /**
      * Whether the heap allocator pools buffers of {@code size}: up to a block, which G1 regions below 16 MiB make
-     * smaller than 4 MiB (see {@link PageStoreConfig#heapSegmentSizeOf}).
+     * smaller than 4 MiB (see {@link PageStoreConfig#clampHeapSegmentSize}).
      */
     static boolean heapSegmentsHold(AdaptiveByteBufAllocator allocator, int size) {
         return size <= heapSegmentSize(allocator);
@@ -915,7 +915,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         Object heap = threadLocalHeap(allocator);
         Field magsField = heap.getClass().getDeclaredField("magazines");
         magsField.setAccessible(true);
-        Object mag = ((Object[]) magsField.get(heap))[AdaptivePoolingAllocator.sizeClassIndexOf(size)];
+        Object mag = ((Object[]) magsField.get(heap))[SizeClassTable.sizeClassIndex(size)];
         Field currentField = mag.getClass().getDeclaredField("current");
         currentField.setAccessible(true);
         return currentField.get(mag);
@@ -1049,7 +1049,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     private static Object magazineCurrent(Object heap, int size) throws Exception {
         Field magsField = heap.getClass().getDeclaredField("magazines");
         magsField.setAccessible(true);
-        Object mag = ((Object[]) magsField.get(heap))[AdaptivePoolingAllocator.sizeClassIndexOf(size)];
+        Object mag = ((Object[]) magsField.get(heap))[SizeClassTable.sizeClassIndex(size)];
         Field currentField = mag.getClass().getDeclaredField("current");
         currentField.setAccessible(true);
         return currentField.get(mag);

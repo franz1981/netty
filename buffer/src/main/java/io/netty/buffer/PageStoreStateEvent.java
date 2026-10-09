@@ -137,7 +137,7 @@ final class PageStoreStateEvent extends Event {
             int runStart = 0;
             int runState = -1;
             for (int slot = 0; slot <= units; slot++) {
-                int state = slot == units ? -1 : sliceStateOf(region, slot, perBlock);
+                int state = slot == units ? -1 : sliceState(region, slot, perBlock);
                 if (state != runState) {
                     if (runState >= 0) {
                         long bytes = (slot - runStart) * sliceSize;
@@ -170,7 +170,7 @@ final class PageStoreStateEvent extends Event {
         }
     }
 
-    private static int sliceStateOf(Region region, int slice, int perBlock) {
+    private static int sliceState(Region region, int slice, int perBlock) {
         return region.blocks[slice / perBlock].sliceState(slice % perBlock);
     }
 

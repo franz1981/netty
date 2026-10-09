@@ -125,7 +125,7 @@ final class AdaptivePoolingAllocator {
 
     /** Number of size classes that are pooled: all of them, except in low-memory mode. */
     private static final int POOLED_SIZE_CLASSES_COUNT =
-            IS_LOW_MEM ? sizeClassIndexOf(LOW_MEM_MAX_SIZE_CLASS) + 1 : SIZE_CLASSES_COUNT;
+            IS_LOW_MEM ? SizeClassTable.sizeClassIndex(LOW_MEM_MAX_SIZE_CLASS) + 1 : SIZE_CLASSES_COUNT;
 
     private final MemorySource memory;
     private final LongAdder usedMemory = new LongAdder();
@@ -206,7 +206,7 @@ final class AdaptivePoolingAllocator {
     private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
         AdaptiveByteBuf allocated = null;
         if (size <= MAX_POOLED_BUF_SIZE) {
-            final int index = sizeClassIndexOf(size);
+            final int index = SizeClassTable.sizeClassIndex(size);
             // Above the size classes: a thread with its own heap never takes a stripe lock for these either.
             if (index < POOLED_SIZE_CLASSES_COUNT || !IS_LOW_MEM) {
                 Heap heap = null;
@@ -281,11 +281,6 @@ final class AdaptivePoolingAllocator {
         }
         STRIPE_SCAN_LENGTH.compareAndSet(this, current, current << 1);
         return true;
-    }
-
-    /** The size class of {@code size}: see {@link SizeClassTable#indexOf}. */
-    static int sizeClassIndexOf(int size) {
-        return SizeClassTable.indexOf(size);
     }
 
     private AdaptiveByteBuf allocateFallback(int size, int maxCapacity, AdaptiveByteBuf buf) {
