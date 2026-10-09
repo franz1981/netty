@@ -17,9 +17,7 @@ package io.netty.util.internal;
 
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -29,27 +27,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 class PlatformDependentMmapTest {
 
-    /**
-     * A failed call says why with its errno: ENOMEM (12) for a mapping larger than the address space, EINVAL (22)
-     * for an address that is not on a page.
-     */
+    /** A failed call throws: a mapping larger than the address space, an address that is not on a page. */
     @Test
-    void failuresCarryTheErrno() {
+    void failuresThrow() {
         assumeTrue(PlatformDependent.hasMmap(), "mmap(2) is not linked here");
 
-        NativeCallException tooLarge = assertThrows(NativeCallException.class,
-                () -> PlatformDependent.mmapAnonymous(1L << 62));
-        assertEquals(12, tooLarge.errno());
-        assertTrue(tooLarge.getMessage().endsWith(": errno 12"), tooLarge.getMessage());
-
-        NativeCallException unmap = assertThrows(NativeCallException.class,
-                () -> PlatformDependent.munmap(1, 4096));
-        assertEquals(22, unmap.errno());
-        assertTrue(unmap.getMessage().endsWith(": errno 22"), unmap.getMessage());
-
-        NativeCallException advise = assertThrows(NativeCallException.class,
-                () -> PlatformDependent.madviseDontNeed(1, 4096));
-        assertEquals(22, advise.errno());
-        assertTrue(advise.getMessage().endsWith(": errno 22"), advise.getMessage());
+        assertThrows(NativeCallException.class, () -> PlatformDependent.mmapAnonymous(1L << 62));
+        assertThrows(NativeCallException.class, () -> PlatformDependent.munmap(1, 4096));
+        assertThrows(NativeCallException.class, () -> PlatformDependent.madviseDontNeed(1, 4096));
     }
 }

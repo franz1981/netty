@@ -16,20 +16,12 @@
 package io.netty.util.internal;
 
 /**
- * A linked native call ({@code mmap}, {@code munmap}, {@code madvise}) failed; {@link #errno()} is the C errno it
- * reported.
+ * A linked native call ({@code mmap}, {@code munmap}, {@code madvise}) failed.
  */
 public final class NativeCallException extends RuntimeException {
     private static final long serialVersionUID = 1L;
 
-    private final int errno;
-
-    NativeCallException(String message, int errno) {
+    NativeCallException(String message) {
         super(message);
-        this.errno = errno;
-    }
-
-    public int errno() {
-        return errno;
     }
 }

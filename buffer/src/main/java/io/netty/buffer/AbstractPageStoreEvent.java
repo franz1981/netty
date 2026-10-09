@@ -38,6 +38,6 @@ abstract class AbstractPageStoreEvent extends Event {
     public long length;
     @Description("Index of the page store region the range is in, or -1")
     public int region;
-    @Description("errno of the failed call, 0 when it succeeded, -1 when it failed with no errno")
-    public int errno;
+    @Description("Whether the call failed")
+    public boolean failed;
 }

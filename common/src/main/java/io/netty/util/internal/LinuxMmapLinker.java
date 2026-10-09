@@ -44,18 +44,9 @@ final class LinuxMmapLinker {
     private static final int MADV_DONTNEED = 4;
     private static final long MAP_FAILED = -1L;
 
-    // Each syscall is bound twice: the plain downcall a successful call pays for alone, and one that also
-    // captures errno in a leading capture-state segment, typed Object, used only once a call fails.
     private static final MethodHandle MMAP;
     private static final MethodHandle MUNMAP;
     private static final MethodHandle MADVISE;
-    private static final MethodHandle MMAP_CAPTURING;
-    private static final MethodHandle MUNMAP_CAPTURING;
-    private static final MethodHandle MADVISE_CAPTURING;
-    private static final MethodHandle OPEN_ARENA;
-    private static final MethodHandle NEW_CALL_STATE;
-    private static final MethodHandle CLOSE_ARENA;
-    private static final MethodHandle ERRNO;
     /** {@code (long address, long size) -> ByteBuffer}, via {@code MemorySegment.ofAddress(...).reinterpret(...)}. */
     private static final MethodHandle WRAP;
 
@@ -63,13 +54,6 @@ final class LinuxMmapLinker {
         MethodHandle mmap = null;
         MethodHandle munmap = null;
         MethodHandle madvise = null;
-        MethodHandle mmapCapturing = null;
-        MethodHandle munmapCapturing = null;
-        MethodHandle madviseCapturing = null;
-        MethodHandle openArena = null;
-        MethodHandle newCallState = null;
-        MethodHandle closeArena = null;
-        MethodHandle errno = null;
         MethodHandle wrap = null;
         Throwable error = null;
         try {
@@ -101,8 +85,6 @@ final class LinuxMmapLinker {
             Class<?> symbolLookupCls = Class.forName("java.lang.foreign.SymbolLookup");
             Class<?> memSegCls = Class.forName("java.lang.foreign.MemorySegment");
             Class<?> funcDescCls = Class.forName("java.lang.foreign.FunctionDescriptor");
-            Class<?> arenaCls = Class.forName("java.lang.foreign.Arena");
-            Class<?> pathElementCls = Class.forName("java.lang.foreign.MemoryLayout$PathElement");
 
             Class<?> addressLayoutCls = Class.forName("java.lang.foreign.AddressLayout");
             Object addressLayout = lookup.findStaticGetter(valueLayoutCls, "ADDRESS", addressLayoutCls).invoke();
@@ -123,46 +105,16 @@ final class LinuxMmapLinker {
             MethodHandle descriptorOf = lookup.findStatic(funcDescCls, "of", methodType(funcDescCls,
                     memoryLayoutCls, Array.newInstance(memoryLayoutCls, 0).getClass())).asFixedArity();
             Object noOptions = Array.newInstance(linkerOptionCls, 0);
-            Object captureErrno = Array.newInstance(linkerOptionCls, 1);
-            Array.set(captureErrno, 0, lookup.findStatic(linkerOptionCls, "captureCallState",
-                    methodType(linkerOptionCls, String[].class)).asFixedArity().invoke(new String[] {"errno"}));
             Object longLayout = lookup.findStaticGetter(valueLayoutCls, "JAVA_LONG",
                     Class.forName("java.lang.foreign.ValueLayout$OfLong")).invoke();
             Object intLayout = lookup.findStaticGetter(valueLayoutCls, "JAVA_INT", ofIntCls).invoke();
 
             mmap = link(memoryLayoutCls, descriptorOf, find, downcall, noOptions,
                     "mmap", longLayout, longLayout, longLayout, intLayout, intLayout, intLayout, longLayout);
-            mmapCapturing = link(memoryLayoutCls, descriptorOf, find, downcall, captureErrno,
-                    "mmap", longLayout, longLayout, longLayout, intLayout, intLayout, intLayout, longLayout);
             munmap = link(memoryLayoutCls, descriptorOf, find, downcall, noOptions,
-                    "munmap", intLayout, longLayout, longLayout);
-            munmapCapturing = link(memoryLayoutCls, descriptorOf, find, downcall, captureErrno,
                     "munmap", intLayout, longLayout, longLayout);
             madvise = link(memoryLayoutCls, descriptorOf, find, downcall, noOptions,
                     "madvise", intLayout, longLayout, longLayout, intLayout);
-            madviseCapturing = link(memoryLayoutCls, descriptorOf, find, downcall, captureErrno,
-                    "madvise", intLayout, longLayout, longLayout, intLayout);
-
-            // The errno rule: a capture state is a MemorySegment, allocated per call in a confined Arena; its
-            // "errno" field sits at a fixed offset in Linker.Option.captureStateLayout().
-            Object stateLayout = lookup.findStatic(linkerOptionCls, "captureStateLayout",
-                    methodType(Class.forName("java.lang.foreign.StructLayout"))).invoke();
-            Object errnoPath = Array.newInstance(pathElementCls, 1);
-            Array.set(errnoPath, 0, lookup.findStatic(pathElementCls, "groupElement",
-                    methodType(pathElementCls, String.class)).invoke("errno"));
-            long errnoOffset = (Long) lookup.findVirtual(memoryLayoutCls, "byteOffset",
-                    methodType(long.class, errnoPath.getClass())).asFixedArity().invoke(stateLayout, errnoPath);
-            openArena = lookup.findStatic(arenaCls, "ofConfined", methodType(arenaCls))
-                    .asType(methodType(Object.class));
-            newCallState = MethodHandles.insertArguments(lookup.findVirtual(
-                    Class.forName("java.lang.foreign.SegmentAllocator"), "allocate",
-                    methodType(memSegCls, memoryLayoutCls)), 1, stateLayout)
-                    .asType(methodType(Object.class, Object.class));
-            closeArena = lookup.findVirtual(arenaCls, "close", methodType(void.class))
-                    .asType(methodType(void.class, Object.class));
-            errno = MethodHandles.insertArguments(lookup.findVirtual(memSegCls, "get",
-                    methodType(int.class, ofIntCls, long.class)), 1, intLayout, errnoOffset)
-                    .asType(methodType(int.class, Object.class));
 
             MethodHandle ofAddress = lookup.findStatic(memSegCls, "ofAddress", methodType(memSegCls, long.class));
             MethodHandle reinterpret = lookup.findVirtual(memSegCls, "reinterpret",
@@ -176,13 +128,6 @@ final class LinuxMmapLinker {
         MMAP = mmap;
         MUNMAP = munmap;
         MADVISE = madvise;
-        MMAP_CAPTURING = mmapCapturing;
-        MUNMAP_CAPTURING = munmapCapturing;
-        MADVISE_CAPTURING = madviseCapturing;
-        OPEN_ARENA = openArena;
-        NEW_CALL_STATE = newCallState;
-        CLOSE_ARENA = closeArena;
-        ERRNO = errno;
         WRAP = wrap;
         if (error == null) {
             logger.debug("mmap(2): available");
@@ -194,7 +139,7 @@ final class LinuxMmapLinker {
     private LinuxMmapLinker() {
     }
 
-    /** The downcall of {@code name}; with a capture option, its leading capture-state segment typed {@code Object}. */
+    /** The downcall of {@code name}. */
     private static MethodHandle link(Class<?> memoryLayoutCls, MethodHandle descriptorOf, MethodHandle find,
             MethodHandle downcall, Object options, String name, Object returnLayout, Object... argumentLayouts)
             throws Throwable {
@@ -207,9 +152,7 @@ final class LinuxMmapLinker {
         if (!symbol.isPresent()) {
             throw new UnsupportedOperationException(name + " is not in the default lookup");
         }
-        MethodHandle handle = (MethodHandle) downcall.invoke(symbol.get(), descriptor, options);
-        return Array.getLength(options) == 0 ? handle
-                : handle.asType(handle.type().changeParameterType(0, Object.class));
+        return (MethodHandle) downcall.invoke(symbol.get(), descriptor, options);
     }
 
     static boolean isAvailable() {
@@ -224,7 +167,10 @@ final class LinuxMmapLinker {
         } catch (Throwable t) {
             throw new Error(t);
         }
-        return address != MAP_FAILED ? address : mmapCapturing(length);
+        if (address == MAP_FAILED) {
+            throw new NativeCallException("mmap(2) failed to map " + length + " bytes");
+        }
+        return address;
     }
 
     static void munmap(long address, long length) {
@@ -235,7 +181,8 @@ final class LinuxMmapLinker {
             throw new Error(t);
         }
         if (result != 0) {
-            munmapCapturing(address, length);
+            throw new NativeCallException("munmap(2) failed for " + length + " bytes at 0x"
+                    + Long.toHexString(address));
         }
     }
 
@@ -247,7 +194,8 @@ final class LinuxMmapLinker {
             throw new Error(t);
         }
         if (result != 0) {
-            madviseCapturing(address, length);
+            throw new NativeCallException("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
+                    + Long.toHexString(address));
         }
     }
 
@@ -258,101 +206,6 @@ final class LinuxMmapLinker {
         } catch (Throwable t) {
             PlatformDependent.throwException(t);
             return null;
-        }
-    }
-
-    // A failed mmap/munmap changed no mapping and madvise(DONTNEED) is idempotent, so the retry is safe.
-    private static long mmapCapturing(long length) {
-        Object[] capture = beginCapture();
-        Object state = capture[1];
-        try {
-            long address;
-            try {
-                address = (long) MMAP_CAPTURING.invokeExact(state, 0L, length, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0L);
-            } catch (Throwable t) {
-                throw new Error(t);
-            }
-            if (address == MAP_FAILED) {
-                throw fail("mmap(2) failed to map " + length + " bytes", state);
-            }
-            return address;
-        } finally {
-            endCapture(capture);
-        }
-    }
-
-    private static void munmapCapturing(long address, long length) {
-        Object[] capture = beginCapture();
-        Object state = capture[1];
-        try {
-            int result;
-            try {
-                result = (int) MUNMAP_CAPTURING.invokeExact(state, address, length);
-            } catch (Throwable t) {
-                throw new Error(t);
-            }
-            if (result != 0) {
-                throw fail("munmap(2) failed for " + length + " bytes at 0x" + Long.toHexString(address), state);
-            }
-        } finally {
-            endCapture(capture);
-        }
-    }
-
-    private static void madviseCapturing(long address, long length) {
-        Object[] capture = beginCapture();
-        Object state = capture[1];
-        try {
-            int result;
-            try {
-                result = (int) MADVISE_CAPTURING.invokeExact(state, address, length, MADV_DONTNEED);
-            } catch (Throwable t) {
-                throw new Error(t);
-            }
-            if (result != 0) {
-                throw fail("madvise(MADV_DONTNEED) failed for " + length + " bytes at 0x"
-                        + Long.toHexString(address), state);
-            }
-        } finally {
-            endCapture(capture);
-        }
-    }
-
-    /** Built only once a call has failed: {@code what} plus the errno the capture state holds for it. */
-    private static NativeCallException fail(String what, Object state) {
-        int errno = errno(state);
-        return new NativeCallException(what + ": errno " + errno, errno);
-    }
-
-    /** A confined arena, open for one retry, and its capture-state segment: {@code [arena, state]}. */
-    private static Object[] beginCapture() {
-        Object arena;
-        try {
-            arena = (Object) OPEN_ARENA.invokeExact();
-        } catch (Throwable t) {
-            throw new Error(t);
-        }
-        try {
-            return new Object[] {arena, (Object) NEW_CALL_STATE.invokeExact(arena)};
-        } catch (Throwable t) {
-            throw new Error(t);
-        }
-    }
-
-    private static void endCapture(Object[] capture) {
-        try {
-            CLOSE_ARENA.invokeExact(capture[0]);
-        } catch (Throwable t) {
-            throw new Error(t);
-        }
-    }
-
-    private static int errno(Object state) {
-        try {
-            return (int) ERRNO.invokeExact(state);
-        } catch (Throwable t) {
-            throw new Error(t);
         }
     }
 }

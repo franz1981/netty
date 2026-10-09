@@ -37,6 +37,7 @@ import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -133,7 +134,7 @@ public class PageStoreJfrTest {
         }
         long purged = 0;
         for (RecordedEvent purge : named(PageStorePurgeEvent.NAME)) {
-            assertEquals(0, purge.getInt("errno"));
+            assertFalse(purge.getBoolean("failed"));
             purged += purge.getLong("length");
         }
         assertEquals(out, purged, "the span's slices and the block's");

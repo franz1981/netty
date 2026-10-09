@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.internal.NativeCallException;
 import io.netty.util.internal.PlatformDependent;
 
 /** {@link PageStoreMapEvent} / {@link PageStorePurgeEvent} / {@link PageStoreUnmapEvent}: one around each syscall. */
@@ -51,24 +50,8 @@ final class PageStoreEvents {
             event.address = address;
             event.length = length;
             event.region = region;
-            event.errno = failure == null ? 0 : errnoOf(failure);
+            event.failed = failure != null;
             event.commit();
         }
-    }
-
-    /** The errno of the {@link NativeCallException} behind {@code failure}, or one it caused or suppressed; else -1. */
-    private static int errnoOf(Throwable failure) {
-        for (Throwable t = failure; t != null; t = t.getCause()) {
-            if (t instanceof NativeCallException) {
-                return ((NativeCallException) t).errno();
-            }
-            for (Throwable suppressed : t.getSuppressed()) {
-                int errno = errnoOf(suppressed);
-                if (errno != -1) {
-                    return errno;
-                }
-            }
-        }
-        return -1;
     }
 }
