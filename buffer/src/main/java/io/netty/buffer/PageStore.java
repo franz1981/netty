@@ -81,15 +81,15 @@ final class PageStore {
      * ({@link SizeClassTable#pageKinds}), the chunks' lengths; every other length, a large buffer's, shares
      * {@link #otherBin}.
      */
-    final byte[] binByLength;
-    final int otherBin;
+    private final byte[] binByLength;
+    private final int otherBin;
     /**
      * Per bin, the span length its bit in {@link #maps} promises room for: 1 for {@link #otherBin}, whose spans
      * are of any length.
      */
-    final int[] binSlices;
+    private final int[] binSlices;
     /** The index of the empty blocks' bitmap in {@link #maps}, after the bins' bitmaps. */
-    final int emptyMap;
+    private final int emptyMap;
     /** A block's id, its bit in each of {@link #maps}, is its region's index shifted by this, or'ed with its slot. */
     private final int idShift;
     /**
@@ -100,12 +100,12 @@ final class PageStore {
      */
     private volatile AtomicLongArray maps;
     /** Where regions of one block come from, while {@link #mmap} is {@code null}. */
-    final MemorySource memory;
+    private final MemorySource memory;
     /**
      * Where regions are mapped; {@code null} when mapping is not available, or once it failed and was given up:
      * regions are then one block each, from {@link #memory}.
      */
-    volatile MmapRegionSource mmap;
+    private volatile MmapRegionSource mmap;
     /** The blocks of the next region, and its alignment: 1 and 0 once {@link #mmap} failed and was given up. */
     private volatile int regionBlocks;
     private int regionAlignment;
@@ -389,7 +389,7 @@ final class PageStore {
         }
     }
 
-    int id(Segment block) {
+    private int id(Segment block) {
         return block.region.index << idShift | block.slot;
     }
 
@@ -409,7 +409,7 @@ final class PageStore {
     }
 
     /** Sets bit {@code id} of {@code map}; again in the longer copy if {@link #growMaps} replaced it meanwhile. */
-    void mark(int map, int id) {
+    private void mark(int map, int id) {
         AtomicLongArray maps = this.maps;
         long bit = 1L << id;
         for (;;) {
@@ -495,13 +495,6 @@ final class PageStore {
                 }
             }
         }
-    }
-
-    /** Whether the bit of {@code block} is set in {@code map}. Racy; for the tests. */
-    boolean marked(int map, Segment block) {
-        AtomicLongArray maps = this.maps;
-        int id = id(block);
-        return (maps.get(word(maps, map, id)) & 1L << id) != 0;
     }
 
     /**

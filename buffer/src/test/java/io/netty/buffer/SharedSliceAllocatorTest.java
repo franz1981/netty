@@ -36,7 +36,6 @@ import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
@@ -56,12 +55,14 @@ final class SharedSliceAllocatorTest {
     private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
     private AdaptivePoolingAllocator allocator;
+    private boolean malloc;
 
     /** On {@code mmap} regions of many blocks, or on {@code malloc}'d ones of one. */
     private void use(boolean malloc) {
         if (!malloc) {
             assumeTrue(MmapRegionSource.isAvailable(), "mmap regions of many blocks need mmap");
         }
+        this.malloc = malloc;
         allocator = closer.add(newSharedAllocator(segments, regions, malloc ? SEGMENT_SIZE : REGION_SIZE, INTERVAL));
     }
 
@@ -70,13 +71,10 @@ final class SharedSliceAllocatorTest {
         assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode pools nothing above the size classes");
     }
 
-    private static AdaptiveByteBuf adaptive(ByteBuf buf) {
-        return (AdaptiveByteBuf) (buf instanceof AdaptiveByteBuf ?
-                buf : buf.unwrap());
-    }
-
+    /** Where {@code buf} starts in the first region: the mapped one, or the first one-block region allocated. */
     private long regionOffset(ByteBuf buf) {
-        return buf.memoryAddress() - allocator.pageStore.regions[0].buffer.memoryAddress();
+        AbstractByteBuf region = malloc ? segments.segments.get(0) : regions.regions.get(0);
+        return buf.memoryAddress() - region.memoryAddress();
     }
 
     @ParameterizedTest(name = "malloc: {0}")
@@ -84,8 +82,6 @@ final class SharedSliceAllocatorTest {
     void sizeClassChunksAreRunsOfSharedSlices(boolean malloc) {
         use(malloc);
         ByteBuf buf = allocator.allocate(1024, 1024);
-        Segment block = ((AdaptivePoolingAllocator.SizeClassedChunk) adaptive(buf).chunk).segment;
-        assertNotNull(block.sharedSpans, "a block of shared slices");
         assertEquals(malloc ? 1 : 0, segments.segmentsAllocated(), "a one-block region, only without mmap");
         assertTrue(regionOffset(buf) >= 0 && regionOffset(buf) < REGION_SIZE);
         assertSharedAccounted(segments, allocator);
@@ -107,7 +103,6 @@ final class SharedSliceAllocatorTest {
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         runOnOwnHeap(() -> {
             ByteBuf buf = allocator.allocate(size, size);
-            assertTrue(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
             first.set(regionOffset(buf) / SLICE);
             buf.release();
         }, failure);
@@ -159,7 +154,6 @@ final class SharedSliceAllocatorTest {
         ByteBuf span = allocator.allocate(3 * MIB, 3 * MIB);
         ByteBuf small = allocator.allocate(MIB, MIB);
         ByteBuf blocks = allocator.allocate(SEGMENT_SIZE + 1, SEGMENT_SIZE + 1);
-        assertTrue(adaptive(span).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
         assertEquals(regionOffset(span) / SEGMENT_SIZE, regionOffset(small) / SEGMENT_SIZE, "one block holds both");
         assertEquals(0, regionOffset(blocks) % SEGMENT_SIZE);
         assertEquals(((3 * MIB + MIB) / SLICE + 2 * (SEGMENT_SIZE / SLICE)) * (long) SLICE, allocator.usedMemory());

@@ -100,7 +100,7 @@ final class Segment {
      * The first of the lowest {@code n} consecutive free slices in {@code free}, or -1: after {@code k} rounds of
      * {@code m &= m >>> 1}, bit {@code i} of {@code m} is set when slices {@code i} to {@code i + k} are all free.
      */
-    static int firstFit(long free, int n) {
+    private static int firstFit(long free, int n) {
         long m = free;
         for (int i = 1; i < n; i++) {
             m &= m >>> 1;

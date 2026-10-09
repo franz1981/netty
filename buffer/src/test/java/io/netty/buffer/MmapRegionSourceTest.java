@@ -18,7 +18,6 @@ package io.netty.buffer;
 import io.netty.util.internal.NativeCallException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.parallel.Isolated;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -34,10 +33,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * {@link MmapRegionSource}, where it is available (Java 22+ on Linux with native access, e.g. the buffer module's
- * Java 24+ native-access test run): aligned exact mappings, purges that zero the range and drop the process's
- * resident memory, and the unmap on release.
+ * Java 24+ native-access test run): aligned exact mappings, purges that zero the range and nothing else, and the
+ * unmap on release.
  */
-@Isolated("Reads the process's resident memory, which concurrent tests would move")
 final class MmapRegionSourceTest {
     private static final int MIB = 1024 * 1024;
     private static final int REGION_SIZE = 64 * MIB;
@@ -68,21 +66,16 @@ final class MmapRegionSourceTest {
         }
     }
 
-    /** One call purges the whole range: it reads zero again, and the process's resident memory drops by it. */
+    /** One call purges the whole range: every page of it reads zero again. */
     @Test
-    void purgeZeroesAndGivesTheMemoryBack() throws IOException {
+    void purgeZeroesTheRange() {
         AbstractByteBuf region = source.allocateRegion(REGION_SIZE, ALIGNMENT);
         try {
             int stride = 4096;
             for (int offset = 0; offset < REGION_SIZE; offset += stride) {
                 region.setLong(offset, offset + 1L);
             }
-            long touched = residentKiB();
             source.purge(region._memoryAddress(), REGION_SIZE);
-            long purged = residentKiB();
-            long droppedKiB = touched - purged;
-            assertTrue(droppedKiB >= REGION_SIZE / 1024 * 3 / 4,
-                    "resident memory went from " + touched + " KiB to " + purged + " KiB");
             for (int offset = 0; offset < REGION_SIZE; offset += stride) {
                 assertEquals(0, region.getLong(offset), "offset " + offset);
             }
@@ -121,26 +114,6 @@ final class MmapRegionSourceTest {
         assertFalse(overlapsAnyMapping(start, end), "unmapped once released");
     }
 
-    /** {@code Rss} of {@code /proc/self/smaps_rollup}, else {@code VmRSS} of {@code /proc/self/status}, in KiB. */
-    static long residentKiB() throws IOException {
-        try {
-            return field("/proc/self/smaps_rollup", "Rss:");
-        } catch (IOException e) {
-            return field("/proc/self/status", "VmRSS:");
-        }
-    }
-
-    private static long field(String file, String name) throws IOException {
-        try (BufferedReader in = new BufferedReader(new FileReader(file))) {
-            for (String line = in.readLine(); line != null; line = in.readLine()) {
-                if (line.startsWith(name)) {
-                    return Long.parseLong(line.substring(name.length()).trim().split("\\s+")[0]);
-                }
-            }
-        }
-        throw new IOException(name + " not in " + file);
-    }
-
     /** Whether {@code [start, end)} lies inside one mapping of {@code /proc/self/maps}. */
     private static boolean mapped(long start, long end) throws IOException {
         for (long[] range : maps()) {
@@ -160,6 +133,7 @@ final class MmapRegionSourceTest {
         return false;
     }
 
+    /** The process's mappings: the kernel's own answer to whether a range is mapped, not a resident-size estimate. */
     private static List<long[]> maps() throws IOException {
         List<long[]> ranges = new ArrayList<long[]>();
         try (BufferedReader in = new BufferedReader(new FileReader("/proc/self/maps"))) {

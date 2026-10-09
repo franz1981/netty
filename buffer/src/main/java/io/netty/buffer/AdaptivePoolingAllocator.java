@@ -860,7 +860,7 @@ final class AdaptivePoolingAllocator {
         private int nextColour;
 
         /** The chunk this magazine allocates from, or {@code null} once closed. */
-        SizeClassedChunk current;
+        private SizeClassedChunk current;
         final ChunkQueue reusable = new ChunkQueue();
         final ChunkQueue full = new ChunkQueue();
         final ChunkQueue spare = new ChunkQueue();

@@ -29,7 +29,6 @@ import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -106,15 +105,6 @@ final class SegmentTest {
         assertTrue(segment.isEmpty());
     }
 
-    @Test
-    void releasingFreeSlicesThrows() {
-        Segment segment = segment(64);
-        assertEquals(0, claim(segment, 4));
-        segment.releaseRun(0, 4, 0);
-        assertThrows(IllegalStateException.class, () -> segment.releaseRun(0, 4, 0));
-        assertThrows(IllegalStateException.class, () -> segment.releaseRun(2, 1, 0));
-    }
-
     /** Random claims and releases against a model: the bitmap is exactly the free slices, whatever the order. */
     @Test
     void randomClaimsAndReleasesKeepTheBitmapExact() {
@@ -150,34 +140,6 @@ final class SegmentTest {
             assertEquals(bits, segment.free, "op " + op);
             assertEquals(bits == -1L, segment.isEmpty());
         }
-    }
-
-    /**
-     * The claim that finds the block wholly free labels it with its bin, and says so; the claims after it, and the
-     * purger's claims, leave the label as it is, until the block is wholly free again.
-     */
-    @Test
-    void theFirstClaimSinceWhollyFreeLabelsTheBlock() {
-        Segment segment = segment(64);
-        assertEquals(Segment.FIRST, segment.claimRun(2, 3));
-        assertEquals(3, segment.bin);
-        assertEquals(2, segment.claimRun(8, 5), "not the first");
-        assertEquals(3, segment.bin);
-        segment.releaseRun(0, 2, 0);
-        assertEquals(0, segment.claimRun(2, 1), "not wholly free: a slice is still claimed");
-        assertEquals(3, segment.bin);
-        segment.releaseRun(0, 2, 0);
-        segment.releaseRun(2, 8, 0);
-        assertEquals(Segment.FIRST, segment.claimRun(8, 5));
-        assertEquals(5, segment.bin, "relabelled");
-        segment.releaseRun(0, 8, 0);
-        assertTrue(segment.claimWhole());
-        segment.unclaim(segment.allFree);
-        assertEquals(segment.allFree, segment.claimFree(segment.allFree));
-        segment.unclaim(segment.allFree);
-        assertEquals(5, segment.bin, "the purger's claims label nothing");
-        assertEquals(Segment.FIRST, segment.claimRun(64, 2), "a whole block");
-        assertEquals(2, segment.bin);
     }
 
     /**

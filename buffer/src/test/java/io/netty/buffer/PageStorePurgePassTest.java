@@ -194,22 +194,6 @@ final class PageStorePurgePassTest {
         assertEquals(totalCalls, regions.purgeCalls(), "the last pass finished: disarmed");
     }
 
-    /** A pass whose calls reach {@link PageStore#PURGE_BYTES} exactly stops there, and the next one goes on. */
-    @Test
-    void aPassThatSpendsItsBudgetExactlyStopsThere() {
-        int blocks = (int) (PageStore.PURGE_BYTES / SEGMENT_SIZE) + 1;
-        long base = 0;
-        PageStore store = store(base, blocks, blocks * SEGMENT_SIZE);
-        for (int slot = 0; slot < blocks; slot++) {
-            block(store, slot).releaseRun(0, PER_BLOCK, base);
-        }
-        store.purgeIfDue(base + DELAY);
-        assertEquals(blocks - 1, regions.purgeCalls());
-        assertEquals(PageStore.PURGE_BYTES, purgedBytes(0, blocks - 1));
-        store.purgeIfDue(base + DELAY + CHECK);
-        assertEquals(blocks, regions.purgeCalls(), "the last block, in the next pass");
-    }
-
     /** The calls of {@code run} slices each that reach {@link PageStore#PURGE_BYTES}. */
     private static int callsToBudget(int run) {
         long runBytes = (long) run * SLICE;

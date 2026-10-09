@@ -37,11 +37,11 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
+import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -93,7 +93,7 @@ final class AdaptiveLargeSegmentsTest {
     }
 
     private void assertAccountedIn(AdaptivePoolingAllocator allocator) {
-        assertAccounted(segments, regions, allocator);
+        assertSharedAccounted(segments, allocator);
     }
 
     private static List<ByteBuf> allocate(AdaptivePoolingAllocator allocator, int size, int count) {
@@ -139,7 +139,7 @@ final class AdaptiveLargeSegmentsTest {
     /** On regions of one block spans fill blocks, which stay until idle for the purge delay: a round reuses them. */
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void spansFillSegmentsKeptInTheHeapReserveWithoutRegions(boolean heap) {
+    void spansFillOneBlockRegionsKeptAcrossRounds(boolean heap) {
         AdaptivePoolingAllocator allocator = withoutRegions(heap);
         for (int round = 0; round < 3; round++) {
             List<ByteBuf> bufs = allocate(allocator, POOLED, 2 * PER_CHUNK + 1);
@@ -177,7 +177,7 @@ final class AdaptiveLargeSegmentsTest {
                 assertArrayEquals(addresses, roundAddresses, "given back and claimed again");
             }
             release(bufs);
-            assertAccounted(segments, regions, allocator);
+            assertSharedAccounted(segments, allocator);
         }
     }
 
@@ -242,9 +242,9 @@ final class AdaptiveLargeSegmentsTest {
         int large = 2200000;
         ByteBuf first = allocate(allocator, large, 1).get(0);
         ByteBuf second = allocate(allocator, 3 * MIB / 2, 1).get(0);
-        assertSame(blockOf(first), blockOf(second), "one block holds both");
+        assertEquals(block(first), block(second), "one block holds both");
         ByteBuf whole = allocate(allocator, SEGMENT_SIZE, 1).get(0);
-        assertNotSame(blockOf(first), blockOf(whole));
+        assertNotEquals(block(first), block(whole));
         assertEquals(0, segments.chunks.size(), "nothing from the chunk allocator");
         assertEquals(mode == Mode.DIRECT_REGIONS ? 0 : 2, segments.segmentsAllocated(), "blocks of their own");
         assertAccountedIn(allocator);
@@ -254,10 +254,23 @@ final class AdaptiveLargeSegmentsTest {
         assertAccountedIn(allocator);
     }
 
-    private static Segment blockOf(ByteBuf buf) {
-        AdaptiveByteBuf adaptive = (AdaptiveByteBuf)
-                (buf instanceof AdaptiveByteBuf ? buf : buf.unwrap());
-        return ((AdaptivePoolingAllocator.SharedSpanChunk) adaptive.chunk).block;
+    /**
+     * The block {@code buf} lies in, by its address: the block's index in the mapped region, or the index of the
+     * one-block region (its {@code byte[]} for heap memory) among those allocated.
+     */
+    private int block(ByteBuf buf) {
+        if (!regions.regions.isEmpty()) {
+            return (int) ((buf.memoryAddress() - regions.regions.get(0).memoryAddress()) / SEGMENT_SIZE);
+        }
+        for (int i = 0; i < segments.segments.size(); i++) {
+            AbstractByteBuf block = segments.segments.get(i);
+            if (block.hasArray() ? block.array() == buf.array()
+                    : buf.memoryAddress() >= block.memoryAddress()
+                            && buf.memoryAddress() < block.memoryAddress() + block.capacity()) {
+                return i;
+            }
+        }
+        throw new AssertionError("in no block");
     }
 
     /**
@@ -273,15 +286,15 @@ final class AdaptiveLargeSegmentsTest {
         assertEquals((long) 3 * PER_BLOCK * PageStoreConfig.SLICE_SIZE_BYTES, allocator.usedMemory());
         ByteBuf huge = allocate(allocator, REGION_SIZE + 1, 1).get(0);
         assertEquals(1, segments.chunks.size(), "larger than a region: its own allocation");
-        assertAccounted(segments, regions, allocator);
+        assertSharedAccounted(segments, allocator);
         run.release();
         huge.release();
-        assertAccounted(segments, regions, allocator);
+        assertSharedAccounted(segments, allocator);
         long now = System.nanoTime();
         store.purgeIfDue(now += INTERVAL);
         store.purgeIfDue(now + INTERVAL);
         assertEquals(0, allocator.usedMemory(), "free a whole interval: purged");
-        assertAccounted(segments, regions, allocator);
+        assertSharedAccounted(segments, allocator);
     }
 
     /** On regions of one block a buffer above a segment is its own allocation, as before the page store. */
@@ -297,9 +310,9 @@ final class AdaptiveLargeSegmentsTest {
         assertAccounted(segments, allocator);
     }
 
-    /** Every slice the large paths commit is counted once, and credited by the purge. */
+    /** Every slice the spans and block runs commit is counted once, and credited by the purge. */
     @Test
-    void largeSlotsAreChargedAndCredited() {
+    void spansAndBlockRunsAreChargedAndCredited() {
         AdaptivePoolingAllocator allocator = withRegions();
         PageStore store = allocator.pageStore;
         List<ByteBuf> bufs = allocate(allocator, POOLED, PER_CHUNK + 1); // spans over two blocks

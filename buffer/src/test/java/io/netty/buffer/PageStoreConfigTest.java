@@ -29,8 +29,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
- * {@link PageStoreConfig}: its validation (whole slices, whole segments per region, aligned segments), and the
- * direct defaults with their property fallbacks.
+ * {@link PageStoreConfig}: its validation (whole slices, whole segments per region, aligned segments), and how the
+ * properties are clamped.
  */
 final class PageStoreConfigTest {
     /** Bad parameters are rejected: too many slices, a partial slice, no interval. */
@@ -50,20 +50,6 @@ final class PageStoreConfigTest {
         assertEquals(SEGMENT_SIZE, ok.regionSize);
     }
 
-    /** The direct defaults: 64 KiB slices, the property-driven segment size, the heaps' decay interval. */
-    @Test
-    void directDefaults() {
-        PageStoreConfig direct = PageStoreConfig.directDefaults();
-        assertEquals(SLICE_SIZE_BYTES, direct.sliceSize);
-        assertEquals(64 * 1024, direct.sliceSize);
-        assertEquals(PageStoreConfig.SEGMENT_SIZE_BYTES, direct.segmentSize);
-        assertEquals(TimeUnit.MILLISECONDS.toNanos(PageStoreConfig.PURGE_DELAY_MILLIS), direct.purgeDelayNanos);
-        assertEquals(direct.purgeDelayNanos / 4, direct.purgeCheckNanos);
-        if (System.getProperty("io.netty.allocator.segmentPurgeDelay") == null) {
-            assertEquals(4000, PageStoreConfig.PURGE_DELAY_MILLIS, "mimalloc's 1000 ms purge delay x 4");
-        }
-    }
-
     /** The heap segment property is rounded down to whole slices, from 3 (one 132 KiB buffer) to 64. */
     @Test
     void heapSegmentSizeIsWholeSlices() {
@@ -73,13 +59,18 @@ final class PageStoreConfigTest {
         assertEquals(PageStoreConfig.HEAP_SEGMENT_SIZE_BYTES, PageStoreConfig.heapDefaults().segmentSize);
     }
 
-    /** The purge delay property is clamped to 10 ms .. 10 minutes. */
+    /** The purge delay property is clamped to 10 ms .. 10 minutes; 4 s by default; passes a quarter of it apart. */
     @Test
     void purgeDelayIsClamped() {
         assertEquals(10, PageStoreConfig.clampPurgeDelayMillis(0));
         assertEquals(10, PageStoreConfig.clampPurgeDelayMillis(-5));
         assertEquals(4000, PageStoreConfig.clampPurgeDelayMillis(4000));
         assertEquals(600000, PageStoreConfig.clampPurgeDelayMillis(Long.MAX_VALUE));
+        PageStoreConfig direct = PageStoreConfig.directDefaults();
+        assertEquals(direct.purgeDelayNanos / 4, direct.purgeCheckNanos);
+        if (System.getProperty("io.netty.allocator.segmentPurgeDelay") == null) {
+            assertEquals(TimeUnit.SECONDS.toNanos(4), direct.purgeDelayNanos, "mimalloc's 1000 ms purge delay x 4");
+        }
     }
 
     /**

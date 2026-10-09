@@ -41,6 +41,7 @@ import static io.netty.buffer.PageStoreTestSupport.REGION_ALIGNMENT;
 import static io.netty.buffer.PageStoreTestSupport.REGION_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.SEGMENT_SIZE;
 import static io.netty.buffer.PageStoreTestSupport.assertAccounted;
+import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.offsetIn;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -50,9 +51,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
- * Buffers above the size classes, up to a whole block, as spans of shared slices (see {@code SpanMagazine}): sized to
- * whole slices, one chunk object per block, released by any thread at once, also once the heap is gone. On regions of
- * one block (direct or heap, as without {@code mmap}) or of many.
+ * Buffers above the size classes, up to a whole block, as spans of shared slices: sized to whole slices, coloured,
+ * released by any thread at once, also once the heap is gone. On regions of one block (direct or heap, as without
+ * {@code mmap}) or of many.
  */
 final class AdaptiveLargeSpansTest {
     private static final int SLICE = PageStoreConfig.SLICE_SIZE_BYTES;
@@ -119,7 +120,6 @@ final class AdaptiveLargeSpansTest {
             assertTrue(fast >= size && fast <= wholeSlices && (wholeSlices - fast) % 64 == 0
                     && wholeSlices - fast <= Math.min(4032, wholeSlices - size),
                     "a span of whole slices, less its colour, for " + size + ": " + fast);
-            assertSame(segmentOf(buf).sharedSpans, adaptive(buf).chunk, "a span for " + size);
             buf.setByte(size - 1, 42);
         }
         assertEquals(0, segments.chunks.size(), "nothing allocated per buffer");
@@ -140,12 +140,11 @@ final class AdaptiveLargeSpansTest {
         }
         if (mode != Mode.DIRECT_REGIONS) {
             ByteBuf own = allocator.allocate(block + 1, block + 1);
-            assertTrue(!(adaptive(own).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk), "above a block");
             assertEquals(1, segments.chunks.size(), "above a block of a one-block region: its own allocation");
             own.release();
             assertAccounted(segments, allocator);
         } else {
-            assertAccounted(segments, regions, allocator);
+            assertSharedAccounted(segments, allocator);
         }
     }
 
@@ -215,33 +214,12 @@ final class AdaptiveLargeSpansTest {
         assertSame(segment, segmentOf(buf));
         assertEquals(fast, buf.capacity());
         buf.writeByte(1);
-        assertTrue(!(adaptive(buf).chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk)
-                || segmentOf(buf) != segment || offsetIn(buf, segment) != offset, "beyond its span: moved");
+        assertTrue(segmentOf(buf) != segment || offsetIn(buf, segment) != offset, "beyond its span: moved");
         buf.release();
         // Nothing else uses this allocator: the old span going back whole is what lets the purge give the block back.
         allocator.pageStore.purgeIfDue(System.nanoTime() + 2 * allocator.pageStore.config.purgeDelayNanos);
         assertEquals(0, segments.segmentsLive(), "the old span went back whole");
         assertAccounted(segments, allocator);
-    }
-
-    /**
-     * The spans of one block share one chunk, for every stripe (or every thread-local heap), on regions of one block
-     * or of many. Allocating and releasing large buffers makes no chunk, even when each release empties the block.
-     */
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void spansOfASegmentShareItsChunk(boolean withRegions) {
-        AdaptivePoolingAllocator allocator = allocator(withRegions);
-        ByteBuf first = allocator.allocate(256 * 1024, 256 * 1024);
-        AdaptivePoolingAllocator.Chunk chunk = adaptive(first).chunk;
-        assertTrue(chunk instanceof AdaptivePoolingAllocator.SharedSpanChunk);
-        first.release();
-        for (int i = 0; i < 1000; i++) {
-            ByteBuf buf = allocator.allocate(512 * 1024, 512 * 1024);
-            assertSame(chunk, adaptive(buf).chunk, "the block keeps its chunk");
-            buf.release();
-        }
-        allocator.pageStore.close();
     }
 
     /**
@@ -334,7 +312,7 @@ final class AdaptiveLargeSpansTest {
         // No heap holds blocks: every slice is back, so a purge to completion gives every idle block back too.
         PageStoreTestSupport.purgeUntilDone(allocator.pageStore, System.nanoTime());
         assertEquals(0, allocator.usedMemory(), "slices claimed");
-        assertAccounted(segments, regions, allocator);
+        assertSharedAccounted(segments, allocator);
     }
 
     /**

@@ -16,12 +16,14 @@
 package io.netty.buffer;
 
 import io.netty.buffer.AdaptivePoolingAllocator.Heap;
+import io.netty.buffer.AdaptivePoolingAllocator.SizeClassedChunk;
 import io.netty.buffer.PageStoreTestSupport.CountingRegionSource;
 import io.netty.buffer.PageStoreTestSupport.CountingMemorySource;
 import io.netty.util.internal.PlatformDependent;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.locks.StampedLock;
 
 import static io.netty.buffer.PageStoreConfig.SLICE_SIZE_BYTES;
 import static io.netty.buffer.PageStoreTestSupport.INTERVAL;
@@ -219,9 +221,59 @@ final class PageStoreTestSupport {
     }
 
     /** The bytes of a chunk of {@code size}'s class under {@code config}: its page kind's slices. */
-    static int chunkSizeOf(int size, PageStoreConfig config) {
+    static int chunkSize(int size, PageStoreConfig config) {
         int index = SizeClassTable.sizeClassIndex(size);
         return new SizeClassTable(config).chunkSlices[index] * config.sliceSize;
+    }
+
+    /**
+     * Whether a direct {@link AdaptiveByteBufAllocator} cuts its blocks from {@code mmap} regions, and so counts
+     * their slices as they are committed rather than a region whole: it does where the defaults have regions and
+     * they can be mapped (see its constructor).
+     */
+    static boolean directRegionsAreMapped() {
+        return PageStoreConfig.directDefaults().regionSize > 0 && MmapRegionSource.isAvailable();
+    }
+
+    /** The {@link AdaptiveByteBuf} behind {@code buf}, under a leak-aware wrapper or not. */
+    static AdaptiveByteBuf adaptive(ByteBuf buf) {
+        while (!(buf instanceof AdaptiveByteBuf)) {
+            buf = buf.unwrap();
+        }
+        return (AdaptiveByteBuf) buf;
+    }
+
+    /** The size-class chunk {@code buf} is a slot of. */
+    static SizeClassedChunk chunk(ByteBuf buf) {
+        return (SizeClassedChunk) adaptive(buf).chunk;
+    }
+
+    /** The heap whose magazine holds {@code buf}'s chunk: the calling thread's own, or the stripe that served it. */
+    static Heap heap(ByteBuf buf) {
+        return chunk(buf).magazine.heap;
+    }
+
+    /** The pooling allocator {@code buf} came from, for a buffer of any chunk. */
+    static AdaptivePoolingAllocator allocator(ByteBuf buf) {
+        return adaptive(buf).chunk.allocator;
+    }
+
+    /** Runs {@code action} as {@code heap}'s owner: under its lock if it is a stripe's. */
+    static void asOwner(Heap heap, Runnable action) {
+        StampedLock lock = heap.lock;
+        long stamp = lock == null ? 0 : lock.writeLock();
+        try {
+            action.run();
+        } finally {
+            if (lock != null) {
+                lock.unlockWrite(stamp);
+            }
+        }
+    }
+
+    /** With regions of one heap block of the heap defaults' size, as the heap allocator has. */
+    static AdaptivePoolingAllocator newHeapAllocator() {
+        return newAllocator(new CountingMemorySource(true), PageStoreConfig.heapDefaults().segmentSize);
     }
 
     /** With regions of one block of {@code segmentSize}, from {@code source}: its segments are those blocks. */
@@ -278,11 +330,5 @@ final class PageStoreTestSupport {
 
     static void assertAccounted(CountingMemorySource source, AdaptivePoolingAllocator allocator) {
         assertEquals(source.unreleasedBytes(), allocator.usedMemory(), "usedMemory() and the segment source disagree");
-    }
-
-    /** As {@link #assertSharedAccounted}: {@code regions} are counted through the store. */
-    static void assertAccounted(CountingMemorySource segments, CountingRegionSource regions,
-                                AdaptivePoolingAllocator allocator) {
-        assertSharedAccounted(segments, allocator);
     }
 }

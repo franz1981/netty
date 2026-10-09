@@ -33,7 +33,6 @@ import static io.netty.buffer.PageStoreTestSupport.assertSharedAccounted;
 import static io.netty.buffer.PageStoreTestSupport.newAllocator;
 import static io.netty.buffer.PageStoreTestSupport.purgeUntilDone;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,19 +54,20 @@ final class PageStoreTest {
     private final CountingMemorySource segments = new CountingMemorySource();
     private final CountingRegionSource regions = new CountingRegionSource();
 
-    /** Where regions are mapped, a region starts at a multiple of 2 MiB, and so does each of its (4 MiB) blocks. */
+    /**
+     * Where regions are mapped, a region starts at a multiple of 2 MiB, and so does each of its (4 MiB) blocks: a
+     * buffer of a whole block, a span with no room for a colour, starts where its block does.
+     */
     @Test
     void regionsAreAligned() {
         assumeTrue(MmapRegionSource.isAvailable(), "aligned regions need mmap");
         AdaptivePoolingAllocator allocator = closer.add(newAllocator(segments, regions, REGION_SIZE, REGION_ALIGNMENT));
-        PageStore store = allocator.pageStore;
         for (int i = 0; i < 3; i++) {
-            long run = store.claimSlices(63, false);
-            assertEquals(0, store.start(run));
-            Segment block = store.block(run);
-            assertEquals(0, (block.buffer.memoryAddress() + block.base) & REGION_ALIGNMENT - 1, "block " + i);
+            ByteBuf block = allocator.allocate(SEGMENT_SIZE, SEGMENT_SIZE);
+            assertEquals(0, block.memoryAddress() & REGION_ALIGNMENT - 1, "block " + i);
         }
-        assertEquals(0, allocator.pageStore.regions[0].buffer.memoryAddress() & REGION_ALIGNMENT - 1);
+        assertEquals(1, regions.regions.size());
+        assertEquals(0, regions.regions.get(0).memoryAddress() & REGION_ALIGNMENT - 1);
     }
 
     /**
@@ -171,21 +171,20 @@ final class PageStoreTest {
         Segment[] blocks = new Segment[SLOTS];
         for (int i = 0; i < SLOTS; i++) {
             blocks[i] = claim(store, SPAN);
-            assertSame(failing, blocks[i].region.source);
         }
+        assertEquals(1, calls[0]);
         Segment first = claim(store, SPAN);
-        assertEquals(2, calls[0]);
-        assertNull(store.mmap, "fell back to one-block regions, for good");
-        assertNull(first.region.source, "a one-block region, no mmap source");
-        assertEquals(1, first.region.slots, "a region of one block");
+        assertEquals(2, calls[0], "a second region was tried");
+        assertEquals(1, segments.segmentsAllocated(), "and failed: a one-block region from memory.allocate instead");
         blocks[4].releaseRun(0, SPAN, System.nanoTime());
         assertSame(blocks[4], claim(store, SPAN), "the free slices of the mapped region");
         Segment second = claim(store, SPAN);
-        assertNull(second.region.source);
         assertEquals(2, calls[0], "never tried again");
         assertEquals(1, regions.regions.size(), "the one region that mapped before mmap was given up");
         assertEquals(2, segments.segmentsAllocated(), "the two one-block regions, from memory.allocate");
-        assertEquals(-1, store.claimBlocks(2), "new regions hold one block");
+        ByteBuf twoBlocks = allocator.allocate(2 * SEGMENT_SIZE + 1, 2 * SEGMENT_SIZE + 1);
+        assertEquals(1, segments.chunks.size(), "new regions hold one block: a run of two is its own allocation");
+        twoBlocks.release();
         assertSharedAccounted(segments, allocator);
         for (Segment block : new Segment[] {first, second}) {
             block.releaseRun(0, SPAN, System.nanoTime());

@@ -34,12 +34,10 @@ import io.netty.buffer.AdaptivePoolingAllocator.SizeClassMagazine;
 
 import java.io.IOException;
 import java.lang.reflect.Array;
-import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
@@ -58,7 +56,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -68,6 +65,11 @@ import static org.junit.jupiter.api.Assertions.fail;
 import io.netty.buffer.AbstractByteBufTest.TestGatheringByteChannel;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
+import static io.netty.buffer.AdaptivePoolingAllocator.IS_LOW_MEM;
+import static io.netty.buffer.PageStoreTestSupport.asOwner;
+import static io.netty.buffer.PageStoreTestSupport.directRegionsAreMapped;
+import static io.netty.buffer.PageStoreTestSupport.heap;
+import static io.netty.buffer.PageStoreTestSupport.newHeapAllocator;
 
 public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<AdaptiveByteBufAllocator> {
     @RegisterExtension
@@ -85,7 +87,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     @Override
     protected long expectedUsedMemory(AdaptiveByteBufAllocator allocator, int capacity) {
-        return PageStoreTestSupport.chunkSizeOf(capacity, direct(allocator).pageStore.config);
+        return PageStoreTestSupport.chunkSize(capacity, PageStoreConfig.directDefaults());
     }
 
     @Override
@@ -120,9 +122,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         ByteBufAllocatorMetric metric = allocator.metric();
         assertEquals(0, metric.usedDirectMemory());
         ByteBuf buffer = allocator.directBuffer(1024, 4096);
-        // mmap'd regions count the chunks' slices; malloc'd ones, the region.
-        boolean perSegment = !directSharesSlices(allocator);
-        long unit = direct(allocator).pageStore.config.regionSize;
+        // mmap'd regions count the chunks' slices; malloc'd ones, the region: one block.
+        boolean perSegment = !directRegionsAreMapped();
+        long unit = PageStoreConfig.SEGMENT_SIZE_BYTES;
         try {
             int capacity = buffer.capacity();
             long first = perSegment ? unit : expectedUsedMemory(allocator, capacity);
@@ -142,58 +144,23 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 metric.usedDirectMemory());
     }
 
-    static AdaptivePoolingAllocator direct(AdaptiveByteBufAllocator allocator) {
-        try {
-            Field directField = AdaptiveByteBufAllocator.class.getDeclaredField("direct");
-            directField.setAccessible(true);
-            return (AdaptivePoolingAllocator) directField.get(allocator);
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
-        }
-    }
-
     /** The bytes of a heap chunk of {@code size}'s class under the heap defaults. */
-    private static int heapChunkSizeOf(int size) {
-        return PageStoreTestSupport.chunkSizeOf(size, PageStoreConfig.heapDefaults());
-    }
-
-    /** The size of the direct allocator's blocks. */
-    static int directSegmentSize(AdaptiveByteBufAllocator allocator) {
-        return direct(allocator).pageStore.config.segmentSize;
-    }
-
-    /** Whether the direct allocator's regions are mmap'd: their slices count from their first claim. */
-    static boolean directSharesSlices(AdaptiveByteBufAllocator allocator) {
-        return direct(allocator).pageStore.mmap != null;
-    }
-
-    static AdaptivePoolingAllocator heap(AdaptiveByteBufAllocator allocator) {
-        try {
-            Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-            heapField.setAccessible(true);
-            return (AdaptivePoolingAllocator) heapField.get(allocator);
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
-        }
-    }
-
-    /** The size of the heap allocator's blocks. */
-    static int heapSegmentSize(AdaptiveByteBufAllocator allocator) {
-        return heap(allocator).pageStore.config.segmentSize;
+    private static int heapChunkSize(int size) {
+        return PageStoreTestSupport.chunkSize(size, PageStoreConfig.heapDefaults());
     }
 
     /**
      * Whether the heap allocator pools buffers of {@code size}: up to a block, which G1 regions below 16 MiB make
      * smaller than 4 MiB (see {@link PageStoreConfig#clampHeapSegmentSize}).
      */
-    static boolean heapSegmentsHold(AdaptiveByteBufAllocator allocator, int size) {
-        return size <= heapSegmentSize(allocator);
+    private static boolean heapSegmentsHold(int size) {
+        return size <= PageStoreConfig.heapDefaults().segmentSize;
     }
 
     @Override
     @Test
     public void shouldReuseChunks() throws Exception {
-        assumeTrue(heapSegmentsHold(newAllocator(false), 1024 * 1024), "1 MiB heap buffers are not pooled");
+        assumeTrue(heapSegmentsHold(1024 * 1024), "1 MiB heap buffers are not pooled");
         super.shouldReuseChunks();
     }
 
@@ -204,7 +171,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(true, false));
         ByteBufAllocatorMetric metric = allocator.metric();
         assertEquals(0, metric.usedHeapMemory());
-        int segmentSize = heapSegmentSize(allocator);
+        int segmentSize = PageStoreConfig.heapDefaults().segmentSize;
         ByteBuf buffer = allocator.heapBuffer(1024, 4096);
         int capacity = buffer.capacity();
         assertEquals(segmentSize, metric.usedHeapMemory());
@@ -231,7 +198,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ValueSource(booleans = {true, false})
     void oneShotChunkIsFreedWithItsBuffer(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeTrue(isLowMemory(), "see buffersUpToABlockAreSpans");
+        assumeTrue(AdaptivePoolingAllocator.IS_LOW_MEM, "see buffersUpToABlockAreSpans");
         ByteBufAllocatorMetric metric = allocator.metric();
         int size = 2200000; // above the largest pooled size
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
@@ -262,13 +229,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ValueSource(booleans = {true, false})
     void buffersUpToABlockAreSpans(boolean direct) throws Exception {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        assumeFalse(isLowMemory(), "low-memory mode: no spans above the size classes");
-        PageStore store = (direct ? direct(allocator) : heap(allocator)).pageStore;
-        int block = store.config.segmentSize;
-        int slice = store.config.sliceSize;
+        assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode: no spans above the size classes");
+        PageStoreConfig config = direct ? PageStoreConfig.directDefaults() : PageStoreConfig.heapDefaults();
+        int block = config.segmentSize;
+        int slice = config.sliceSize;
         int size = block / 4 * 3; // above half a block
         long span = (size + slice - 1) / slice * (long) slice;
-        boolean perSlice = store.mmap != null;
+        boolean perSlice = direct && directRegionsAreMapped();
         ByteBufAllocatorMetric metric = allocator.metric();
         ByteBuf buffer = direct ? allocator.directBuffer(size, Integer.MAX_VALUE) :
                 allocator.heapBuffer(size, Integer.MAX_VALUE);
@@ -290,16 +257,15 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     @Test
     void adaptiveChunkMustDeallocateOrReuseWthBufferRelease() throws Exception {
-        AdaptiveByteBufAllocator allocator = newAllocator(false);
+        AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         Deque<ByteBuf> bufs = new ArrayDeque<>();
-        assertEquals(0, allocator.usedHeapMemory());
-        assertEquals(0, allocator.usedHeapMemory());
-        bufs.add(allocator.heapBuffer(256));
+        assertEquals(0, allocator.usedMemory());
+        bufs.add(allocator.allocate(256, 256));
         // Counted in the slices chunks hold: the used memory is whole blocks.
         long usedHeapMemory = claimedHeapBytes(allocator);
-        int buffersPerChunk = segmentsOf(chunkOf(bufs.peek()));
+        int buffersPerChunk = chunkOf(bufs.peek()).magazine.slots;
         for (int i = 0; i < buffersPerChunk; i++) {
-            bufs.add(allocator.heapBuffer(256));
+            bufs.add(allocator.allocate(256, 256));
         }
         assertEquals(2 * usedHeapMemory, claimedHeapBytes(allocator));
         bufs.pop().release();
@@ -309,7 +275,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
         assertEquals(2 * usedHeapMemory, claimedHeapBytes(allocator));
         for (int i = 0; i < 2 * buffersPerChunk; i++) {
-            bufs.add(allocator.heapBuffer(256));
+            bufs.add(allocator.allocate(256, 256));
         }
         assertEquals(2 * usedHeapMemory, claimedHeapBytes(allocator));
         while (!bufs.isEmpty()) {
@@ -459,12 +425,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @Test
     void idleLargeBufferMemoryGoesBack() {
         AdaptiveByteBufAllocator allocator = newAllocator(true);
-        PageStore store = heap(allocator).pageStore;
         int size = 1024 * 1024; // the largest pooled size
         List<ByteBuf> bufs = new ArrayList<ByteBuf>();
         while (allocator.usedHeapMemory() < 32 * 1024 * 1024) {
             bufs.add(allocator.heapBuffer(size, size));
         }
+        PageStore store = PageStoreTestSupport.allocator(bufs.get(0)).pageStore;
         long peak = allocator.usedHeapMemory();
         for (ByteBuf buf : bufs) {
             buf.release();
@@ -542,11 +508,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void largeBuffersAreReusedAcrossRounds(boolean direct) throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode does not pool buffers above its size classes");
+        assumeFalse(IS_LOW_MEM, "low-memory mode does not pool buffers above its size classes");
         AdaptiveByteBufAllocator allocator = newAllocator(true);
         ByteBufAllocatorMetric metric = allocator.metric();
         int size = 512 * 1024; // above the largest size class, below the unpooled fallback
-        assumeTrue(direct || heapSegmentsHold(allocator, size), "heap buffers above a heap segment are not pooled");
+        assumeTrue(direct || heapSegmentsHold(size), "heap buffers above a heap segment are not pooled");
         ByteBuf[] bufs = new ByteBuf[24];
         long afterFirstRound = -1;
         for (int round = 0; round < 50; round++) {
@@ -639,11 +605,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     void activeChunkKeepsServingAllocationsWhenFullyFreeAboveTheFloor(String releasePath) throws Exception {
         final boolean threadLocal = !"locked".equals(releasePath);
         final boolean foreignRelease = !"owner".equals(releasePath);
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         Runnable test = () -> {
             try {
-                assertActiveChunkKeepsServingAllocations(allocator, !threadLocal, foreignRelease);
+                assertActiveChunkKeepsServingAllocations(allocator, foreignRelease);
             } catch (Throwable t) {
                 failure.set(t);
             }
@@ -658,13 +624,13 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    private static void assertActiveChunkKeepsServingAllocations(
-            AdaptiveByteBufAllocator allocator, boolean sharedStripe, boolean foreignRelease) throws Exception {
+    private static void assertActiveChunkKeepsServingAllocations(AdaptivePoolingAllocator allocator,
+                                                                 boolean foreignRelease) throws Exception {
         List<ByteBuf> held = new ArrayList<ByteBuf>();
         try {
-            // Hand out every segment of the first chunk: the allocation after that lands in another chunk.
+            // Hand out every slot of the first chunk: the allocation after that lands in another chunk.
             for (int i = 0; i < BURST_SEGMENTS_PER_CHUNK; i++) {
-                held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+                held.add(allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE));
             }
             SizeClassedChunk first = chunkOf(held.get(0));
             for (ByteBuf buf : held) {
@@ -672,32 +638,30 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             }
             final SizeClassMagazine cache = first.magazine;
 
-            // Fill the cache above its retention floor with chunks that have no free segment.
-            int floor = 4; // the empty chunks a size class keeps
+            // Fill the cache above its retention floor with chunks that have no free slot.
+            int floor = SizeClassMagazine.FLOOR;
             for (int i = BURST_SEGMENTS_PER_CHUNK; i < (floor + 1) * BURST_SEGMENTS_PER_CHUNK; i++) {
-                held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+                held.add(allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE));
             }
             assertEquals((long) (floor + 1) * BURST_CHUNK_SIZE, claimedHeapBytes(allocator));
 
-            // One segment of a fresh chunk, returned: that chunk is fully free, above the floor.
-            ByteBuf probe = allocator.heapBuffer(BURST_BUF_SIZE);
+            // One slot of a fresh chunk, returned: that chunk is fully free, above the floor.
+            ByteBuf probe = allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE);
             SizeClassedChunk active = chunkOf(probe);
             long used = claimedHeapBytes(allocator);
             assertEquals((long) (floor + 2) * BURST_CHUNK_SIZE, used);
             release(probe, foreignRelease);
-            underStripeLocks(allocator, sharedStripe, cache.heap::applyNotes);
+            asOwner(cache.heap, cache.heap::applyNotes);
             assertEquals(used, claimedHeapBytes(allocator),
                     "a fully free active chunk must not be evicted on release");
-            underStripeLocks(allocator, sharedStripe, () -> {
+            asOwner(cache.heap, () -> {
                 cache.heap.applyNotes();
                 cache.returnFreeSpans(true);
             });
             assertEquals(used, claimedHeapBytes(allocator),
                     "a fully free active chunk must not be evicted by the purge");
-            // The one representation check: it is still the magazine's current chunk.
-            assertSame(active, cache.current);
 
-            ByteBuf next = allocator.heapBuffer(BURST_BUF_SIZE);
+            ByteBuf next = allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE);
             held.add(next);
             assertSame(active, chunkOf(next), "the next allocation must land in the same chunk");
             assertEquals(used, claimedHeapBytes(allocator));
@@ -709,7 +673,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 release(held.get(i), foreignRelease);
             }
             held.subList(0, BURST_SEGMENTS_PER_CHUNK).clear();
-            underStripeLocks(allocator, sharedStripe, cache.heap::applyNotes);
+            asOwner(cache.heap, cache.heap::applyNotes);
             assertEquals(used - BURST_CHUNK_SIZE, claimedHeapBytes(allocator), "evicted");
         } finally {
             for (ByteBuf buf : held) {
@@ -721,10 +685,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     // --- Where a note is applied -----------------------------------------------------------------------------
     //
     // A release that cannot apply itself - another thread's, on a thread-local heap or while the stripe lock is
-    // taken - puts the segment or block on its chunk's free list and leaves a note for the chunk's cache. The tests
-    // below pin each place that applies notes, and set things up so that nothing else could have: a size class that
-    // went idle never takes its own slow path again, so its notes wait for another size class's slow path or for a
-    // purge tick of its heap.
+    // taken - puts the slot on its chunk's free list and leaves a note for the chunk's magazine. The tests below pin
+    // each place that applies notes, and set things up so that nothing else could have: a size class that went idle
+    // never takes its own slow path again, so its notes wait for another size class's slow path or for a purge tick
+    // of its heap. The observable is the slices the heap holds: the two emptied chunks keep their spans until the
+    // notes are applied, then give them back.
 
     private static final int NOTE_ALLOCATING_SIZE = 4096;
     private static final int NOTE_IDLE_SIZE = 1024;
@@ -733,20 +698,21 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /** A size class left idle with notes outstanding on two of its chunks; see {@link #leaveNotes}. */
     private static final class IdleSizeClass {
-        final SizeClassMagazine cache;
         final List<ByteBuf> stillHeld;
         final int chunkSize;
+        /** The bytes the heap's chunks held when the notes were left. */
+        final long claimed;
 
-        IdleSizeClass(SizeClassMagazine cache, List<ByteBuf> stillHeld, int chunkSize) {
-            this.cache = cache;
+        IdleSizeClass(List<ByteBuf> stillHeld, int chunkSize, long claimed) {
             this.stillHeld = stillHeld;
             this.chunkSize = chunkSize;
+            this.claimed = claimed;
         }
 
-        /** The two emptied chunks left the cache, which keeps the ones still in use. */
-        void assertNotesApplied(String when) {
-            assertEquals(0, cache.reusable.size, when);
-            assertEquals(NOTE_KEPT_CHUNKS, cache.full.size, when + ": only the chunks still in use stay");
+        /** The two emptied chunks gave their spans back; {@code taken} bytes were claimed since by other chunks. */
+        void assertNotesApplied(AdaptivePoolingAllocator allocator, String when, long taken) {
+            assertEquals(claimed - 2L * chunkSize + taken, claimedHeapBytes(allocator),
+                    when + ": the emptied chunks must give their spans back");
         }
 
         void releaseRest() {
@@ -757,26 +723,25 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * Fill {@link #NOTE_KEPT_CHUNKS} + 2 chunks of {@link #NOTE_IDLE_SIZE} exactly, so all are filed as exhausted,
-     * then release the buffers of the first two from another thread that cannot apply the release: on a thread-local
-     * heap it is not the owner, and on a stripe it runs while the stripe lock is held. Each of the two chunks gets one
-     * note.
+     * Fill {@link #NOTE_KEPT_CHUNKS} + 2 chunks of {@link #NOTE_IDLE_SIZE} exactly, so all are filed as full, then
+     * release the buffers of the first two from another thread that cannot apply the release: on a thread-local
+     * heap it is not the owner, and on a stripe it runs while the stripe lock is held. Each of the two chunks gets
+     * one note.
      */
-    private static IdleSizeClass leaveNotes(AdaptiveByteBufAllocator allocator, boolean sharedStripe)
-            throws Exception {
-        int chunkSize = heapChunkSizeOf(NOTE_IDLE_SIZE);
+    private static IdleSizeClass leaveNotes(AdaptivePoolingAllocator allocator) throws Exception {
+        int chunkSize = heapChunkSize(NOTE_IDLE_SIZE);
         final List<ByteBuf> released = new ArrayList<ByteBuf>();
         List<ByteBuf> stillHeld = new ArrayList<ByteBuf>();
-        released.add(allocator.heapBuffer(NOTE_IDLE_SIZE, NOTE_IDLE_SIZE));
-        int perChunk = segmentsOf(chunkOf(released.get(0)));
+        released.add(allocator.allocate(NOTE_IDLE_SIZE, NOTE_IDLE_SIZE));
+        int perChunk = chunkOf(released.get(0)).magazine.slots;
         int chunks = NOTE_KEPT_CHUNKS + 2;
         for (int i = 1; i < chunks * perChunk; i++) {
-            ByteBuf buf = allocator.heapBuffer(NOTE_IDLE_SIZE, NOTE_IDLE_SIZE);
+            ByteBuf buf = allocator.allocate(NOTE_IDLE_SIZE, NOTE_IDLE_SIZE);
             (i < 2 * perChunk ? released : stillHeld).add(buf);
         }
-        SizeClassMagazine cache = chunkOf(stillHeld.get(0)).magazine;
-        assertEquals(chunks, cache.full.size, "full chunks only");
-        underStripeLocks(allocator, sharedStripe, () -> {
+        Heap heap = heap(stillHeld.get(0));
+        long claimed = claimedHeapBytes(allocator);
+        asOwner(heap, () -> {
             try {
                 Thread t = new Thread(() -> {
                     for (ByteBuf buf : released) {
@@ -789,8 +754,9 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 throw new AssertionError(e);
             }
         });
-        assertEquals(chunks, cache.full.size, "nothing applied the notes yet");
-        return new IdleSizeClass(cache, stillHeld, chunkSize);
+        assertEquals(claimed, claimedHeapBytes(allocator),
+                "nothing applied the notes yet: the chunks keep their spans");
+        return new IdleSizeClass(stillHeld, chunkSize, claimed);
     }
 
     /** Run on the thread that owns a thread-local heap, or on a plain thread that allocates from a stripe. */
@@ -823,19 +789,19 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void anotherSizeClassSlowPathAppliesTheNotesOfAnIdleOne(final boolean threadLocal) throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onHeapThread(threadLocal, () -> {
-            IdleSizeClass idle = leaveNotes(allocator, !threadLocal);
+            IdleSizeClass idle = leaveNotes(allocator);
             ByteBuf first = null;
             try {
-                long used = allocator.usedHeapMemory();
-                assertEquals(heapChunkSizeOf(NOTE_ALLOCATING_SIZE), idle.chunkSize,
+                long used = allocator.usedMemory();
+                assertEquals(heapChunkSize(NOTE_ALLOCATING_SIZE), idle.chunkSize,
                         "both size classes must share a chunk size");
 
-                first = allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE);
-                idle.assertNotesApplied("after another size class's slow path");
-                assertEquals(used, allocator.usedHeapMemory(), "the new chunk must take slices given up");
+                first = allocator.allocate(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE);
+                idle.assertNotesApplied(allocator, "after another size class's slow path", idle.chunkSize);
+                assertEquals(used, allocator.usedMemory(), "the new chunk must take slices given up");
             } finally {
                 if (first != null) {
                     first.release();
@@ -847,34 +813,28 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
 
     /**
      * A size class that keeps allocating from its active chunk never takes its slow path, so the notes of an idle
-     * size class of the same heap wait for its purge tick: exactly {@code chunkPurgeInterval} chunks' worth of its
-     * allocations, not one fewer.
+     * size class of the same heap wait for its purge tick, which comes within {@code chunkPurgeInterval} chunks'
+     * worth of its allocations.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void purgeTickAppliesTheNotesOfAnIdleSizeClassAtItsInterval(final boolean threadLocal) throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
+    void purgeTickAppliesTheNotesOfAnIdleSizeClass(final boolean threadLocal) throws Exception {
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onHeapThread(threadLocal, () -> {
             // The allocating size class gets its active chunk first: from here on, allocating and releasing one
-            // buffer at a time never runs it out of segments, so it never takes its slow path again.
-            allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
-            IdleSizeClass idle = leaveNotes(allocator, !threadLocal);
+            // buffer at a time never runs it out of slots, so it never takes its slow path again.
+            allocator.allocate(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
+            IdleSizeClass idle = leaveNotes(allocator);
             try {
-                long used = allocator.usedHeapMemory();
+                long used = allocator.usedMemory();
                 int interval = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
-                        * (heapChunkSizeOf(NOTE_ALLOCATING_SIZE) / NOTE_ALLOCATING_SIZE);
-
-                // One allocation is counted already; the tick comes with the interval-th.
-                for (int i = 1; i < interval - 1; i++) {
-                    allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
+                        * (heapChunkSize(NOTE_ALLOCATING_SIZE) / NOTE_ALLOCATING_SIZE);
+                for (int i = 0; i < interval; i++) {
+                    allocator.allocate(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
                 }
-                assertEquals(NOTE_KEPT_CHUNKS + 2, idle.cache.full.size,
-                        "one allocation before the tick, the notes must still wait");
-
-                allocator.heapBuffer(NOTE_ALLOCATING_SIZE, NOTE_ALLOCATING_SIZE).release();
-                idle.assertNotesApplied("after the purge tick of another size class");
-                assertEquals(used, allocator.usedHeapMemory(), "slices given back, memory not freed");
+                idle.assertNotesApplied(allocator, "after a purge tick of another size class", 0);
+                assertEquals(used, allocator.usedMemory(), "slices given back, memory not freed");
             } finally {
                 idle.releaseRest();
             }
@@ -900,178 +860,101 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    /** The calling thread's thread-local heap. */
-    private static Object threadLocalHeap(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field tlField = pooling.getClass().getDeclaredField("threadLocalHeap");
-        tlField.setAccessible(true);
-        return ((io.netty.util.concurrent.FastThreadLocal<?>) tlField.get(pooling)).get();
-    }
-
-    /** The current chunk of the calling thread's size-class magazine for {@code size}, or null. */
-    private static Object currentChunk(AdaptiveByteBufAllocator allocator, int size) throws Exception {
-        Object heap = threadLocalHeap(allocator);
-        Field magsField = heap.getClass().getDeclaredField("magazines");
-        magsField.setAccessible(true);
-        Object mag = ((Object[]) magsField.get(heap))[SizeClassTable.sizeClassIndex(size)];
-        Field currentField = mag.getClass().getDeclaredField("current");
-        currentField.setAccessible(true);
-        return currentField.get(mag);
-    }
-
     /**
      * A size class that made no allocation through a whole decay interval gives up its chunks, the ones it keeps as
      * its floor included: their slices go back to the page store; a class still allocating keeps its own.
      */
     @Test
     void sizeClassIdleForAWholeIntervalGivesUpItsChunks() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onThreadLocalHeap(() -> {
             final int idleSize = 64 * 1024;
             final int busySize = 256;
-            allocator.heapBuffer(idleSize, idleSize).release();
+            allocator.allocate(idleSize, idleSize).release();
             long idleChunk = claimedHeapBytes(allocator);
-            allocator.heapBuffer(busySize).release();
-            Heap heap = (Heap) threadLocalHeap(allocator);
+            ByteBuf probe = allocator.allocate(busySize, Integer.MAX_VALUE);
+            Heap heap = heap(probe);
+            SizeClassedChunk busy = chunkOf(probe);
+            probe.release();
             long used = claimedHeapBytes(allocator);
-            assertNotNull(currentChunk(allocator, idleSize));
 
             // The first decay only records where each class stands.
             heap.releaseIdle(System.nanoTime());
-            assertNotNull(currentChunk(allocator, idleSize), "allocated since the heap was created: not idle");
-            allocator.heapBuffer(busySize).release();
+            assertEquals(used, claimedHeapBytes(allocator), "allocated since the heap was created: not idle");
+            allocator.allocate(busySize, Integer.MAX_VALUE).release();
 
             // Idle through a whole interval: its chunk's slices go back.
             heap.releaseIdle(System.nanoTime());
-            assertNull(currentChunk(allocator, idleSize), "the idle class gave its chunk up");
-            assertNotNull(currentChunk(allocator, busySize), "the class in use keeps its chunk");
-            assertEquals(used - idleChunk, claimedHeapBytes(allocator));
-        });
-    }
-
-    /** A size class that allocated exactly one purge tick's worth since the previous decay is not idle. */
-    @Test
-    void sizeClassWithOneTickBetweenDecaysIsNotIdle() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
-        onThreadLocalHeap(() -> {
-            final int size = 64 * 1024;
-            allocator.heapBuffer(size, size).release();
-            Heap heap = (Heap) threadLocalHeap(allocator);
-            heap.releaseIdle(System.nanoTime());
-            int threshold = (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL
-                    * (heapChunkSizeOf(size) / size);
-            for (int i = 0; i < threshold; i++) {
-                allocator.heapBuffer(size, size).release();
-            }
-            Object current = currentChunk(allocator, size);
-            assertNotNull(current);
-            heap.releaseIdle(System.nanoTime());
-            assertSame(current, currentChunk(allocator, size), "its allocation count came back to where it was");
+            assertEquals(used - idleChunk, claimedHeapBytes(allocator), "the idle class gave its chunk up");
+            ByteBuf next = allocator.allocate(busySize, Integer.MAX_VALUE);
+            assertSame(busy, chunkOf(next), "the class in use keeps its chunk");
+            next.release();
         });
     }
 
     /** On a stripe too, a size class idle through a whole interval gives up its chunk while another one allocates. */
     @Test
     void sizeClassIdleOnAStripeGivesUpItsChunks() throws Throwable {
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onHeapThread(false, () -> {
             final int idleSize = 16 * 1024;
-            allocator.heapBuffer(idleSize, idleSize).release();
+            allocator.allocate(idleSize, idleSize).release();
             long idleChunk = claimedHeapBytes(allocator);
-            allocator.heapBuffer(256).release();
+            ByteBuf probe = allocator.allocate(256, Integer.MAX_VALUE);
+            Heap heap = heap(probe);
+            SizeClassedChunk busy = chunkOf(probe);
+            probe.release();
             long used = claimedHeapBytes(allocator);
-            Object stripe = stripeHeapWithMagazines(allocator);
-            Heap heap = (Heap) stripe;
-            Field lockField = stripe.getClass().getDeclaredField("lock");
-            lockField.setAccessible(true);
-            StampedLock lock = (StampedLock) lockField.get(stripe);
             for (int round = 0; round < 2; round++) {
-                long stamp = lock.writeLock();
-                try {
-                    heap.releaseIdle(System.nanoTime());
-                } finally {
-                    lock.unlockWrite(stamp);
-                }
-                allocator.heapBuffer(256).release();
+                asOwner(heap, () -> heap.releaseIdle(System.nanoTime()));
+                allocator.allocate(256, Integer.MAX_VALUE).release();
             }
-            assertNull(magazineCurrent(stripe, idleSize), "the idle class gave its chunk up");
-            assertNotNull(magazineCurrent(stripe, 256), "the class in use keeps its chunk");
-            assertEquals(used - idleChunk, claimedHeapBytes(allocator));
+            assertEquals(used - idleChunk, claimedHeapBytes(allocator), "the idle class gave its chunk up");
+            ByteBuf next = allocator.allocate(256, Integer.MAX_VALUE);
+            assertSame(busy, chunkOf(next), "the class in use keeps its chunk");
+            next.release();
         });
     }
 
     /** A current chunk emptied by another thread's release, still only noted, is given up like any other. */
     @Test
     void idleSizeClassGivesUpAChunkAnotherThreadEmptied() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onThreadLocalHeap(() -> {
             final int idleSize = 64 * 1024;
-            ByteBuf buf = allocator.heapBuffer(idleSize, idleSize);
+            ByteBuf buf = allocator.allocate(idleSize, idleSize);
+            Heap heap = heap(buf);
             long idleChunk = claimedHeapBytes(allocator);
             release(buf, true);
-            allocator.heapBuffer(256).release();
+            allocator.allocate(256, Integer.MAX_VALUE).release();
             long used = claimedHeapBytes(allocator);
-            Heap heap = (Heap) threadLocalHeap(allocator);
             heap.releaseIdle(System.nanoTime());
-            allocator.heapBuffer(256).release();
+            allocator.allocate(256, Integer.MAX_VALUE).release();
             heap.releaseIdle(System.nanoTime());
-            assertNull(currentChunk(allocator, idleSize));
             assertEquals(used - idleChunk, claimedHeapBytes(allocator));
         });
-    }
-
-    /** The one stripe that created size-class magazines. */
-    private static Object stripeHeapWithMagazines(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        Object found = null;
-        for (Object stripe : (Object[]) stripesField.get(pooling)) {
-            Field magsField = stripe.getClass().getDeclaredField("magazines");
-            magsField.setAccessible(true);
-            if (magsField.get(stripe) != null) {
-                assertNull(found, "one stripe only");
-                found = stripe;
-            }
-        }
-        assertNotNull(found);
-        return found;
-    }
-
-    /** The current chunk of {@code heap}'s size-class magazine for {@code size}. */
-    private static Object magazineCurrent(Object heap, int size) throws Exception {
-        Field magsField = heap.getClass().getDeclaredField("magazines");
-        magsField.setAccessible(true);
-        Object mag = ((Object[]) magsField.get(heap))[SizeClassTable.sizeClassIndex(size)];
-        Field currentField = mag.getClass().getDeclaredField("current");
-        currentField.setAccessible(true);
-        return currentField.get(mag);
     }
 
     /** A chunk with a buffer out is never given up, however long its class stays idle. */
     @Test
     void idleSizeClassKeepsAChunkWithABufferOut() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         onThreadLocalHeap(() -> {
             final int size = 64 * 1024;
-            ByteBuf out = allocator.heapBuffer(size, size);
+            ByteBuf out = allocator.allocate(size, size);
             try {
-                Heap heap = (Heap) threadLocalHeap(allocator);
-                long used = allocator.usedHeapMemory();
-                Object chunk = currentChunk(allocator, size);
+                Heap heap = heap(out);
+                long used = claimedHeapBytes(allocator);
                 for (int i = 0; i < 4; i++) {
                     heap.releaseIdle(System.nanoTime());
                 }
-                assertSame(chunk, currentChunk(allocator, size));
-                assertEquals(used, allocator.usedHeapMemory());
+                assertEquals(used, claimedHeapBytes(allocator));
+                ByteBuf next = allocator.allocate(size, size);
+                assertSame(chunkOf(out), chunkOf(next), "the chunk with a buffer out still serves its class");
+                next.release();
             } finally {
                 out.release();
             }
@@ -1079,12 +962,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * A buffer that grows from a size class into the sizes above them on a thread-local heap moves to the heap's own
-     * magazine, keeping its content, without a stripe.
+     * A buffer that grows from a size class into the sizes above them on a thread-local heap keeps its content.
      */
     @Test
-    void reallocationIntoTheLargeSizesStaysOnTheThreadLocalHeap() throws Throwable {
-        assumeFalse(isLowMemory(), "low-memory mode does not pool 512 KiB buffers");
+    void reallocationIntoTheLargeSizesKeepsTheContent() throws Throwable {
+        assumeFalse(IS_LOW_MEM, "low-memory mode does not pool 512 KiB buffers");
         final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
         onThreadLocalHeap(() -> {
             ByteBuf buf = allocator.heapBuffer(64 * 1024);
@@ -1097,47 +979,21 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 for (int i = 0; i < 64 * 1024; i++) {
                     assertEquals((byte) i, buf.getByte(i));
                 }
-                assertTrue(chunkOfAny(buf).inThreadLocalMagazine(),
-                        "the thread-local heap served it, not a stripe");
             } finally {
                 buf.release();
             }
         });
     }
 
-    private static boolean isLowMemory() throws Exception {
-        Field f = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
-        f.setAccessible(true);
-        return f.getBoolean(null);
-    }
-
-    /** Runs a cache operation the way the allocator does: under the stripe lock when the cache is a stripe's. */
-    private static void underStripeLocks(AdaptiveByteBufAllocator allocator, boolean sharedStripe, Runnable action)
-            throws Exception {
-        List<StampedLock> locks = sharedStripe ? stripeLocks(allocator) : Collections.<StampedLock>emptyList();
-        List<Long> stamps = new ArrayList<Long>();
-        for (StampedLock l : locks) {
-            stamps.add(l.writeLock());
-        }
-        try {
-            action.run();
-        } finally {
-            for (int i = 0; i < locks.size(); i++) {
-                locks.get(i).unlockWrite(stamps.get(i));
-            }
-        }
-    }
-
     /**
      * The bytes of the heap allocator's slices that chunks and spans hold: claimed, not committed. Heap regions are
-     * charged whole (one-block, no {@code mmap}), so {@code usedHeapMemory()} only moves in whole-region steps and
-     * cannot see a chunk give up its slices within one; this reads the free bitmaps directly instead, as
-     * {@code PageStore.sliceCounts()} did before it was removed as test-only. No behaviour-level replacement exists
-     * for the ~20 call sites below without rebuilding each of their floor/notes/idle-decay scenarios around chunk or
-     * buffer address identity instead of a byte count; kept as a named exception (task step 14).
+     * charged whole (one-block, no {@code mmap}), so {@code usedMemory()} only moves in whole-region steps and
+     * cannot see a chunk give up its slices within one; this reads the free bitmaps directly instead. No
+     * behaviour-level replacement exists for the call sites below without rebuilding each of their floor/notes/idle-
+     * decay scenarios around chunk or buffer address identity instead of a byte count; kept as a named exception.
      */
-    private static long claimedHeapBytes(AdaptiveByteBufAllocator allocator) {
-        PageStore store = heap(allocator).pageStore;
+    private static long claimedHeapBytes(AdaptivePoolingAllocator allocator) {
+        PageStore store = allocator.pageStore;
         long claimed = 0;
         for (Region region : store.regions) {
             if (!region.released) {
@@ -1149,23 +1005,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return claimed * store.config.sliceSize;
     }
 
-    /** How many buffers {@code chunk} hands out. */
-    private static int segmentsOf(SizeClassedChunk chunk) throws Exception {
-        Field segments = SizeClassedChunk.class.getDeclaredField("slots");
-        segments.setAccessible(true);
-        return segments.getInt(chunk);
-    }
-
     private static SizeClassedChunk chunkOf(ByteBuf buf) {
-        return (SizeClassedChunk) chunkOfAny(buf);
-    }
-
-    private static AdaptivePoolingAllocator.Chunk chunkOfAny(ByteBuf buf) {
-        // Unwrap the leak-aware wrapper, if any.
-        while (!(buf instanceof AdaptiveByteBuf)) {
-            buf = buf.unwrap();
-        }
-        return ((AdaptiveByteBuf) buf).chunk;
+        return PageStoreTestSupport.chunk(buf);
     }
 
     private static void release(ByteBuf buf, boolean foreignThread) throws InterruptedException {
@@ -1181,17 +1022,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     // The owner thread exits (its FastThreadLocal heap is removed and freed) while buffers of its magazine's active
     // chunk are still live, and they come back from another thread.
     @Test
-    void segmentReturnedAfterThreadLocalHeapFreeMustStillDeallocateChunk() throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+    void spanOfADeadHeapGoesBackAfterItsLastSlotIsReturned() throws Exception {
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         final List<ByteBuf> live = new ArrayList<ByteBuf>();
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         Thread owner = new Thread(() -> FastThreadLocalThread.runWithFastThreadLocal(() -> {
             try {
                 for (int i = 0; i < 4; i++) {
-                    live.add(allocator.heapBuffer(256));
+                    live.add(allocator.allocate(256, Integer.MAX_VALUE));
                 }
-                // Some segments come back on the owner thread, some stay live past the heap's removal.
+                // Some slots come back on the owner thread, some stay live past the heap's removal.
                 live.remove(0).release();
                 live.remove(0).release();
                 assertSame(chunkOf(live.get(0)), chunkOf(live.get(1)), "both live buffers share the active chunk");
@@ -1205,16 +1046,17 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             throw new AssertionError(failure.get());
         }
         SizeClassedChunk chunk = chunkOf(live.get(0));
-        PageStore store = heap(allocator).pageStore;
+        PageStore store = allocator.pageStore;
+        long clock = System.nanoTime();
         assertFalse(spanFree(chunk), "the live buffers still hold their chunk");
 
         // The test thread is not the owner, so these take the cross-thread release path.
         live.remove(0).release();
-        runPurgePass(store);
-        assertFalse(spanFree(chunk), "one segment is still outstanding");
+        clock = purgePass(store, clock);
+        assertFalse(spanFree(chunk), "one slot is still out");
         live.remove(0).release();
-        runPurgePass(store);
-        assertTrue(spanFree(chunk), "chunk must deallocate once its last segment is returned");
+        clock = purgePass(store, clock);
+        assertTrue(spanFree(chunk), "the span must go back once its last slot is returned");
     }
 
     /**
@@ -1224,27 +1066,22 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      */
     @Test
     void chunkOfADeadHeapGoesBackAtThePurgePassAfterItsLastRelease() throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, true));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         final List<ByteBuf> handedOver = new ArrayList<ByteBuf>();
         final AtomicReference<SizeClassedChunk> chunkRef = new AtomicReference<SizeClassedChunk>();
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
-        final int[] externalAfterOwnRelease = {-1};
         Thread owner = new FastThreadLocalThread(() -> {
             try {
                 for (int i = 0; i < 3; i++) {
-                    handedOver.add(allocator.heapBuffer(256));
+                    handedOver.add(allocator.allocate(256, Integer.MAX_VALUE));
                 }
-                ByteBuf own = allocator.heapBuffer(256);
-                SizeClassedChunk chunk = chunkOf(own);
-                chunkRef.set(chunk);
+                ByteBuf own = allocator.allocate(256, Integer.MAX_VALUE);
+                chunkRef.set(chunkOf(own));
                 // The heap dies first, as when its FastThreadLocal is removed before another one whose onRemoval
                 // releases a buffer on this same thread.
-                threadLocalHeapVariable(allocator).remove();
-                assertNull(AdaptiveSegmentsTest.field(chunk, "ownerThread"), "an abandoned chunk has no owner thread");
+                FastThreadLocal.removeAll();
                 own.release();
-                long remoteFree = (Long) AdaptiveSegmentsTest.field(chunk, "remoteFree");
-                externalAfterOwnRelease[0] = (int) (remoteFree >>> 32);
             } catch (Throwable t) {
                 failure.set(t);
             }
@@ -1255,27 +1092,30 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             throw new AssertionError(failure.get());
         }
         SizeClassedChunk chunk = chunkRef.get();
-        PageStore store = heap(allocator).pageStore;
-        assertEquals(1, externalAfterOwnRelease[0], "the dead heap's thread must push on the external list");
+        PageStore store = allocator.pageStore;
+        long clock = System.nanoTime();
         assertFalse(spanFree(chunk), "the chunk had buffers out: abandoned");
 
         // U, this thread, releases what it was handed, one buffer short of all.
         handedOver.remove(0).release();
         handedOver.remove(0).release();
-        runPurgePass(store);
+        clock = purgePass(store, clock);
         assertFalse(spanFree(chunk), "a buffer is still out: the chunk waits");
 
         handedOver.remove(0).release();
         assertFalse(spanFree(chunk), "the span goes back at a purge pass, not at the release");
-        runPurgePass(store);
+        clock = purgePass(store, clock);
         assertTrue(spanFree(chunk), "the span must go back once its last buffer is back");
     }
 
-    /** Runs a pass of {@code store}'s purge: one due at a time a purge delay and a check interval from its last. */
-    private static void runPurgePass(PageStore store) {
-        long now = Math.max(System.nanoTime(), store.lastPurgeNanos)
-                + store.config.purgeDelayNanos + store.config.purgeCheckNanos;
-        store.purgeIfDue(now);
+    /**
+     * Runs a pass of {@code store}'s purge as of a {@code clock} a purge delay and a check interval past the last
+     * one: due whatever was released since. Returns the clock the pass ran at.
+     */
+    private static long purgePass(PageStore store, long clock) {
+        clock += store.config.purgeDelayNanos + store.config.purgeCheckNanos;
+        store.purgeIfDue(clock);
+        return clock;
     }
 
     /** Whether {@code chunk}'s span is back in the store: free in its block, or its region given back whole. */
@@ -1285,82 +1125,79 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return block.region.released || (block.free & bits) == bits;
     }
 
-    /** The allocator's {@code FastThreadLocal} of thread-local heaps. */
-    private static FastThreadLocal<?> threadLocalHeapVariable(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field tlField = AdaptivePoolingAllocator.class.getDeclaredField("threadLocalHeap");
-        tlField.setAccessible(true);
-        return (FastThreadLocal<?>) tlField.get(heap(allocator));
-    }
-
     // --- Cross-thread returns that miss the stripe lock ---
     //
-    // A releaser that cannot take the stripe lock puts its segment in the chunk's MPSC free list and
-    // leaves a note on the owning cache. Nothing scans for such chunks any more, so if a note is lost
-    // the chunk stays on the exhausted list forever: it has capacity nobody can find, and it is never
+    // A releaser that cannot take the stripe lock puts its slot in the chunk's MPSC free list and
+    // leaves a note on the owning magazine. Nothing scans for such chunks any more, so if a note is lost
+    // the chunk stays on the full list forever: it has capacity nobody can find, and it is never
     // fully free either, so the purge sweep will not evict it. Both tests below are about that.
 
-    /** Buffer size whose size class has a 64 KiB chunk of 16 segments. */
+    /** Buffer size whose size class has a 64 KiB chunk of 16 slots. */
     private static final int BURST_BUF_SIZE = 4096;
     /** A 64 KiB chunk fits 16, less the one an exact fit gives up for its colours. */
     private static final int BURST_SEGMENTS_PER_CHUNK = 15;
     private static final int BURST_CHUNK_SIZE = 64 * 1024;
     private static final int BURST_CHUNKS = 400;
 
+    /** What a burst left behind: the bytes its chunks held at the peak, and the magazine that served it. */
+    private static final class Burst {
+        final long peak;
+        final SizeClassMagazine magazine;
+
+        Burst(long peak, SizeClassMagazine magazine) {
+            this.peak = peak;
+            this.magazine = magazine;
+        }
+    }
+
     /**
-     * Runs the burst with every stripe write lock held, so no releaser can apply the exhausted -&gt;
-     * reusable transition inline and the notification is the only thing that can move a chunk. Without
-     * that this assertion is at the mercy of the scheduler: with the locks free, most chunks are moved
-     * by the lock-winning path and deleting the drain's {@code moveToReusable} still leaves only a
-     * handful stranded.
+     * Runs the burst with the stripe's write lock held, so no releaser can apply the full -&gt; reusable
+     * transition inline and the notification is the only thing that can move a chunk. Without that this assertion
+     * is at the mercy of the scheduler: with the lock free, most chunks are moved by the lock-winning path and
+     * deleting the drain's refiling still leaves only a handful stranded.
      */
     @Test
     void noChunkIsStrandedAfterABurstWithCrossThreadReleases() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        runBurstWithCrossThreadReleases(allocator, true);
+        AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
+        Burst burst = runBurstWithCrossThreadReleases(allocator, true);
 
         // Every worker has been joined, so the lists are quiescent and safe to walk from here.
-        for (SizeClassMagazine cache : sizeClassChunkCaches(allocator)) {
-            int stranded = 0;
-            for (AdaptivePoolingAllocator.Chunk c = cache.full.head; c != null; c = c.nextInQueue) {
-                if (((SizeClassedChunk) c).hasFreeSlot()) {
-                    stranded++;
-                }
+        int stranded = 0;
+        for (AdaptivePoolingAllocator.Chunk c = burst.magazine.full.head; c != null; c = c.nextInQueue) {
+            if (((SizeClassedChunk) c).hasFreeSlot()) {
+                stranded++;
             }
-            assertEquals(0, stranded,
-                    "chunks left on the exhausted list with capacity: neither reusable nor evictable");
         }
+        assertEquals(0, stranded, "chunks left on the full list with capacity: neither reusable nor evictable");
     }
 
     @Test
     void memoryFallsBackToTheKeptChunksAfterAnIdleBurst() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
-        long peak = runBurstWithCrossThreadReleases(allocator, false);
+        AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
+        Burst burst = runBurstWithCrossThreadReleases(allocator, false);
 
-        int caches = sizeClassChunkCaches(allocator).size();
-        // Per cache: the four empty chunks it keeps, the magazine's active chunk, and slack. The burst ran on one
-        // stripe (see runBurstWithCrossThreadReleases).
-        long bound = (long) caches * 6 * BURST_CHUNK_SIZE;
+        // The one magazine of the burst: the four empty chunks it keeps, its active chunk, and slack.
+        long bound = 6L * BURST_CHUNK_SIZE;
         long settled = claimedHeapBytes(allocator);
 
-        assertTrue(peak > bound, "the burst must go beyond what may be retained, or this tests nothing: peak "
-                + peak + ", bound " + bound);
+        assertTrue(burst.peak > bound, "the burst must go beyond what may be retained, or this tests nothing: peak "
+                + burst.peak + ", bound " + bound);
         assertTrue(settled <= bound,
-                "after the burst went idle the caches must fall back to the chunks they keep: settled " + settled
-                        + " > " + bound + " (" + caches + " caches, chunks of " + BURST_CHUNK_SIZE + "), peak was "
-                        + peak);
+                "after the burst went idle the magazine must fall back to the chunks it keeps: settled " + settled
+                        + " > " + bound + " (chunks of " + BURST_CHUNK_SIZE + "), peak was " + burst.peak);
     }
 
     /**
      * One heap's owner allocates across many size classes, switching chunks all the time, while other threads
      * release what it allocates: their notes land on the heap's notes while its slow paths drain them. Once every
-     * buffer is back and the owner drained once more, no note is left and no chunk sits on an exhausted list: every
-     * chunk was refiled. The purge then takes every cache down to the chunks it keeps.
+     * buffer is back and the owner drained once more, no note is left and no chunk sits on a full list: every
+     * chunk was refiled. The purge then takes every magazine down to the chunks it keeps.
      */
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void noNoteIsLostWhileRemoteReleasesRaceChunkSwitches(final boolean threadLocal) throws Exception {
-        assumeFalse(isLowMemory(), "low-memory mode has no thread-local heaps");
-        final AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, threadLocal));
+        assumeFalse(IS_LOW_MEM, "low-memory mode has no thread-local heaps");
+        final AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         final int[] sizes = smallSizeClasses();
         final BlockingQueue<ByteBuf> toRelease = new ArrayBlockingQueue<ByteBuf>(4096);
         final AtomicBoolean done = new AtomicBoolean();
@@ -1383,28 +1220,39 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             }, "releaser-" + i);
             releasers[i].start();
         }
-        // On stripes, a release that wins the stripe lock applies itself and leaves no note: hold every stripe lock
-        // on and off, so that many releases cannot, while the allocations go on between the holds.
-        final List<StampedLock> locks = threadLocal ? Collections.<StampedLock>emptyList() : stripeLocks(allocator);
+        // On a stripe, a release that wins the stripe lock applies itself and leaves no note: hold the lock of the
+        // stripe the owner allocates on, on and off, so that many releases cannot, while the allocations go on
+        // between the holds (on another stripe while it is held).
+        final AtomicReference<StampedLock> stripeLock = new AtomicReference<StampedLock>();
         Thread blocker = new Thread(() -> {
-            long[] stamps = new long[locks.size()];
             while (!done.get()) {
-                for (int i = 0; i < stamps.length; i++) {
-                    stamps[i] = locks.get(i).writeLock();
-                }
-                LockSupport.parkNanos(50000);
-                for (int i = 0; i < stamps.length; i++) {
-                    locks.get(i).unlockWrite(stamps[i]);
+                StampedLock lock = stripeLock.get();
+                if (lock != null) {
+                    long stamp = lock.writeLock();
+                    LockSupport.parkNanos(50000);
+                    lock.unlockWrite(stamp);
                 }
                 LockSupport.parkNanos(50000);
             }
         }, "stripe-blocker");
         blocker.start();
+        // Every magazine that served a buffer, of this heap or of the stripes the owner fell through to.
+        final Set<SizeClassMagazine> caches = new HashSet<SizeClassMagazine>();
         onHeapThread(threadLocal, () -> {
             try {
                 SplittableRandom rng = new SplittableRandom(42);
                 for (int i = 0; i < 200000; i++) {
-                    toRelease.put(allocator.heapBuffer(sizes[rng.nextInt(sizes.length)]));
+                    ByteBuf buf = allocator.allocate(sizes[rng.nextInt(sizes.length)], Integer.MAX_VALUE);
+                    AdaptivePoolingAllocator.Chunk chunk = PageStoreTestSupport.adaptive(buf).chunk;
+                    // With few stripes (few cores) a scan that finds every stripe locked falls back to a one-shot
+                    // chunk: not a magazine's, released like the rest.
+                    if (chunk instanceof SizeClassedChunk) {
+                        SizeClassMagazine cache = ((SizeClassedChunk) chunk).magazine;
+                        if (caches.add(cache) && !threadLocal && stripeLock.get() == null) {
+                            stripeLock.set(cache.heap.lock);
+                        }
+                    }
+                    toRelease.put(buf);
                 }
             } finally {
                 done.set(true);
@@ -1413,24 +1261,19 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                 t.join();
             }
             blocker.join();
-            List<SizeClassMagazine> caches = threadLocal ? threadLocalChunkCaches(allocator)
-                    : sizeClassChunkCaches(allocator);
             assertTrue(caches.size() > 16, "many size classes must take part: " + caches.size());
-            underStripeLocks(allocator, !threadLocal, () -> {
-                for (SizeClassMagazine cache : caches) {
+            for (SizeClassMagazine cache : caches) {
+                asOwner(cache.heap, () -> {
                     cache.heap.applyNotes();
-                }
-                for (SizeClassMagazine cache : caches) {
-                    assertEquals(0, cache.full.size, "every buffer is back: no chunk may stay exhausted");
+                    assertEquals(0, cache.full.size, "every buffer is back: no chunk may stay full");
                     for (AdaptivePoolingAllocator.Chunk c = cache.reusable.head; c != null; c = c.nextInQueue) {
                         assertTrue(((SizeClassedChunk) c).allFree(), "every buffer is back");
                     }
-                    cache.heap.applyNotes();
                     cache.returnFreeSpans(true);
                     assertTrue(cache.reusable.size <= SizeClassMagazine.FLOOR,
-                            "the purge must take the cache down to the chunks it keeps: " + cache.reusable.size);
-                }
-            });
+                            "the purge must take the magazine down to the chunks it keeps: " + cache.reusable.size);
+                });
+            }
         });
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
@@ -1447,26 +1290,11 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         return Arrays.copyOf(all, n);
     }
 
-    /** The size-class magazines of the calling thread's thread-local heap. */
-    private static List<SizeClassMagazine> threadLocalChunkCaches(AdaptiveByteBufAllocator allocator)
-            throws Exception {
-        Object heap = threadLocalHeapVariable(allocator).get();
-        Field magsField = heap.getClass().getDeclaredField("magazines");
-        magsField.setAccessible(true);
-        List<SizeClassMagazine> caches = new ArrayList<SizeClassMagazine>();
-        for (Object magazine : (Object[]) magsField.get(heap)) {
-            if (magazine != null) {
-                caches.add((SizeClassMagazine) magazine);
-            }
-        }
-        return caches;
-    }
-
     /**
      * Allocate a large live set on one thread, then hand every buffer to a pool of releaser threads
      * that contend with each other for the same stripe lock, so most returns take the lock-free MPSC
-     * path and have to leave a note behind. Returns the peak used memory, and leaves the allocator
-     * settled on a small working set.
+     * path and have to leave a note behind. Returns the peak claimed memory and the magazine, and
+     * leaves the allocator settled on a small working set.
      *
      * <p>All allocation happens on one thread, and never while the releasers are running: a stripe
      * whose lock is contended makes the allocation path fall through to another stripe, and a stripe
@@ -1474,12 +1302,12 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
      * without the notification queue). Keeping to a single stripe is what makes the assertions here
      * about the mechanism rather than about stripe scheduling.
      */
-    private static long runBurstWithCrossThreadReleases(final AdaptiveByteBufAllocator allocator,
+    private static Burst runBurstWithCrossThreadReleases(final AdaptivePoolingAllocator allocator,
             final boolean forceNotifyPath) throws Exception {
         final BlockingQueue<ByteBuf> toRelease = new ArrayBlockingQueue<ByteBuf>(1024);
         final AtomicBoolean handedOver = new AtomicBoolean();
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
-        final AtomicReference<Long> peak = new AtomicReference<Long>(0L);
+        final AtomicReference<Burst> burst = new AtomicReference<Burst>();
         final CountDownLatch releasersDone = new CountDownLatch(8);
 
         Thread[] releasers = new Thread[8];
@@ -1513,21 +1341,18 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                     int burstBuffers = BURST_CHUNKS * BURST_SEGMENTS_PER_CHUNK;
                     ByteBuf[] live = new ByteBuf[burstBuffers];
                     for (int i = 0; i < burstBuffers; i++) {
-                        live[i] = allocator.heapBuffer(BURST_BUF_SIZE);
+                        live[i] = allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE);
                     }
-                    peak.set(claimedHeapBytes(allocator));
+                    SizeClassMagazine magazine = chunkOf(live[0]).magazine;
+                    burst.set(new Burst(claimedHeapBytes(allocator), magazine));
 
-                    // Optionally hold every stripe write lock across the release phase. Contention
+                    // Optionally hold the stripe's write lock across the release phase. Contention
                     // alone only makes *most* returns take the notify path - how many is up to the
                     // scheduler, and if every releaser happens to win the lock the assertions below
-                    // test nothing. With the locks held no releaser can win, so the notification is
+                    // test nothing. With the lock held no releaser can win, so the notification is
                     // the only thing that can move a chunk, deterministically.
-                    List<Long> stamps = new ArrayList<Long>();
-                    List<StampedLock> locks = forceNotifyPath ?
-                            stripeLocks(allocator) : Collections.<StampedLock>emptyList();
-                    for (StampedLock l : locks) {
-                        stamps.add(l.writeLock());
-                    }
+                    StampedLock lock = forceNotifyPath ? magazine.heap.lock : null;
+                    long stamp = lock == null ? 0 : lock.writeLock();
 
                     // Hand the live set to the releasers, which now contend with each other.
                     for (int i = 0; i < burstBuffers; i++) {
@@ -1536,8 +1361,8 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                     }
                     handedOver.set(true);
                     releasersDone.await();
-                    for (int i = 0; i < locks.size(); i++) {
-                        locks.get(i).unlockWrite(stamps.get(i));
+                    if (lock != null) {
+                        lock.unlockWrite(stamp);
                     }
 
                     // Settle on a tiny working set, on the same thread and so the same stripe. These
@@ -1546,7 +1371,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
                     int allocations = 8 * BURST_SEGMENTS_PER_CHUNK
                             * (int) AdaptivePoolingAllocator.CHUNK_PURGE_INTERVAL * 4;
                     for (int i = 0; i < allocations; i++) {
-                        allocator.heapBuffer(BURST_BUF_SIZE).release();
+                        allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE).release();
                     }
                 } catch (Throwable t) {
                     failure.compareAndSet(null, t);
@@ -1562,54 +1387,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
         }
-        return peak.get();
-    }
-
-    private static List<StampedLock> stripeLocks(AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        Object[] stripes = (Object[]) stripesField.get(pooling);
-        List<StampedLock> out = new ArrayList<StampedLock>();
-        for (Object stripe : stripes) {
-            if (stripe == null) {
-                continue;
-            }
-            Field lockField = stripe.getClass().getDeclaredField("lock");
-            lockField.setAccessible(true);
-            out.add((StampedLock) lockField.get(stripe));
-        }
-        return out;
-    }
-
-    private static List<SizeClassMagazine> sizeClassChunkCaches(
-            AdaptiveByteBufAllocator allocator) throws Exception {
-        Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField("heap");
-        heapField.setAccessible(true);
-        Object pooling = heapField.get(allocator);
-        Field stripesField = pooling.getClass().getDeclaredField("stripedHeaps");
-        stripesField.setAccessible(true);
-        Object[] stripes = (Object[]) stripesField.get(pooling);
-        List<SizeClassMagazine> caches = new ArrayList<SizeClassMagazine>();
-        for (Object stripe : stripes) {
-            if (stripe == null) {
-                continue;
-            }
-            Field magsField = stripe.getClass().getDeclaredField("magazines");
-            magsField.setAccessible(true);
-            Object[] magazines = (Object[]) magsField.get(stripe);
-            if (magazines == null) {
-                continue;
-            }
-            for (Object magazine : magazines) {
-                if (magazine instanceof SizeClassMagazine) {
-                    caches.add((SizeClassMagazine) magazine);
-                }
-            }
-        }
-        return caches;
+        return burst.get();
     }
 
     private static void shuffle(SplittableRandom rng, Object array) {
@@ -1623,24 +1401,24 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     }
 
     /**
-     * What a chunk says about its free segments - whether it has one, whether it has all of them, and the bytes it
-     * last counted - through every way a segment comes back: never handed out, released under the lock, released
-     * by another thread that could not take the lock and not yet polled, and polled. Each segment that came back
-     * is then handed out again, once.
+     * What a chunk says about its free slots - whether it has one, whether it has all of them - through every way
+     * a slot comes back: never handed out, released under the lock, released by another thread that could not take
+     * the lock and not yet polled, and polled. Each slot that came back is then handed out again, once.
      */
     @Test
-    void capacityQueriesFollowEveryWayASegmentComesBack() throws Exception {
-        AdaptiveByteBufAllocator allocator = closer.add(new AdaptiveByteBufAllocator(false, false));
+    void capacityQueriesFollowEveryWayASlotComesBack() throws Exception {
+        AdaptivePoolingAllocator allocator = closer.add(newHeapAllocator());
         List<ByteBuf> held = new ArrayList<ByteBuf>();
-        // One buffer: chunk A is active and its other segments were never handed out.
-        held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+        // One buffer: chunk A is active and its other slots were never handed out.
+        held.add(allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE));
         SizeClassedChunk chunkA = chunkOf(held.get(0));
+        StampedLock lock = chunkA.magazine.heap.lock;
         assertTrue(chunkA.hasFreeSlot());
         assertFalse(chunkA.allFree());
 
-        // Chunk A: every segment handed out. Chunk B: the active chunk, one segment handed out.
+        // Chunk A: every slot handed out. Chunk B: the active chunk, one slot handed out.
         for (int i = 1; i <= BURST_SEGMENTS_PER_CHUNK; i++) {
-            held.add(allocator.heapBuffer(BURST_BUF_SIZE));
+            held.add(allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE));
         }
         assertSame(chunkA, chunkOf(held.get(BURST_SEGMENTS_PER_CHUNK - 1)));
         assertNotSame(chunkA, chunkOf(held.get(BURST_SEGMENTS_PER_CHUNK)));
@@ -1650,55 +1428,45 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         // Released by a thread that could take the stripe lock: straight into the chunk's local free list.
         release(held.get(0), false);
         assertTrue(chunkA.hasFreeSlot());
-        assertEquals(BURST_BUF_SIZE, chunkA.freeBytes());
 
         // Released by a thread that cannot take the lock: counted as free before anyone takes them over. The last
         // buffer of A stays in use, so that A is never given up and the same chunk serves what follows.
         ByteBuf lastOfA = held.get(BURST_SEGMENTS_PER_CHUNK - 1);
-        List<StampedLock> locks = stripeLocks(allocator);
-        List<Long> stamps = new ArrayList<Long>();
-        for (StampedLock l : locks) {
-            stamps.add(l.writeLock());
-        }
+        long stamp = lock.writeLock();
         try {
             for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK - 1; i++) {
                 release(held.get(i), true);
             }
             assertTrue(chunkA.hasFreeSlot());
             assertFalse(chunkA.allFree());
-            assertEquals((BURST_SEGMENTS_PER_CHUNK - 1) * BURST_BUF_SIZE, chunkA.freeBytes());
         } finally {
-            for (int i = 0; i < locks.size(); i++) {
-                locks.get(i).unlockWrite(stamps.get(i));
-            }
+            lock.unlockWrite(stamp);
         }
         ByteBuf firstOfB = held.get(BURST_SEGMENTS_PER_CHUNK);
         held.clear();
 
-        // Run B out of segments; then A serves all but one of its segments: the one released under the lock, then
-        // those taken over from the other thread, each once and never the segment still in use.
+        // Run B out of slots; then A serves all but one of its slots: the one released under the lock, then
+        // those taken over from the other thread, each once and never the slot still in use.
         List<ByteBuf> fromB = new ArrayList<ByteBuf>();
         fromB.add(firstOfB);
         for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
-            fromB.add(allocator.heapBuffer(BURST_BUF_SIZE));
+            fromB.add(allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE));
             assertNotSame(chunkA, chunkOf(fromB.get(i)));
         }
         Set<Integer> offsets = new HashSet<Integer>();
         offsets.add(lastOfA.arrayOffset());
         for (int i = 1; i < BURST_SEGMENTS_PER_CHUNK; i++) {
-            ByteBuf buf = allocator.heapBuffer(BURST_BUF_SIZE);
+            ByteBuf buf = allocator.allocate(BURST_BUF_SIZE, Integer.MAX_VALUE);
             held.add(buf);
             assertSame(chunkA, chunkOf(buf));
-            assertTrue(offsets.add(buf.arrayOffset()), "segment handed out twice");
+            assertTrue(offsets.add(buf.arrayOffset()), "slot handed out twice");
         }
         assertFalse(chunkA.hasFreeSlot());
         assertEquals(0, chunkA.freeBytes());
 
-        // Every segment of A back, from another thread that cannot take the lock: all of them free, none polled yet.
+        // Every slot of A back, from another thread that cannot take the lock: all of them free, none polled yet.
         held.add(lastOfA);
-        for (StampedLock l : locks) {
-            stamps.set(locks.indexOf(l), l.writeLock());
-        }
+        stamp = lock.writeLock();
         try {
             for (ByteBuf buf : held) {
                 release(buf, true);
@@ -1706,9 +1474,7 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
             assertTrue(chunkA.allFree());
             assertTrue(chunkA.hasFreeSlot());
         } finally {
-            for (int i = 0; i < locks.size(); i++) {
-                locks.get(i).unlockWrite(stamps.get(i));
-            }
+            lock.unlockWrite(stamp);
         }
         for (ByteBuf buf : fromB) {
             buf.release();

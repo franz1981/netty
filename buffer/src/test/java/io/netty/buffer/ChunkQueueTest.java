@@ -25,18 +25,18 @@ import static org.mockito.Mockito.mock;
 
 public class ChunkQueueTest {
 
-    private static SizeClassedChunk chunkWithCapacity() {
-        SizeClassedChunk chunk = mock(SizeClassedChunk.class);
-        return chunk;
+    /** A chunk with the queue links and nothing else. */
+    private static SizeClassedChunk chunk() {
+        return mock(SizeClassedChunk.class);
     }
 
     @Test
     void theQueueKeepsItsTailAcrossRemovals() {
         AdaptivePoolingAllocator.ChunkQueue queue = new AdaptivePoolingAllocator.ChunkQueue();
-        SizeClassedChunk a = chunkWithCapacity();
-        SizeClassedChunk b = chunkWithCapacity();
-        SizeClassedChunk c = chunkWithCapacity();
-        SizeClassedChunk d = chunkWithCapacity();
+        SizeClassedChunk a = chunk();
+        SizeClassedChunk b = chunk();
+        SizeClassedChunk c = chunk();
+        SizeClassedChunk d = chunk();
         queue.pushBack(b);
         queue.pushFront(a);
         queue.pushBack(c);

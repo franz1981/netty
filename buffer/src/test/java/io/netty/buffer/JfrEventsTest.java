@@ -15,7 +15,6 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingStream;
@@ -28,7 +27,6 @@ import org.junit.jupiter.api.parallel.Isolated;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -70,12 +68,10 @@ public class JfrEventsTest {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     public void adaptiveSegmentChunkEventsAddUpToUsedMemory(final boolean direct) throws Exception {
-        Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
-        lowMem.setAccessible(true);
-        assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools less");
+        assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM, "low-memory mode has no thread-local heaps and pools less");
         final AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, true));
-        final int segmentSize = direct ? AdaptiveByteBufAllocatorTest.directSegmentSize(alloc) :
-                AdaptiveByteBufAllocatorTest.heapSegmentSize(alloc);
+        final int segmentSize = (direct ? PageStoreConfig.directDefaults() : PageStoreConfig.heapDefaults())
+                .segmentSize;
         assumeTrue(segmentSize > 0, "chunks are not carved out of segments");
         final String threadName = "adaptive-segment-chunk-events";
         final int sentinel = 5 * 1024 * 1024 + 4099;
@@ -118,13 +114,15 @@ public class JfrEventsTest {
 
             Thread thread = new FastThreadLocalThread(() -> {
                 // Spans of 8 slices: the 16 KiB burst fills a segment, the 64 KiB one reuses its spans.
-                releaseAll(allocateMany(alloc, direct, 16 * 1024, 32 * 8));
+                List<ByteBuf> small = allocateMany(alloc, direct, 16 * 1024, 32 * 8);
+                AdaptivePoolingAllocator.Heap heap = PageStoreTestSupport.heap(small.get(0));
+                releaseAll(small);
                 releaseAll(allocateMany(alloc, direct, 64 * 1024, 8 * 8));
                 allocateMany(alloc, direct, segmentSize, 1).get(0).release();
                 // At most a segment: heap segments are smaller under G1 with small regions.
                 releaseAll(allocateMany(alloc, direct, Math.min(512 * 1024, segmentSize), 8));
                 // The size classes go idle and give their spans back: the emptied segment waits in the cache.
-                decayThreadLocalHeap(alloc, direct ? "direct" : "heap", 3);
+                decay(heap, 3);
                 heldPastTheEnd[0] = allocateMany(alloc, direct, 1024, 1).get(0);
             }, threadName);
             thread.start();
@@ -139,7 +137,7 @@ public class JfrEventsTest {
         assertTrue(segments[0] > 0, "segments are announced");
         assertEquals(Collections.emptyList(), otherSegmentEvents, "segment events are on the workload threads");
         long unit = segmentSize;
-        boolean shared = direct && AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
+        boolean shared = direct && PageStoreTestSupport.directRegionsAreMapped();
         for (int capacity : units) {
             if (shared) {
                 // With shared slices, each event is the slices a claim committed.
@@ -169,23 +167,10 @@ public class JfrEventsTest {
         return bufs;
     }
 
-    /**
-     * Run the calling thread's thread-local heap's decay {@code decays} times now.
-     */
-    private static void decayThreadLocalHeap(AdaptiveByteBufAllocator alloc, String which, int decays) {
-        try {
-            Field heapField = AdaptiveByteBufAllocator.class.getDeclaredField(which);
-            heapField.setAccessible(true);
-            Object pooling = heapField.get(alloc);
-            Field tlField = pooling.getClass().getDeclaredField("threadLocalHeap");
-            tlField.setAccessible(true);
-            AdaptivePoolingAllocator.Heap heap =
-                    (AdaptivePoolingAllocator.Heap) ((FastThreadLocal<?>) tlField.get(pooling)).get();
-            for (int i = 0; i < decays; i++) {
-                heap.releaseIdle(System.nanoTime());
-            }
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError(e);
+    /** Runs the decay of {@code heap}, the calling thread's own, {@code decays} times now. */
+    private static void decay(AdaptivePoolingAllocator.Heap heap, int decays) {
+        for (int i = 0; i < decays; i++) {
+            heap.releaseIdle(System.nanoTime());
         }
     }
 
@@ -393,10 +378,10 @@ public class JfrEventsTest {
             RecordedEvent allocate = allocateFuture.get();
             // A direct size class takes a segment and carves its chunk out of it: the segment is the event, a
             // region's or not.
-            int segmentSize = AdaptiveByteBufAllocatorTest.directSegmentSize(alloc);
+            int segmentSize = PageStoreConfig.directDefaults().segmentSize;
             // With shared slices, the event is the chunk's slices.
-            boolean perSegment = !AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
-            int chunkSize = PageStoreTestSupport.chunkSizeOf(128, PageStoreConfig.directDefaults());
+            boolean perSegment = !PageStoreTestSupport.directRegionsAreMapped();
+            int chunkSize = PageStoreTestSupport.chunkSize(128, PageStoreConfig.directDefaults());
             assertEquals(perSegment ? segmentSize : chunkSize, allocate.getInt("capacity"));
             assertTrue(allocate.getBoolean("pooled"));
             assertFalse(allocate.getBoolean("threadLocal"));
@@ -418,7 +403,7 @@ public class JfrEventsTest {
             AdaptiveByteBufAllocator allocator = newAdaptiveAllocator(false);
             int bufSize = 16896;
             // The events are the page store's blocks: fill one, then take a buffer from the next.
-            int blockSize = AdaptiveByteBufAllocatorTest.heapSegmentSize(allocator);
+            int blockSize = PageStoreConfig.heapDefaults().segmentSize;
             List<ByteBuf> buffers = new ArrayList<>();
             while (allocator.usedHeapMemory() <= blockSize) {
                 buffers.add(allocator.heapBuffer(bufSize, bufSize));
@@ -472,13 +457,12 @@ public class JfrEventsTest {
     @SuppressWarnings("Since15")
     @Test
     public void adaptiveLargeBufferOnAThreadLocalHeapIsThreadLocalInBothEvents() throws Exception {
-        Field lowMem = AdaptivePoolingAllocator.class.getDeclaredField("IS_LOW_MEM");
-        lowMem.setAccessible(true);
-        assumeFalse(lowMem.getBoolean(null), "low-memory mode has no thread-local heaps and pools no 512 KiB buffers");
+        assumeFalse(AdaptivePoolingAllocator.IS_LOW_MEM,
+                "low-memory mode has no thread-local heaps and pools no 512 KiB buffers");
         final int size = 512 * 1024;
         AdaptiveByteBufAllocator alloc = closer.add(new AdaptiveByteBufAllocator(true, true));
         // With shared slices the page store's event is the span's own slices.
-        final boolean shared = AdaptiveByteBufAllocatorTest.directSharesSlices(alloc);
+        final boolean shared = PageStoreTestSupport.directRegionsAreMapped();
         Callable<Void> allocateAndRelease = () -> {
             try (RecordingStream stream = new RecordingStream()) {
                 CompletableFuture<RecordedEvent> chunkFuture = new CompletableFuture<>();

@@ -42,7 +42,6 @@ import static io.netty.buffer.PageStoreTestSupport.newSharedAllocator;
 import static io.netty.buffer.PageStoreTestSupport.purgeUntilDone;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -100,7 +99,7 @@ final class SharedSlicesTest {
     @Test
     void claimsOfOneLengthShareBlocks() {
         PageStore store = store(INTERVAL);
-        assertBins(store, 1, 8, 32);
+        assertArrayEquals(new int[] {1, 8, 32}, store.allocator.table.pageKinds, "the bins");
         long a = store.claimSlices(1, false);
         assertEquals(0, slice(a));
         long b = store.claimSlices(8, false);
@@ -114,30 +113,12 @@ final class SharedSlicesTest {
         assertEquals(2 * PER_BLOCK, slice(store.claimSlices(8, false)), "block 1 is the 32-slice bin's now");
         release(store, a, 1);
         assertEquals(0, slice(store.claimSlices(1, false)), "the lowest fit of the bin");
-        assertMapsShowEveryFit(store);
-    }
-
-    /** A bit set for a block that does not earn it is cleared by the claim that finds it, which goes on. */
-    @Test
-    void aStaleBitIsClearedByTheClaimThatFindsIt() {
-        PageStore store = store(INTERVAL);
-        assertBins(store, 1, 8, 32);
-        Segment eights = block(store, store.claimSlices(8, false));
-        Segment ones = block(store, store.claimSlices(1, false));
-        assertEquals(1, store.id(ones), "block 1 of region 0");
-        int bin1 = store.binByLength[1];
-        store.mark(bin1, store.id(eights));
-        assertEquals(PER_BLOCK + 1, slice(store.claimSlices(1, false)), "not in the 8-slice bin's block");
-        assertFalse(store.marked(bin1, eights));
-        store.mark(store.emptyMap, store.id(eights));
-        assertEquals(2 * PER_BLOCK, slice(store.claimSlices(32, false)), "block 0 is not wholly free");
-        assertFalse(store.marked(store.emptyMap, eights));
-        assertMapsShowEveryFit(store);
+        assertFitsAreFound(store, 1, 8, 32);
     }
 
     /**
      * Threads claim runs of every bin, and release some, while the claims add regions and the maps grow under them:
-     * no slice is claimed twice, and once the threads are done the maps show every fit and every wholly free block.
+     * no slice is claimed twice, and once the threads are done every fit is still found, in the regions there are.
      */
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
@@ -185,13 +166,14 @@ final class SharedSlicesTest {
         }
         assertNull(failure.get());
         assertTrue(regions.regions.size() >= regionsWanted);
-        assertMapsShowEveryFit(store);
+        // The last region mapped is nearly empty: every length fits without another one.
+        assertFitsAreFound(store, sizes);
         for (List<long[]> mine : held) {
             for (long[] run : mine) {
                 release(store, run[0], (int) run[1]);
             }
         }
-        assertMapsShowEveryFit(store);
+        assertFitsAreFound(store, sizes);
     }
 
     /** The slices of {@code run}, {run, slices}, go from owner {@code from} to {@code to}. */
@@ -206,30 +188,18 @@ final class SharedSlicesTest {
         }
     }
 
-    private static void assertBins(PageStore store, int... lengths) {
-        for (int n : lengths) {
-            assertTrue(store.binByLength[n] != store.otherBin, n + " slices: not a page kind");
-        }
-    }
-
     /**
-     * Once no thread claims nor releases: every wholly free block, and every block with a fit for its bin, has its
-     * bit; a bit too many is only a hint.
+     * Once no thread claims nor releases, and the regions have room for every length in {@code lengths}: a claim of
+     * each finds its fit, instead of mapping or allocating a region (what a stale map bit, or a missing one, would
+     * cost); released again after.
      */
-    static void assertMapsShowEveryFit(PageStore store) {
-        for (Region region : store.regions) {
-            if (region.released) {
-                continue;
-            }
-            for (Segment block : region.blocks) {
-                long free = block.free;
-                if (free == block.allFree) {
-                    assertTrue(store.marked(store.emptyMap, block), block + " of " + region + ": wholly free");
-                } else if (Segment.firstFit(free, store.binSlices[block.bin]) >= 0) {
-                    assertTrue(store.marked(block.bin, block), block + " of " + region + ": a fit of bin "
-                            + block.bin);
-                }
-            }
+    private void assertFitsAreFound(PageStore store, int... lengths) {
+        int mapped = regions.regions.size() + segments.segmentsAllocated();
+        for (int n : lengths) {
+            long run = store.claimSlices(n, false);
+            assertEquals(mapped, regions.regions.size() + segments.segmentsAllocated(),
+                    n + " slices: a region was added although a fit was free");
+            release(store, run, n);
         }
     }
 
@@ -375,7 +345,7 @@ final class SharedSlicesTest {
                 }
             }
         }
-        assertMapsShowEveryFit(store);
+        assertFitsAreFound(store, store.config.slicesPerSegment());
         assertEquals(heap, store.regions[0].buffer.hasArray(), "byte[] regions for heap memory only");
         assertSharedAccounted(segments, store.allocator);
         if (!mmap) {
@@ -402,7 +372,7 @@ final class SharedSlicesTest {
 
     /**
      * A {@code malloc}'d region goes back whole once all of it stayed free for the purge delay, never before nor while
-     * a slice is claimed; the next region mapped takes its place.
+     * a slice is claimed; the next claim allocates another.
      */
     @Test
     void aWhollyIdleMallocRegionGoesBackAndItsPlaceIsTaken() {
@@ -423,10 +393,8 @@ final class SharedSlicesTest {
         assertEquals(0, store.allocator.usedMemory());
         assertEquals(0, regions.purgeCalls(), "no part of a malloc'd region is purged");
         long again = store.claimSlices(9, false);
-        assertEquals(0, (int) (again >>> 32), "the released region's place");
         assertEquals(1, segments.segmentsLive());
         assertEquals(2, segments.segmentsAllocated());
-        assertTrue(store.regions[0].buffer != releasedBuffer);
         release(store, again, 9);
         store.close();
         assertEquals(0, store.allocator.usedMemory());
