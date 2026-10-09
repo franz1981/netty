@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * The units, largest first, and their names in the code:
@@ -77,8 +78,11 @@ final class PageStore {
     /** The blocks of a new region, and where it starts: 1 and 0 once {@link #mmap} fails and is given up. */
     private volatile int regionBlocks;
     private int regionAlignment;
-    /** Replaced under this store's monitor, one longer or with a released region's place taken; read without it. */
+    /** Replaced under {@link #lock}, one longer or with a released region's place taken; read without it. */
     volatile Region[] regions = NO_REGIONS;
+    /** Taken to add a region, to give one back whole, and to close: never on a claim or a release. */
+    private final ReentrantLock lock = new ReentrantLock();
+    /** Under {@link #lock}. */
     private boolean closed;
     private volatile int purging;
     volatile long lastPurgeNanos = System.nanoTime();
@@ -137,69 +141,95 @@ final class PageStore {
     }
 
     /** Maps a new region, unless one was added since {@code seen} was read, claiming the caller's run in it before
-     *  publishing it: published empty, the purger could give it back idle before this claim scanned it. */
-    private synchronized long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
-        if (closed) {
-            throw new IllegalStateException("closed");
-        }
-        if (regions != seen) {
-            return -1;
-        }
-        MmapRegionSource mmap = this.mmap;
-        int slots = regionBlocks;
-        int size = slots * config.segmentSize;
-        AbstractByteBuf buffer;
-        AbstractPageStoreEvent event = PageStoreEvents.beginMap();
+     *  publishing it: published empty, the purger could give it back idle before this claim scanned it. One adder
+     *  at a time: the ones that wait find the region added and claim in it. */
+    private long addRegion(Region[] seen, boolean threadLocal, int slices, int blocks) {
+        lock.lock();
         try {
-            buffer = mmap != null ? mmap.allocateRegion(size, regionAlignment) : memory.allocate(size, size);
-        } catch (OutOfMemoryError | RuntimeException e) {
-            PageStoreEvents.end(event, 0, size, seen.length, e);
-            if (mmap == null || config.mallocRegionSize <= 0 || config.regionSize == config.mallocRegionSize) {
-                // A block (malloc, byte[]) that cannot be had, or the direct memory limit it is charged to: this
-                // allocation fails, the next region may well fit.
-                throw e;
+            if (closed) {
+                throw new IllegalStateException("closed");
             }
-            this.mmap = null;
-            regionBlocks = 1;
-            regionAlignment = 0;
-            logger.warn("Cannot map a region of {} bytes: regions are one block each from now on.", size, e);
-            return -1;
+            if (regions != seen) {
+                return -1;
+            }
+            MmapRegionSource mmap = this.mmap;
+            int slots = regionBlocks;
+            int size = slots * config.segmentSize;
+            AbstractByteBuf buffer;
+            AbstractPageStoreEvent event = PageStoreEvents.beginMap();
+            try {
+                buffer = mmap != null ? mmap.allocateRegion(size, regionAlignment) : memory.allocate(size, size);
+            } catch (OutOfMemoryError | RuntimeException e) {
+                PageStoreEvents.end(event, 0, size, seen.length, e);
+                if (mmap == null || config.mallocRegionSize <= 0 || config.regionSize == config.mallocRegionSize) {
+                    // A block (malloc, byte[]) that cannot be had, or the direct memory limit it is charged to: this
+                    // allocation fails, the next region may well fit.
+                    throw e;
+                }
+                this.mmap = null;
+                regionBlocks = 1;
+                regionAlignment = 0;
+                logger.warn("Cannot map a region of {} bytes: regions are one block each from now on.", size, e);
+                return -1;
+            }
+            assert buffer.capacity() == size;
+            PageStoreEvents.end(event, buffer._memoryAddress(), size, seen.length, null);
+            return publish(seen, threadLocal, slices, blocks, buffer, mmap, slots, size);
+        } finally {
+            lock.unlock();
         }
-        assert buffer.capacity() == size;
-        PageStoreEvents.end(event, buffer._memoryAddress(), size, seen.length, null);
+    }
+
+    /** Under {@link #lock}: publishes the region of {@code buffer}, or gives {@code buffer} back if that fails. */
+    private long publish(Region[] seen, boolean threadLocal, int slices, int blocks, AbstractByteBuf buffer,
+                         MmapRegionSource mmap, int slots, int size) {
         int index = 0;
         while (index < seen.length && !seen[index].released) {
             index++;
         }
-        // A region charged whole has memory behind all of it, free since now.
-        Region region = new Region(this, buffer, mmap, slots, config, mmap == null, System.nanoTime(), index);
-        if (region.source == null) {
-            // Charged by its allocation, counted whole from now on.
-            allocator.memoryCommitted(buffer._memoryAddress(), size, buffer.isDirect(), true, threadLocal);
-        }
-        // The place of a region given back is taken again: nothing claims in a released region.
-        Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
-        growMaps(index);
-        int first;
-        if (blocks != 0) {
-            first = region.claimBlocks(blocks);
-            if (first >= 0) {
-                first *= config.slicesPerSegment();
+        Region region = null;
+        boolean published = false;
+        try {
+            // A region charged whole has memory behind all of it, free since now.
+            region = new Region(this, buffer, mmap, slots, config, mmap == null, System.nanoTime(), index);
+            if (region.source == null) {
+                // Charged by its allocation, counted whole from now on.
+                allocator.memoryCommitted(buffer._memoryAddress(), size, buffer.isDirect(), true, threadLocal);
             }
-        } else {
-            Segment block = region.blocks[0];
-            first = block.claimFirst(slices, binOf[slices]) ? 0 : -1;
+            // The place of a region given back is taken again: nothing claims in a released region.
+            Region[] grown = index < seen.length ? seen.clone() : Arrays.copyOf(seen, seen.length + 1);
+            growMaps(index);
+            int first;
+            if (blocks != 0) {
+                first = region.claimBlocks(blocks);
+                if (first >= 0) {
+                    first *= config.slicesPerSegment();
+                }
+            } else {
+                Segment block = region.blocks[0];
+                first = block.claimFirst(slices, binOf[slices]) ? 0 : -1;
+            }
+            grown[index] = region;
+            regions = grown;
+            published = true;
+            for (Segment block : region.blocks) {
+                slicesReleased(block, block.free);
+            }
+            if (region.source == null) {
+                // Its free slices have memory behind them, all of them if the claim failed.
+                armPurge(System.nanoTime());
+            }
+            return first < 0 ? -1 : run(index, first);
+        } finally {
+            if (!published) {
+                // A throw (out of heap) before the region was reachable: nothing else would ever give it back.
+                if (region != null) {
+                    releaseRegion(region);
+                } else {
+                    buffer.release();
+                }
+            }
         }
-        grown[index] = region;
-        regions = grown;
-        for (Segment block : region.blocks) {
-            slicesReleased(block, block.free);
-        }
-        if (region.source == null) {
-            // Its free slices have memory behind them, all of them if the claim failed.
-            armPurge(System.nanoTime());
-        }
-        return first < 0 ? -1 : run(index, first);
     }
 
     /** Shared slices, any thread: claims a run of {@code slices} free slices of one block, lowest fit first, so
@@ -362,7 +392,7 @@ final class PageStore {
         }
     }
 
-    /** Under this store's monitor: grows the maps to hold region {@code index}'s block ids before it is published;
+    /** Under {@link #lock}: grows the maps to hold region {@code index}'s block ids before it is published;
      *  a mark lost to a reader mid-copy is caught by copying twice. */
     private void growMaps(int index) {
         AtomicLongArray old = maps;
@@ -507,15 +537,20 @@ final class PageStore {
     }
 
     /** Unmaps every region: only when nothing can touch them any more (the allocator is unreachable). */
-    synchronized void close() {
-        closed = true;
-        Region[] regions = this.regions;
-        this.regions = NO_REGIONS;
-        for (Region region : regions) {
-            if (region.released) {
-                continue;
+    void close() {
+        lock.lock();
+        try {
+            closed = true;
+            Region[] regions = this.regions;
+            this.regions = NO_REGIONS;
+            for (Region region : regions) {
+                if (region.released) {
+                    continue;
+                }
+                releaseRegion(region);
             }
-            releaseRegion(region);
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -724,12 +759,17 @@ final class PageStore {
     }
 
     /** {@code region}, which the purger holds whole, goes back to its source, unless the store was closed. */
-    private synchronized boolean releaseIdleRegion(Region region) {
-        if (closed) {
-            return false;
+    private boolean releaseIdleRegion(Region region) {
+        lock.lock();
+        try {
+            if (closed) {
+                return false;
+            }
+            releaseRegion(region);
+            return true;
+        } finally {
+            lock.unlock();
         }
-        releaseRegion(region);
-        return true;
     }
 
     /** Purges the contiguous slices {@code bits} of {@code block}, claimed by the purger, with one call. */

@@ -27,7 +27,7 @@ final class Region {
     final int length;
     final Segment[] blocks;
     final int index;
-    /** Set by the purger under the store's monitor; every block stays claimed once set. */
+    /** Set under the store's lock; every block stays claimed once set. */
     volatile boolean released;
 
     Region(PageStore store, AbstractByteBuf buffer, MmapRegionSource source, int slots,
