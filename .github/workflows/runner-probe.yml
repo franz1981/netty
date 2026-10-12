@@ -1,0 +1,22 @@
+name: runner probe
+on:
+  push:
+    branches: [ "ci/runner-probe" ]
+jobs:
+  probe:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, ubuntu-22.04 ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '11'
+      - name: CPUs, memory, default JVM heap on the host and in a container without limits
+        run: |
+          nproc
+          free -m
+          java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E ' MaxHeapSize | ActiveProcessorCount |UseG1GC '
+          docker run --rm azul/zulu-openjdk-centos:11 java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E ' MaxHeapSize |UseG1GC '
+          docker run --rm azul/zulu-openjdk-centos:11 sh -c 'nproc; java -XshowSettings:system -version 2>&1 | head -12'
