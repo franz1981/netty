@@ -20,7 +20,6 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.embedded.EmbeddedChannel;
-import io.netty.handler.codec.http.HttpRequestDecoder;
 import io.netty.microbench.util.AbstractMicrobenchmark;
 import io.netty.util.ReferenceCountUtil;
 import org.openjdk.jmh.annotations.Benchmark;
@@ -38,12 +37,10 @@ import java.util.ArrayList;
 import java.util.Queue;
 import java.util.concurrent.TimeUnit;
 
-import static io.netty.handler.codec.http.HttpObjectDecoder.DEFAULT_INITIAL_BUFFER_SIZE;
-import static io.netty.handler.codec.http.HttpObjectDecoder.DEFAULT_MAX_CHUNK_SIZE;
-import static io.netty.handler.codec.http.HttpObjectDecoder.DEFAULT_MAX_HEADER_SIZE;
-import static io.netty.handler.codec.http.HttpObjectDecoder.DEFAULT_MAX_INITIAL_LINE_LENGTH;
 import static io.netty.microbench.http.HttpRequestDecoderUtils.CONTENT_LENGTH;
 import static io.netty.microbench.http.HttpRequestDecoderUtils.CONTENT_MIXED_DELIMITERS;
+import static io.netty.microbench.http.HttpRequestDecoderUtils.checkDecodes;
+import static io.netty.microbench.http.HttpRequestDecoderUtils.newDecoder;
 
 /**
  * This benchmark is based on HttpRequestDecoderTest class.
@@ -96,9 +93,8 @@ public class HttpFragmentedRequestDecoderBenchmark extends AbstractMicrobenchmar
     public void initPipeline() {
         final ByteBufAllocator allocator = pooled? PooledByteBufAllocator.DEFAULT : UnpooledByteBufAllocator.DEFAULT;
         fragmentedRequest = stepsBuffers(allocator, CONTENT_MIXED_DELIMITERS, headerFragmentBytes, direct);
-        channel = new EmbeddedChannel(
-                new HttpRequestDecoder(DEFAULT_MAX_INITIAL_LINE_LENGTH, DEFAULT_MAX_HEADER_SIZE, DEFAULT_MAX_CHUNK_SIZE,
-                                       validateHeaders, DEFAULT_INITIAL_BUFFER_SIZE));
+        channel = new EmbeddedChannel(newDecoder(validateHeaders));
+        checkDecodes(channel, 1, fragmentedRequest);
     }
 
     @TearDown

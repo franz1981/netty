@@ -15,7 +15,14 @@
  */
 package io.netty.microbench.http;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderResultProvider;
+import io.netty.handler.codec.http.HttpDecoderConfig;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpRequestDecoder;
 import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
 
 final class HttpRequestDecoderUtils {
 
@@ -24,6 +31,44 @@ final class HttpRequestDecoderUtils {
 
     static final byte[] CONTENT_MIXED_DELIMITERS = createContent("\r\n", "\n");
     static final int CONTENT_LENGTH = 120;
+
+    /**
+     * {@link #CONTENT_MIXED_DELIMITERS} ends some lines with a bare LF, which only a decoder without strict line
+     * parsing accepts.
+     */
+    static HttpRequestDecoder newDecoder(boolean validateHeaders) {
+        return new HttpRequestDecoder(new HttpDecoderConfig()
+                .setValidateHeaders(validateHeaders)
+                .setStrictLineParsing(false));
+    }
+
+    /**
+     * Decodes the buffers once and fails unless they produce {@code requests} requests and no decoder failure.
+     */
+    static void checkDecodes(EmbeddedChannel channel, int requests, ByteBuf... buffers) {
+        int decoded = 0;
+        for (ByteBuf buffer : buffers) {
+            buffer.resetReaderIndex();
+            channel.writeInbound(buffer.retain());
+            Object msg;
+            while ((msg = channel.readInbound()) != null) {
+                try {
+                    if (((DecoderResultProvider) msg).decoderResult().isFailure()) {
+                        throw new IllegalStateException("Decoding failed",
+                                ((DecoderResultProvider) msg).decoderResult().cause());
+                    }
+                    if (msg instanceof HttpRequest) {
+                        decoded++;
+                    }
+                } finally {
+                    ReferenceCountUtil.release(msg);
+                }
+            }
+        }
+        if (decoded != requests) {
+            throw new IllegalStateException("Decoded " + decoded + " requests instead of " + requests);
+        }
+    }
 
     private static byte[] createContent(String... lineDelimiters) {
         String lineDelimiter;
