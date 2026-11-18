@@ -18,6 +18,7 @@
   <!-- Artifacts requiring Java 8 and nothing else -->
   <feature name="netty-java8" version="${project.version}">
     <bundle>mvn:io.netty/netty-buffer/${project.version}</bundle>
+    <bundle>mvn:io.netty/netty-incubator-allocator/${project.version}</bundle>
     <bundle>mvn:io.netty/netty-codec-base/${project.version}</bundle>
     <bundle>mvn:io.netty/netty-codec-classes-quic/${project.version}</bundle>
     <bundle>mvn:io.netty/netty-codec-compression/${project.version}</bundle>

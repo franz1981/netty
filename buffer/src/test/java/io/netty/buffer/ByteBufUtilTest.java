@@ -40,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -101,6 +102,34 @@ public class ByteBufUtilTest {
                 { BufferType.DIRECT_ADAPTIVE },
                 { BufferType.HEAP_ADAPTIVE }
         });
+    }
+
+    @Test
+    public void loadAllocatorCreatesThePresentClass() {
+        ByteBufAllocator allocator = ByteBufUtil.loadAllocator(
+                AdaptiveByteBufAllocator.class.getName(), "netty-buffer", ByteBufUtilTest.class.getClassLoader());
+        assertInstanceOf(AdaptiveByteBufAllocator.class, allocator);
+    }
+
+    @Test
+    public void loadAllocatorReturnsNullForAnAbsentClass() {
+        assertNull(ByteBufUtil.loadAllocator("io.netty.incubator.allocator.NoSuchAllocator",
+                "netty-incubator-allocator", ByteBufUtilTest.class.getClassLoader()));
+    }
+
+    @Test
+    public void loadAllocatorReturnsNullForAClassThatFails() {
+        ClassLoader loader = ByteBufUtilTest.class.getClassLoader();
+        assertNull(ByteBufUtil.loadAllocator(FailingAllocator.class.getName(), "x", loader));
+        assertNull(ByteBufUtil.loadAllocator(String.class.getName(), "x", loader));
+        assertNull(ByteBufUtil.loadAllocator(UnpooledByteBufAllocator.class.getName(), "x", loader),
+                "no public no-argument constructor");
+    }
+
+    public static final class FailingAllocator extends PooledByteBufAllocator {
+        public FailingAllocator() {
+            throw new IllegalStateException("no allocator today");
+        }
     }
 
     @Test

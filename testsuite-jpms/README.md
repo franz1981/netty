@@ -15,6 +15,7 @@ The module names follow the reverse-DNS style, and are derived from subproject n
 historical reasons. They are listed below:
 
 * `io.netty.buffer`
+* `io.netty.incubator.allocator`
 * `io.netty.codec`
 * `io.netty.codec.dns`
 * `io.netty.codec.haproxy`

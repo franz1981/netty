@@ -858,6 +858,7 @@
     <module>dev-tools</module>
     <module>common</module>
     <module>buffer</module>
+    <module>incubator-allocator</module>
     <module>codec-base</module>
     <module>codec-compression</module>
     <module>codec-protobuf</module>

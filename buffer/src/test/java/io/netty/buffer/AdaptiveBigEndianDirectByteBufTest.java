@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class AdaptiveBigEndianDirectByteBufTest extends AbstractAdaptiveByteBufTest {
 
     @Override
-    protected ByteBuf alloc(AdaptiveByteBufAllocator allocator, int length, int maxCapacity) {
+    protected ByteBuf alloc(ByteBufAllocator allocator, int length, int maxCapacity) {
         ByteBuf buffer = allocator.directBuffer(length, maxCapacity);
         assertTrue(buffer.isDirect());
         return buffer;

@@ -1,0 +1,68 @@
+[
+  {
+    "name": "io.netty.incubator.allocator.AdaptiveByteBufAllocator",
+    "methods": [
+      {
+        "name": "<init>",
+        "parameterTypes": []
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.AdaptivePoolingAllocator",
+    "fields": [
+      {
+        "name": "stripes"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.AdaptivePoolingAllocator$Chunk",
+    "fields": [
+      {
+        "name": "pendingNext"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.AdaptivePoolingAllocator$PendingChunks",
+    "fields": [
+      {
+        "name": "head"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.AdaptivePoolingAllocator$SlotFreeList",
+    "fields": [
+      {
+        "name": "remoteFreeList"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.PageStore",
+    "fields": [
+      {
+        "name": "purging"
+      },
+      {
+        "name": "armed"
+      },
+      {
+        "name": "abandoned"
+      }
+    ]
+  },
+  {
+    "name": "io.netty.incubator.allocator.Segment",
+    "fields": [
+      {
+        "name": "free"
+      },
+      {
+        "name": "committed"
+      }
+    ]
+  }
+]

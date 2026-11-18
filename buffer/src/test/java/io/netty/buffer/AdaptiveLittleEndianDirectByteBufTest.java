@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class AdaptiveLittleEndianDirectByteBufTest extends AbstractAdaptiveByteBufTest {
 
     @Override
-    protected ByteBuf alloc(AdaptiveByteBufAllocator allocator, int length, int maxCapacity) {
+    protected ByteBuf alloc(ByteBufAllocator allocator, int length, int maxCapacity) {
         ByteBuf buffer = allocator.directBuffer(length, maxCapacity)
                 .order(ByteOrder.LITTLE_ENDIAN);
         assertSame(ByteOrder.LITTLE_ENDIAN, buffer.order());

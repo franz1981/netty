@@ -1,0 +1,39 @@
+/*
+ * Copyright 2025 The Netty Project
+ *
+ * The Netty Project licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+package io.netty.incubator.allocator;
+
+import io.netty.buffer.AbstractByteBufAllocator;
+import jdk.jfr.Category;
+import jdk.jfr.Description;
+import jdk.jfr.Enabled;
+import jdk.jfr.Event;
+import jdk.jfr.Label;
+import jdk.jfr.Registered;
+
+/**
+ * An abstract memory allocator event.
+ * <p>
+ * The events are registered by {@link PageStoreJfr} once a Flight Recorder exists.
+ */
+@Enabled(false)
+@Registered(false)
+@Category({"Netty", "Page Store"})
+@SuppressWarnings("Since15")
+abstract class AbstractAllocatorEvent extends Event {
+    @Label("Allocator type")
+    @Description("The type of allocator this event is for")
+    public Class<? extends AbstractByteBufAllocator> allocatorType;
+}

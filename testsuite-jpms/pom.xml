@@ -54,6 +54,12 @@
     </dependency>
     <dependency>
       <groupId>${project.groupId}</groupId>
+      <artifactId>netty-incubator-allocator</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
       <artifactId>netty-handler</artifactId>
       <version>${project.version}</version>
     </dependency>
@@ -435,6 +441,23 @@
                     <includes>
                       <include>io/netty/testsuite_jpms/it/Log4jTest.java</include>
                     </includes>
+                  </configuration>
+                </execution>
+                <execution>
+                  <!-- ByteBufUtil picks the default allocator once per JVM: this one needs a JVM of its own. -->
+                  <id>pagestore-allocator-test</id>
+                  <phase>package</phase>
+                  <goals>
+                    <goal>test</goal>
+                  </goals>
+                  <configuration>
+                    <includes>
+                      <include>io/netty/testsuite_jpms/it/PageStoreAllocatorTest.java</include>
+                    </includes>
+                    <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+                    <systemPropertyVariables>
+                      <io.netty.allocator.type>pagestore</io.netty.allocator.type>
+                    </systemPropertyVariables>
                   </configuration>
                 </execution>
                 <execution>

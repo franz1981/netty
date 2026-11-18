@@ -40,6 +40,13 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
+      <!-- so that -Dio.netty.allocator.type=pagestore runs the testsuite on it -->
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-incubator-allocator</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>${project.groupId}</groupId>
       <artifactId>netty-transport</artifactId>
       <version>${project.version}</version>

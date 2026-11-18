@@ -15,6 +15,7 @@
  */
 package io.netty.buffer;
 
+import io.netty.buffer.internal.CustomAllocatorAccess;
 import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.CharsetUtil;
@@ -63,6 +64,7 @@ public abstract class AbstractByteBuf extends ByteBuf {
             logger.debug("-D{}: {}", PROP_CHECK_ACCESSIBLE, checkAccessible);
             logger.debug("-D{}: {}", PROP_CHECK_BOUNDS, checkBounds);
         }
+        CustomAllocatorAccess.set(new CustomAllocatorAccessImpl());
     }
 
     static final ResourceLeakDetector<ByteBuf> leakDetector =

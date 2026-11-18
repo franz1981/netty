@@ -17,7 +17,7 @@ name: Build PR
 
 on:
   pull_request:
-    branches: [ "4.2"]
+    branches: [ "4.2", "pagestore-ci-base" ]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -270,6 +270,12 @@ jobs:
           - setup: linux-x86_64-java11-pooled
             docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build"
             docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run build-leak-pooled-affected-only"
+          # The page store as the default allocator, to run the tests of every module on it. To change the JDK, change
+          # the name of the setup, the compose file in the two lines below, and define build-leak-pagestore and
+          # build-leak-pagestore-affected-only in that compose file, with its image, as docker-compose.centos-7.25.yaml does.
+          - setup: linux-x86_64-java25-pagestore
+            docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.25.yaml build"
+            docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.25.yaml run build-leak-pagestore-affected-only"
           - setup: linux-x86_64-java11-boringssl-jdk8-tests
             docker-compose-build: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml build"
             docker-compose-run: "-f docker/docker-compose.yaml -f docker/docker-compose.centos-7.111.yaml run build-boringssl-static-jdk8-tests-affected-only"
@@ -376,6 +382,10 @@ jobs:
 
       - name: Checking for detected leak
         run: ./.github/scripts/check_leak.sh build-leak.output
+
+      - name: Checking that the page store was the default allocator
+        if: ${{ endsWith(matrix.setup, '-pagestore') }}
+        run: ./.github/scripts/check_pagestore.sh build-leak.output
 
       - name: print JVM thread dumps when cancelled
         uses: ./netty/.github/actions/thread-dump-jvms

@@ -17,7 +17,11 @@ package java.lang.foreign;
 
 public interface ValueLayout extends MemoryLayout {
     AddressLayout ADDRESS = null;
+    OfInt JAVA_INT = null;
     OfLong JAVA_LONG = null;
+
+    interface OfInt extends ValueLayout {
+    }
 
     interface OfLong extends ValueLayout {
     }

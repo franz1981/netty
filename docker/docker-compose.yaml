@@ -115,6 +115,21 @@ services:
       - NETTY_AFFECTED_MODULES
     command: /bin/bash -cl "./.github/scripts/mvn_affected.sh -B -ntp -Pboringssl,leak clean install -Dio.netty.testsuite.badHost=netty.io -Dxml.skip=true -Dio.netty.allocator.type=pooled -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true"
 
+  build-leak-pagestore:
+    <<: *common
+    command: /bin/bash -cl "./mvnw -B -ntp -Pboringssl,leak clean install -Dio.netty.testsuite.badHost=netty.io -Dxml.skip=true -Dio.netty.allocator.type=pagestore -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true"
+
+  # Same as "build-leak-pagestore" but only builds and tests the modules affected by a change, see
+  # "build-affected-only". Only when the page store, or a module it is built on (buffer, common, jfr-stub, ffm-stub,
+  # testsuite-common), changed is everything built and tested: its dependents are not part of the affected modules
+  # otherwise.
+  build-leak-pagestore-affected-only:
+    <<: *common
+    environment:
+      - MAVEN_OPTS
+      - NETTY_AFFECTED_MODULES
+    command: /bin/bash -cl "if ./.github/scripts/affected_includes.sh incubator-allocator || ./.github/scripts/affected_includes.sh buffer || ./.github/scripts/affected_includes.sh common || ./.github/scripts/affected_includes.sh jfr-stub || ./.github/scripts/affected_includes.sh ffm-stub || ./.github/scripts/affected_includes.sh testsuite-common; then export NETTY_AFFECTED_MODULES=ALL; fi && ./.github/scripts/mvn_affected.sh -B -ntp -Pboringssl,leak clean install -Dio.netty.testsuite.badHost=netty.io -Dxml.skip=true -Dio.netty.allocator.type=pagestore -Drevapi.skip=true -Dcheckstyle.skip=true -Dforbiddenapis.skip=true"
+
   build-boringssl-snapshot:
     <<: *common
     command: /bin/bash -cl "./mvnw -B -ntp -pl handler -Pboringssl-snapshot clean package -Dxml.skip=true -Dtcnative.classifier=linux-x86_64"

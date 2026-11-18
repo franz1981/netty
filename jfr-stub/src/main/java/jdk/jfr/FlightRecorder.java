@@ -20,7 +20,19 @@ public final class FlightRecorder {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
 
+    public static FlightRecorder getFlightRecorder() throws IllegalStateException {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public java.util.List<EventType> getEventTypes() {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
     public static boolean isAvailable() {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public static boolean isInitialized() {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
 
@@ -33,6 +45,14 @@ public final class FlightRecorder {
     }
 
     public static void register(Class<? extends Event> eventClass) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public static void addPeriodicEvent(Class<? extends Event> eventClass, Runnable hook) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public static boolean removePeriodicEvent(Runnable hook) {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
 }
