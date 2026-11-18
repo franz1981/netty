@@ -1104,7 +1104,14 @@ public final class PlatformDependent {
         }
     }
 
-    static void incrementMemoryCounter(int capacity) {
+    /**
+     * Charges {@code capacity} bytes to the direct memory counter that {@code -XX:MaxDirectMemorySize} limits.
+     * For memory allocated outside {@link #allocateDirect(int, boolean)}; undone by
+     * {@link #decrementMemoryCounter(int)}. Does nothing when the counter is off.
+     *
+     * @throws OutOfDirectMemoryError if the charge would pass the limit; nothing is charged then.
+     */
+    public static void incrementMemoryCounter(int capacity) {
         if (DIRECT_MEMORY_COUNTER != null) {
             long newUsedMemory = DIRECT_MEMORY_COUNTER.addAndGet(capacity);
             if (newUsedMemory > DIRECT_MEMORY_LIMIT) {
@@ -1116,7 +1123,8 @@ public final class PlatformDependent {
         }
     }
 
-    static void decrementMemoryCounter(int capacity) {
+    /** Credits {@code capacity} bytes charged by {@link #incrementMemoryCounter(int)}. */
+    public static void decrementMemoryCounter(int capacity) {
         if (DIRECT_MEMORY_COUNTER != null) {
             long usedMemory = DIRECT_MEMORY_COUNTER.addAndGet(-capacity);
             assert usedMemory >= 0;

@@ -74,6 +74,8 @@ public final class ByteBufUtil {
 
     static final int WRITE_CHUNK_SIZE = 8192;
     static final ByteBufAllocator DEFAULT_ALLOCATOR;
+    private static final String PAGESTORE_ALLOCATOR_CLASS = "io.netty.incubator.allocator.AdaptiveByteBufAllocator";
+    private static final String PAGESTORE_ARTIFACT = "netty-incubator-allocator";
     private static final boolean SWAR_UNALIGNED = PlatformDependent.canUnalignedAccess();
 
     static {
@@ -90,6 +92,14 @@ public final class ByteBufUtil {
         } else if ("adaptive".equals(allocType)) {
             alloc = new AdaptiveByteBufAllocator();
             logger.debug("-Dio.netty.allocator.type: {}", allocType);
+        } else if ("pagestore".equals(allocType)) {
+            alloc = loadAllocator(PAGESTORE_ALLOCATOR_CLASS, PAGESTORE_ARTIFACT, ByteBufUtil.class.getClassLoader());
+            if (alloc == null) {
+                alloc = new AdaptiveByteBufAllocator();
+                logger.debug("-Dio.netty.allocator.type: adaptive (pagestore is not available)");
+            } else {
+                logger.debug("-Dio.netty.allocator.type: {}", allocType);
+            }
         } else {
             alloc = PooledByteBufAllocator.DEFAULT;
             logger.debug("-Dio.netty.allocator.type: pooled (unknown: {})", allocType);
@@ -135,6 +145,26 @@ public final class ByteBufUtil {
             throw new IllegalReferenceCountException(buffer.refCnt());
         }
         return buffer;
+    }
+
+    /**
+     * Creates the allocator of {@code className} with its no-argument constructor, for an allocator that lives in an
+     * optional artifact. Returns {@code null} when it cannot: a missing class is one warning that names
+     * {@code artifact}, any other failure is an error with its cause.
+     */
+    static ByteBufAllocator loadAllocator(String className, String artifact, ClassLoader classLoader) {
+        try {
+            Class<?> allocatorClass = Class.forName(className, true, classLoader);
+            return (ByteBufAllocator) allocatorClass.getConstructor().newInstance();
+        } catch (ClassNotFoundException e) {
+            logger.warn("-Dio.netty.allocator.type needs {}: {} was not found. Add the jar to the class path, or on "
+                    + "the module path resolve it with --add-modules (nothing requires it). "
+                    + "Using the adaptive allocator", artifact, className);
+        } catch (Throwable t) {
+            logger.error("-Dio.netty.allocator.type: {} from {} failed to load: using the adaptive allocator",
+                    className, artifact, t);
+        }
+        return null;
     }
 
     /**

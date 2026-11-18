@@ -94,6 +94,29 @@
   </dependencies>
 
   <profiles>
+    <!-- -Dio.netty.allocator.type=pagestore on the Maven command line runs the tests of the other modules on the page
+         store. The page store is built after this module, which cannot depend on it, so these tests run on the
+         default allocator instead of printing that the page store is missing. The profile stops every -D property
+         on the command line from becoming a system property of this module's tests, not only that one. -->
+    <profile>
+      <id>allocator-type-pagestore</id>
+      <activation>
+        <property>
+          <name>io.netty.allocator.type</name>
+          <value>pagestore</value>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <configuration>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
     <profile>
       <id>java24</id>
       <activation>
@@ -156,6 +179,8 @@
                 <Import-Package>
                   <!-- JFR is available only in JDK9+ and is optional -->
                   jdk.jfr;resolution:=optional,
+                  <!-- ByteBufUtil loads the allocator of netty-incubator-allocator by name, when it is selected -->
+                  io.netty.incubator.allocator;version="[4.2,5)";resolution:=optional,
                   *
                 </Import-Package>
               </instructions>

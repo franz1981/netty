@@ -19,4 +19,12 @@ public class EventSettings {
     public EventSettings() {
         throw new UnsupportedOperationException("Stub should only be used at compile time");
     }
+
+    public final EventSettings withPeriod(java.time.Duration duration) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
+
+    public final EventSettings with(String name, String value) {
+        throw new UnsupportedOperationException("Stub should only be used at compile time");
+    }
 }

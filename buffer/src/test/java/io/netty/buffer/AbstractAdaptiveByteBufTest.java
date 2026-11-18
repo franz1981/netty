@@ -22,14 +22,19 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public abstract class AbstractAdaptiveByteBufTest extends AbstractPooledByteBufTest {
-    private final AdaptiveByteBufAllocator allocator = new AdaptiveByteBufAllocator();
+    private final ByteBufAllocator allocator = newAllocator();
+
+    /** The allocator under test: the adaptive one unless a subclass says otherwise. */
+    protected ByteBufAllocator newAllocator() {
+        return new AdaptiveByteBufAllocator();
+    }
 
     @Override
     protected final ByteBuf alloc(int length, int maxCapacity) {
         return alloc(allocator, length, maxCapacity);
     }
 
-    protected abstract ByteBuf alloc(AdaptiveByteBufAllocator allocator, int length, int maxCapacity);
+    protected abstract ByteBuf alloc(ByteBufAllocator allocator, int length, int maxCapacity);
 
     @Disabled("Assumes the ByteBuf can be cast to PooledByteBuf")
     @Test

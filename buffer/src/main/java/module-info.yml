@@ -17,3 +17,8 @@ requires:
   - module: io.netty.common
   - module: jdk.jfr
     static: true
+exports:
+  # module-info plugin skips any package containing "internal" therefore we explicitly need to add it
+  - package: io.netty.buffer.internal
+    to:
+      - io.netty.incubator.allocator

@@ -33,6 +33,12 @@ public final class TestsuitePermutation {
         List<ByteBufAllocator> allocators = new ArrayList<ByteBufAllocator>();
         allocators.add(PooledByteBufAllocator.DEFAULT);
         allocators.add(DEFAULT_ADAPTIVE_ALLOCATOR);
+        // -Dio.netty.allocator.type can name another allocator, which then runs the whole testsuite too
+        ByteBufAllocator defaultAllocator = ByteBufAllocator.DEFAULT;
+        if (!(defaultAllocator instanceof PooledByteBufAllocator)
+                && !(defaultAllocator instanceof AdaptiveByteBufAllocator)) {
+            allocators.add(defaultAllocator);
+        }
         return allocators;
     }
 

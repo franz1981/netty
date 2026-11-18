@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 public class AdaptiveBigEndianHeapByteBufTest extends AbstractAdaptiveByteBufTest {
 
     @Override
-    protected ByteBuf alloc(AdaptiveByteBufAllocator allocator, int length, int maxCapacity) {
+    protected ByteBuf alloc(ByteBufAllocator allocator, int length, int maxCapacity) {
         ByteBuf buffer = allocator.heapBuffer(length, maxCapacity);
         assertFalse(buffer.isDirect());
         return buffer;

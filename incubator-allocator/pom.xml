@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Copyright 2026 The Netty Project
+  ~
+  ~ The Netty Project licenses this file to you under the Apache License,
+  ~ version 2.0 (the "License"); you may not use this file except in compliance
+  ~ with the License. You may obtain a copy of the License at:
+  ~
+  ~   https://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+  ~ WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  ~ License for the specific language governing permissions and limitations
+  ~ under the License.
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/maven-v4_0_0.xsd">
+
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>io.netty</groupId>
+    <artifactId>netty-parent</artifactId>
+    <version>4.2.21.Final-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>netty-incubator-allocator</artifactId>
+  <packaging>jar</packaging>
+
+  <name>Netty/Incubator/Allocator</name>
+
+  <properties>
+    <javaModuleName>io.netty.incubator.allocator</javaModuleName>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-buffer</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.projectreactor.tools</groupId>
+      <artifactId>blockhound</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-jfr-stub</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-ffm-stub</artifactId>
+      <version>${project.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-buffer</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-testsuite-common</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-params</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <profiles>
+    <!-- The executions that link mmap(2): they need native access and Java 23+ (LinuxMmapLinker).
+         Active from Java 25, the LTS that CI runs; on any JDK from 23 with -Ppagestore-mmap-tests. -->
+    <profile>
+      <id>pagestore-mmap-tests</id>
+      <activation>
+        <jdk>[25,)</jdk>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <executions>
+              <!-- The default execution has no native access, so mmap(2) regions are not linked there. These two
+                   run the whole module with them and with -Dio.netty.allocator.pagestore.mmap=true, once with Unsafe off
+                   (the JDK 25 default) and once with it on (roots over mapped regions are then the Unsafe ones). -->
+              <execution>
+                <id>test-mmap</id>
+                <goals>
+                  <goal>test</goal>
+                </goals>
+                <configuration>
+                  <runOrder>random</runOrder>
+                  <systemPropertyVariables>
+                    <logback.configurationFile>${logging.config}</logback.configurationFile>
+                    <logLevel>warn</logLevel>
+                    <io.netty.allocator.pagestore.mmap>true</io.netty.allocator.pagestore.mmap>
+                    <pagestore.test.nativeAccess>true</pagestore.test.nativeAccess>
+                  </systemPropertyVariables>
+                  <!-- Give native access to unnamed modules, which will be the case with how the tests are run. -->
+                  <argLine>${argLine.common} ${argLine.printGC} ${argLine.leak} ${argLine.coverage} ${argLine.jni} ${argLine.java9} ${argLine.javaProperties} -Dio.netty.bootstrap.extensions=serviceload -Dio.netty.eventLoopThreads=2 --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=deny</argLine>
+                  <!-- Ensure the whole stacktrace is preserved when an exception is thrown. See https://issues.apache.org/jira/browse/SUREFIRE-1457 -->
+                  <trimStackTrace>false</trimStackTrace>
+                </configuration>
+              </execution>
+              <execution>
+                <id>test-mmap-unsafe</id>
+                <goals>
+                  <goal>test</goal>
+                </goals>
+                <configuration>
+                  <runOrder>random</runOrder>
+                  <systemPropertyVariables>
+                    <logback.configurationFile>${logging.config}</logback.configurationFile>
+                    <logLevel>warn</logLevel>
+                    <io.netty.allocator.pagestore.mmap>true</io.netty.allocator.pagestore.mmap>
+                    <pagestore.test.nativeAccess>true</pagestore.test.nativeAccess>
+                  </systemPropertyVariables>
+                  <argLine>${argLine.common} ${argLine.printGC} ${argLine.leak} ${argLine.coverage} ${argLine.jni} ${argLine.java9} ${argLine.javaProperties} -Dio.netty.bootstrap.extensions=serviceload -Dio.netty.eventLoopThreads=2 --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow</argLine>
+                  <trimStackTrace>false</trimStackTrace>
+                </configuration>
+              </execution>
+              <!-- Native access but not -Dio.netty.allocator.pagestore.mmap: the default, where direct regions are
+                   malloc'd blocks although mmap(2) could be linked. -->
+              <execution>
+                <id>test-mmap-off</id>
+                <goals>
+                  <goal>test</goal>
+                </goals>
+                <configuration>
+                  <test>PageStoreMmapOptInTest</test>
+                  <!-- A -Dio.netty.allocator.pagestore.mmap=true on the command line must not turn its off-case into
+                       a skip. -->
+                  <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+                  <systemPropertyVariables>
+                    <logback.configurationFile>${logging.config}</logback.configurationFile>
+                    <logLevel>warn</logLevel>
+                    <pagestore.test.nativeAccess>true</pagestore.test.nativeAccess>
+                  </systemPropertyVariables>
+                  <argLine>${argLine.common} ${argLine.printGC} ${argLine.leak} ${argLine.coverage} ${argLine.jni} ${argLine.java9} ${argLine.javaProperties} -Dio.netty.bootstrap.extensions=serviceload -Dio.netty.eventLoopThreads=2 --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=deny</argLine>
+                  <trimStackTrace>false</trimStackTrace>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+    <!-- A JVM of its own for PageStoreJfrLazyTest: any other test that records initializes the Flight Recorder first.
+         Active from Java 11, where Recording exists. -->
+    <profile>
+      <id>pagestore-jfr-lazy-tests</id>
+      <activation>
+        <jdk>[11,)</jdk>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <artifactId>maven-surefire-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>test-jfr-lazy</id>
+                <goals>
+                  <goal>test</goal>
+                </goals>
+                <configuration>
+                  <!-- Named, not included: a -Dtest on the command line would otherwise run the whole module here. -->
+                  <test>PageStoreJfrLazyTest</test>
+                  <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+                  <systemPropertyVariables>
+                    <logback.configurationFile>${logging.config}</logback.configurationFile>
+                    <logLevel>warn</logLevel>
+                    <pagestore.test.jfrLazyExecution>true</pagestore.test.jfrLazyExecution>
+                  </systemPropertyVariables>
+                  <argLine>${argLine.common} ${argLine.printGC} ${argLine.leak} ${argLine.coverage} ${argLine.jni} ${argLine.java9} ${argLine.javaProperties} -Dio.netty.bootstrap.extensions=serviceload -Dio.netty.eventLoopThreads=2</argLine>
+                  <trimStackTrace>false</trimStackTrace>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+
+  <build>
+    <plugins>
+      <plugin>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!-- The FFM compile-time stub lives in java.lang and must not be visible to Surefire's forked JVM. -->
+          <classpathDependencyExcludes>
+            <classpathDependencyExclude>io.netty:netty-ffm-stub</classpathDependencyExclude>
+          </classpathDependencyExcludes>
+        </configuration>
+        <executions>
+          <!-- ByteBufUtil picks its default allocator once, so the loader needs a JVM of its own. -->
+          <execution>
+            <id>test-allocator-type-pagestore</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <!-- Named, not included: a -Dtest on the command line would otherwise run the whole module here. -->
+              <test>PageStoreDefaultAllocatorTest</test>
+              <!-- A -Dio.netty.allocator.type on the Maven command line (CI's leak job passes pooled) must not
+                   replace the value this execution tests. -->
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <io.netty.allocator.type>pagestore</io.netty.allocator.type>
+                <pagestore.test.defaultAllocatorExecution>true</pagestore.test.defaultAllocatorExecution>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+          <!-- AbstractByteBuf reads checkAccessible once, so the released-buffer test needs a JVM of its own. -->
+          <execution>
+            <id>test-unchecked-access</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <!-- Named, not included: a -Dtest on the command line would otherwise run every test with the
+                   check off, and tests of released buffers read freed memory. -->
+              <test>PageStoreReleasedBufferTest</test>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <io.netty.buffer.checkAccessible>false</io.netty.buffer.checkAccessible>
+                <pagestore.test.uncheckedAccessExecution>true</pagestore.test.uncheckedAccessExecution>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+          <!-- Low-memory mode is read when the class loads, so each mode needs a JVM of its own. -->
+          <execution>
+            <id>test-low-memory</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <test>PageStoreLowMemoryTest</test>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <io.netty.allocator.pagestore.lowMemory>true</io.netty.allocator.pagestore.lowMemory>
+                <pagestore.test.lowMemoryExecution>true</pagestore.test.lowMemoryExecution>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+          <execution>
+            <id>test-low-memory-thread-local-heaps</id>
+            <goals>
+              <goal>test</goal>
+            </goals>
+            <configuration>
+              <test>PageStoreLowMemoryTest</test>
+              <promoteUserPropertiesToSystemProperties>false</promoteUserPropertiesToSystemProperties>
+              <systemPropertyVariables>
+                <io.netty.allocator.pagestore.lowMemory>true</io.netty.allocator.pagestore.lowMemory>
+                <io.netty.allocator.pagestore.disableThreadLocalMagazinesOnLowMemory>false</io.netty.allocator.pagestore.disableThreadLocalMagazinesOnLowMemory>
+                <pagestore.test.lowMemoryExecution>true</pagestore.test.lowMemoryExecution>
+              </systemPropertyVariables>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.felix</groupId>
+        <artifactId>maven-bundle-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>generate-manifest</id>
+            <phase>process-classes</phase>
+            <goals>
+              <goal>manifest</goal>
+            </goals>
+            <configuration>
+              <instructions>
+                <Import-Package>
+                  <!-- JFR is available only in JDK9+ and is optional -->
+                  jdk.jfr;resolution:=optional,
+                  *
+                </Import-Package>
+              </instructions>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>io.github.dmlloyd.module-info</groupId>
+        <artifactId>module-info</artifactId>
+        <executions>
+          <execution>
+            <id>module-info</id>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>

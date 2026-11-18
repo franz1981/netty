@@ -15,40 +15,32 @@
  */
 package io.netty.buffer;
 
-import io.netty.util.NettyRuntime;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.PlatformDependent;
-import io.netty.util.test.DisabledForSlowLeakDetection;
-import org.junit.jupiter.api.RepeatedTest;
-import org.junit.jupiter.api.RepetitionInfo;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.io.IOException;
-import java.lang.reflect.Array;
-import java.nio.channels.FileChannel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
-import java.util.SplittableRandom;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
-import io.netty.buffer.AbstractByteBufTest.TestGatheringByteChannel;
 
-public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<AdaptiveByteBufAllocator> {
+public class AdaptiveByteBufAllocatorTest extends AbstractAdaptiveByteBufAllocatorTest<AdaptiveByteBufAllocator> {
+    @Override
+    protected Class<? extends ByteBuf> bufferClass() {
+        return AdaptivePoolingAllocator.AdaptiveByteBuf.class;
+    }
+
+    @Override
+    protected AdaptiveByteBufAllocator newDefaultAllocator() {
+        return new AdaptiveByteBufAllocator();
+    }
+
     @Override
     protected AdaptiveByteBufAllocator newAllocator(boolean preferDirect) {
         return new AdaptiveByteBufAllocator(preferDirect);
@@ -67,21 +59,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
     @Override
     protected long expectedUsedMemoryAfterRelease(AdaptiveByteBufAllocator allocator, int capacity) {
         return 128 * 1024; // Min chunk size
-    }
-
-    @Override
-    @Test
-    public void testUnsafeHeapBufferAndUnsafeDirectBuffer() {
-        AdaptiveByteBufAllocator allocator = newUnpooledAllocator();
-        ByteBuf directBuffer = allocator.directBuffer();
-        assertInstanceOf(directBuffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
-        assertTrue(directBuffer.isDirect());
-        directBuffer.release();
-
-        ByteBuf heapBuffer = allocator.heapBuffer();
-        assertInstanceOf(heapBuffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
-        assertFalse(heapBuffer.isDirect());
-        heapBuffer.release();
     }
 
     @Test
@@ -193,166 +170,6 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         }
     }
 
-    @Test
-    public void getBytesBoundaryCheckWithFileChannel() {
-        AdaptiveByteBufAllocator allocator = newAllocator(false);
-        final ByteBuf buf = allocator.directBuffer(7);
-        try {
-            assertThrows(IndexOutOfBoundsException.class, new Executable() {
-                @Override
-                public void execute() throws IOException {
-                    // capacity 7，4+8=12 <= maxFastCapacity 32
-                    buf.getBytes(4, (FileChannel) null, 0L, 8);
-                }
-            });
-        } finally {
-            buf.release();
-        }
-    }
-
-    @Test
-    public void testGetBytesBoundaryCheckWithGatheringByteChannel() throws Exception {
-        AdaptiveByteBufAllocator allocator = newAllocator(false);
-        TestGatheringByteChannel channel = new TestGatheringByteChannel();
-        final ByteBuf buf = allocator.directBuffer(7);
-        try {
-            assertThrows(IndexOutOfBoundsException.class, new Executable() {
-                @Override
-                public void execute() throws IOException {
-                    // capacity 7，4+8=12 <= maxFastCapacity 32
-                    buf.getBytes(4, channel, 8);
-                }
-            });
-        } finally {
-            channel.close();
-            buf.release();
-        }
-    }
-
-    @ParameterizedTest
-    @ValueSource(booleans = { true, false })
-    void sliceOrDuplicateUnwrapLetNotEscapeRootParent(boolean slice) {
-        AdaptiveByteBufAllocator allocator = newAllocator(false);
-        ByteBuf buffer = allocator.buffer(8);
-        assertInstanceOf(buffer, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
-        // Unwrap if this is wrapped by a leak aware buffer.
-        if (buffer instanceof SimpleLeakAwareByteBuf) {
-            assertNull(buffer.unwrap().unwrap());
-        } else {
-            assertNull(buffer.unwrap());
-        }
-
-        ByteBuf derived = slice ? buffer.slice(0, 4) : buffer.duplicate();
-        // When we unwrap the derived buffer we should get our original buffer of type AdaptiveByteBuf back.
-        ByteBuf unwrapped = derived instanceof SimpleLeakAwareByteBuf ?
-                derived.unwrap().unwrap() : derived.unwrap();
-        assertInstanceOf(unwrapped, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
-        assertSameBuffer(buffer instanceof SimpleLeakAwareByteBuf ? buffer.unwrap() : buffer, unwrapped);
-
-        ByteBuf retainedDerived = slice ? buffer.retainedSlice(0, 4) : buffer.retainedDuplicate();
-        // When we unwrap the derived buffer we should get our original buffer of type AdaptiveByteBuf back.
-        ByteBuf unwrappedRetained = retainedDerived instanceof SimpleLeakAwareByteBuf ?
-                retainedDerived.unwrap().unwrap() :  retainedDerived.unwrap();
-        assertInstanceOf(unwrappedRetained, AdaptivePoolingAllocator.AdaptiveByteBuf.class);
-        assertSameBuffer(buffer instanceof SimpleLeakAwareByteBuf ? buffer.unwrap() : buffer, unwrappedRetained);
-        retainedDerived.release();
-
-        assertTrue(buffer.release());
-    }
-
-    @Test
-    public void testAllocateWithoutLock() throws InterruptedException {
-        final AdaptiveByteBufAllocator alloc = new AdaptiveByteBufAllocator();
-        // Make `threadCount` bigger than `AdaptivePoolingAllocator.MAX_STRIPES`, to let thread collision easily happen.
-        int threadCount = NettyRuntime.availableProcessors() * 4;
-        final CountDownLatch countDownLatch = new CountDownLatch(threadCount);
-        final AtomicReference<Throwable> throwableAtomicReference = new AtomicReference<Throwable>();
-        for (int i = 0; i < threadCount; i++) {
-            new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    for (int j = 0; j < 1024; j++) {
-                        try {
-                            ByteBuf buffer = null;
-                            try {
-                                buffer = alloc.heapBuffer(128);
-                                buffer.ensureWritable(ThreadLocalRandom.current().nextInt(512, 32769));
-                            } finally {
-                                if (buffer != null) {
-                                    buffer.release();
-                                }
-                            }
-                        } catch (Throwable t) {
-                            throwableAtomicReference.set(t);
-                        }
-                    }
-                    countDownLatch.countDown();
-                }
-            }).start();
-        }
-        countDownLatch.await();
-        Throwable throwable = throwableAtomicReference.get();
-        if (throwable != null) {
-            fail("Expected no exception, but got", throwable);
-        }
-    }
-
-    @DisabledForSlowLeakDetection
-    @RepeatedTest(100)
-    void buddyAllocationConsistency(RepetitionInfo info) {
-        SplittableRandom rng = new SplittableRandom(info.getCurrentRepetition());
-        AdaptiveByteBufAllocator allocator = newAllocator(true);
-        int small = 32768;
-        int large = 2 * small;
-        int xlarge = 2 * large;
-
-        int[] allocationSizes = {
-                small, small, small, small, small, small, small, small,
-                large, large, large, large,
-                xlarge, xlarge,
-        };
-
-        shuffle(rng, allocationSizes);
-
-        ByteBuf[] bufs = new ByteBuf[allocationSizes.length];
-        Arrays.setAll(bufs, i -> allocator.buffer(allocationSizes[i], allocationSizes[i]));
-
-        shuffle(rng, bufs);
-
-        int[] reallocations = new int[bufs.length / 2];
-        for (int i = 0; i < reallocations.length; i++) {
-            reallocations[i] = bufs[i].capacity();
-            bufs[i].release();
-            bufs[i] = null;
-        }
-        for (int i = 0; i < reallocations.length; i++) {
-            assertNull(bufs[i]);
-            bufs[i] = allocator.buffer(reallocations[i], reallocations[i]);
-        }
-
-        for (int i = 0; i < bufs.length; i++) {
-            while (bufs[i].isWritable()) {
-                bufs[i].writeByte(i + 1);
-            }
-        }
-        try {
-            for (int i = 0; i < bufs.length; i++) {
-                while (bufs[i].isReadable()) {
-                    int b = Byte.toUnsignedInt(bufs[i].readByte());
-                    if (b != i + 1) {
-                        fail("Expected byte " + (i + 1) +
-                                " at index " + (bufs[i].readerIndex() - 1) +
-                                " but got " + b);
-                    }
-                }
-            }
-        } finally {
-            for (ByteBuf buf : bufs) {
-                buf.release();
-            }
-        }
-    }
-
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     void purgeScanShouldEvictIdleChunks(boolean threadLocal) throws Exception {
@@ -413,15 +230,5 @@ public class AdaptiveByteBufAllocatorTest extends AbstractByteBufAllocatorTest<A
         assertTrue(memoryAfterPurge < memoryAfterRelease,
                 "Memory should decrease after purge scans evict idle chunks. " +
                 "Before purge: " + memoryAfterRelease + ", after purge: " + memoryAfterPurge);
-    }
-
-    private static void shuffle(SplittableRandom rng, Object array) {
-        int len = Array.getLength(array);
-        for (int i = 0; i < len; i++) {
-            int n = rng.nextInt(i, len);
-            Object value = Array.get(array, i);
-            Array.set(array, i, Array.get(array, n));
-            Array.set(array, n, value);
-        }
     }
 }

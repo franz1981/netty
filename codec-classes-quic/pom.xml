@@ -88,6 +88,13 @@
       <artifactId>assertj-core</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <!-- so that -Dio.netty.allocator.type=pagestore runs the tests of this module on it -->
+      <groupId>${project.groupId}</groupId>
+      <artifactId>netty-incubator-allocator</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
